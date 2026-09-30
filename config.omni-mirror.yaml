@@ -1,0 +1,85 @@
+# Mirror of the live OmniRoute combos on this machine (PORT 20129, v16.3.1),
+# read 2026-09-30 from its storage.sqlite `combos` table.
+#
+# Fidelity notes (deliberate, documented):
+# - Same combo ids, same strategies, same targets in the same order. Model
+#   spellings drop the redundant `<providerId>/` prefix OmniRoute stores
+#   (`nvidia/moonshotai/kimi-k3` -> target `nvidia/moonshotai/kimi-k3`
+#   would rsplit to provider `nvidia/moonshotai`; the first-slash fallback
+#   in ServerConfig handles the rest).
+# - small-stack's `openai-compatible-chat-<uuid>` target is EXCLUDED: it is a
+#   user-defined custom provider with no compiled-in registry entry, and an
+#   unknown provider fails the whole file loudly. Custom-provider import is
+#   the known gap (see README parity notes).
+# - paper-stack `strategy: auto` parses to Deferred("auto"): with all five
+#   targets on one provider the auto pool and config order pick identically,
+#   so routing is the same; multi-provider auto pools fall back to config
+#   order (request-time auto scoring engages only for literal `auto/*`
+#   model names).
+# - Port differs (22128 vs 20129) so both servers run side by side.
+# - Keys stay in the environment; dummy values boot/serve, real values route.
+#
+#   export AR_KEY_NVIDIA=... AR_KEY_CLINE=... AR_KEY_KILOCODE=... \
+#          AR_KEY_OPENROUTER=... AR_KEY_GEMINI=... AR_KEY_ZENMUX_FREE=...
+#   ar --config config.omni-mirror.yaml doctor
+#   ar --config config.omni-mirror.yaml serve
+
+server:
+  host: 127.0.0.1
+  port: 22128
+
+keys:
+  nvidia: $AR_KEY_NVIDIA
+  cline: $AR_KEY_CLINE
+  kilocode: $AR_KEY_KILOCODE
+  openrouter: $AR_KEY_OPENROUTER
+  gemini: $AR_KEY_GEMINI
+  zenmux-free: $AR_KEY_ZENMUX_FREE
+
+providers:
+  - id: nvidia
+    key: nvidia
+  - id: cline
+    key: cline
+  - id: kilocode
+    key: kilocode
+  - id: openrouter
+    key: openrouter
+  - id: gemini
+    key: gemini
+  - id: zenmux-free
+    key: zenmux-free
+
+combos:
+  - id: free-stack
+    strategy: least-used
+    targets:
+      - nvidia/z-ai/glm-5.3
+      - nvidia/moonshotai/kimi-k3
+
+  - id: small-stack
+    strategy: priority
+    targets:
+      - cline/stealth/space-bunny-alpha
+      - kilocode/stealth/space-bunny-alpha
+      - openrouter/stealth/space-bunny-alpha
+      - cline/cline-free/mimo-v2.6-flash
+      - cline/cline-free/deepseek-v4.1-flash
+      - gemini/gemini-3.8-flash
+      - kilocode/nex-agi/nex-n2.5-pro:free
+      - cline/nex-agi/nex-n2.5-pro:free
+      - kilocode/poolside/laguna-s-2.1:free
+      - cline/poolside/laguna-s-2.1:free
+      - kilocode/nvidia/nemotron-3-ultra-550b-a55b:free
+      - cline/nvidia/nemotron-3-ultra-550b-a55b:free
+      - kilocode/dots-studio/dots-3-note-preview:free
+      - cline/dots-studio/dots-3-note-preview:free
+
+  - id: paper-stack
+    strategy: auto
+    targets:
+      - zenmux-free/z-ai/glm-5.3-flash
+      - zenmux-free/deepseek/deepseek-v4.1-flash
+      - zenmux-free/sakana/fugu-ultra-v2
+      - zenmux-free/qwen/qwen3.8-flash
+      - zenmux-free/openai/gpt-5.6-luna

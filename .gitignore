@@ -15,3 +15,6 @@
 # Profiling / fuzz artifacts
 perf.data*
 *.profraw
+
+# Release staging (built artifacts, shipped via GitHub Releases)
+/dist/

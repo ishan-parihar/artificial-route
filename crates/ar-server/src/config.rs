@@ -221,7 +221,25 @@ impl ServerConfig {
             }
             let mut targets = Vec::with_capacity(combo.targets.len());
             for (rank, target) in combo.targets.iter().enumerate() {
-                let (provider, model) = split_target(target);
+                let (mut provider, mut model) = split_target(target);
+                if ar_registry::global().get(provider).is_none()
+                    && !cfg.providers.iter().any(|p| p.id == provider)
+                {
+                    // `split_target` takes the longest provider-looking prefix,
+                    // which is wrong when the *model* half is the nested one
+                    // (`nvidia/moonshotai/kimi-k3`). Retry at the first slash
+                    // when that names a known provider; a genuinely nested
+                    // provider id still wins because it matched first.
+                    if let Some((head, tail)) = target.split_once('/')
+                        && !head.is_empty()
+                        && !tail.is_empty()
+                        && (ar_registry::global().get(head).is_some()
+                            || cfg.providers.iter().any(|p| p.id == head))
+                    {
+                        provider = head;
+                        model = tail;
+                    }
+                }
                 let def = ar_registry::global().get(provider).ok_or_else(|| ComboError::UnknownProvider {
                     target: target.clone(),
                     provider: provider.to_owned(),
@@ -782,6 +800,30 @@ combos:
             ServerConfig::from_ar_config(&cfg, None, None, false),
             Err(ComboError::UnknownProvider { .. })
         ));
+    }
+
+    #[test]
+    fn splits_a_nested_model_path_at_a_known_provider() {
+        // Live OmniRoute combos address nested model paths
+        // (`nvidia/moonshotai/kimi-k3`); the rsplit half names no provider,
+        // so the first slash wins when it names one.
+        let yaml = "keys:\n  nvidia: k\nproviders:\n  - id: nvidia\n    key: nvidia\ncombos:\n  - id: free-stack\n    strategy: least-used\n    targets:\n      - nvidia/moonshotai/kimi-k3\n      - nvidia/z-ai/glm-5.3\n";
+        let cfg = parse(yaml).expect("config parses");
+        let server =
+            ServerConfig::from_ar_config(&cfg, None, None, false).expect("combos build");
+        let combo = server.combo("free-stack").expect("combo exists");
+        let got: Vec<(String, String)> = server
+            .candidates(Some(combo))
+            .iter()
+            .map(|c| (c.provider.as_str().to_owned(), c.model.as_ref().to_owned()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("nvidia".to_owned(), "moonshotai/kimi-k3".to_owned()),
+                ("nvidia".to_owned(), "z-ai/glm-5.3".to_owned())
+            ]
+        );
     }
 
     #[test]
