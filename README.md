@@ -35,12 +35,18 @@ The OmniRoute figure is its full Next.js desktop/PWA server, not just its proxy 
 | Surface | Artificial Route | OmniRoute | agentgateway |
 |---|---|---|---|
 | providers | **276** (identical set) | 276 | 8 + 13 presets |
-| routing strategies | **20** + 6-variant auto factory | 20 + auto | 3 |
-| wire dialects | 6 in, 18 named-missing | 24 cells | passthrough |
-| compression | 3 engines | 12+ engines | 0 |
+| strategies | **20** + 6-variant auto | 20 + auto | 3 (+LB modes) |
+| dialects | 6 in, 18 named-missing | 24 cells | 8 formats |
+| compression | 3 engines, per-request | 12 (+stubs), per-combo | 4, reactive, no knob |
+| upstream auth | apikey only | apikey + 24-entry OAuth | 9 strategies, exchange-only |
+| key storage | env vars (local db planned) | encrypted DB | env/file/`ate-secret://` |
+| model refresh | snapshot + import | sync + overlays | catalog + refresh API |
 | routes | 7 (`chat`, `messages`, `responses`, `api/chat`, `models`, `healthz`, `metrics`) | full gateway + UI | 22 data-plane |
 
-Known gaps, stated plainly: user-defined custom providers need a registry import; multi-provider `auto` pools fall back to config order (single-provider pools score identically); the 8 MCP tools exist as a library crate not yet wired to the binary; the registry snapshot lags OmniRoute's model rotation — `ar doctor` names each stale model and the `ar import` fix.
+Full depth — OAuth mechanics, refresh triggers, quota tables, engine-catalog
+divergences, and every gap with its fix — lives in [AUDIT-REPORT.md](AUDIT-REPORT.md).
+
+Known gaps, stated plainly: no OAuth dispatch yet (codex/cline/grok-cli sessions unusable); provider keys are env-only until the local encrypted store lands; user-defined custom providers need a registry import; multi-provider `auto` pools fall back to config order (single-provider pools score identically); the 8 MCP tools exist as a library crate not yet wired to the binary; the registry snapshot lags OmniRoute's model rotation — `ar doctor` names each stale model and the `ar import` fix.
 
 ## Installation
 

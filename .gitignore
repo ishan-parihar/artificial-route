@@ -11,6 +11,10 @@
 .env
 *.pem
 *.key
+*.db
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
 
 # Profiling / fuzz artifacts
 perf.data*
