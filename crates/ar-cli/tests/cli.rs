@@ -61,7 +61,7 @@ fn exits_fast_when_version() {
     let out = Command::new(BIN).arg("--version").current_dir(&empty).output().expect("the ar binary runs");
 
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
-    assert_eq!(stdout(&out), "ar 0.1.0\n");
+    assert_eq!(stdout(&out), "ar 0.1.1\n");
     assert_eq!(stderr(&out), "", "the fast path must not emit diagnostics");
 }
 

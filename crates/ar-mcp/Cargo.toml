@@ -1,6 +1,6 @@
 [package]
 name = "ar-mcp"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.90"
 description = "Optional MCP control plane: essential-8 catalog + tool_search discovery + scope/audit guard, wrapping ar-route/ar-tokens/ar-keys (Artificial Route P1)"

@@ -221,25 +221,9 @@ impl ServerConfig {
             }
             let mut targets = Vec::with_capacity(combo.targets.len());
             for (rank, target) in combo.targets.iter().enumerate() {
-                let (mut provider, mut model) = split_target(target);
-                if ar_registry::global().get(provider).is_none()
-                    && !cfg.providers.iter().any(|p| p.id == provider)
-                {
-                    // `split_target` takes the longest provider-looking prefix,
-                    // which is wrong when the *model* half is the nested one
-                    // (`nvidia/moonshotai/kimi-k3`). Retry at the first slash
-                    // when that names a known provider; a genuinely nested
-                    // provider id still wins because it matched first.
-                    if let Some((head, tail)) = target.split_once('/')
-                        && !head.is_empty()
-                        && !tail.is_empty()
-                        && (ar_registry::global().get(head).is_some()
-                            || cfg.providers.iter().any(|p| p.id == head))
-                    {
-                        provider = head;
-                        model = tail;
-                    }
-                }
+                let (provider, model) = split_target_known(target, |id| {
+                    ar_registry::global().get(id).is_some()
+                });
                 let def = ar_registry::global().get(provider).ok_or_else(|| ComboError::UnknownProvider {
                     target: target.clone(),
                     provider: provider.to_owned(),
@@ -552,6 +536,31 @@ pub enum ComboError {
     },
 }
 
+/// Splits a `provider/model` target at the longest provider-looking prefix.
+///
+/// Every `/`-boundary is tried from longest provider to shortest, and the
+/// first whose left half names a known provider wins. That covers both
+/// shapes the ecosystem uses: nested provider paths
+/// (`accounts/fireworks/models/mixtral`) and nested model paths
+/// (`nvidia/moonshotai/kimi-k3`, `aihorde/aphrodite/TheDrummer/...`).
+/// A target with no known prefix falls back to [`split_target`], so the
+/// error names the longest guess rather than silently accepting it.
+///
+/// The one shared grammar: `ar serve` and `ar doctor` both resolve through
+/// here, so a config one accepts is one the other accepts.
+#[must_use]
+pub fn split_target_known(target: &str, known: impl Fn(&str) -> bool) -> (&str, &str) {
+    let mut end = target.len();
+    while let Some(i) = target[..end].rfind('/') {
+        let (head, tail) = (&target[..i], &target[i + 1..]);
+        if !head.is_empty() && !tail.is_empty() && known(head) {
+            return (head, tail);
+        }
+        end = i;
+    }
+    split_target(target)
+}
+
 /// Splits a `provider/model` target.
 ///
 /// `rsplit_once` rather than `split_once`: a provider path can itself be
@@ -823,6 +832,27 @@ combos:
                 ("nvidia".to_owned(), "moonshotai/kimi-k3".to_owned()),
                 ("nvidia".to_owned(), "z-ai/glm-5.3".to_owned())
             ]
+        );
+    }
+
+    #[test]
+    fn splits_a_multi_slash_model_path_at_the_registered_provider() {
+        // `aihorde/aphrodite/TheDrummer/Cydonia-24B-v4.3`: neither the rsplit
+        // half nor the first-slash half names a provider on its own; the
+        // longest registered prefix wins.
+        let yaml = "keys:\n  aihorde: k\nproviders:\n  - id: aihorde\n    key: aihorde\ncombos:\n  - id: c\n    strategy: priority\n    targets:\n      - aihorde/aphrodite/TheDrummer/Cydonia-24B-v4.3\n";
+        let cfg = parse(yaml).expect("config parses");
+        let server =
+            ServerConfig::from_ar_config(&cfg, None, None, false).expect("combos build");
+        let combo = server.combo("c").expect("combo exists");
+        let got: Vec<(String, String)> = server
+            .candidates(Some(combo))
+            .iter()
+            .map(|c| (c.provider.as_str().to_owned(), c.model.as_ref().to_owned()))
+            .collect();
+        assert_eq!(
+            got,
+            [("aihorde".to_owned(), "aphrodite/TheDrummer/Cydonia-24B-v4.3".to_owned())]
         );
     }
 

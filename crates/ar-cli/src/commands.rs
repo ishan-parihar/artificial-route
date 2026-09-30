@@ -13,6 +13,7 @@ use std::path::Path;
 
 use ar_config::{Combo, Config, ProviderCfg};
 use ar_registry::global as registry;
+use ar_server::config::split_target_known;
 use clap::error::ErrorKind;
 use clap::CommandFactory;
 
@@ -168,7 +169,7 @@ fn model_rows(cfg: &Config) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
     for c in &cfg.combos {
         for t in &c.targets {
-            let (provider, model) = split_target(t);
+            let (provider, model) = split_target_known(t, |id| registry().get(id).is_some());
             let status = match registry().get(provider) {
                 None => "unknown-provider",
                 Some(_) if !model_known(provider, model) => "unknown-model",
@@ -200,18 +201,10 @@ fn model_rows(cfg: &Config) -> Vec<Row> {
     rows
 }
 
-/// Splits a `provider/model` target.
-///
-/// A target with no slash yields an empty model and the whole string as the
-/// provider, which `doctor` then reports as unroutable rather than this function
-/// silently accepting it.
-pub fn split_target(target: &str) -> (&str, &str) {
-    target.split_once('/').map_or((target, ""), |(p, m)| (p, m))
-}
-
-/// The provider half of a `provider/model` target.
-fn target_provider(target: &str) -> &str {
-    split_target(target).0
+/// The provider half of a `provider/model` target, under the same grammar
+/// `ar serve` routes with (see `ar_server::config::split_target_known`).
+pub fn target_provider(target: &str) -> &str {
+    split_target_known(target, |id| registry().get(id).is_some()).0
 }
 
 fn providers(cli: &Cli, args: &ListArgs) -> anyhow::Result<()> {
@@ -344,7 +337,7 @@ fn findings(cfg: &Config, path: &str) -> Vec<Row> {
 
     let targets: BTreeSet<&str> = cfg.combos.iter().flat_map(|c| c.targets.iter().map(String::as_str)).collect();
     for t in targets {
-        let (provider, model) = split_target(t);
+        let (provider, model) = split_target_known(t, |id| registry().get(id).is_some());
         let (status, detail) = if registry().get(provider).is_none() {
             ("fail", "provider not in registry")
         } else if !cfg.providers.iter().any(|p| p.id == provider) {
@@ -547,8 +540,20 @@ mod tests {
     }
 
     #[test]
-    fn treats_bare_target_as_provider() {
-        assert_eq!(target_provider("openai"), "openai");
+    fn treats_bare_target_as_unroutable() {
+        // No slash: the shared grammar yields the default-combo provider,
+        // which names no registry entry — doctor reports it, serve refuses it.
+        assert_eq!(target_provider("openai"), "default");
+    }
+
+    #[test]
+    fn splits_nested_model_paths_at_the_registered_provider() {
+        // Same grammar `ar serve` routes with: longest registered prefix wins.
+        assert_eq!(target_provider("nvidia/moonshotai/kimi-k3"), "nvidia");
+        assert_eq!(
+            target_provider("aihorde/aphrodite/TheDrummer/Cydonia-24B-v4.3"),
+            "aihorde"
+        );
     }
 
     #[test]

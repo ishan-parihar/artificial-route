@@ -1,6 +1,6 @@
 [package]
 name = "ar-obs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.90"
 description = "Metrics, JSON tracing and the redacted audit ledger (Artificial Route P5)"

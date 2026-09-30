@@ -3,12 +3,12 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/ishan-parihar/artificial-route/main/install.sh | sh
 #
-# Env knobs: AR_VERSION (default v0.1.0), AR_INSTALL_DIR (default $HOME/.local/bin).
+# Env knobs: AR_VERSION (default v0.1.1), AR_INSTALL_DIR (default $HOME/.local/bin).
 # Flags: --version <tag> --dir <path>. Unknown flags fail loudly (exit 2).
 set -eu
 
 REPO="ishan-parihar/artificial-route"
-VERSION="${AR_VERSION:-v0.1.0}"
+VERSION="${AR_VERSION:-v0.1.1}"
 DIR="${AR_INSTALL_DIR:-$HOME/.local/bin}"
 
 while [ $# -gt 0 ]; do

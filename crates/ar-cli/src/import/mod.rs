@@ -287,7 +287,7 @@ pub fn rows(imported: &Imported, out_dir: &str) -> Vec<Vec<String>> {
         .iter()
         .map(|c| {
             let providers: BTreeSet<&str> =
-                c.targets.iter().map(|t| crate::commands::split_target(t).0).collect();
+                c.targets.iter().map(|t| crate::commands::target_provider(t)).collect();
             vec![c.id.clone(), providers.into_iter().collect::<Vec<_>>().join("+"), "active".to_owned(), out_dir.to_owned()]
         })
         .collect()
