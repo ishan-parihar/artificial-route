@@ -1,0 +1,55 @@
+[package]
+name = "ar-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "The `ar` binary: AXI/TOON command surface over ar-config + ar-registry + ar-server"
+license = "Apache-2.0"
+
+[[bin]]
+name = "ar"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+ar-config = { workspace = true }
+ar-core = { workspace = true }
+ar-registry = { workspace = true }
+ar-route = { workspace = true }
+
+# Not hoisted into `[workspace.dependencies]`: this task's write scope is
+# `crates/ar-cli`, and a path here resolves inside the workspace all the same.
+# It is also the fix for the "two `ar` binaries" seam in the root README — from
+# here on `ar serve` delegates to `ar_server::server()` instead of
+# re-implementing a listener, so `ar-server`'s own `[[bin]] ar` is redundant.
+ar-server = { path = "../ar-server" }
+# For the price table `ServerConfig::from_ar_config` takes, loaded from the
+# compiled-in registry so `cost-optimized` sorts on real prices.
+ar-tokens = { path = "../ar-tokens" }
+
+anyhow = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+http-body-util = { workspace = true }
+jemallocator = { workspace = true }
+# For the one `ar import --from omniroute` GET against models.dev. Already in the
+# workspace and in `Cargo.lock` via `ar-exec` / `ar-server`, so naming it here
+# adds no new dependency, only a new consumer of one that is already vetted.
+reqwest = { workspace = true }
+# The `LiteLlm` shapes in `import.rs` are Deserialize; `serde_yaml` only
+# deserializes into them, it does not bring the derive.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# LiteLLM configs are YAML in every config people actually have.
+serde_yaml = { workspace = true }
+tokio = { workspace = true }
+# `util` for `ServiceExt::oneshot`, which lets `ar run` drive the real router
+# in-process instead of re-implementing the request path.
+tower = { workspace = true, features = ["util"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }

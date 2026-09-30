@@ -1,0 +1,8 @@
+---
+source: crates/ar-cli/tests/cli.rs
+expression: "stdout(&ar(&[\"providers\"]))"
+---
+count: 2 of 2 total
+providers[2]{id,provider,status}:
+  anthropic,anthropic,ok
+  openai,openai,ok

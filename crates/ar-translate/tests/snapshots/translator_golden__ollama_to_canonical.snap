@@ -1,0 +1,31 @@
+---
+source: crates/ar-translate/tests/translator_golden.rs
+expression: canonical
+---
+CanonicalChat {
+    model: "llama3.2",
+    messages: [
+        Msg {
+            role: System,
+            content: "be terse",
+            media: [],
+        },
+        Msg {
+            role: User,
+            content: "hello",
+            media: [],
+        },
+        Msg {
+            role: Assistant,
+            content: "hi",
+            media: [],
+        },
+    ],
+    temperature: Some(
+        0.4,
+    ),
+    max_tokens: Some(
+        128,
+    ),
+    stream: true,
+}

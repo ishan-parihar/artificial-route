@@ -1,0 +1,35 @@
+# Deterministic fixture for the ar-cli integration tests.
+#
+# Keys are literals, not environment references, so `ar` needs no environment to
+# load this file and the TOON goldens stay byte-stable. Note that expansion
+# covers comments too, so no prose in this file may contain a dollar sign
+# followed by a name.
+
+server:
+  host: 127.0.0.1
+  port: 20128
+
+keys:
+  openai: sk-test-openai
+  anthropic: sk-test-anthropic
+
+providers:
+  - id: openai
+    key: openai
+  - id: anthropic
+    key: anthropic
+
+combos:
+  - id: default
+    strategy: lkgp
+    targets:
+      - openai/gpt-5.4
+      - anthropic/claude-sonnet-5
+
+  # Two priced targets so `cost-optimized` compares real prices.
+  - id: cheap
+    strategy: cost-optimized
+    targets:
+      - openai/gpt-5.4
+      - openai/gpt-5.4-nano
+

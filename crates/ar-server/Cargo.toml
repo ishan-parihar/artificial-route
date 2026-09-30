@@ -1,0 +1,61 @@
+[package]
+name = "ar-server"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "axum spine: /v1/chat/completions, /v1/models, /healthz, /metrics (Artificial Route P0)"
+license = "Apache-2.0"
+
+[lints]
+workspace = true
+
+# No `[[bin]]`. `ar` belongs to `ar-cli`, which already depends on this crate
+# and delegates `serve` to `ar_server::server()`. Two crates producing a binary
+# of the same name made `target/release/ar` whichever linked last and made
+# `cargo run --bin ar` ambiguous; see the root README's "Open seams".
+
+[dependencies]
+ar-route = { workspace = true }
+
+# Path deps rather than workspace entries: the sibling crates are already in the
+# workspace, and hoisting them into `[workspace.dependencies]` is that file's
+# owner's edit, not this crate's.
+ar-exec = { path = "../ar-exec" }
+ar-config = { path = "../ar-config" }
+ar-registry = { path = "../ar-registry" }
+ar-translate = { path = "../ar-translate" }
+ar-compress = { path = "../ar-compress" }
+ar-cache = { path = "../ar-cache" }
+ar-guard = { path = "../ar-guard" }
+ar-keys = { path = "../ar-keys" }
+ar-tokens = { path = "../ar-tokens" }
+
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+# Libs use `thiserror` for typed errors (`BindError`, `ComboError`); `anyhow` is
+# for binaries only, per AGENTS.md.
+thiserror = { workspace = true }
+# The cache-write path tees the relayed body and stores it on the generator's
+# final poll, which needs `stream!`. Already in the graph via `ar-exec`.
+async-stream = { workspace = true }
+# `CancellationToken` for the per-attempt abort handle `ar-exec`'s core takes.
+# Already in the graph via `reqwest`.
+tokio-util = { version = "0.7", features = ["rt"] }
+
+[dev-dependencies]
+axum = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+http-body-util = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true, features = ["util"] }

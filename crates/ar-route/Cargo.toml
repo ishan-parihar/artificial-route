@@ -1,0 +1,30 @@
+[package]
+name = "ar-route"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "Routing: 19 strategies, attempt loop, per-key backoff (Artificial Route)"
+license = "Apache-2.0"
+
+[lints]
+workspace = true
+# NOTE: `clippy::todo` is intentionally NOT denied here. Cargo forbids mixing
+# `lints.workspace = true` with local overrides, and denying it workspace-wide
+# would break the P0 cross-crate trait seams, which are `todo!()` until
+# `ar-translate` / `ar-exec` / `ar-route` land. Express "not implemented" as
+# `Strategy::Deferred` (docs/02) rather than a panic on a live request.
+
+[dependencies]
+# Prefix-pin: `context-relay|context-optimized|cache-optimized|fusion` rank
+# candidates by the same stateless HRW hash `ar_cache::affinity` uses, so this
+# crate holds no pin store. Workspace-internal, no new external dep; the cycle
+# is impossible because `ar-cache` does not depend on `ar-route`.
+ar-cache = { path = "../ar-cache" }
+bytes = { workspace = true }
+futures = { workspace = true }
+http = "1"
+# `pipeline.rs` parses the `reflect` judge's JSON verdict. Already a workspace
+# dep; the reflect parser is the only thing in this crate that needs it.
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

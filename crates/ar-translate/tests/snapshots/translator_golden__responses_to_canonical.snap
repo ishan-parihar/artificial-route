@@ -1,0 +1,36 @@
+---
+source: crates/ar-translate/tests/translator_golden.rs
+expression: canonical
+---
+CanonicalChat {
+    model: "gpt-5.4",
+    messages: [
+        Msg {
+            role: System,
+            content: "be terse",
+            media: [],
+        },
+        Msg {
+            role: User,
+            content: "hello",
+            media: [],
+        },
+        Msg {
+            role: Assistant,
+            content: "hi",
+            media: [],
+        },
+        Msg {
+            role: User,
+            content: "again",
+            media: [],
+        },
+    ],
+    temperature: Some(
+        0.1,
+    ),
+    max_tokens: Some(
+        256,
+    ),
+    stream: true,
+}

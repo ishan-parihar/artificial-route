@@ -1,0 +1,17 @@
+# Rust build output (the binary ships; the build dir does not)
+/target/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local secrets — never commit
+.env
+*.pem
+*.key
+
+# Profiling / fuzz artifacts
+perf.data*
+*.profraw

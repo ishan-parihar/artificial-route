@@ -1,0 +1,26 @@
+---
+source: crates/ar-translate/tests/translator_golden.rs
+expression: round_tripped
+---
+CanonicalChat {
+    model: "gpt-5.4",
+    messages: [
+        Msg {
+            role: User,
+            content: "what is this?",
+            media: [
+                MediaPart {
+                    kind: "image_url",
+                    body: Object {
+                        "image_url": Object {
+                            "url": String("http://x/i.png"),
+                        },
+                    },
+                },
+            ],
+        },
+    ],
+    temperature: None,
+    max_tokens: None,
+    stream: false,
+}

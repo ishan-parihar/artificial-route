@@ -1,0 +1,25 @@
+[package]
+name = "ar-tokens"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "Token counting, usage normalization, cost ledger and per-key caps (Artificial Route P1)"
+license = "Apache-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+# For `PricingTable::from_registry`: the price rows and the flat-rate ids are
+# catalog data, and a pricing table that had its own copy of them would be a
+# second place for them to drift.
+ar-registry = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Exact BPE counting; `cl100k_base` only — see src/count.rs for why o200k is not
+# wired yet.
+tiktoken-rs = { workspace = true }
+# `bundled` so the ledger does not depend on a system libsqlite3 being present.
+rusqlite = { workspace = true }
+# Only for `DenyReason::status`, matching ar-route's `RouteError::status`.
+http = "1"

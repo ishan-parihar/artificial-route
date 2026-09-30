@@ -1,0 +1,55 @@
+[package]
+name = "ar-mcp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "Optional MCP control plane: essential-8 catalog + tool_search discovery + scope/audit guard, wrapping ar-route/ar-tokens/ar-keys (Artificial Route P1)"
+license = "Apache-2.0"
+
+[lints]
+workspace = true
+
+# Accept gate (docs/06): a default `cargo tree -e no-dev` must contain no
+# `rmcp`. So the protocol SDK is OPTIONAL and nothing else is. Scope checks,
+# the audit trail and the eight tool bodies compile with no SDK present --
+# which is also what makes them callable and testable in-process.
+[features]
+default = []
+mcp = ["dep:rmcp"]
+
+[dependencies]
+ar-route = { workspace = true }
+# `ar-tokens` and `ar-keys` are not in `[workspace.dependencies]`, so they are
+# path deps -- the same call `ar-route` makes for `ar-cache`. Adding them to the
+# root manifest is not this crate's write scope, and a duplicate declaration is
+# how two crates end up on two versions of one workspace crate.
+ar-tokens = { path = "../ar-tokens" }
+ar-keys = { path = "../ar-keys" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# `redb` 4.3 is already resolved in Cargo.lock via `ar-cache`, so the audit
+# table costs no new transitive dependency.
+redb = "4.3.0"
+# `blake3` 1.8.7 is already resolved in Cargo.lock via `ar-cache/src/key.rs`,
+# declared inline for the same reason `ar-tokens`/`ar-keys` are inline above --
+# adding it to the root manifest is not this crate's write scope. So the audit
+# digest `docs/06` asks for costs zero new transitive dependencies; it is the
+# same crate, the same version, one lockfile entry. `docs/06` names blake3
+# explicitly and `std::hash::DefaultHasher` is *not* stable across Rust
+# releases, which makes an audit row written by one build unmatchable by
+# another. See `src/audit.rs`.
+blake3 = "1.8.7"
+
+# --- `mcp` only. See [features] above. ---
+# `default-features = false` keeps the SDK's own `client`, `auth` and reqwest
+# halves out of the graph: this crate is a server. `server` is the only feature
+# that matters until the transports land -- see `src/transport.rs`.
+rmcp = { version = "3.5.0", optional = true, default-features = false, features = ["server"] }
+
+[dev-dependencies]
+# `rt`/`macros` so a test can hold a real `Admission` lease and assert the
+# health reading tracks it. `tokio` is already in the lockfile via `ar-keys`,
+# and `ar-keys` declares the identical dev-dependency for the identical reason.
+tokio = { workspace = true, features = ["rt", "macros", "time", "sync"] }

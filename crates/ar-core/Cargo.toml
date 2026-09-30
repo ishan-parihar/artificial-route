@@ -1,0 +1,15 @@
+[package]
+name = "ar-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "Shared vocabulary: interned name type, cross-crate trait seams, P0 errors"
+license = "Apache-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

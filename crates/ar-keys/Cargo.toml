@@ -1,0 +1,46 @@
+[package]
+name = "ar-keys"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "Credential protection, scoped access tokens, and lane admission"
+license = "Apache-2.0"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# The OS keychain is a desktop concern. It stays off by default so the VPS
+# build has no `dbus`/`secret-service` in its tree — `docs/04` calls for
+# `keyring` on desktop and an `age` file on the host, and a default-on desktop
+# dependency would make the second half impossible.
+keyring = ["dep:keyring"]
+
+[dependencies]
+ar-core = { workspace = true }
+
+# Versions are the ones pinned in `docs/03-crates-and-deps.md`. Declared inline
+# rather than added to `[workspace.dependencies]`, following the precedent in
+# `ar-exec`: several sibling crates are being written concurrently and editing
+# one shared file invites a conflict that has nothing to do with this crate.
+# `ar-keys` itself is in the workspace, so `members = ["crates/*"]` picks it up
+# with no change to the root manifest.
+aes-gcm = "0.10"
+argon2 = "0.5"
+base64 = "0.22"
+governor = "0.10"
+jsonwebtoken = "9.3"
+redb = "2.6"
+serde = { workspace = true }
+serde_json = { workspace = true }
+subtle = "2.6"
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+zeroize = "1.8"
+
+keyring = { version = "3.6", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }

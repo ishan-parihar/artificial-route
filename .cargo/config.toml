@@ -1,0 +1,7 @@
+# Build behaviour only. Deliberately no `[build] rustflags`: a rustflags entry here
+# would silently override the workspace lint table in `Cargo.toml` and break the
+# `--locked` clippy gate in docs/03.
+
+[net]
+retry = 2
+git-fetch-with-cli = true

@@ -1,0 +1,7 @@
+---
+source: crates/ar-translate/tests/translator_golden.rs
+expression: err
+---
+UnsupportedPart {
+    kind: "realtime_audio",
+}

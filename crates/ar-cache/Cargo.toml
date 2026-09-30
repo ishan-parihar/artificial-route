@@ -1,0 +1,41 @@
+[package]
+name = "ar-cache"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "Exact response cache: quick_cache 32MB + redb disk + Idempotency-Key + prefix-pin (Artificial Route P1)"
+license = "Apache-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Key: blake3 over a BTreeMap-canonical JSON rendering (docs/04 §cache).
+blake3 = "1.8.7"
+# Mem tier. Weight capacity (bytes), not item count: the RAM budget in
+# docs/00 is a byte budget, and an item-count LRU is how OmniRoute's 2MB
+# thrash happened. quick_cache shards internally, so `Options::shards`
+# gives the "sharded 32MB" of docs/04 without a hand-rolled shard array.
+quick_cache = "0.7.0"
+# Disk tier. One file, two tables (entries + size ledger). Bounded by a
+# logical byte cap, lossy on pressure -- see `tier::DiskTier`.
+redb = "4.3.0"
+# Response bodies are `Bytes` so a cache hit is a refcount bump, not a copy.
+# Deliberately without the `serde` feature: `serde_json` renders `Bytes` as an
+# array of decimal integers (4x the payload), which would make the disk byte cap
+# mean something other than what it says. See `Entry::encode`.
+bytes = "1.10"
+serde = { workspace = true }
+serde_json = { workspace = true }
+# `rt` only: `get_with_disk` needs `spawn_blocking` so the `redb` read does not
+# block a reactor worker. No macros, no time, no net.
+tokio = { version = "1.47", features = ["rt"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# `rt` is already a normal dependency; the tests additionally need a runtime to
+# `block_on` the `get_with_disk` future, which pulls in `rt`'s time driver.
+tokio = { version = "1.47", features = ["rt", "time"] }
+# `Bytes::as_ref` in the hit assertions, matching the library's own body type.
+bytes = "1.10"

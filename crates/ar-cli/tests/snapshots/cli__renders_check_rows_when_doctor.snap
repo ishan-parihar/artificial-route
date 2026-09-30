@@ -1,0 +1,15 @@
+---
+source: crates/ar-cli/tests/cli.rs
+expression: stdout(&out)
+---
+count: 9 of 9 total
+checks[9]{check,status,detail}:
+  config,ok,config.yaml (2 providers, 2 combos)
+  registry,ok,276 providers compiled in
+  provider/openai,ok,in registry
+  provider/anthropic,ok,in registry
+  key/anthropic,ok,resolved for anthropic
+  key/openai,ok,resolved for openai
+  target/anthropic/claude-sonnet-5,ok,routable
+  target/openai/gpt-5.4,ok,routable
+  target/openai/gpt-5.4-nano,ok,routable

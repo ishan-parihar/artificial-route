@@ -1,0 +1,26 @@
+[package]
+name = "ar-guard"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "Two-stage text guard: linear-time PII/credential redaction, then a prompt-injection verdict"
+license = "Apache-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Declared inline rather than in `[workspace.dependencies]`, following the
+# `ar-exec`/`ar-keys` precedent: sibling crates are being written concurrently
+# and editing one shared file invites an unrelated conflict.
+aho-corasick = "1.1"
+# Default features on purpose: `meta` is the multi-pattern engine, `perf` is the
+# literal prefilter that makes the no-match case a memchr, and `unicode-case` is
+# what `(?i)` needs to compile — a `default-features = false` build is smaller
+# but silently fails to build this crate's patterns.
+regex-automata = "0.4"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# `tests/guard.rs` doubles as the p95 benchmark (std-time, no criterion):
+# `cargo test -p ar-guard --release -- --nocapture p95` prints the distribution.

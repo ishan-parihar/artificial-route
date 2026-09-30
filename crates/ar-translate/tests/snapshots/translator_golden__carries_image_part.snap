@@ -1,0 +1,26 @@
+---
+source: crates/ar-translate/tests/translator_golden.rs
+expression: canonical
+---
+CanonicalChat {
+    model: "m",
+    messages: [
+        Msg {
+            role: User,
+            content: "",
+            media: [
+                MediaPart {
+                    kind: "image_url",
+                    body: Object {
+                        "image_url": Object {
+                            "url": String("http://x"),
+                        },
+                    },
+                },
+            ],
+        },
+    ],
+    temperature: None,
+    max_tokens: None,
+    stream: false,
+}

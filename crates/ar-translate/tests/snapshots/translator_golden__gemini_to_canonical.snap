@@ -1,0 +1,41 @@
+---
+source: crates/ar-translate/tests/translator_golden.rs
+expression: canonical
+---
+CanonicalChat {
+    model: "gemini-2.5-flash",
+    messages: [
+        Msg {
+            role: System,
+            content: "be terse",
+            media: [],
+        },
+        Msg {
+            role: User,
+            content: "add 2 and 3",
+            media: [],
+        },
+        Msg {
+            role: Tool,
+            content: "5",
+            media: [],
+        },
+        Msg {
+            role: Assistant,
+            content: "calling",
+            media: [],
+        },
+        Msg {
+            role: User,
+            content: "thanks",
+            media: [],
+        },
+    ],
+    temperature: Some(
+        0.3,
+    ),
+    max_tokens: Some(
+        512,
+    ),
+    stream: false,
+}

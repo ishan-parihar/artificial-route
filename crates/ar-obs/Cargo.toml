@@ -1,0 +1,28 @@
+[package]
+name = "ar-obs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "Metrics, JSON tracing and the redacted audit ledger (Artificial Route P5)"
+license = "Apache-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Audit records arrive already redacted: `ar_keys::AuditLine` structurally cannot
+# hold a credential (every field is a `&'static str` or a `Strng` this crate
+# does not build), and `ar-keys/src/audit.rs` names this crate as the
+# persistence half. So the ledger consumes the redacted `Display` rendering
+# instead of re-implementing masking -- guard/redact is a sibling's job.
+ar-keys = { path = "../ar-keys" }
+# `docs/04-subsystems.md`: "crossbeam 128k lossy + dedicated writer". `try_send`
+# is what makes the channel lossy -- a full buffer drops a batch instead of
+# stalling the request path, which is the whole point of a dedicated writer.
+crossbeam-channel = "0.5.17"
+# Same disk tier and same lockfile entry as `ar-cache`: one file per ledger.
+redb = "4.3.0"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# `env-filter` + `json` are already on in the workspace table.
+tracing-subscriber = { workspace = true }

@@ -1,0 +1,35 @@
+---
+source: crates/ar-translate/tests/translator_golden.rs
+expression: "body.parse::<serde_json::Value>().expect(\"the body is JSON\")"
+---
+{
+  "max_tokens": 256,
+  "messages": [
+    {
+      "content": "be terse",
+      "role": "system"
+    },
+    {
+      "content": [
+        {
+          "text": "what is this?",
+          "type": "text"
+        },
+        {
+          "image_url": {
+            "url": "http://x/i.png"
+          },
+          "type": "image_url"
+        }
+      ],
+      "role": "user"
+    },
+    {
+      "content": "42",
+      "role": "tool"
+    }
+  ],
+  "model": "gpt-5.4",
+  "stream": true,
+  "temperature": 0.20000000298023224
+}

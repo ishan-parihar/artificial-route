@@ -1,0 +1,20 @@
+[package]
+name = "ar-config"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "File-mode configuration: YAML + $VAR injection, hot reload, live ArcSwap snapshot"
+license = "Apache-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+ar-core = { workspace = true }
+arc-swap = { workspace = true }
+notify-debouncer-full = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+shellexpand = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

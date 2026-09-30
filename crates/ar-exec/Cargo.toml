@@ -1,0 +1,37 @@
+[package]
+name = "ar-exec"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "Upstream dispatch: pooled H2 POST, header merge, bounded SSE decode"
+license = "Apache-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+ar-config = { workspace = true }
+ar-core = { workspace = true }
+ar-registry = { workspace = true }
+# Not in `[workspace.dependencies]` yet; a path dep needs no version pin.
+ar-translate = { path = "../ar-translate" }
+
+async-stream = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+# Not in `[workspace.dependencies]`; declare inline to avoid racing the sibling
+# agents editing that file. All three are already in the dependency graph
+# (hyper -> httpdate, reqwest -> tokio-util, tokio -> tokio-stream), so none
+# adds a new crate to the build.
+httpdate = "1.0"
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
+
+[dev-dependencies]
+axum = { workspace = true }
+tokio = { workspace = true }

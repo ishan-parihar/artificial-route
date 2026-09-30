@@ -1,0 +1,21 @@
+[package]
+name = "ar-compress"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "Compression plan resolution, hard token budget, and the compression eval corpus (Artificial Route P1)"
+license = "Apache-2.0"
+
+[lints]
+workspace = true
+
+# Declared inline rather than added to `[workspace.dependencies]`, following the
+# precedent in `ar-exec`/`ar-keys`: several sibling crates are being written
+# concurrently and editing one shared file invites a conflict that has nothing
+# to do with this crate. `ar-compress` is in the workspace, so
+# `members = ["crates/*"]` picks it up with no change to the root manifest.
+[dependencies]
+# `count_text` is the single token-counting authority: the budget clamp and the
+# eval savings figures must not disagree with what `ar-tokens` charges for.
+ar-tokens = { path = "../ar-tokens" }
+thiserror = { workspace = true }

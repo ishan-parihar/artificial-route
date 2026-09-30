@@ -1,0 +1,41 @@
+---
+source: crates/ar-translate/tests/translator_golden.rs
+expression: canonical
+---
+CanonicalChat {
+    model: "claude-sonnet-4-5",
+    messages: [
+        Msg {
+            role: System,
+            content: "be terse\nand cite sources",
+            media: [],
+        },
+        Msg {
+            role: User,
+            content: "add 2 and 3",
+            media: [],
+        },
+        Msg {
+            role: Tool,
+            content: "5",
+            media: [],
+        },
+        Msg {
+            role: Assistant,
+            content: "calling",
+            media: [],
+        },
+        Msg {
+            role: User,
+            content: "thanks",
+            media: [],
+        },
+    ],
+    temperature: Some(
+        0.2,
+    ),
+    max_tokens: Some(
+        1024,
+    ),
+    stream: true,
+}

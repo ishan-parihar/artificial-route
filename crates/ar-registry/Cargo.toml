@@ -1,0 +1,30 @@
+[package]
+name = "ar-registry"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "Compile-time provider catalog: id -> base URL, wire format, auth class"
+license = "Apache-2.0"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+
+# Brute-force cosine index in `vector` (`usearch`-shaped surface, no C++ build).
+# P1: costs RAM proportional to the number of indexed model ids, against a
+# <35 MB idle budget (docs/00), so it is off unless asked for.
+usearch = []
+
+[dependencies]
+ar-core = { workspace = true }
+# `rc` is compile-time only: it is what makes `Arc<str>` implement
+# `Deserialize`/`Serialize`, which `HashMap<Strng, ProviderDef>` requires.
+# Declared here rather than in `[workspace.dependencies]` so the requirement
+# cannot be lost by an unrelated workspace-manifest edit.
+serde = { workspace = true, features = ["rc"] }
+serde_json = { workspace = true }
+# Typed errors on the public refresh path, per the workspace discipline. Declared
+# here rather than hoisted because this crate is the only new consumer.
+thiserror = { workspace = true }
