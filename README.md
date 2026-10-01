@@ -45,10 +45,44 @@ The OmniRoute figure is its full Next.js desktop/PWA server, not just its proxy 
 | model refresh | snapshot + import | sync + overlays | catalog + refresh API |
 | routes | 7 (`chat`, `messages`, `responses`, `api/chat`, `models`, `healthz`, `metrics`) | full gateway + UI | 22 data-plane |
 
-Full depth — OAuth mechanics, refresh triggers, quota tables, engine-catalog
-divergences, and every gap with its fix — lives in [AUDIT-REPORT.md](AUDIT-REPORT.md).
+## Artificial Route vs OmniRoute v16.3.1
 
-Known gaps, stated plainly: OAuth login works via `ar auth login` — a PKCE browser redirect (loopback catch locally, or carry the URL to any device and paste the redirect back) or, for a session that declares `device_initiate_url`/`device_poll_url`, an RFC 8628 device code you approve on another device — plus four MCP tools, and no refresh/authorize/device endpoint is hardcoded, because an auth endpoint guessed from a provider id would be an invented wire format; `grok-cli` has an executor but only for authentication, its Responses body and `x-grok-*` headers are not transcribed, so it builds a session and still does not dispatch; `kilocode` is an RFC 8628 device-flow provider that also serves a free tier, and both mechanisms are ported — a device code, and `anonymous: true` dispatch that needs no credential row at all — but neither is an OAuth *executor*, because its dispatch wire is not transcribed, so with neither mechanism declared its `oauth/` row is still a `fail` whose fix names the YAML for either one; the full explanation is [AUDIT-REPORT.md](AUDIT-REPORT.md) R1; the local credential store holds API keys plus a non-secret `oauth_sessions` table (which credential name a provider's session lives behind, and whether a refresh retired it — never a token), so the generated terminal-status CHECK has a home, but a `config.yaml` must still *declare* each OAuth key name (a `$VAR` there has to be exported, empty is fine); custom providers are file-declared (`custom_providers:`), so a new endpoint needs no rebuild — but only the OpenAI wire dispatches, and an `id` that collides with a compiled-in one is refused; multi-provider `auto` pools fall back to config order (single-provider pools score identically); the MCP control plane is stdio-only (StreamableHTTP deferred) and ships behind `--features mcp`; the registry snapshot lags OmniRoute's model rotation — `ar doctor` reports the snapshot's age, warns past 7 days, names each stale model and the `ar import` fix.
+Measured 2026-10-01, `ar` 0.1.1 against a live OmniRoute v16.3.1, both on loopback. Every cell is an observation from that one session.
+
+| Surface | Artificial Route 0.1.1 | OmniRoute v16.3.1 |
+|---|---|---|
+| shared routes | `POST /v1/chat/completions`, `/v1/messages`, `/v1/responses`, `GET /v1/models`, `GET /healthz` | the same five |
+| `GET /healthz` | `ok` 200 in **0.4 ms** | `ok` 200 in **4.4 ms** |
+| routes beyond those five | `GET /metrics` (Prometheus), `POST /api/chat` (Ollama) | **~723 more**: dashboard, embeddings, media, audio, rerank, search, OCR, files, batches, WebSocket, tokenized aliases, A2A |
+| unknown model | 400, names the routable combos | 400, suggests a `provider/` prefix |
+| malformed JSON | 400 | 400 |
+| unknown path | 404, empty body | 404, JSON envelope carrying the path |
+| `/v1/*` auth | none, see below | API key required, 401 JSON envelope without one |
+| RSS | **~14.6MB** | **~823MB** (**56x**) |
+| cold boot | ~1s | not measured |
+| CLI verbs | 10: `serve`, `models`, `providers`, `combo`, `doctor`, `run`, `configure`, `auth`, `import`, plus `mcp` behind `--features mcp` | ~78 |
+| MCP tools | 12-tool catalog + `tool_search`, behind the default-off `mcp` feature | 110 tools + A2A |
+| terminal-status list | 6 rows + 1 carve-out-only, generated into the store's CHECK | taxonomy it was reconciled against |
+| test gate | 42 suites, 1282 passed, 0 failed; clippy `-D warnings` clean | not measured |
+
+No upstream chat call was made in either column, so the shared-route row is a
+surface match, not verified call parity. The classifiers agree except for one
+owned divergence, first-sighting timing on `(401, token_revoked)`: we retire on
+the first sighting, OmniRoute on the third (fix record:
+[docs/audit-notes.md](docs/audit-notes.md)). The footprint row is the trade:
+those ~723 extra routes, 110 MCP tools and dashboard are real capability and
+cost ~823MB, while `ar` covers the routing core in ~14.6MB. The ~823MB figure
+is a different OmniRoute process state than the ~994 MiB above.
+
+> [!WARNING]
+> `ar serve` listens unauthenticated. `ar-server` has a bearer gate, but it reads
+> `Components.master_key` and no shipped command sets that field, so the
+> listener is open whatever `AR_MASTER_KEY` holds (that arms the credential
+> store, not HTTP auth). Keep it on loopback or front it with an authenticating proxy.
+
+Full depth, OAuth mechanics, refresh triggers, quota tables, engine-catalog divergences and every gap with its fix: [AUDIT-REPORT.md](AUDIT-REPORT.md).
+
+Known gaps, stated plainly: OAuth login works via `ar auth login` — a PKCE browser redirect (loopback catch locally, or carry the URL to any device and paste the redirect back) or, for a session that declares `device_initiate_url`/`device_poll_url`, an RFC 8628 device code you approve on another device — plus four MCP tools, and no refresh/authorize/device endpoint is hardcoded, because an auth endpoint guessed from a provider id would be an invented wire format; `grok-cli` has an executor but only for authentication, its Responses body and `x-grok-*` headers are not transcribed, so it builds a session and still does not dispatch; `kilocode` is an RFC 8628 device-flow provider that also serves a free tier, and both mechanisms are ported — a device code, and `anonymous: true` dispatch that needs no credential row at all — but neither is an OAuth *executor*, because its dispatch wire is not transcribed, so with neither mechanism declared its `oauth/` row is still a `fail` whose fix names the YAML for either one; the full explanation is [AUDIT-REPORT.md](AUDIT-REPORT.md) R1; the local credential store holds API keys plus a non-secret `oauth_sessions` table (which credential name a provider's session lives behind, and whether a refresh retired it — never a token), so the generated terminal-status CHECK has a home, but a `config.yaml` must still *declare* each OAuth key name (a `$VAR` there has to be exported, empty is fine); custom providers are file-declared (`custom_providers:`), so a new endpoint needs no rebuild — but only the OpenAI wire dispatches, and an `id` that collides with a compiled-in one is refused; multi-provider `auto` pools fall back to config order (single-provider pools score identically); the MCP control plane is stdio-only (StreamableHTTP deferred) and ships behind `--features mcp`; the registry snapshot lags OmniRoute's model rotation — `ar doctor` reports the snapshot's age, warns past 7 days, names each stale model and the `ar import` fix; an unknown path returns a bare 404 with no body, where OmniRoute returns a JSON envelope carrying the path, so a client that parses every error as JSON gets nothing to parse on a typo'd route; `ar serve` listens unauthenticated, because the `ar-server` bearer gate is driven by a `Components.master_key` that no shipped command sets (`AR_MASTER_KEY` arms the credential store, not HTTP auth), so loopback or a reverse proxy is the only thing between a caller and the provider keys; and the non-routing surface is deliberately narrow, with no dashboard, embeddings, media, audio, rerank, search, OCR, files, batches, WebSocket or A2A, which is where OmniRoute's other ~723 routes and 110 MCP tools live; and only `x-ar-compression` is read, so a client sending OmniRoute's `x-omniroute-compression` header, or its standard/aggressive/ultra plan modes, is silently ignored.
 
 ## Installation
 
@@ -69,10 +103,7 @@ curl -s localhost:20128/healthz && curl -s localhost:20128/v1/models
 
 One-shot without the server: `ar run -m cheap -p 'hello'`.
 
-Keys can also live encrypted at rest in a gitignored `credentials.db` beside the config
-(`$AR_CRED_STORE` moves it; `$AR_MASTER_KEY` holds the 32-byte master). Resolution order
-is store → `$VAR`, so an install with no store behaves exactly as before. `ar doctor`
-reports the `store` row and which source each key resolved from.
+Keys can also live encrypted at rest in a gitignored `credentials.db` beside the config (`$AR_CRED_STORE` moves it; `$AR_MASTER_KEY` holds the 32-byte master). Resolution order is store → `$VAR`, so an install with no store behaves as before, and `ar doctor` reports the `store` row and which source each key resolved from.
 
 Config defaults to `./config.yaml` (see the repo's for the shape: `keys` → `providers` → `combos`). Mirror your OmniRoute combos 1:1 with `config.omni-mirror.yaml` as the template — same ids, strategies, target order. Point any OpenAI client at `http://127.0.0.1:20128/v1` with `model` set to a combo id.
 
@@ -86,9 +117,7 @@ combos:                                    # clients request the combo id as `mo
   - { id: cheap, strategy: cost-optimized, targets: [openai/gpt-5.4-nano] }
 ```
 
-An OAuth session adds one block. The **access** token is the provider's existing
-`keys:` entry; the **refresh** token is a second credential row; the block itself
-carries no secret, so a committed `config.yaml` cannot leak one through it.
+An OAuth session adds one block. The **access** token is the provider's existing `keys:` entry, the **refresh** token is a second credential row, and the block carries no secret, so a committed `config.yaml` cannot leak one through it.
 
 ```yaml
 providers: [{ id: codex, key: codex }]
@@ -100,12 +129,9 @@ oauth:
     client_id: <your public OAuth client id>
 ```
 
-`token_url` is mandatory and deliberately not hardcoded: an auth endpoint
-inferred from a provider id would be an invented wire format. Without it the
-session still dispatches, and `ar doctor` says its first 401 will be terminal.
+`token_url` is mandatory and deliberately not hardcoded: an auth endpoint inferred from a provider id would be an invented wire format. Without it the session still dispatches, and `ar doctor` says its first 401 will be terminal.
 
-An endpoint the registry does not carry is declared in the same file, with no
-rebuild — `id` resolves exactly like a catalog provider's:
+An endpoint the registry lacks is declared in the same file, no rebuild, and `id` resolves exactly like a catalog provider's:
 
 ```yaml
 custom_providers:
@@ -113,18 +139,10 @@ custom_providers:
       base_url: https://gateway.internal.example/v1, key_ref: my_gateway }
 ```
 
-`protocol` is `openai-compatible` or `anthropic-compatible`; only the OpenAI wire
-dispatches today, and `headers:` adds outbound headers for a gateway that wants
-something other than a bearer token. `ar doctor` checks the base URL shape, the
-credential binding, and refuses an `id` that collides with a compiled-in one.
-
-> [!TIP]
-> `config.omni-mirror.yaml` mirrors three live OmniRoute combos 1:1 — same
-> ids, strategies, target order. Copy it as your starting point.
+`protocol` is `openai-compatible` or `anthropic-compatible`; only the OpenAI wire dispatches today, and `headers:` adds outbound headers for a gateway that wants something other than a bearer token. `ar doctor` checks the base URL shape, the credential binding, and refuses an `id` that collides with a compiled-in one.
 
 > [!WARNING]
-> `ar doctor` and `ar serve` share one target grammar: a config one accepts,
-> the other accepts. If `serve` refuses a file, `doctor` says why.
+> `ar doctor` and `ar serve` share one target grammar: a config one accepts, the other accepts. If `serve` refuses a file, `doctor` says why.
 
 ## Documentation
 
