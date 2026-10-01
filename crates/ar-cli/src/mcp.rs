@@ -2,32 +2,34 @@
 //!
 //! # Why this file exists
 //!
-//! F-HIGH-5: the essential-8 lived in `ar-mcp` as a library no binary reached, so
+//! F-HIGH-5: the catalog lived in `ar-mcp` as a library no binary reached, so
 //! the crate advertised a capability nothing could invoke. This is the wiring.
 //! Everything a tool needs is already resolved elsewhere in the binary —
 //! `ar_server::ServerConfig` for the routable combos and their candidates,
-//! `ar-keys` for real lane state — so this file supplies those to
-//! [`ar_mcp::Host`] and starts the stdio transport. It deliberately does not
-//! re-derive a combo table, a price table or a credential binding.
+//! `ar-keys` for real lane state, `ar_config::OAuthSession` for the login
+//! endpoints — so this file supplies those to [`ar_mcp::Host`] and starts the
+//! stdio transport. It deliberately does not re-derive a combo table, a price
+//! table, a credential binding or an OAuth session.
 //!
 //! # `--list` needs no config
 //!
-//! The catalog is eight static names, so discovery must answer on a host with no
+//! The catalog is twelve static names, so discovery must answer on a host with no
 //! `config.yaml` at all. Only the serving path loads one.
 //!
 //! # `AR_MCP_SCOPE`
 //!
 //! The held scope. Unset means everything, which is the honest reading for a
 //! stdio child the operator launched themselves. Set, it is the *only* thing
-//! granted — `ar_switch_combo` and `ar_route_request` are refused under a bare
-//! `read:*` — and an unrecognised name is a startup error rather than a bit
-//! silently dropped.
+//! granted — `ar_switch_combo`, `ar_route_request`, `ar_auth_complete` and
+//! `ar_auth_logout` are refused under a bare `read:*` — and an unrecognised name
+//! is a startup error rather than a bit silently dropped.
 
 use std::path::PathBuf;
 
 use ar_config::Config;
+use ar_exec::{ArExec, OAuthKind, Session};
 use ar_keys::{Admission, LaneSpec};
-use ar_mcp::{Audit, ComboState, Host, HostCombo, Scope, Tool};
+use ar_mcp::{Audit, AuthTarget, ComboState, Host, HostCombo, PendingLogins, Scope, Tool};
 use ar_tokens::PricingTable;
 
 use crate::cli::{Cli, McpArgs};
@@ -157,10 +159,20 @@ fn build(cli: &Cli, cfg: &Config, scope: Scope) -> Result<Host, anyhow::Error> {
     let admission = Admission::new([LaneSpec::INTERACTIVE, LaneSpec::BATCH, LaneSpec::HEAVY], CONTROL_PLANE_RPM)
         .map_err(|e| commands::fail(e, "the admission controller could not be built; this is a host problem"))?;
 
+    let exec = ArExec::new()
+        .map_err(|e| commands::fail(e, "the pooled HTTP client could not be built; this is a host problem"))?;
+
     Ok(Host {
         combos,
         admission,
         ledger_path: dir.join(LEDGER_FILE),
+        // `commands::store_path` rather than a second guess: `ar serve` and
+        // `ar mcp` must agree on where a credential lives or a login writes rows
+        // nothing will read.
+        store_path: commands::store_path(&cli.config),
+        exec,
+        auth: auth_targets(cfg),
+        pending: PendingLogins::default(),
         active: std::sync::Mutex::new(ComboState {
             active: cfg.combos.first().map(|c| c.id.clone()),
         }),
@@ -174,6 +186,50 @@ fn build(cli: &Cli, cfg: &Config, scope: Scope) -> Result<Host, anyhow::Error> {
         })?,
         key_id: key_id(cfg),
     })
+}
+
+/// The providers `oauth:` blocks declare that a person can actually log into.
+///
+/// A session missing an endpoint is left out rather than carried half-built:
+/// `ar_auth_login_url` answers with a list of what it can *start*, and a row it
+/// cannot start is a row a host would try and fail on. The same block still
+/// dispatches with a key it was given — this is a login surface, not a
+/// requirement — so the omission costs nothing.
+///
+/// The [`Session`] is built exactly as `ar auth login` builds it, because it is
+/// the type `authorize_url` and `exchange_code` read: a second construction here
+/// would be a second answer to "which endpoints does this provider authorize
+/// against". The row *names* are what `Session` cannot know; the access token's
+/// row is the provider's own `keys:` entry, resolved through [`Config::key_name`],
+/// so a login writes where `ar serve` reads and no second credential name is
+/// invented for it.
+fn auth_targets(cfg: &Config) -> Vec<AuthTarget> {
+    cfg.oauth
+        .iter()
+        .filter_map(|s| {
+            let kind = OAuthKind::parse(&s.provider)?;
+            let mut session = Session::new(s.provider.clone(), kind);
+            if let Some(url) = &s.authorization_url {
+                session = session.with_authorization_url(url.clone());
+            }
+            if let Some(url) = &s.token_url {
+                session = session.with_token_url(url.clone());
+            }
+            if let Some(id) = &s.client_id {
+                session = session.with_client_id(id.clone());
+            }
+            if let Some(scope) = &s.scope {
+                session = session.with_scope(scope.clone());
+            }
+            Some(AuthTarget {
+                session,
+                redirect_uri: s.redirect_uri.clone()?,
+                access_key: cfg.key_name(&s.provider).unwrap_or(&s.provider).to_owned(),
+                refresh_key: s.refresh_key.clone(),
+                client_secret_key: s.client_secret_key.clone(),
+            })
+        })
+        .collect()
 }
 
 /// The scope this process holds, from `$AR_MCP_SCOPE`.
@@ -218,6 +274,18 @@ mod tests {
     use super::*;
 
     const YAML: &str = "keys:\n  k: v\nproviders:\n  - id: openai\n    key: k\ncombos:\n  - id: cheap\n    strategy: cost-optimized\n    targets:\n      - openai/gpt-5.4-nano\n";
+
+    /// A config with a loginable `oauth:` block on top of [`YAML`]'s combo.
+    const LOGIN_YAML: &str = concat!(
+        "keys:\n  k: v\n  codex: $CODEX\n  codex_refresh: $CODEX_REFRESH\n",
+        "providers:\n  - id: openai\n    key: k\n  - id: codex\n    key: codex\n",
+        "combos:\n  - id: cheap\n    strategy: cost-optimized\n    targets:\n      - openai/gpt-5.4-nano\n",
+        "oauth:\n  - provider: codex\n    refresh_key: codex_refresh\n",
+        "    token_url: https://auth.test/token\n",
+        "    authorization_url: https://auth.test/authorize\n",
+        "    redirect_uri: http://127.0.0.1:1455/callback\n",
+        "    client_id: cid\n    scope: openid\n",
+    );
 
     /// A CLI pointed at a per-test scratch directory.
     ///
@@ -300,7 +368,72 @@ mod tests {
     fn lists_every_registered_tool() {
         // `list` writes to stdout, so the assertion is on the catalog it reads
         // rather than on captured output.
-        assert_eq!(Tool::ALL.len() + 1, 9, "essential-8 plus tool_search");
+        assert_eq!(Tool::ALL.len() + 1, 13, "essential-12 plus tool_search");
+    }
+
+    #[test]
+    fn a_narrow_grant_leaves_the_login_writes_refused() {
+        let read_only = Scope::parse("read:*").expect("known");
+        for tool in [Tool::AuthComplete, Tool::AuthLogout] {
+            assert!(!read_only.permits(tool.scope()), "{} is reachable under read:*", tool.name());
+        }
+    }
+
+    #[test]
+    fn a_read_grant_reaches_both_login_reads() {
+        let read_only = Scope::parse("read:*").expect("known");
+        for tool in [Tool::AuthLoginUrl, Tool::AuthStatus] {
+            assert!(read_only.permits(tool.scope()), "{} is refused under read:*", tool.name());
+        }
+    }
+
+    #[test]
+    fn a_login_target_carries_credential_names_not_values() {
+        // `config()` resolves every `$VAR` to the literal `v`, so if a value
+        // reached a login row this would see it.
+        let target = &auth_targets(&config(LOGIN_YAML))[0];
+        assert_eq!(target.access_key, "codex", "the access token lands in the provider's own key row");
+        assert_eq!(target.refresh_key.as_deref(), Some("codex_refresh"));
+        assert_eq!(target.client_secret_key, None, "a public PKCE client declares no secret row");
+    }
+
+    #[test]
+    fn the_login_session_carries_the_configured_endpoints() {
+        // One builder, shared with `ar auth login`: the executor's `authorize_url`
+        // reads `Session`, so a login row must not re-spell them.
+        let target = &auth_targets(&config(LOGIN_YAML))[0];
+        assert_eq!(target.session.authorization_url(), Some("https://auth.test/authorize"));
+        assert_eq!(target.session.token_url(), Some("https://auth.test/token"));
+    }
+
+    #[test]
+    fn builds_a_login_target_from_an_oauth_block() {
+        let targets = auth_targets(&config(LOGIN_YAML));
+        assert_eq!(targets.len(), 1);
+    }
+
+    #[test]
+    fn an_oauth_block_without_endpoints_is_not_offered_as_loggable() {
+        let half = config("keys:\n  k: v\nproviders:\n  - id: openai\n    key: k\ncombos: []\noauth:\n  - provider: openai\n    refresh_key: k\n");
+        assert!(auth_targets(&half).is_empty(), "no authorization_url means no login to start");
+    }
+
+    #[test]
+    fn the_login_tools_reach_the_configured_provider() {
+        let host = build(&cli("login"), &config(LOGIN_YAML), Scope::ALL).expect("built");
+        assert_eq!(host.auth[0].provider(), "codex");
+    }
+
+    #[test]
+    fn the_login_tools_write_where_serve_reads() {
+        let host = build(&cli("login-store"), &config(LOGIN_YAML), Scope::ALL).expect("built");
+        assert_eq!(host.store_path, commands::store_path(&cli("login-store").config));
+    }
+
+    #[test]
+    fn no_login_is_pending_until_one_is_started() {
+        let host = build(&cli("pending"), &config(LOGIN_YAML), Scope::ALL).expect("built");
+        assert!(host.pending.is_empty());
     }
 
     #[test]

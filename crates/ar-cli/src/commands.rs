@@ -136,11 +136,17 @@ pub fn credential_store(cli: &Cli) -> Option<CredentialStore> {
 
 /// What `ar` found at the credential-store path.
 ///
-/// Three outcomes because the three mean different things to an operator: a
-/// store that is not there is a supported install, a store that is there and
-/// reads is the feature working, and a store that is there and does not is a
-/// silent loss of every credential it holds.
-enum StoreProbe {
+/// Public because `ar auth` resolves the same probe `ar doctor` prints, and two
+/// implementations of "which credentials can this config see" is two chances for
+/// a login to write a row a dispatch will not read.
+///
+/// Four outcomes because the four mean different things to an operator: a store
+/// that is not there is a supported install, a store that is there and reads is
+/// the feature working, a store that is there and does not is a silent loss of
+/// every credential it holds, and a store that cannot even be opened is a
+/// different failure from one that opens and refuses to read.
+#[derive(Debug)]
+pub enum StoreProbe<'a> {
     /// No file at the store path. `$VAR` only.
     Absent(PathBuf),
     /// Opened and listed. Names only — the names are the `keys:` labels already
@@ -158,12 +164,23 @@ enum StoreProbe {
         /// `ar-keys`' own reason, redacted by construction.
         reason: String,
     },
+    /// Already-open store, for a caller that holds one.
+    ///
+    /// A login and a logout both *have* a store open — they are about to write
+    /// through it — so re-probing the path would resolve a second connection to
+    /// a file this process is mid-write on and report on the wrong half.
+    Live {
+        /// The store itself.
+        store: &'a CredentialStore,
+        /// Where it is, for the `store` row.
+        path: PathBuf,
+    },
 }
 
-impl StoreProbe {
+impl StoreProbe<'_> {
     /// Resolves the store once, so `doctor` and `serve` cannot disagree about
     /// whether it is usable.
-    fn resolve(config_path: &Path) -> Self {
+    pub fn resolve(config_path: &Path) -> Self {
         let path = store_path(config_path);
         // Not opened when absent: `open` would *create* the file, and a
         // read-only check that leaves a database behind is a check that lies
@@ -192,6 +209,13 @@ impl StoreProbe {
                 "ok".to_owned(),
                 format!("{} readable with {} credential(s)", path.display(), names.len()),
             ),
+            Self::Live { path, store } => match store.list_names() {
+                Ok(names) => (
+                    "ok".to_owned(),
+                    format!("{} readable with {} credential(s)", path.display(), names.len()),
+                ),
+                Err(e) => ("fail".to_owned(), format!("{} unreadable: {e}", path.display())),
+            },
             Self::Unreadable { path, reason } => (
                 "fail".to_owned(),
                 format!("{} unreadable: {reason}", path.display()),
@@ -200,9 +224,10 @@ impl StoreProbe {
     }
 
     /// Whether `name` is stored here, consulting nothing else.
-    fn holds(&self, name: &str) -> bool {
+    pub fn holds(&self, name: &str) -> bool {
         match self {
             Self::Open { names, .. } => names.iter().any(|n| n == name),
+            Self::Live { store, .. } => store.list_names().is_ok_and(|names| names.iter().any(|n| n == name)),
             _ => false,
         }
     }
@@ -239,6 +264,35 @@ where
     rt.block_on(future)
 }
 
+/// The `ar auth status` probe for a caller that already holds a store.
+///
+/// Names over values, so a status listing never decrypts a row it does not need
+/// — the same discipline [`StoreProbe::resolve`] keeps for `ar doctor`.
+pub fn store_probe(config_path: &Path) -> StoreProbe<'static> {
+    StoreProbe::resolve(config_path)
+}
+
+/// A probe over an already-open store, for a caller that is about to write
+/// through it.
+///
+/// Borrowed rather than owned because a login both reads the client-secret row
+/// and writes the token rows through the same handle, and a second connection to
+/// a file this process is mid-write on would report on the wrong half.
+pub fn live_store_probe<'a>(path: &Path, store: &'a CredentialStore) -> StoreProbe<'a> {
+    StoreProbe::Live { path: path.to_path_buf(), store }
+}
+
+/// The `ar auth status` spelling of a doctor row's status, as a borrowed
+/// `&'static str`.
+///
+/// The doctor vocabulary is `ok`/`fail` because a `fail` there exits 1; a status
+/// listing has no exit to justify, so it names the state the operator is asking
+/// about. Derived from the row's own status rather than re-decided, which is what
+/// keeps the two surfaces from drifting.
+pub fn armed_spelling(status: &str) -> &'static str {
+    if status == "ok" { "armed" } else { "unarmed" }
+}
+
 /// Dispatches a parsed command.
 pub fn dispatch(cli: &Cli) -> anyhow::Result<()> {
     match &cli.command {
@@ -248,6 +302,7 @@ pub fn dispatch(cli: &Cli) -> anyhow::Result<()> {
         Some(Command::Providers(a)) => providers(cli, a),
         Some(Command::Combo(a)) => combo(cli, a),
         Some(Command::Doctor) => doctor(cli),
+        Some(Command::Auth(a)) => crate::auth::run(cli, a),
         Some(Command::Run(a)) => block_on(serve::run(cli, a)),
         Some(Command::Configure(a)) => configure(cli, a),
         Some(Command::Import(a)) => import_config(a),
@@ -465,7 +520,7 @@ fn doctor(cli: &Cli) -> anyhow::Result<()> {
 /// two can never disagree about whether a config is valid. `store` is the same
 /// [`StoreProbe`] `ar serve` resolves, so a credential the server would take
 /// from the store and one this calls `$VAR` cannot be two different claims.
-fn findings(cfg: &Config, path: &str, store: &StoreProbe) -> Vec<Row> {
+fn findings(cfg: &Config, path: &str, store: &StoreProbe<'_>) -> Vec<Row> {
     // A collision makes every merged lookup ambiguous, so it becomes one `fail`
     // row rather than a per-node complaint: no node is wrong on its own, the id
     // is. The rows below then read the compiled-in set alone — the collision has
@@ -538,6 +593,13 @@ fn findings(cfg: &Config, path: &str, store: &StoreProbe) -> Vec<Row> {
         if def.auth_kind.as_ref() == "oauth" {
             let (status, detail) = oauth_row(&p.id, cfg, store);
             rows.push(vec![format!("oauth/{}", p.id), status, detail]);
+            // Login readiness is its own row rather than part of the `oauth/` one:
+            // the two answer different questions (does it dispatch vs can it be
+            // re-authorised) and a session can be `ok` on the first and
+            // `unavailable` on the second. Folding it in would make a working
+            // session read as broken.
+            let (login, why) = login_readiness(&p.id, cfg, store);
+            rows.push(vec![format!("auth/{}", p.id), login, why]);
         }
     }
 
@@ -652,7 +714,7 @@ fn registry_row_at(unroutable: usize, now: u64) -> Row {
     vec!["registry".to_owned(), "ok".to_owned(), compiled]
 }
 
-/// The `(status, detail)` cell of an `oauth/<provider>` row.
+/// The `(status, detail)` cell of an `oauth/<provider>` row, public for `ar auth`.
 ///
 /// Five states, each a different operator action, so they cannot share a status:
 ///
@@ -669,7 +731,12 @@ fn registry_row_at(unroutable: usize, now: u64) -> Row {
 /// would learn that from nowhere. Audit R2 is exactly this case — `kimi-coding`
 /// expired with no stored refresh, which has to be visible now rather than a bare
 /// 502 later.
-fn oauth_row(provider: &str, cfg: &Config, store: &StoreProbe) -> (String, String) {
+///
+/// This row is about *dispatch*. Whether the session can be (re-)authorised is
+/// [`login_readiness`]'s question, folded in as the `auth/<id>` row below: a
+/// session can be armed here and unloggable there, and collapsing the two would
+/// report a working session as broken.
+pub fn oauth_row(provider: &str, cfg: &Config, store: &StoreProbe<'_>) -> (String, String) {
     let Some(kind) = ar_server::OAuthKind::parse(provider) else {
         return (
             "fail".to_owned(),
@@ -679,7 +746,7 @@ fn oauth_row(provider: &str, cfg: &Config, store: &StoreProbe) -> (String, Strin
     let Some(declared) = cfg.oauth_for(provider) else {
         return (
             "fail".to_owned(),
-            "catalog authType is oauth; add an `oauth:` block naming a refresh_key and token_url, or the session dies on its first 401".to_owned(),
+            format!("catalog authType is oauth; add an `oauth:` block naming a refresh_key and token_url{}", relogin(provider)),
         );
     };
 
@@ -717,6 +784,59 @@ fn oauth_row(provider: &str, cfg: &Config, store: &StoreProbe) -> (String, Strin
     }
 }
 
+/// Login readiness for one declared session: whether `ar auth login` can run it.
+///
+/// Separate from [`oauth_row`] on purpose. `oauth_row` answers "does this session
+/// dispatch", which is a question about what is *already stored*; this answers
+/// "can it be (re-)authorised", which is a question about what the operator
+/// *declared*. A session can be fully armed and unloggable — both tokens present,
+/// no `authorization_url` — and reporting that as a dispatch `fail` would be a
+/// lie in the direction that costs an operator the most: the session works, and
+/// the only thing missing is the ability to renew it by hand.
+///
+/// The fix therefore names two commands: `ar auth login` for the endpoint the
+/// operator has to add, and the login itself for the tokens a re-auth mints.
+pub fn login_readiness(
+    provider: &str,
+    cfg: &Config,
+    store: &StoreProbe<'_>,
+) -> (String, String) {
+    let Some(declared) = cfg.oauth_for(provider) else {
+        return (
+            "unavailable".to_owned(),
+            "no `oauth:` block declares this provider".to_owned(),
+        );
+    };
+    let Some(endpoint) = declared.authorization_url.as_deref() else {
+        return (
+            "unavailable".to_owned(),
+            format!(
+                "no authorization_url in the `oauth:` block, so there is no url to open; add one, then run {}",
+                relogin(provider)
+            ),
+        );
+    };
+    let access_name = cfg.key_name(provider).unwrap_or(provider);
+    let armed = resolves(access_name, cfg, store);
+    (
+        if armed { "armed".to_owned() } else { "needs-login".to_owned() },
+        format!(
+            "authorize at {endpoint}; access {access_name:?} {}{}",
+            if armed { "resolves" } else { "does not resolve yet" },
+            relogin(provider)
+        ),
+    )
+}
+
+/// The fix clause every unarmed `oauth/<id>` row carries.
+///
+/// One function so the fix string is one string: an operator who reads it on
+/// one row and a different one on the next has two commands to learn, and the
+/// whole point of the row is that the next command is on it.
+fn relogin(provider: &str) -> String {
+    format!("; run `ar auth login --provider {provider}`")
+}
+
 /// The canonical spelling of a terminal reason, read from the one list the
 /// executor classifies against.
 ///
@@ -732,7 +852,7 @@ fn terminal_reason(status: u16, reason: &str) -> Option<&'static str> {
 
 /// Whether a credential name resolves, in the order `ar serve` resolves it: the
 /// store first, then `keys:`.
-fn resolves(name: &str, cfg: &Config, store: &StoreProbe) -> bool {
+fn resolves(name: &str, cfg: &Config, store: &StoreProbe<'_>) -> bool {
     store.holds(name) || cfg.key(name).is_some_and(|s| !s.expose().trim().is_empty())
 }
 
@@ -766,7 +886,7 @@ fn needs_credential(provider: &str) -> bool {
 /// then the config's `$VAR`-expanded `keys:` map. A name that resolves in neither
 /// place is a failure only when something bound to it actually needs a
 /// credential.
-fn key_status(name: &str, cfg: &Config, store: &StoreProbe) -> String {
+fn key_status(name: &str, cfg: &Config, store: &StoreProbe<'_>) -> String {
     if store.holds(name) || cfg.key(name).is_some_and(|s| !s.expose().trim().is_empty()) {
         return "ok".to_owned();
     }
@@ -783,7 +903,7 @@ fn key_status(name: &str, cfg: &Config, store: &StoreProbe) -> String {
 
 /// The `detail` cell of a `key/<name>` row. Names the binding and the source, and
 /// never a value — a `doctor` transcript is something people paste into issues.
-fn key_detail(name: &str, cfg: &Config, store: &StoreProbe) -> String {
+fn key_detail(name: &str, cfg: &Config, store: &StoreProbe<'_>) -> String {
     let users: Vec<&str> = cfg
         .providers
         .iter()
@@ -940,13 +1060,30 @@ pub fn check_fields(cli: &Cli) -> Option<String> {
 /// The loud hint `docs/06` requires on an unknown flag: the offending name plus
 /// the flags that command actually accepts.
 ///
-/// The subcommand is found by matching a known name, not by taking the first
-/// non-flag token — `ar --config path models --nope` would read `path` as the
-/// subcommand that way. Globals (`--config`) reach every subcommand, and clap
-/// already folded them into each one, so the list below is complete.
+/// The subcommand is found by walking the command graph as deep as the arguments
+/// go, by *name* rather than by position: `ar --config path auth login --nope`
+/// has four tokens before the flag, and a positional read of "the first non-flag
+/// token" would land on `path` and list the root's flags instead of the login
+/// verb's. The deepest level reached wins, so a sub-subcommand's flags are on
+/// the hint — which is the whole point of adding a subtree.
 pub fn unknown_flag_hint(args: &[OsString], invalid: &str) -> String {
     let root = Cli::command();
-    let sub = args.iter().filter_map(|a| a.to_str()).find_map(|tok| root.find_subcommand(tok));
+    let mut deepest = None;
+    let mut current = &root;
+    // Two levels is the deepest this surface goes (`ar auth login`), so a fixed
+    // walk beats a recursive descent that would have nothing left to descend into.
+    for _ in 0..2 {
+        let Some(found) = args
+            .iter()
+            .filter_map(|a| a.to_str())
+            .find_map(|tok| current.find_subcommand(tok))
+        else {
+            break;
+        };
+        current = found;
+        deepest = Some(found);
+    }
+    let sub = deepest;
 
     // `Arg::get_long` is the bare name, without the dashes.
     let mut flags: Vec<String> = sub
@@ -1121,7 +1258,7 @@ mod tests {
         .expect("the fixture parses")
     }
 
-    fn no_store() -> StoreProbe {
+    fn no_store() -> StoreProbe<'static> {
         StoreProbe::Absent(PathBuf::from("credentials.db"))
     }
 
@@ -1201,8 +1338,59 @@ mod tests {
         "keys:\n  kilocode: $KILO_ACCESS\nproviders:\n  - id: kilocode\n    key: kilocode\n",
         "oauth:\n  - provider: kilocode\n    refresh_key: kilocode_refresh\n",
         "    token_url: https://auth.example.invalid/token\n",
+        "    authorization_url: https://auth.example.invalid/authorize\n",
         "combos:\n  - id: c\n    strategy: priority\n    targets:\n      - kilocode/kilo-1\n",
     );
+
+    /// The armed session plus the one endpoint a browser login starts at.
+    ///
+    /// `authorization_url` is separate from arming on purpose: a session can hold
+    /// both tokens and still be un-*loggable*, and that is a different fix from a
+    /// missing refresh row, so it gets its own row and its own test.
+    const OAUTH_LOGINABLE: &str = concat!(
+        "keys:\n  codex: $CODEX_ACCESS\nproviders:\n  - id: codex\n    key: codex\n",
+        "oauth:\n  - provider: codex\n    refresh_key: codex_refresh\n",
+        "    token_url: https://auth.example.invalid/token\n",
+        "    authorization_url: https://auth.example.invalid/authorize\n",
+        "    client_id: synthetic-client\n",
+        "combos:\n  - id: c\n    strategy: priority\n    targets:\n      - codex/gpt-5.4-codex\n",
+    );
+
+    #[test]
+    fn names_the_login_command_as_the_fix_when_a_session_cannot_be_logged_into() {
+        // A session that holds both tokens but declares no authorization_url is
+        // armed for dispatch and unloggable forever. Reporting that as a dispatch
+        // `fail` would be a lie that costs an operator the most: the session
+        // works, and only re-auth is impossible.
+        let rows = checks(OAUTH_ARMED, &probe(&["codex", "codex_refresh"]));
+        assert_eq!(row(&rows, "oauth/codex")[1], "ok", "it still dispatches: {rows:?}");
+        let detail = &row(&rows, "auth/codex")[2];
+        assert!(detail.contains("ar auth login --provider codex"), "the row names the fix: {detail}");
+    }
+
+    #[test]
+    fn reports_login_readiness_as_unavailable_when_no_authorize_endpoint_is_declared() {
+        let rows = checks(OAUTH_ARMED, &probe(&["codex", "codex_refresh"]));
+        assert_eq!(row(&rows, "auth/codex")[1], "unavailable", "{rows:?}");
+    }
+
+    #[test]
+    fn reports_a_loggable_session_as_armed_once_it_declares_an_authorize_endpoint() {
+        let rows = checks(OAUTH_LOGINABLE, &probe(&["codex", "codex_refresh"]));
+        assert_eq!(row(&rows, "auth/codex")[1], "armed", "{rows:?}");
+    }
+
+    #[test]
+    fn reports_login_readiness_as_needed_when_no_access_token_resolves_anywhere() {
+        // The state a first-ever login is in: the endpoint is declared, and the
+        // access row resolves in neither the store nor `keys:`. `needs-login` says
+        // so without claiming anything is broken. The empty expansion is the whole
+        // point — a `$VAR` that expands to a value would resolve, which is a
+        // different and also correct answer.
+        let cfg = Config::parse(OAUTH_LOGINABLE, |_| Ok(Some(String::new()))).expect("the fixture parses");
+        let rows = findings(&cfg, "config.yaml", &probe(&[]));
+        assert_eq!(row(&rows, "auth/codex")[1], "needs-login", "{rows:?}");
+    }
 
     #[test]
     fn fails_an_oauth_target_that_declares_no_session() {
@@ -1276,11 +1464,11 @@ mod tests {
         assert!(detail.contains(&ar_server::TERMINAL_REFRESH_STATUS.len().to_string()), "{detail}");
     }
 
-    fn probe(names: &[&str]) -> StoreProbe {
+    fn probe(names: &[&str]) -> StoreProbe<'static> {
         StoreProbe::Open { path: PathBuf::from("credentials.db"), names: names.iter().map(|n| (*n).to_owned()).collect() }
     }
 
-    fn checks(yaml: &str, store: &StoreProbe) -> Vec<Row> {
+    fn checks(yaml: &str, store: &StoreProbe<'_>) -> Vec<Row> {
         let cfg = Config::parse(yaml, |name| Ok(Some(format!("secret-{name}")))).expect("the fixture parses");
         findings(&cfg, "config.yaml", store)
     }

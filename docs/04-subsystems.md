@@ -89,7 +89,7 @@ Accept: no raw prompt in metrics; stolen `read` token can't dump traffic.
 ## mcp (`ar-mcp`, optional `--features mcp`, default off)
 
 Control-plane, not data-plane. Wraps same `ar-route|ar-tokens|ar-keys` fns — no second impl.
-P1 essential-8 only (full 110-tool catalog in `06-axi-mcp.md`):
+P1 a 12-tool catalog only (full 110-tool catalog in `06-axi-mcp.md`):
 `get_health, list_combos, switch_combo, check_quota, route_request, cost_report, list_models_catalog, explain_route`.
 Bodies are `pub(crate)`; `guard()` is the sole public entry, so no host can reach a tool without the scope check and the audit row. `Tool::ALL` stays public for listing — listing is not calling.
 `get_health` reads `ar-keys::Admission` lane state (in-flight/queued/capacity per lane); the caller-supplied `KeyPressure` path is `Health::from_snapshot` and tags itself `source: Snapshot`. Breakers + cache counters stay host-supplied — no P0 equivalent exists.

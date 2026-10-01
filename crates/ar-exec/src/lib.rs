@@ -27,8 +27,12 @@
 //! [`oauth`] adds the token lifecycle on top of this core: token injection,
 //! refresh on expiry, one rotation retry on 401, and a per-connection mutex so a
 //! concurrent burst cannot present the same refresh token twice. It is a P5 item
-//! per `docs/02`, and it consumes an already-obtained access token — the
-//! browser-session login that would *produce* one is out of scope.
+//! per `docs/02`.
+//!
+//! The browser-login half of [`oauth`] *obtains* the access token the connection
+//! executor consumes: PKCE authorization-code, with the redirect read out of the
+//! address bar by a person (or an MCP host) and pasted back. No browser is
+//! driven, and no endpoint is guessed.
 //!
 //! ```
 //! # use ar_config::Secret;
@@ -99,8 +103,10 @@ pub mod url;
 // because every consumer needs more than one of these, and a path-per-item import
 // list is a second place to forget an item.
 pub use crate::oauth::{
-    Connected, Connection, HttpRefresher, OAuthKind, OAuthToken, Origin, Refresher, RotationPool,
-    Session, TERMINAL_REFRESH_STATUS, Unconnected, terminal_check_constraint,
+    AuthorizeRequest, CallbackListener, Connected, Connection, HttpRefresher, LoginError, OAuthKind,
+    OAuthToken, Origin, Refresher, RotationPool, Session, TERMINAL_REFRESH_STATUS, Unconnected,
+    authorize_url, exchange_code, new_authorize_request, parse_callback_url,
+    terminal_check_constraint,
 };
 
 // `into_sse` yields `SseEvent`, and `ExecError::Sse` wraps `SseError`, so both

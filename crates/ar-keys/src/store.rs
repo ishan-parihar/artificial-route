@@ -105,6 +105,8 @@ ON CONFLICT(name) DO UPDATE SET provider = ?2, envelope = ?3
 const SELECT_CREDENTIAL: &str = "SELECT provider, envelope FROM credentials WHERE name = ?1";
 const SELECT_NAMES: &str = "SELECT name FROM credentials ORDER BY name";
 
+const DELETE_CREDENTIAL: &str = "DELETE FROM credentials WHERE name = ?1";
+
 /// A sqlite-backed table of `enc:` credential envelopes.
 ///
 /// A row is `(name, provider, envelope)`, and `name` is the key name
@@ -236,6 +238,19 @@ impl CredentialStore {
                 .map(Some)
                 .map_err(|_| KeyError::Store(format!("credential {name:?} is not valid UTF-8"))),
         }
+    }
+
+    /// Forgets the row named `name`, reporting whether one was there.
+    ///
+    /// A logout has to remove the row, not overwrite it with an empty value: an
+    /// empty credential still resolves, still gets sent upstream, and turns a
+    /// deliberate logout into a silent 401 that reads as a provider problem.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyError::Store`] on a write failure.
+    pub fn remove(&self, name: &str) -> Result<bool, KeyError> {
+        self.conn.execute(DELETE_CREDENTIAL, [name]).map(|n| n > 0).map_err(sql)
     }
 
     /// Every credential name in the store, sorted.

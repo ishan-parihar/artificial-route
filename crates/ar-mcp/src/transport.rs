@@ -7,12 +7,13 @@
 //!
 //! # What this file is for
 //!
-//! F-HIGH-5: the essential-8 existed as a library no binary reached. A
+//! F-HIGH-5: the catalog existed as a library no binary reached. A
 //! `ServerHandler` over [`Tool::ALL`] is the whole of the missing wiring — the
-//! catalog, the default-deny check and the eight bodies were already here and
+//! catalog, the default-deny check and the bodies were already here and
 //! SDK-free, so the handler is plumbing and not logic. Every tool below goes
-//! through [`crate::guard`]; there is no path from a request to a body that skips
-//! the scope check or loses the audit row.
+//! through [`crate::guard`] — or [`crate::guard_async`] for the one that awaits —
+//! and there is no path from a request to a body that skips the scope check or
+//! loses the audit row.
 //!
 //! # [`Host`] is the binary's half
 //!
@@ -22,19 +23,35 @@
 //! reads it. That keeps the crate free of a config loader and a second way to
 //! answer "what can this proxy route".
 //!
-//! # `ar_tool_search` is the ninth registered tool, and why
+//! # The four login tools, and why two of them are not here
+//!
+//! `ar_auth_login_url` and `ar_auth_status` are reads and live in
+//! [`Server::call`] like the rest. `ar_auth_complete` awaits the token exchange
+//! and `ar_auth_logout` is the write half of a pair `call` cannot express as one
+//! closure, so each is its own method — [`ServerHandler::call_tool`] picks them
+//! out by name.
+//!
+//! The two-call split is what keeps a remote login remote: the PKCE verifier
+//! stays in this process between the calls ([`crate::PendingLogins`]), so nothing
+//! an agent holds can redeem a code, and there is no stdin read anywhere on this
+//! path.
+//!
+//! # `ar_tool_search` is the thirteenth registered tool, and why
 //!
 //! `docs/06` puts `tool_search` "from day one" and the crate's own docs are
-//! explicit that it is a *function* over [`Tool::ALL`], not a ninth enum variant,
-//! so that every count a host reports stays 8. It is therefore registered here
-//! rather than in the catalog. It touches no host state — its answer is eight
-//! static strings — so it needs no scope, but it still writes an audit row, or
-//! "every tool leaves a row" would have an exception written in the code that
-//! implements the audit.
+//! explicit that it is a *function* over [`Tool::ALL`], not a thirteenth enum
+//! variant, so that every count a host reports stays 12. It is therefore
+//! registered here rather than in the catalog. It touches no host state — its
+//! answer is twelve static strings — so it needs no scope, but it still writes an
+//! audit row, or "every tool leaves a row" would have an exception written in the
+//! code that implements the audit.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::sync::atomic::AtomicU64;
 
+use ar_exec::{
+    ArExec, LoginError, authorize_url, exchange_code, new_authorize_request, parse_callback_url,
+};
 use ar_keys::Admission;
 use ar_route::{AutoCandidate, AutoCombo, AutoSelector, AutoVariant, Candidate, Strategy};
 use ar_tokens::Ledger;
@@ -48,6 +65,7 @@ use rmcp::{RoleServer, ServerHandler, ServiceExt};
 
 use crate::Error;
 use crate::audit::{Audit, CallOutcome};
+use crate::login::{AuthTarget, LOGIN_TTL, PendingLogins};
 use crate::scope::Scope;
 use crate::tools::{ComboState, Switch};
 use crate::{Tool, tool_search};
@@ -74,7 +92,7 @@ pub struct HostCombo {
     pub pool: Vec<Candidate>,
 }
 
-/// Everything the eight tools read.
+/// Everything the twelve tools read.
 ///
 /// Public fields rather than a constructor: the only thing that can build this is
 /// the `ar` binary, which already resolves every field from its own config, and a
@@ -95,6 +113,22 @@ pub struct Host {
     /// cheap trade for a control plane that sees a handful of calls a minute,
     /// and it is what the `Ledger` doc comment asks for anyway.
     pub ledger_path: std::path::PathBuf,
+    /// Where the encrypted credential store lives, for the same per-call reason
+    /// as [`Self::ledger_path`]. `ar_auth_complete` writes the two rows a login
+    /// produces and `ar_auth_logout` removes them.
+    pub store_path: std::path::PathBuf,
+    /// The pooled upstream client, so the token exchange reuses the one pool this
+    /// process already has instead of opening a second — see
+    /// [`ar_exec::ArExec::client`].
+    pub exec: ArExec,
+    /// Providers from `config.yaml`'s `oauth:` blocks, with every endpoint and
+    /// credential *name* resolved. Empty is normal: an install with no `oauth:`
+    /// block serves the other eight tools and answers these with an empty list.
+    pub auth: Vec<AuthTarget>,
+    /// Started-but-uncompleted logins. In memory and in this process only, so a
+    /// restart drops a pending login rather than leaving a redeemable verifier
+    /// behind on disk.
+    pub pending: PendingLogins,
     /// Which combo is live. Behind a mutex because `ar_switch_combo` is the one
     /// writing tool and the transport serves calls concurrently.
     pub active: Mutex<ComboState>,
@@ -131,6 +165,52 @@ impl Host {
     /// The ledger, opened for one call. See [`Host::ledger_path`].
     fn ledger(&self) -> Result<Ledger, Error> {
         Ledger::open(&self.ledger_path).map_err(Error::from)
+    }
+
+    /// The credential store, opened for one call. See [`Host::store_path`].
+    ///
+    /// `None` when this install has none — an unset `$AR_MASTER_KEY` is the
+    /// pre-store configuration, not a failure, and this is the same fallback
+    /// `ar serve` makes rather than a second rule.
+    fn store(&self) -> Option<ar_keys::CredentialStore> {
+        match ar_keys::CredentialStore::open_with_env_key(&self.store_path) {
+            Ok(store) => Some(store),
+            Err(_) if !self.store_path.exists() => None,
+            Err(e) => {
+                tracing::warn!(path = %self.store_path.display(), error = %e, "credential store unusable; a login cannot persist its tokens");
+                None
+            }
+        }
+    }
+
+    /// The provider a login call names, or a refusal naming what is missing.
+    fn auth_target(&self, provider: &str) -> Result<&AuthTarget, Error> {
+        self.auth.iter().find(|t| t.provider() == provider).ok_or(Error::Auth(LoginError::NoAuthorizationUrl))
+    }
+
+    /// The credential *names* this host has stored, sorted, narrowed to one
+    /// provider when `provider` is given.
+    ///
+    /// Names and never values, in both directions: `ar_auth_status` reports this
+    /// and `ar_auth_logout` reports it after removing rows, and a login tool whose
+    /// answer is pasteable into a bug report is one an operator will paste. The
+    /// prefix match is what picks `codex_refresh` up alongside `codex` without
+    /// this being a second table of "which rows belong to which provider".
+    fn stored_keys(&self, provider: Option<&str>) -> Vec<String> {
+        let Some(store) = self.store() else { return Vec::new() };
+        match store.list_names() {
+            Ok(names) => names
+                .into_iter()
+                .filter(|name| match provider {
+                    Some(p) => p == name || name.starts_with(&format!("{p}_refresh")),
+                    None => true,
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "credential store names unavailable");
+                Vec::new()
+            }
+        }
     }
 
     /// Every model this host can route to, targets and bench alike.
@@ -250,6 +330,12 @@ fn describe(tool: Tool) -> McpTool {
         Tool::SwitchCombo => (serde_json::json!({ "name": string_prop(), "active": { "type": "boolean" } }), &["name"]),
         Tool::CheckQuota => (serde_json::json!({ "key_id": string_prop() }), &[]),
         Tool::RouteRequest => (serde_json::json!({ "combo": string_prop(), "session": string_prop() }), &[]),
+        Tool::AuthLoginUrl => (serde_json::json!({ "provider": string_prop() }), &["provider"]),
+        Tool::AuthComplete => {
+            (serde_json::json!({ "session_id": string_prop(), "code_or_url": string_prop() }), &["session_id", "code_or_url"])
+        }
+        Tool::AuthStatus => (serde_json::json!({ "provider": string_prop() }), &[]),
+        Tool::AuthLogout => (serde_json::json!({ "provider": string_prop() }), &["provider"]),
     };
     // `read_only_hint` is the one annotation a client can act on without trusting
     // this server, and it is exactly the distinction `Tool::scope` already draws:
@@ -364,7 +450,144 @@ impl Server {
                     "fallbacks": trace.fallbacks.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
                 }))
             }),
+            // The two read login tools: build the public half of a login, and
+            // report the pending ones. Neither writes anything, which is why
+            // `read:*` is the whole of what they need.
+            Tool::AuthLoginUrl => crate::guard(tool, host.scope, &host.audit, &host.key_id, &input, || {
+                let provider = raw.str("provider").ok_or(Error::MissingArgument { name: "provider" })?;
+                let target = host.auth_target(provider)?;
+                let request = new_authorize_request(&target.session, &target.redirect_uri);
+                let url = authorize_url(&request)?;
+                let session_id = host.pending.start(target.provider(), request, url.clone());
+                Ok(serde_json::json!({
+                    "provider": target.provider(),
+                    "session_id": session_id,
+                    "authorize_url": url,
+                    "redirect_uri": target.redirect_uri,
+                    "expires_in_secs": LOGIN_TTL.as_secs(),
+                }))
+            }),
+            Tool::AuthStatus => crate::guard(tool, host.scope, &host.audit, &host.key_id, &input, || {
+                let provider = raw.str("provider");
+                // Provider *names*, not `AuthTarget`s: `Session` has no `Serialize`
+                // and this answer goes to an agent that will read it aloud.
+                Ok(serde_json::json!({
+                    "providers": host.auth.iter().map(|t| t.provider()).collect::<Vec<_>>(),
+                    "pending": host.pending.rows(),
+                    "stored_keys": host.stored_keys(provider),
+                }))
+            }),
+        Tool::AuthComplete | Tool::AuthLogout => {
+                // Dispatched from `call_tool` with its own body; reaching one here
+                // would mean the guard ran twice.
+                return render(Err(Error::UnknownTool(tool.name().to_owned())));
+            }
         };
+        render(outcome)
+    }
+
+    /// `ar_auth_complete`: redeem, persist, verify.
+    ///
+    /// The one body that awaits, so it goes through [`crate::guard_async`] — the
+    /// same scope check and the same single audit row as its siblings. It is split
+    /// out of [`Server::call`] for exactly that reason: an awaiting body inside a
+    /// synchronous dispatch would need a guard of its own, and a second guard is
+    /// a second place for a scope check to go stale.
+    ///
+    /// OmniRoute's order, unchanged: url (already done, by `ar_auth_login_url`)
+    /// → complete (this call) → persist (the two store rows) → verify (read the
+    /// row back, so "armed" means the store answered rather than that the insert
+    /// did not throw).
+async fn complete(&self, args: &JsonObject) -> CallToolResult {
+        let host = &*self.host;
+        let raw = Args::new(Some(args));
+        let input = serde_json::Value::Object(args.clone());
+        let outcome = crate::guard_async(Tool::AuthComplete, host.scope, &host.audit, &host.key_id, &input, || async {
+            let session_id = raw.str("session_id").ok_or(Error::MissingArgument { name: "session_id" })?.to_owned();
+            let pasted = raw.str("code_or_url").ok_or(Error::MissingArgument { name: "code_or_url" })?.trim().to_owned();
+            // `take` before the exchange, not after: a failed exchange must not
+            // leave the verifier redeemable, and the upstream code is spent either
+            // way once it has been sent.
+            let pending = host.pending.take(&session_id).ok_or(Error::NoPendingSession(session_id.clone()))?;
+            let target = host.auth_target(pending.provider())?.clone();
+            let code = code_from(&pasted, &pending.request().state)?;
+            // A confidential client's secret is a store row like any other, read
+            // only because the session declared one. `None` for a public PKCE
+            // client, which is the common case. `get_text` rather than `get`
+            // because the exchange wants `ar_config::Secret`, and `ar-keys`
+            // spells its bytes — so the UTF-8 check happens once, in the store,
+            // instead of being re-derived here.
+            let store = host.store().ok_or_else(|| Error::StoreRequired(host.store_path.display().to_string()))?;
+            let secret = match target.client_secret_key.as_deref() {
+                Some(row) => store.get_text(row).map_err(Error::from)?.map(|text| ar_config::Secret::new(&text)),
+                None => None,
+            };
+            let token = exchange_code(
+                &host.exec,
+                &target.session,
+                &code,
+                &pending.request().verifier,
+                &pending.request().redirect_uri,
+                secret.as_ref(),
+            )
+            .await?;
+            // Persist before reporting: a login that printed success and lost the
+            // token would be the one failure an operator cannot detect. The two
+            // `Secret` types are bridged here, once, at the one boundary that
+            // holds both.
+            store
+                .insert(target.provider(), &target.access_key, &store_secret(token.access().expose()))
+                .map_err(Error::from)?;
+            if let (Some(row), Some(refresh)) = (target.refresh_key.as_deref(), token.refresh()) {
+                store.insert(target.provider(), row, &store_secret(refresh.expose())).map_err(Error::from)?;
+            }
+            // The verify step: read the row back rather than trusting the insert,
+            // so `armed` is a fact about the store and not about this function.
+            let armed = store.get(&target.access_key).map_err(Error::from)?.is_some();
+            Ok(serde_json::json!({
+                "provider": target.provider(),
+                "status": if armed { "armed" } else { "failed" },
+                "armed": armed,
+                "stored_keys": host.stored_keys(Some(target.provider())),
+            }))
+        })
+        .await;
+        render(outcome)
+    }
+
+    /// `ar_auth_logout`: forget a provider's rows.
+    ///
+    /// Removing rows rather than writing empty ones — see
+    /// [`ar_keys::CredentialStore::remove`]. Idempotent: a provider with nothing
+    /// stored is a success reporting `removed: 0`, not an error, so a host can
+    /// run it twice.
+    fn logout(&self, args: &JsonObject) -> CallToolResult {
+        let host = &*self.host;
+        let raw = Args::new(Some(args));
+        let input = serde_json::Value::Object(args.clone());
+        let outcome = crate::guard(Tool::AuthLogout, host.scope, &host.audit, &host.key_id, &input, || {
+            let provider = raw.str("provider").ok_or(Error::MissingArgument { name: "provider" })?.to_owned();
+            let target = host.auth_target(&provider)?;
+            let mut removed = 0_usize;
+            if let Some(store) = host.store() {
+                for name in [Some(target.access_key.as_str()), target.refresh_key.as_deref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    if store.remove(name).map_err(Error::from)? {
+                        removed += 1;
+                    }
+                }
+            }
+            // Drop any half-finished login too, so a logout cannot be undone by a
+            // code pasted just before it.
+            host.pending.discard(&provider);
+            Ok(serde_json::json!({
+                "provider": target.provider(),
+                "removed": removed,
+                "stored_keys": host.stored_keys(Some(target.provider())),
+            }))
+        });
         render(outcome)
     }
 
@@ -393,6 +616,42 @@ impl Server {
         }
         CallToolResult::structured(body)
     }
+}
+
+/// The authorization code out of whatever the host pasted.
+///
+/// A whole redirect URL *or* a bare code, for the same reason `ar auth login`
+/// accepts both: a provider that shows the code on a page gives the operator no
+/// URL to paste, and asking them to synthesise one is asking for the paste to be
+/// wrong. The bare-code branch is the fallback, not the first test, because a
+/// pasted code has no `state` to check and the URL parser would report a
+/// misleading verdict for it.
+///
+/// # Errors
+///
+/// Whatever [`parse_callback_url`] returns — `LoginDenied` for a `?error=`
+/// redirect (a person clicking Cancel, which the operator must be told is *not* a
+/// bug), `StateMismatch` for someone else's authorization — plus
+/// [`LoginError::LoginExpired`] for an empty paste.
+fn code_from(pasted: &str, expected_state: &str) -> Result<String, Error> {
+    if pasted.contains('?') || pasted.contains("://") {
+        return Ok(parse_callback_url(pasted, expected_state)?);
+    }
+    if pasted.is_empty() {
+        return Err(Error::Auth(LoginError::LoginExpired));
+    }
+    Ok(pasted.to_owned())
+}
+
+/// `ar_config::Secret` as the byte secret `ar_keys` stores.
+///
+/// The two crates spell a secret differently — one a `String`, one a
+/// zeroizing byte buffer — and the login flow is the one place that holds both.
+/// Bridged here, once, rather than with a `From` impl neither crate owns: an
+/// implicit conversion between two secret types is a conversion somebody will
+/// eventually make without noticing.
+fn store_secret(raw: &str) -> ar_keys::Secret {
+    ar_keys::Secret::new(raw.as_bytes().to_vec())
 }
 
 /// `spend` as JSON. `Usd` is a micro-dollar struct with no `Serialize`, so the
@@ -443,6 +702,10 @@ impl ServerHandler for Server {
             Ok(self.search(&args))
         } else {
             match Tool::parse(request.name.as_ref()) {
+                // The two bodies that are not `call`: one awaits, one is the
+                // write half of the pair `call` cannot express as a closure.
+                Ok(Tool::AuthComplete) => Ok(self.complete(&args).await),
+                Ok(Tool::AuthLogout) => Ok(self.logout(&args)),
                 Ok(tool) => Ok(self.call(tool, &args)),
                 // An unknown name is a routing failure, not a tool failure: this
                 // server cannot find the tool at all, which is the case MCP wants
@@ -456,7 +719,7 @@ impl ServerHandler for Server {
     }
 }
 
-/// Serves the essential-8 plus `ar_tool_search` over stdio.
+/// Serves the twelve catalog tools plus `ar_tool_search` over stdio.
 ///
 /// # Errors
 ///
@@ -484,11 +747,13 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
 
-    use super::{Args, Host, Mutex, STDIO_WIRED, TOOL_SEARCH_NAME, describe, describe_search, render, spend_json};
-    use crate::scope::Scope;
-    use crate::Tool;
-    use ar_keys::{Admission, LaneSpec};
-    use ar_route::ProviderId;
+use super::{Args, Host, Mutex, STDIO_WIRED, TOOL_SEARCH_NAME, code_from, describe, describe_search, render, spend_json};
+use crate::login::{AuthTarget, LOGIN_TTL, PendingLogins};
+use crate::scope::Scope;
+use crate::Tool;
+use ar_exec::{OAuthKind, Session};
+use ar_keys::{Admission, LaneSpec};
+use ar_route::ProviderId;
 
     /// `redb` allows one open handle per file, and the tests run in parallel, so
     /// every host gets its own name and therefore its own ledger and audit db.
@@ -503,12 +768,35 @@ mod tests {
             admission: Admission::new([LaneSpec::INTERACTIVE, LaneSpec::BATCH, LaneSpec::HEAVY], 600)
                 .expect("build"),
             ledger_path: scratch(name, "ledger.sqlite"),
+            store_path: scratch(name, "credentials.db"),
+            exec: ar_exec::ArExec::new().expect("client"),
+            auth: vec![auth_target()],
+            pending: PendingLogins::default(),
             active: Mutex::new(crate::ComboState::default()),
             cursor: AtomicU64::new(0),
             scope: Scope::ALL,
             audit: crate::Audit::open(&scratch(name, "audit.redb")).expect("audit"),
             key_id: "k1".to_owned(),
         }
+    }
+
+    /// One loginable provider, as `ar mcp`'s `build` resolves it from `oauth:`.
+    fn auth_target() -> AuthTarget {
+        let session = Session::new("codex", OAuthKind::Codex)
+            .with_authorization_url("https://auth.test/authorize")
+            .with_token_url("https://auth.test/token")
+            .with_client_id("cid");
+        AuthTarget {
+            session,
+            redirect_uri: "http://127.0.0.1:1455/callback".to_owned(),
+            access_key: "codex".to_owned(),
+            refresh_key: Some("codex_refresh".to_owned()),
+            client_secret_key: None,
+        }
+    }
+
+    fn args(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        v.as_object().cloned().expect("an object")
     }
 
     #[test]
@@ -518,7 +806,7 @@ mod tests {
             .map(|t| t.name())
             .chain(std::iter::once(TOOL_SEARCH_NAME))
             .count();
-        assert_eq!(count, 9);
+        assert_eq!(count, 13);
     }
 
     #[test]
@@ -598,7 +886,7 @@ mod tests {
     }
 
     #[test]
-    fn a_health_call_over_the_transport_goes_through_the_guard() {
+    fn a_call_over_the_transport_goes_through_the_guard() {
         // The whole point of the transport: a real call lands a real audit row.
         let h = host("health");
         let before = h.audit.len();
@@ -621,8 +909,8 @@ mod tests {
     fn a_switch_activates_the_named_combo_and_is_idempotent() {
         let h = host("switch");
         let s = super::Server { host: Arc::new(h) };
-        let first = s.call(Tool::SwitchCombo, &serde_json::json!({ "name": "cheap" }).as_object().cloned().expect("obj"));
-        let second = s.call(Tool::SwitchCombo, &serde_json::json!({ "name": "cheap" }).as_object().cloned().expect("obj"));
+        let first = s.call(Tool::SwitchCombo, &args(serde_json::json!({ "name": "cheap" })));
+        let second = s.call(Tool::SwitchCombo, &args(serde_json::json!({ "name": "cheap" })));
         let changed = |r: &rmcp::model::CallToolResult| {
             r.structured_content.as_ref().and_then(|v| v.get("changed")).and_then(serde_json::Value::as_bool)
         };
@@ -633,8 +921,7 @@ mod tests {
     #[test]
     fn the_search_tool_returns_the_catalog_it_was_asked_about() {
         let s = super::Server { host: Arc::new(host("search-body")) };
-        let args = serde_json::json!({ "query": "switch" });
-        let out = s.search(args.as_object().expect("obj"));
+        let out = s.search(&args(serde_json::json!({ "query": "switch" })));
         let names = out.structured_content.expect("body");
         assert_eq!(names["tools"][0]["name"], "ar_switch_combo", "{names}");
     }
@@ -684,5 +971,96 @@ mod tests {
     fn renders_spend_in_the_unit_the_ledger_computes_with() {
         let s = ar_tokens::Spend::default();
         assert_eq!(spend_json(s)["tokens"], serde_json::json!(0));
+    }
+
+    #[test]
+    fn a_login_url_call_hands_back_a_url_and_a_session_id() {
+        let s = super::Server { host: Arc::new(host("login-url")) };
+        let out = s.call(Tool::AuthLoginUrl, &args(serde_json::json!({ "provider": "codex" })));
+        let body = out.structured_content.expect("body");
+        assert!(body["authorize_url"].as_str().expect("url").contains("code_challenge="), "{body}");
+        assert!(body["session_id"].as_str().is_some(), "{body}");
+    }
+
+    #[test]
+    fn a_login_url_answer_carries_only_the_five_declared_keys() {
+        // The "never returns a secret" test, as a shape: an answer with exactly the
+        // keys the schema declares cannot be carrying a verifier or a token,
+        // because there is no field for one.
+        let s = super::Server { host: Arc::new(host("login-verifier")) };
+        let out = s.call(Tool::AuthLoginUrl, &args(serde_json::json!({ "provider": "codex" })));
+        let body = out.structured_content.expect("body");
+        let keys: Vec<&str> = body.as_object().expect("object").keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            ["authorize_url", "expires_in_secs", "provider", "redirect_uri", "session_id"],
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn a_status_call_lists_the_provider_and_the_pending_login() {
+        let s = super::Server { host: Arc::new(host("login-status")) };
+        s.call(Tool::AuthLoginUrl, &args(serde_json::json!({ "provider": "codex" })));
+        let out = s.call(Tool::AuthStatus, &serde_json::Map::new());
+        let body = out.structured_content.expect("body");
+        assert_eq!(body["providers"][0], "codex", "{body}");
+        assert_eq!(body["pending"].as_array().expect("array").len(), 1, "{body}");
+    }
+
+    #[tokio::test]
+    async fn completing_an_unknown_session_is_a_clean_error() {
+        let s = super::Server { host: Arc::new(host("login-unknown")) };
+        let out = s.complete(&args(serde_json::json!({ "session_id": "nope", "code_or_url": "abc" }))).await;
+        assert_eq!(out.is_error, Some(true), "{out:?}");
+    }
+
+    #[test]
+    fn a_read_grant_refuses_the_login_write_over_the_transport() {
+        let mut h = host("login-denied");
+        h.scope = Scope::READ;
+        let s = super::Server { host: Arc::new(h) };
+        let out = s.logout(&args(serde_json::json!({ "provider": "codex" })));
+        assert_eq!(out.is_error, Some(true), "a default-deny refusal is visible: {out:?}");
+    }
+
+    #[test]
+    fn a_bare_code_is_accepted_where_a_whole_redirect_is_not_required() {
+        assert_eq!(code_from("plain-code", "st8").expect("bare code"), "plain-code");
+    }
+
+    #[test]
+    fn a_pasted_redirect_is_held_to_the_same_state_check() {
+        let e = code_from("http://127.0.0.1:1455/callback?code=abc&state=other", "st8")
+            .expect_err("someone else's code");
+        assert!(e.to_string().contains("state"), "{e}");
+    }
+
+#[test]
+    fn an_empty_paste_is_an_expiry_rather_than_a_bare_code() {
+        assert!(code_from("", "st8").is_err());
+    }
+
+    #[test]
+    fn a_denied_redirect_reports_the_provider_own_reason() {
+        let request =
+            ar_exec::new_authorize_request(&auth_target().session, "http://127.0.0.1:1455/callback");
+        let url =
+            format!("http://127.0.0.1:1455/callback?error=access_denied&state={}", request.state);
+        let e = code_from(&url, &request.state).expect_err("a refusal is not a code");
+        assert!(e.to_string().contains("access_denied"), "{e}");
+    }
+
+    #[test]
+    fn a_logout_is_idempotent_for_a_provider_with_nothing_stored() {
+        let s = super::Server { host: Arc::new(host("login-logout")) };
+        let out = s.logout(&args(serde_json::json!({ "provider": "codex" })));
+        let body = out.structured_content.expect("body");
+        assert_eq!(body["removed"], serde_json::json!(0), "{body}");
+    }
+
+    #[test]
+    fn the_login_budget_the_tools_report_is_the_clis_default() {
+        assert_eq!(LOGIN_TTL, std::time::Duration::from_secs(300));
     }
 }

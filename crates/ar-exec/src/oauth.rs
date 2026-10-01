@@ -36,6 +36,54 @@
 //! `ar_keys::CredentialStore`'s job (F-CRIT-2) and `ar-server`'s, and this file
 //! is downstream of both. `ar-server`'s config reader is the single place that
 //! pulls a token out of the store and hands it over.
+//!
+//! # Browser login: the redirect-catch half
+//!
+//! An access token has to come from somewhere, and the browser is how a human
+//! gets one. The flow splits in two, and only the catch half lives here:
+//!
+//! * **Path A — same machine.** [`CallbackListener`] binds `127.0.0.1:0` once,
+//!   hands its [`CallbackListener::redirect_uri`] to the authorize-URL builder as
+//!   `redirect_uri`, and waits for the browser to be redirected back at it.
+//! * **Path B — any other device.** [`parse_callback_url`] takes the same
+//!   redirected URL as a pasted string, for a phone completing consent on a
+//!   machine that has no listener to return to.
+//!
+//! Both converge on the same two questions about a §4.1.2 redirect — *was this
+//! mine?* (`state`) and *what did the provider say?* (`code` or `error`) — so
+//! they share one parser and one [`LoginError`] taxonomy rather than each
+//! inventing a verdict.
+//!
+//! # Browser login: the authorize + exchange half
+//!
+//! The other two steps of the same flow live here too, because a code is worth
+//! nothing until something can be done with it:
+//!
+//! * [`new_authorize_request`] mints a PKCE `S256` pair and a CSRF `state`.
+//! * [`authorize_url`] builds the §4.1.1 URL.
+//! * [`exchange_code`] posts the §4.1.3 code for tokens.
+//!
+//! Three properties this half holds to:
+//!
+//! * **PKCE `S256`, mandatory.** [`authorize_url`] emits
+//!   `code_challenge_method=S256` with no knob for `plain`. `plain` protects
+//!   nothing against a leaked authorization request, and a switch toward a
+//!   weaker flow no provider needs is not a knob worth having.
+//! * **No endpoint is ever inferred.** `authorization_url` and `token_url` are
+//!   operator-supplied ([`Session::with_authorization_url`],
+//!   [`Session::with_token_url`]); an absent one is [`LoginError`], never a
+//!   guess — the same rule that keeps refresh from inventing a wire format.
+//! * **Failures share the taxonomy.** An exchange failure is classified by
+//!   [`classify_refresh`], so a 400 `invalid_grant` from the *login* is the same
+//!   [`RefreshFault`] the refresh path produces and a provider's carve-out
+//!   (Claude's transient `invalid_grant`) applies to a login too. One list, one
+//!   meaning.
+//!
+//! The socket is unauthenticated for its entire life, so it is bound to the
+//! loopback address and never to `0.0.0.0`, it serves exactly one request, and it
+//! is dropped the moment that request is answered or the deadline passes. A
+//! login listener is not a server: leaving one open would keep a socket, a port
+//! and a code inside the `docs/00` RAM budget for as long as the tab stayed open.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -45,9 +93,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ar_config::Secret;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bytes::Bytes;
-use reqwest::StatusCode;
+use reqwest::{StatusCode, Url};
+use uuid::Uuid;
 use sha2::{Digest as _, Sha256};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
@@ -67,6 +120,22 @@ const EXPIRY_SKEW_SECS: u64 = 30;
 /// carries a JSON error object. Bounded because the body is attacker-adjacent
 /// and a provider error page can be megabytes of HTML.
 const REFRESH_BODY_SCAN: usize = 2 * 1024;
+
+/// Ceiling on one token-endpoint round trip, shared by the refresher and the
+/// login exchange.
+///
+/// One constant for both because they are the same operation against the same
+/// operator-supplied host: two numbers would let the paths drift, and a login
+/// that stalls where a refresh would have returned is a bug nobody can see.
+/// Not a knob — a login the operator is watching a browser for is not a hot
+/// path.
+const TOKEN_ENDPOINT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// RFC 7636 §4.1's floor on `code_verifier` length.
+///
+/// The RFC permits 43..=128 and this build always produces 64, so the test
+/// asserts against the floor: shorter is a spec violation, longer is allowed.
+pub const PKCE_VERIFIER_MIN_LEN: usize = 43;
 
 /// Why a dispatch came from the proxy rather than from a client.
 ///
@@ -457,6 +526,16 @@ impl OAuthToken {
         &self.access
     }
 
+    /// The refresh token, when there is one.
+    ///
+    /// Paired with [`Self::can_refresh`]; a login that just minted a token needs
+    /// to write *both* halves to the store, and there was no accessor for the
+    /// second one.
+    #[must_use]
+    pub fn refresh(&self) -> Option<&Secret> {
+        self.refresh.as_ref()
+    }
+
     /// Whether this token carries a refresh token.
     #[must_use]
     pub fn can_refresh(&self) -> bool {
@@ -531,6 +610,7 @@ impl RotationPool {
 pub struct Session {
     provider: String,
     kind: OAuthKind,
+    authorization_url: Option<String>,
     token_url: Option<String>,
     client_id: Option<String>,
     scope: Option<String>,
@@ -543,10 +623,22 @@ impl Session {
         Self {
             provider: provider.into(),
             kind,
+            authorization_url: None,
             token_url: None,
             client_id: None,
             scope: None,
         }
+    }
+
+    /// Sets the authorization endpoint a browser login starts at.
+    ///
+    /// Absent one means there is no browser login — [`authorize_url`] answers
+    /// [`LoginError::NoAuthorizationUrl`] rather than guessing an endpoint from
+    /// the provider id, which would be an invented wire format (AGENTS.md).
+    #[must_use]
+    pub fn with_authorization_url(mut self, url: impl Into<String>) -> Self {
+        self.authorization_url = Some(url.into());
+        self
     }
 
     /// Sets the refresh endpoint. Without one the session cannot renew.
@@ -580,6 +672,12 @@ impl Session {
     #[must_use]
     pub fn kind(&self) -> OAuthKind {
         self.kind
+    }
+
+    /// The authorization endpoint, when one is configured.
+    #[must_use]
+    pub fn authorization_url(&self) -> Option<&str> {
+        self.authorization_url.as_deref()
     }
 
     /// The refresh endpoint, when one is configured.
@@ -1046,7 +1144,7 @@ impl HttpRefresher {
     /// ([`RefreshFault::Unrecoverable`]), not a construction failure.
     #[must_use]
     pub fn new(client: reqwest::Client) -> Self {
-        Self { client, timeout: Duration::from_secs(30) }
+        Self { client, timeout: TOKEN_ENDPOINT_TIMEOUT }
     }
 
     /// Overrides the refresh timeout.
@@ -1164,6 +1262,584 @@ pub fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// Every way a browser login can fail.
+///
+/// One sentence per variant, because this is what an operator reads: the caller
+/// is usually a person looking at a phone, and "login failed" with no cause is
+/// the failure mode this enum exists to remove. Nothing here names a code, a
+/// `state`, or a token.
+///
+/// The enum is shared by both halves of the flow. The redirect-catch half
+/// ([`CallbackListener`], [`parse_callback_url`]) produces the four
+/// redirect variants; [`authorize_url`] produces [`Self::NoAuthorizationUrl`]
+/// and [`Self::InvalidRedirectUri`]; [`exchange_code`] produces
+/// [`Self::NoTokenUrl`] and [`Self::ExchangeFailed`]. A caller matches on the
+/// variant, never on the string.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum LoginError {
+    /// The provider refused: §4.1.2 answered with `?error=…` instead of a code.
+    ///
+    /// Carries the provider's own error code (`access_denied` and friends),
+    /// bounded by [`PROVIDER_ERROR_SCAN`]. `error_description` is deliberately
+    /// not carried — it is unbounded provider prose.
+    #[error("provider refused the login: {0}")]
+    LoginDenied(String),
+    /// The token POST failed, or produced nothing usable.
+    ///
+    /// Carries a [`RefreshFault`], not a free-form string, so a login failure
+    /// and a refresh failure answer the same question the same way: the exchange
+    /// went through [`classify_refresh`], so a 400 `invalid_grant` here is the
+    /// same terminal verdict the refresh path reaches and a provider's carve-out
+    /// applies to a login too. A malformed callback reported through this
+    /// variant is [`RefreshFault::Transient`] — an unrecognised condition must
+    /// never retire an account.
+    #[error("oauth exchange failed: {0}")]
+    ExchangeFailed(RefreshFault),
+    /// The callback's `state` was absent or did not match the one this client
+    /// generated, so the redirect cannot be attributed to this request.
+    #[error("oauth state mismatch")]
+    StateMismatch,
+    /// No callback arrived inside the deadline.
+    #[error("oauth login expired before the provider redirected back")]
+    LoginExpired,
+    /// The loopback socket could not be bound, accepted on, or read from.
+    #[error("oauth callback listener failed: {0}")]
+    ListenerBind(String),
+    /// The session declares no usable authorization endpoint.
+    ///
+    /// Either `authorization_url` or `client_id` is absent, and §4.1.1 requires
+    /// both. Neither is ever inferred from the provider id.
+    #[error("no authorization endpoint is configured; set authorization_url and client_id")]
+    NoAuthorizationUrl,
+    /// The session declares no token endpoint, so there is nowhere to post the
+    /// authorization code.
+    #[error("no token endpoint is configured; set token_url")]
+    NoTokenUrl,
+    /// The redirect URI is not an absolute URL, so §4.1.2 would send the
+    /// provider's answer somewhere this client cannot read.
+    ///
+    /// A private-use scheme (`myapp://callback`) passes: RFC 8252 §7.1 names it
+    /// for native clients, and refusing it would refuse the flow it exists for.
+    #[error("the redirect uri is not an absolute url")]
+    InvalidRedirectUri,
+}
+
+impl From<LoginError> for ExecError {
+    /// Keeps a terminal exchange failure typed, and widens the rest.
+    ///
+    /// [`Self::ExchangeFailed`] defers to [`RefreshFault::into_exec`], so a
+    /// terminal account arrives as [`ExecError::OAuthTerminal`] with a
+    /// [`TerminalReport`] rather than as prose — the same visible verdict the
+    /// refresh path produces. Everything else is a fact about the operator's
+    /// configuration, and [`ExecError::Transport`] is the widest variant this
+    /// enum owns; the sentence inside it says exactly what is missing, so the
+    /// width costs no accuracy. A future `ar` that wants these as their own
+    /// status adds one `ExecError` variant rather than four.
+    fn from(err: LoginError) -> Self {
+        match err {
+            LoginError::ExchangeFailed(fault) => fault.into_exec("oauth-browser-login"),
+            other => ExecError::Transport(format!("oauth browser login: {other}")),
+        }
+    }
+}
+
+/// Ceiling on a provider's `?error=` value.
+///
+/// The redirect lands on an unauthenticated local socket, so the string is
+/// provider-supplied text arriving from an untrusted peer. Bounded for the same
+/// reason [`REFRESH_BODY_SCAN`] bounds a refresh body: an error a caller might
+/// print should not be able to be megabytes long.
+const PROVIDER_ERROR_SCAN: usize = 64;
+
+/// Ceiling on an `io::Error` message carried into [`LoginError::ListenerBind`].
+const IO_REASON_SCAN: usize = 128;
+
+/// Ceiling on a callback request head.
+///
+/// A browser's is well under 4 KiB. The cap is what stops an unauthenticated
+/// local socket from being a memory-growth knob: the buffer stops growing here
+/// whether or not the peer ever sends a blank line.
+const CALLBACK_HEAD_MAX: usize = 8 * 1024;
+
+/// The path a provider is told to redirect to, and the one the listener serves.
+///
+/// `/callback` rather than `/` so the shape of this socket is obvious in a port
+/// listing and in a provider's registered-redirect allowlist.
+const CALLBACK_PATH: &str = "/callback";
+
+/// The page the browser lands on once the code is in hand.
+const CALLBACK_PAGE_OK: &str = "<!doctype html><meta charset=\"utf-8\"><title>Signed in</title>\
+     <p>Login complete. You can close this tab and return to the terminal.</p>";
+
+/// The page the browser lands on when the redirect is refused.
+const CALLBACK_PAGE_ERR: &str = "<!doctype html><meta charset=\"utf-8\"><title>Sign-in failed</title>\
+     <p>Sign-in did not complete. Return to the terminal and retry.</p>";
+
+/// A single-use loopback listener for one OAuth redirect (RFC 6749 §4.1).
+///
+/// Bind it, hand [`Self::redirect_uri`] to the authorize-URL builder, show that
+/// URL to a human, then [`Self::wait_for_code`] for exactly one request. `self`
+/// is consumed, so a listener cannot be reused: the second callback of a login
+/// attempt has nothing listening, which is the whole point of the design — an
+/// authorization code is single-use, and a socket that outlived the exchange
+/// would be a credential waiting to be replayed by anything on the loopback.
+///
+/// The bind is `127.0.0.1:0` — loopback only, never a wildcard, and never a
+/// fixed port, so two concurrent logins cannot collide and neither can be
+/// predicted by a local process guessing the port.
+pub struct CallbackListener {
+    listener: TcpListener,
+    port: u16,
+}
+
+impl CallbackListener {
+    /// Binds an ephemeral port on the loopback address.
+    ///
+    /// The only construction failure is the OS refusing the socket, which is a
+    /// per-machine fact rather than a per-session one.
+    pub async fn bind() -> Result<Self, LoginError> {
+        // Loopback and never `0.0.0.0`: this socket is unauthenticated for its
+        // whole life, so a wildcard bind would offer the authorization code to
+        // every host that can route to this machine.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| LoginError::ListenerBind(io_reason(&e)))?;
+        let port = listener
+            .local_addr()
+            .map_err(|e| LoginError::ListenerBind(io_reason(&e)))?
+            .port();
+        Ok(Self { listener, port })
+    }
+
+    /// The `redirect_uri` to put on the authorize URL.
+    ///
+    /// Read it before moving the listener into [`Self::wait_for_code`]; the port
+    /// is fixed from bind onwards, so the URI is stable for the attempt's life.
+    #[must_use]
+    pub fn redirect_uri(&self) -> String {
+        format!("http://127.0.0.1:{port}{CALLBACK_PATH}", port = self.port)
+    }
+
+    /// Waits for one callback and returns its authorization code.
+    ///
+    /// Answers the browser with a self-contained page — [`CALLBACK_PAGE_OK`] for
+    /// a usable code, [`CALLBACK_PAGE_ERR`] for anything else — so the tab the
+    /// human is looking at and the value the caller gets cannot disagree. The
+    /// page never echoes the code, `state`, or the provider's error.
+    ///
+    /// The deadline covers the accept *and* the read, so a peer that opens the
+    /// socket and then stalls cannot hold the listener past it; on expiry the
+    /// socket is dropped, which is what keeps a login attempt from outliving
+    /// itself in the `docs/00` RAM budget.
+    pub async fn wait_for_code(
+        self,
+        expected_state: &str,
+        timeout: Duration,
+    ) -> Result<String, LoginError> {
+        let Self { listener, port } = self;
+        match tokio::time::timeout(timeout, serve_one(&listener, port, expected_state)).await {
+            Ok(verdict) => verdict,
+            Err(_elapsed) => Err(LoginError::LoginExpired),
+        }
+    }
+}
+
+/// Answers exactly one callback request, then returns.
+///
+/// The verdict is computed before the page is written so the 200 and the returned
+/// code come from the same value, and the write is best-effort: a human who
+/// closed the tab early has still completed the login, so a broken pipe must not
+/// turn a captured code into an error.
+async fn serve_one(
+    listener: &TcpListener,
+    port: u16,
+    expected_state: &str,
+) -> Result<String, LoginError> {
+    let (mut stream, _) = listener
+        .accept()
+        .await
+        .map_err(|e| LoginError::ListenerBind(io_reason(&e)))?;
+    let head = read_head(&mut stream).await?;
+
+    let verdict = request_target(&head, port).and_then(|url| code_in(&url, expected_state));
+    let page = match &verdict {
+        Ok(_) => CALLBACK_PAGE_OK,
+        Err(_) => CALLBACK_PAGE_ERR,
+    };
+    let _ = write_page(&mut stream, if verdict.is_ok() { 200 } else { 400 }, page).await;
+    verdict
+}
+
+/// Reads a request head, up to the blank line that ends it or [`CALLBACK_HEAD_MAX`].
+///
+/// Returns what arrived even if the peer hung up mid-head: the parse below is
+/// what decides whether it was usable, and a truncated head that parses is still
+/// a head a browser really sent.
+async fn read_head(stream: &mut TcpStream) -> Result<String, LoginError> {
+    let mut head = Vec::with_capacity(CALLBACK_HEAD_MAX / 2);
+    let mut chunk = [0_u8; 1024];
+    loop {
+        let read = stream
+            .read(&mut chunk)
+            .await
+            .map_err(|e| LoginError::ListenerBind(io_reason(&e)))?;
+        if read == 0 {
+            break;
+        }
+        head.extend_from_slice(&chunk[..read]);
+        if head.windows(4).any(|window| window == b"\r\n\r\n") || head.len() >= CALLBACK_HEAD_MAX {
+            break;
+        }
+    }
+    Ok(String::from_utf8_lossy(&head).into_owned())
+}
+
+/// The request line's target, parsed as a URL.
+///
+/// A request target is origin-form (`/callback?…`), so it is re-based onto this
+/// listener's own loopback origin rather than hand-split — which also means
+/// [`Url`] does the percent-decoding the callback's values need, and an
+/// absolute-form target from a peer trying something clever fails to parse
+/// instead of being followed.
+fn request_target(head: &str, port: u16) -> Result<Url, LoginError> {
+    let target = head
+        .lines()
+        .next()
+        .and_then(|request_line| request_line.split_whitespace().nth(1))
+        .ok_or(LoginError::ExchangeFailed(RefreshFault::Transient(
+            "callback-request-has-no-target",
+        )))?;
+    Url::parse(&format!("http://127.0.0.1:{port}{target}")).map_err(|_| {
+        LoginError::ExchangeFailed(RefreshFault::Transient("callback-target-is-not-a-url"))
+    })
+}
+
+/// Writes one complete HTTP response and closes the write half.
+///
+/// `Connection: close` because there is no second request to serve: a browser
+/// waiting on a keep-alive connection that will never be answered shows a
+/// spinner, not the page that tells it the login is done.
+async fn write_page(stream: &mut TcpStream, status: u16, page: &str) -> std::io::Result<()> {
+    let reason = if status == 200 { "OK" } else { "Bad Request" };
+    let head = format!(
+        "HTTP/1.1 {status} {reason}\r\n\
+         Content-Type: text/html; charset=utf-8\r\n\
+         Content-Length: {len}\r\n\
+         Connection: close\r\n\
+         Cache-Control: no-store\r\n\r\n",
+        len = page.len(),
+    );
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(page.as_bytes()).await?;
+    stream.shutdown().await
+}
+
+/// The authorization code `url` carries, or why it carries none.
+///
+/// §4.1.2 answers with `?code=…&state=…`, or with `?error=…` and no code, and
+/// both paths return `state`. State is checked *first* and on its own: it is the
+/// only thing that says this redirect belongs to the request this client made
+/// (RFC 6749 §10.12), so a callback that fails it must not reach the exchange on
+/// the strength of a code alone. Unknown parameters are ignored rather than
+/// rejected — providers add their own, and §4.1.2 says to.
+fn code_in(url: &Url, expected_state: &str) -> Result<String, LoginError> {
+    let mut state = None;
+    let mut code = None;
+    let mut denied = None;
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "state" => state = Some(value.into_owned()),
+            "code" => code = Some(value.into_owned()),
+            "error" => denied = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+
+    if state.as_deref() != Some(expected_state) {
+        return Err(LoginError::StateMismatch);
+    }
+    if let Some(error) = denied {
+        return Err(LoginError::LoginDenied(provider_error(&error)));
+    }
+    code.filter(|value| !value.is_empty()).ok_or(LoginError::ExchangeFailed(
+        RefreshFault::Transient("callback-carries-no-code"),
+    ))
+}
+
+/// A provider's `?error=` value, bounded and defaulted.
+///
+/// `access_denied` is the case an operator needs to read off the error, so the
+/// spec's short code is kept. Anything empty or oversized collapses to one
+/// static name rather than being echoed.
+fn provider_error(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > PROVIDER_ERROR_SCAN {
+        return "provider_error".to_owned();
+    }
+    trimmed.to_owned()
+}
+
+/// An `io::Error`'s own message, truncated.
+///
+/// A socket error is a kernel message with no secret content and is what tells
+/// an operator whether the bind failed because the port was taken or the
+/// sandbox refused — a static reason would throw that away. A `std::io::Error`
+/// can still be constructed from anything, so the string is cut before it
+/// becomes an error somebody might print.
+fn io_reason(e: &std::io::Error) -> String {
+    e.to_string().chars().take(IO_REASON_SCAN).collect()
+}
+
+/// The authorization code in a full redirected URL, pasted by hand.
+///
+/// The Path B counterpart to [`CallbackListener::wait_for_code`], for a consent
+/// completed on a device that has no listener to return to: the browser lands on
+/// a dead loopback port and shows the URL it tried, which the human copies back
+/// here. Same `state` check, same `?error=` handling, same [`LoginError`]
+/// variants — so a caller cannot pass Path A output to Path B's parser and get a
+/// weaker verdict.
+pub fn parse_callback_url(url: &str, expected_state: &str) -> Result<String, LoginError> {
+    let parsed =
+        Url::parse(url).map_err(|_| LoginError::ExchangeFailed(RefreshFault::Transient("not-a-callback-url")))?;
+    code_in(&parsed, expected_state)
+}
+
+/// One browser login's PKCE pair, its CSRF nonce, and where it will land.
+///
+/// Holds the whole §4.1 state so a caller cannot pair one request's `state` with
+/// another request's `verifier`: the two are generated together here and travel
+/// together into [`authorize_url`]. Every field is public because the consumer is
+/// a CLI or an MCP host that has to hand the URL to a browser and the verifier to
+/// [`exchange_code`] — private would mean an accessor for each, and an accessor
+/// that returns the verifier is the same exposure with more ceremony.
+///
+/// [`Debug`] is the exception and is hand-written: see that impl.
+pub struct AuthorizeRequest {
+    /// The session being authorized. Supplies the endpoints, client id and scope.
+    pub session: Session,
+    /// Where the provider will redirect, byte-for-byte.
+    ///
+    /// Carried verbatim into the authorize URL and into the exchange POST, because
+    /// RFC 6749 §4.1.3 requires the exchange to repeat *exactly* what was
+    /// authorized — a normalised copy is a `redirect_uri` mismatch.
+    pub redirect_uri: String,
+    /// CSRF nonce (§10.12), checked against the callback's `state`.
+    pub state: String,
+    /// The PKCE verifier (§4.1). The secret half of the pair; never logged.
+    pub verifier: String,
+    /// `BASE64URL(SHA256(ASCII(verifier)))`, the half that goes on the wire (§4.2).
+    pub challenge: String,
+}
+
+impl std::fmt::Debug for AuthorizeRequest {
+    /// Prints everything except the verifier.
+    ///
+    /// The verifier is the whole security of the flow: anyone holding it plus a
+    /// leaked authorization code can redeem that code for tokens. [`Grant`] and
+    /// [`TokenHash`] redact for the same reason and the same way — a type that
+    /// holds a bearer says so in its `Debug` rather than relying on nobody
+    /// printing it. The challenge and the state are public by construction (both
+    /// travel in the authorize URL), so they stay legible.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthorizeRequest")
+            .field("provider", &self.session.provider())
+            .field("redirect_uri", &self.redirect_uri)
+            .field("state", &self.state)
+            .field("challenge", &self.challenge)
+            .field("verifier", &"<32 bytes withheld>")
+            .finish()
+    }
+}
+
+/// Starts a login: a fresh PKCE `S256` pair and a fresh `state`.
+///
+/// Cannot fail, so it is not `Result` — every input is either generated here or
+/// checked later, by [`authorize_url`] (endpoint, redirect URI) or by
+/// [`exchange_code`] (endpoint). Splitting the failure that way keeps the
+/// operator's mistake and the transport's verdict in the two functions that can
+/// name them.
+///
+/// Two v4 UUIDs per value, rendered `simple()` as 64 hex characters: every
+/// character is inside RFC 7636's unreserved set (`ALPHA / DIGIT / - . _ ~`) so
+/// no percent-encoding can change what the provider hashes, and 64 clears the
+/// 43-character [`PKCE_VERIFIER_MIN_LEN`] floor. `uuid`'s v4 draws from the OS
+/// CSPRNG, which is the requirement here — a predictable verifier is the one bug
+/// that turns PKCE into decoration.
+#[must_use]
+pub fn new_authorize_request(session: &Session, redirect_uri: &str) -> AuthorizeRequest {
+    let verifier = random_unreserved();
+    AuthorizeRequest {
+        session: session.clone(),
+        redirect_uri: redirect_uri.to_owned(),
+        state: random_unreserved(),
+        challenge: code_challenge_for(&verifier),
+        verifier,
+    }
+}
+
+/// 64 unreserved characters of CSPRNG output. See [`new_authorize_request`].
+fn random_unreserved() -> String {
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
+/// `BASE64URL(SHA256(ASCII(verifier)))` — RFC 7636 §4.2, the only method used.
+///
+/// `URL_SAFE_NO_PAD` because §4.2 says `BASE64URL` with the trailing `=` removed,
+/// and unpadded output is also what keeps the value legal in a query string
+/// without escaping.
+fn code_challenge_for(verifier: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+}
+
+/// The §4.1.1 authorization URL to open in a browser.
+///
+/// Every parameter is one the RFCs define — `response_type`, `client_id`,
+/// `redirect_uri`, `scope`, `code_challenge`, `code_challenge_method`, `state` —
+/// and nothing provider-specific is appended, because a guess here would be an
+/// invented wire format (AGENTS.md). `scope` is sent only when the operator
+/// configured one, since §3.3 makes it optional; `client_id` is required, so its
+/// absence is [`LoginError::NoAuthorizationUrl`].
+///
+/// `code_challenge_method` is `S256` with no alternative and no knob: `plain`
+/// exists for clients that cannot hash, which is not this one.
+///
+/// # Errors
+///
+/// [`LoginError::InvalidRedirectUri`] when `redirect_uri` is not absolute — a
+/// relative target would send the provider's answer nowhere this client reads.
+/// [`LoginError::NoAuthorizationUrl`] when the session declares no
+/// `authorization_url`, no `client_id`, or an endpoint that is not a URL.
+///
+/// Percent-encoding goes through [`Url`]'s query builder rather than string
+/// concatenation, because `redirect_uri` carries a `?` and `&` of its own and a
+/// hand-built query would silently split it.
+pub fn authorize_url(req: &AuthorizeRequest) -> Result<String, LoginError> {
+    // Validity gate only: the parameter sent below is the caller's original
+    // string, because §4.1.3 wants the same bytes the authorize request carried.
+    Url::parse(&req.redirect_uri).map_err(|_| LoginError::InvalidRedirectUri)?;
+    let (Some(endpoint), Some(client_id)) =
+        (req.session.authorization_url(), req.session.client_id())
+    else {
+        return Err(LoginError::NoAuthorizationUrl);
+    };
+    let mut url = Url::parse(endpoint).map_err(|_| LoginError::NoAuthorizationUrl)?;
+
+    let mut query = url.query_pairs_mut();
+    query.append_pair("response_type", "code").append_pair("client_id", client_id);
+    // The original text, not `redirect`: §4.1.3 wants the same bytes the
+    // authorize request carried, and `Url` normalises (`/path` gains a trailing
+    // `/`, a host gains a lowercased case) which would break the match.
+    query.append_pair("redirect_uri", req.redirect_uri.as_str());
+    if let Some(scope) = req.session.scope() {
+        query.append_pair("scope", scope);
+    }
+    query
+        .append_pair("code_challenge", req.challenge.as_str())
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("state", req.state.as_str());
+    drop(query);
+
+    Ok(url.into())
+}
+
+/// Trades an authorization code for tokens: the RFC 6749 §4.1.3 form POST.
+///
+/// One `async fn`, not a second [`Refresher`] implementation. A login happens
+/// once per account while a refresh happens on every expiry, so the trait's
+/// shape — a boxed future behind a `dyn`, held by a connection for its lifetime
+/// — would buy nothing here.
+///
+/// `client_secret` is a parameter rather than read from the session because it is
+/// token material: the credential store holds it as its own row and the caller
+/// passes it in already decrypted, the same seam [`OAuthToken`] establishes.
+/// Confidential clients send it; public PKCE clients pass `None` and the field is
+/// then absent rather than empty, since §2.3.1 treats the two differently.
+///
+/// `core`'s client is the one that already pools the connections this proxy
+/// makes, so a login does not open a second pool for the same hosts.
+///
+/// # Errors
+///
+/// [`LoginError::NoTokenUrl`] when the session declares no `token_url`.
+/// [`LoginError::ExchangeFailed`] otherwise, carrying a [`RefreshFault`] from
+/// [`classify_refresh`] — so the caller learns whether the account is finished
+/// rather than only that the POST failed. An absent `refresh_token` on a
+/// successful response is *not* an error: §5.1 makes it optional and its absence
+/// means "there is no renewal", which the returned token records by having none.
+pub async fn exchange_code(
+    core: &ArExec,
+    session: &Session,
+    code: &str,
+    verifier: &str,
+    redirect_uri: &str,
+    client_secret: Option<&Secret>,
+) -> Result<OAuthToken, LoginError> {
+    let Some(url) = session.token_url() else {
+        return Err(LoginError::NoTokenUrl);
+    };
+
+    let mut form: Vec<(&str, &str)> = vec![
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("redirect_uri", redirect_uri),
+        ("code_verifier", verifier),
+    ];
+    if let Some(client_id) = session.client_id() {
+        form.push(("client_id", client_id));
+    }
+    if let Some(secret) = client_secret {
+        form.push(("client_secret", secret.expose()));
+    }
+
+    let response = match core
+        .client()
+        .post(url)
+        .form(&form)
+        .timeout(TOKEN_ENDPOINT_TIMEOUT)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        // A transport failure is transient by definition: no verdict was
+        // produced, so nothing was learned about the account.
+        Err(e) => return Err(LoginError::ExchangeFailed(RefreshFault::Transient(transport_reason(&e)))),
+    };
+
+    let status = response.status().as_u16();
+    let success = response.status().is_success();
+    let raw = response.bytes().await.unwrap_or_default();
+    let body = String::from_utf8_lossy(&raw[..raw.len().min(REFRESH_BODY_SCAN)]).into_owned();
+    if !success {
+        return Err(LoginError::ExchangeFailed(classify_refresh(session.kind(), status, &body)));
+    }
+
+    let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|_| {
+        LoginError::ExchangeFailed(RefreshFault::Transient("unreadable-refresh-response"))
+    })?;
+    let Some(access) = parsed
+        .get("access_token")
+        .and_then(serde_json::Value::as_str)
+        .map(Secret::new)
+    else {
+        return Err(LoginError::ExchangeFailed(RefreshFault::Transient(
+            "refresh-response-has-no-access-token",
+        )));
+    };
+
+    let mut token = OAuthToken::new(access).with_expiry(expiry_at(&parsed, unix_now()));
+    // §5.1: optional, and its absence means this session cannot be renewed —
+    // the first 401 is then terminal, which `Session::can_refresh` reports
+    // rather than a later dispatch discovering.
+    if let Some(refresh) = parsed
+        .get("refresh_token")
+        .and_then(serde_json::Value::as_str)
+        .map(Secret::new)
+    {
+        token = token.with_refresh(refresh);
+    }
+    Ok(token)
+}
+
 // A connection is shared across request tasks and holds two locks; the rotation
 // pool is shared across connections. Prove it at compile time rather than
 // discovering it from a spawn error on the first concurrent request (ch.9).
@@ -1179,8 +1855,9 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use ar_config::Secret;
     use ar_registry::WireFormat;
@@ -1188,11 +1865,27 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        Connected, Dispatch, EXPIRY_SKEW_SECS, ExecError, OAuthKind, OAuthToken, Origin, RefreshFault,
-        Refresher, RotationPool, Session, TERMINAL_REFRESH_STATUS, TerminalReport, Unconnected,
-        classify_refresh, terminal_check_constraint, token_hash, unix_now,
+        CallbackListener, Connected, Dispatch, EXPIRY_SKEW_SECS, ExecError,
+        LoginError, OAuthKind, OAuthToken, Origin, PKCE_VERIFIER_MIN_LEN, RefreshFault, Refresher,
+        RotationPool, Session, TERMINAL_REFRESH_STATUS, TerminalReport, Unconnected, authorize_url,
+        classify_refresh, code_challenge_for, exchange_code, new_authorize_request,
+        parse_callback_url, terminal_check_constraint, token_hash, unix_now,
     };
     use crate::oauth::Connection;
+
+    /// Plays the browser's part in a loopback callback: one GET at the
+    /// listener's own redirect URI, answered by the listener itself.
+    ///
+    /// Returns the status the browser would have rendered, which is the only way
+    /// to assert on the page — the code never appears in it.
+    async fn browse(uri: &str, query: &str) -> StatusCode {
+        reqwest::Client::new()
+            .get(format!("{uri}?{query}"))
+            .send()
+            .await
+            .expect("the loopback callback is answered")
+            .status()
+    }
 
     /// A refresher that counts calls and hands back a scripted token, so the
     /// single-flight test measures *one* refresh rather than one socket.
@@ -1720,5 +2413,528 @@ mod tests {
         assert_eq!(refresher.calls(), 0, "still inside the window");
         assert!(conn.grant_at(Origin::Client, 1_000_000).await.is_ok());
         assert_eq!(refresher.calls(), 1, "at the expiry it refreshed once");
+    }
+
+    #[tokio::test]
+    async fn names_a_loopback_redirect_uri() {
+        // The bind address is the security claim: a wildcard `0.0.0.0` here
+        // would offer the authorization code to the whole network, and a fixed
+        // port would let a local process aim at the next login before it binds.
+        let listener = CallbackListener::bind().await.expect("loopback binds");
+        let uri = listener.redirect_uri();
+        assert!(
+            uri.starts_with("http://127.0.0.1:") && uri.ends_with("/callback"),
+            "loopback-only, ephemeral, /callback — got {uri}"
+        );
+    }
+
+    #[tokio::test]
+    async fn captures_the_code_when_the_provider_redirects_with_the_expected_state() {
+        let listener = CallbackListener::bind().await.expect("loopback binds");
+        let uri = listener.redirect_uri();
+        let (verdict, _page) = tokio::join!(
+            listener.wait_for_code("state-abc", Duration::from_secs(5)),
+            browse(&uri, "code=auth-code-1&state=state-abc"),
+        );
+        assert_eq!(
+            verdict.expect("a matching callback yields its code"),
+            "auth-code-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn answers_the_browser_with_a_page_when_the_code_is_captured() {
+        let listener = CallbackListener::bind().await.expect("loopback binds");
+        let uri = listener.redirect_uri();
+        let (_verdict, page) = tokio::join!(
+            listener.wait_for_code("state-abc", Duration::from_secs(5)),
+            browse(&uri, "code=auth-code-1&state=state-abc"),
+        );
+        assert_eq!(page, StatusCode::OK, "the tab is told the login is done");
+    }
+
+    #[tokio::test]
+    async fn rejects_a_callback_whose_state_does_not_match() {
+        // RFC 6749 §10.12: `state` is the only thing binding a callback to the
+        // request this client made, so a redirect carrying somebody else's state
+        // must not produce a code even when it carries a plausible one.
+        let listener = CallbackListener::bind().await.expect("loopback binds");
+        let uri = listener.redirect_uri();
+        let (verdict, _page) = tokio::join!(
+            listener.wait_for_code("state-abc", Duration::from_secs(5)),
+            browse(&uri, "code=auth-code-1&state=state-from-another-login"),
+        );
+        assert!(
+            matches!(verdict, Err(LoginError::StateMismatch)),
+            "a foreign state is refused, not exchanged: {verdict:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn answers_the_browser_with_a_failure_page_when_the_state_does_not_match() {
+        let listener = CallbackListener::bind().await.expect("loopback binds");
+        let uri = listener.redirect_uri();
+        let (_verdict, page) = tokio::join!(
+            listener.wait_for_code("state-abc", Duration::from_secs(5)),
+            browse(&uri, "code=auth-code-1&state=state-from-another-login"),
+        );
+        assert_eq!(page, StatusCode::BAD_REQUEST, "the tab is told it failed");
+    }
+
+    #[tokio::test]
+    async fn reports_expired_when_no_callback_arrives_before_the_deadline() {
+        // One millisecond is the whole assertion: a listener that outlived its
+        // deadline would keep a socket open inside the docs/00 RAM budget for as
+        // long as the tab sat there.
+        let listener = CallbackListener::bind().await.expect("loopback binds");
+        let verdict = listener
+            .wait_for_code("state-abc", Duration::from_millis(1))
+            .await;
+        assert!(
+            matches!(verdict, Err(LoginError::LoginExpired)),
+            "an unattended login gives up: {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn extracts_the_code_from_a_pasted_callback_url() {
+        // Path B: consent completed on a phone, URL copied back by hand.
+        assert_eq!(
+            parse_callback_url(
+                "http://127.0.0.1:53219/callback?code=auth-code-2&state=state-abc",
+                "state-abc",
+            )
+            .expect("a pasted callback yields its code"),
+            "auth-code-2",
+        );
+    }
+
+    #[test]
+    fn extracts_the_code_when_the_pasted_url_carries_extra_params() {
+        // §4.1.2 lets a provider add parameters; rejecting an unrecognised one
+        // would break the flow on the provider's next release, not protect it.
+        assert_eq!(
+            parse_callback_url(
+                "http://127.0.0.1:53219/callback\
+                 ?code=auth-code-3&state=state-abc&scope=openid+profile&iss=https%3A%2F%2Fauth.test",
+                "state-abc",
+            )
+            .expect("extra parameters are ignored, not rejected"),
+            "auth-code-3",
+        );
+    }
+
+    #[test]
+    fn rejects_a_pasted_callback_url_whose_state_does_not_match() {
+        // The paste path is the exposed one: the URL arrives from a human and
+        // from whatever was in their clipboard, so the state check is what stops
+        // a code minted for someone else's login being pasted in here.
+        let verdict = parse_callback_url(
+            "http://127.0.0.1:53219/callback?code=auth-code-4&state=state-from-another-login",
+            "state-abc",
+        );
+        assert!(
+            matches!(verdict, Err(LoginError::StateMismatch)),
+            "a foreign state is refused: {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_pasted_callback_url_carrying_a_provider_error() {
+        // `?error=` with no code is a denial, not a malformed callback, and
+        // `error_description` is unbounded provider prose — only the spec's short
+        // code is kept.
+        let verdict = parse_callback_url(
+            "http://127.0.0.1:53219/callback\
+             ?error=access_denied&error_description=The+user+declined&state=state-abc",
+            "state-abc",
+        );
+        assert!(
+            matches!(verdict, Err(LoginError::LoginDenied(ref reason)) if reason == "access_denied"),
+            "an access_denied redirect reads as a denial: {verdict:?}"
+        );
+    }
+
+    /// A session configured for a browser login: both endpoints the operator must
+    /// supply, a client id, and a scope.
+    ///
+    /// Synthetic hostnames throughout; nothing here reaches a real provider.
+    fn login_session() -> Session {
+        Session::new("codex", OAuthKind::Codex)
+            .with_authorization_url("https://auth.test/authorize")
+            .with_token_url("https://auth.test/token")
+            .with_client_id("client-synthetic")
+            .with_scope("openid profile")
+    }
+
+    /// A token endpoint that records the raw form it was posted and answers
+    /// `reply`.
+    ///
+    /// The raw body rather than a parsed form because the assertion is about the
+    /// exact field names and values going out, and a parser would normalise away
+    /// the very thing under test.
+    async fn token_endpoint(reply: (StatusCode, &'static str)) -> (String, Arc<Mutex<String>>) {
+        let seen: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let slot = Arc::clone(&seen);
+        let app = axum::Router::new().fallback(move |req: axum::http::Request<axum::body::Body>| {
+            let slot = Arc::clone(&slot);
+            async move {
+                let raw = axum::body::to_bytes(req.into_body(), 64 * 1024)
+                    .await
+                    .unwrap_or_default();
+                // `into_inner` rather than `expect`: a poisoned lock here would
+                // mean an earlier assertion panicked, and that panic is the
+                // failure the test already reported.
+                *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    String::from_utf8_lossy(&raw).into_owned();
+                reply
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback binds");
+        let addr = listener.local_addr().expect("bound socket has an address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// A urlencoded body or query as `name=value` pairs, percent-decoded.
+    fn urlencoded_pairs(raw: &str) -> Vec<(String, String)> {
+        raw.split('&')
+            .filter(|pair| !pair.is_empty())
+            .map(|pair| {
+                let (name, value) = pair.split_once('=').expect("a urlencoded field has a name");
+                (percent_decode(name), percent_decode(value))
+            })
+            .collect()
+    }
+
+    fn percent_decode(raw: &str) -> String {
+        let bytes = raw.replace('+', " ");
+        let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+        let mut rest = bytes.as_str();
+        while let Some(at) = rest.find('%') {
+            out.extend_from_slice(&rest.as_bytes()[..at]);
+            let hex = rest.get(at + 1..at + 3).expect("a percent escape carries two digits");
+            out.push(u8::from_str_radix(hex, 16).expect("hex digits"));
+            rest = rest.get(at + 3..).unwrap_or_default();
+        }
+        out.extend_from_slice(rest.as_bytes());
+        String::from_utf8(out).expect("utf-8 form value")
+    }
+
+    #[test]
+    fn derives_the_rfc7636_s256_challenge_from_the_specs_own_verifier() {
+        // RFC 7636 Appendix B. Written from the RFC's literals, not from this
+        // implementation's output, so a change in the digest or the encoding
+        // fails here rather than passing a self-consistent round trip.
+        assert_eq!(
+            code_challenge_for("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
+
+    #[test]
+    fn generates_a_verifier_the_rfc7636_alphabet_and_length_permit() {
+        let request = new_authorize_request(&login_session(), "http://127.0.0.1:1455/auth/callback");
+        assert!(
+            request.verifier.len() >= PKCE_VERIFIER_MIN_LEN
+                && request.verifier.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b)),
+            "verifier {:?} is outside RFC 7636's unreserved set or shorter than 43",
+            request.verifier
+        );
+    }
+
+    #[test]
+    fn generates_a_fresh_state_and_verifier_for_each_login() {
+        // Two logins must not share a `state` (that would make one redirect
+        // attributable to the other) nor a verifier (that would make one
+        // intercepted request redeemable against the other).
+        let session = login_session();
+        let first = new_authorize_request(&session, "http://127.0.0.1:1455/auth/callback");
+        let second = new_authorize_request(&session, "http://127.0.0.1:1455/auth/callback");
+        assert!(
+            first.state != second.state && first.verifier != second.verifier,
+            "state {} / {} and verifier {} / {} must differ per login",
+            first.state,
+            second.state,
+            first.verifier,
+            second.verifier
+        );
+    }
+
+    #[test]
+    fn keeps_the_verifier_out_of_an_authorize_request_debug() {
+        let request = new_authorize_request(&login_session(), "http://127.0.0.1:1455/auth/callback");
+        assert!(
+            !format!("{request:?}").contains(&request.verifier),
+            "the verifier is the whole security of PKCE and must not be printable"
+        );
+    }
+
+    #[test]
+    fn builds_an_authorize_url_carrying_the_rfc6749_and_7636_parameters() {
+        let request = new_authorize_request(&login_session(), "http://127.0.0.1:1455/auth/callback");
+        let url = authorize_url(&request).expect("a configured session authorizes");
+        let query = url.split_once('?').expect("an authorize url carries a query").1;
+        let pairs: std::collections::HashMap<_, _> = urlencoded_pairs(query).into_iter().collect();
+
+        // Borrowed pairs: the expected values live in the fixture or in `request`,
+        // so nothing here copies a string to compare it.
+        for (name, value) in [
+            ("response_type", "code"),
+            ("client_id", "client-synthetic"),
+            ("redirect_uri", "http://127.0.0.1:1455/auth/callback"),
+            ("scope", "openid profile"),
+            ("code_challenge", request.challenge.as_str()),
+            ("code_challenge_method", "S256"),
+            ("state", request.state.as_str()),
+        ] {
+            assert_eq!(pairs.get(name).map(String::as_str), Some(value), "{name}={value} in {query}");
+        }
+    }
+
+    #[test]
+    fn encodes_a_redirect_uri_that_carries_its_own_query_string() {
+        // The provider must receive one `redirect_uri` value, not two: a
+        // hand-built query would split the target at its own `&`.
+        let target = "http://127.0.0.1:1455/cb?tenant=acme&next=%2Fhome";
+        let request = new_authorize_request(&login_session(), target);
+        let url = authorize_url(&request).expect("a configured session authorizes");
+        let pairs = urlencoded_pairs(url.split_once('?').expect("a query").1);
+        assert_eq!(
+            pairs.iter().filter(|(name, _)| name == "redirect_uri").collect::<Vec<_>>(),
+            vec![&("redirect_uri".to_owned(), target.to_owned())],
+            "the redirect target survives intact: {url}"
+        );
+    }
+
+    #[test]
+    fn refuses_to_build_an_authorize_url_when_the_session_declares_no_endpoint() {
+        let request = new_authorize_request(
+            &Session::new("codex", OAuthKind::Codex).with_client_id("client-synthetic"),
+            "http://127.0.0.1:1455/auth/callback",
+        );
+        assert_eq!(authorize_url(&request).err(), Some(LoginError::NoAuthorizationUrl));
+    }
+
+    #[test]
+    fn refuses_to_build_an_authorize_url_for_a_relative_redirect_uri() {
+        let request = new_authorize_request(&login_session(), "/auth/callback");
+        assert_eq!(authorize_url(&request).err(), Some(LoginError::InvalidRedirectUri));
+    }
+
+    #[tokio::test]
+    async fn posts_the_rfc6749_code_exchange_fields_to_the_token_endpoint() {
+        let (base, seen) =
+            token_endpoint((StatusCode::OK, r#"{"access_token":"at-1","refresh_token":"rt-1","expires_in":3600}"#))
+                .await;
+        let core = crate::ArExec::new().expect("client");
+        let session = login_session().with_token_url(format!("{base}/token"));
+
+        let token = exchange_code(
+            &core,
+            &session,
+            "auth-code-1",
+            "verifier-1",
+            "http://127.0.0.1:1455/auth/callback",
+            None,
+        )
+        .await
+        .expect("the mock grants the code");
+
+        let pairs = urlencoded_pairs(&seen.lock().unwrap_or_else(|p| p.into_inner()));
+        for (name, value) in [
+            ("grant_type", "authorization_code"),
+            ("code", "auth-code-1"),
+            ("redirect_uri", "http://127.0.0.1:1455/auth/callback"),
+            ("code_verifier", "verifier-1"),
+            ("client_id", "client-synthetic"),
+        ] {
+            assert!(
+                pairs.iter().any(|(n, v)| n == name && v == value),
+                "{name}={value} is missing from {pairs:?}"
+            );
+        }
+        assert_eq!(token.access().expose(), "at-1", "the access token is parsed");
+    }
+
+    #[tokio::test]
+    async fn sends_the_client_secret_when_the_operator_supplied_one() {
+        // A confidential client's secret is a third store row, handed in already
+        // decrypted — the same seam an access token uses.
+        let (base, seen) =
+            token_endpoint((StatusCode::OK, r#"{"access_token":"at-1"}"#)).await;
+        let core = crate::ArExec::new().expect("client");
+        let session = login_session().with_token_url(format!("{base}/token"));
+
+        exchange_code(
+            &core,
+            &session,
+            "auth-code-1",
+            "verifier-1",
+            "http://127.0.0.1:1455/auth/callback",
+            Some(&Secret::new("secret-synthetic")),
+        )
+        .await
+        .expect("the mock grants the code");
+
+        let pairs = urlencoded_pairs(&seen.lock().unwrap_or_else(|p| p.into_inner()));
+        assert!(
+            pairs.iter().any(|(name, value)| name == "client_secret" && value == "secret-synthetic"),
+            "a confidential client authenticates: {pairs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn omits_the_client_secret_for_a_public_pkce_client() {
+        // §2.3.1 treats an empty `client_secret` and an absent one differently, so
+        // a public client must send no field at all.
+        let (base, seen) =
+            token_endpoint((StatusCode::OK, r#"{"access_token":"at-1"}"#)).await;
+        let core = crate::ArExec::new().expect("client");
+        let session = login_session().with_token_url(format!("{base}/token"));
+
+        exchange_code(
+            &core,
+            &session,
+            "auth-code-1",
+            "verifier-1",
+            "http://127.0.0.1:1455/auth/callback",
+            None,
+        )
+        .await
+        .expect("the mock grants the code");
+
+        let pairs = urlencoded_pairs(&seen.lock().unwrap_or_else(|p| p.into_inner()));
+        assert!(
+            !pairs.iter().any(|(name, _)| name == "client_secret"),
+            "a public client sends no client_secret: {pairs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn keeps_an_exchange_failure_out_of_the_refreshable_state_when_no_refresh_token_comes_back() {
+        let (base, _seen) =
+            token_endpoint((StatusCode::OK, r#"{"access_token":"at-1","expires_in":3600}"#)).await;
+        let core = crate::ArExec::new().expect("client");
+        let session = login_session().with_token_url(format!("{base}/token"));
+
+        let token = exchange_code(
+            &core,
+            &session,
+            "auth-code-1",
+            "verifier-1",
+            "http://127.0.0.1:1455/auth/callback",
+            None,
+        )
+        .await
+        .expect("the mock grants the code");
+
+        assert!(
+            !token.can_refresh(),
+            "§5.1 makes refresh_token optional; its absence means no renewal, which this records"
+        );
+    }
+
+    #[tokio::test]
+    async fn classifies_an_exchange_invalid_grant_through_the_terminal_set() {
+        let (base, _seen) =
+            token_endpoint((StatusCode::BAD_REQUEST, r#"{"error":"invalid_grant"}"#)).await;
+        let core = crate::ArExec::new().expect("client");
+        let session = login_session().with_token_url(format!("{base}/token"));
+
+        let err = exchange_code(
+            &core,
+            &session,
+            "auth-code-1",
+            "verifier-1",
+            "http://127.0.0.1:1455/auth/callback",
+            None,
+        )
+        .await
+        .err();
+
+        assert_eq!(
+            err,
+            Some(LoginError::ExchangeFailed(RefreshFault::Unrecoverable {
+                status: 400,
+                reason: "invalid_grant"
+            })),
+            "a login refusal is the same verdict a refresh refusal is"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_to_exchange_a_code_when_the_session_declares_no_token_url() {
+        let core = crate::ArExec::new().expect("client");
+        // Endpoints are operator-supplied; a session without one has nowhere to
+        // post the code, and this build refuses rather than guessing one.
+        let session = Session::new("codex", OAuthKind::Codex).with_client_id("client-synthetic");
+        let err = exchange_code(
+            &core,
+            &session,
+            "auth-code-1",
+            "verifier-1",
+            "http://127.0.0.1:1455/auth/callback",
+            None,
+        )
+        .await
+        .err();
+        assert_eq!(err, Some(LoginError::NoTokenUrl));
+    }
+
+    #[test]
+    fn converts_a_terminal_exchange_fault_into_the_typed_exec_error() {
+        // The point of carrying a RefreshFault rather than a string: a caller
+        // that turns a login failure into a response must be able to reach the
+        // same visible terminal verdict the refresh path produces.
+        let exec: ExecError = LoginError::ExchangeFailed(RefreshFault::Unrecoverable {
+            status: 400,
+            reason: "invalid_grant",
+        })
+        .into();
+        assert!(
+            exec.terminal_report().is_some(),
+            "a terminal login keeps its typed report: {exec:?}"
+        );
+    }
+
+    #[test]
+    fn renders_the_absence_variants_as_the_operator_sentence() {
+        // The literals, not an interpolation of this file's own format strings:
+        // these are what an operator reads when a login cannot start.
+        assert_eq!(
+            LoginError::NoAuthorizationUrl.to_string(),
+            "no authorization endpoint is configured; set authorization_url and client_id"
+        );
+    }
+
+    #[test]
+    fn renders_a_missing_token_endpoint_as_the_operator_sentence() {
+        assert_eq!(
+            LoginError::NoTokenUrl.to_string(),
+            "no token endpoint is configured; set token_url"
+        );
+    }
+
+    #[test]
+    fn renders_a_relative_redirect_as_the_operator_sentence() {
+        assert_eq!(
+            LoginError::InvalidRedirectUri.to_string(),
+            "the redirect uri is not an absolute url"
+        );
+    }
+
+    #[test]
+    fn carries_the_exchange_faults_own_sentence_inside_the_login_sentence() {
+        assert_eq!(
+            LoginError::ExchangeFailed(RefreshFault::Unrecoverable {
+                status: 400,
+                reason: "invalid_grant"
+            })
+            .to_string(),
+            "oauth exchange failed: terminal (refresh returned 400: invalid_grant)"
+        );
     }
 }

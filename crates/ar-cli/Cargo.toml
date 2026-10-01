@@ -38,6 +38,12 @@ ar-server = { path = "../ar-server" }
 # resolves against. Already in the workspace and in `Cargo.lock` via `ar-server`,
 # so this names a second consumer rather than a new dependency.
 ar-keys = { path = "../ar-keys" }
+# `ar auth login` drives the browser-session flow: `new_authorize_request`,
+# `authorize_url`, `CallbackListener`, `parse_callback_url` and `exchange_code`
+# all live in `ar_exec::oauth`, and the PKCE pair is the contract's. Already a
+# transitive dep via `ar-server` and in `Cargo.lock`, so this names a consumer
+# rather than adding a crate to the build.
+ar-exec = { path = "../ar-exec" }
 # `ar mcp`'s control plane. Optional, and only its `mcp` feature turns on the
 # transport, so the default build links the catalog and nothing else.
 ar-mcp = { path = "../ar-mcp", optional = true }
@@ -69,3 +75,7 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }
+# `ar auth` round-trip tests seed a real credential store and read it back, which
+# is the only way to prove a logout removed the right rows. Already a normal
+# dependency of this crate, so this names a dev consumer rather than a new crate.
+ar-keys = { path = "../ar-keys" }

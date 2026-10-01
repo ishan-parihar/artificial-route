@@ -7,7 +7,7 @@
 One OpenAI-compatible endpoint `http://127.0.0.1:20128/v1` serving 300+ providers.
 P0 ships **lean-routing** (4 strategies, ~80% traffic) at <50MB RSS idle.
 P2 reaches **full-strategies** parity (19 strategies + 16-factor `auto/*`).
-Agent-native operation via optional `ar-mcp` (essential-8 tools, default off).
+Agent-native operation via optional `ar-mcp` (12 tools, default off).
 
 ## Non-goals (explicit)
 
@@ -16,7 +16,7 @@ Agent-native operation via optional `ar-mcp` (essential-8 tools, default off).
 * No xDS control plane, no HBONE, no SPIFFE.
 * No cloud bundle sync, no BigQuery export, no gamification, no plugins marketplace.
 * No OAuth browser-session providers in P0 (claude-web, gemini-web, codex-web). API-key only first.
-* No full 110-tool MCP in P0 — essential-8 only, feature-gated (see `06-axi-mcp.md`).
+* No full 110-tool MCP in P0 — a 12-tool catalog, feature-gated (see `06-axi-mcp.md`).
 
 ## Routing parity law
 
@@ -43,7 +43,7 @@ Enforced by: `jemalloc` decay 5s, `Strng` interning, `BufList` zero-copy,
 * Copy directly: `agentgateway/crates/{core,http,pool,llm,agentgateway-app}` — see `01-copy-from-agentgateway.md`.
 * Port as reference: `OmniRoute/open-sse/{config,translator,executors,services}` — see `02-port-from-omniroute.md`.
 * Crates: see `03-crates-and-deps.md`. Subsystems: `04-subsystems.md`. Phases: `05-roadmap.md`.
-* CLI+MCP ergonomics: `06-axi-mcp.md` (normative AXI gates + essential-8 catalog).
+* CLI+MCP ergonomics: `06-axi-mcp.md` (normative AXI gates + the tool catalog).
 
 ## Entry points (read in this order)
 

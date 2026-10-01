@@ -22,7 +22,11 @@ futures = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+# `oauth.rs`'s `CallbackListener` speaks HTTP over a `TcpListener` by hand:
+# AsyncReadExt/AsyncWriteExt live behind `io-util`. `reqwest` already turns that
+# feature on for the whole build, so declaring it adds no crate to the graph —
+# it just stops this crate from depending on feature unification to compile.
+tokio = { workspace = true, features = ["io-util"] }
 # `oauth.rs` logs a retired session and a swallowed rotation at `warn`/`error`.
 # Already in the graph via `ar-server`, so this names a consumer rather than
 # adding a crate to the build.
@@ -42,6 +46,16 @@ sha2 = "0.10"
 httpdate = "1.0"
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["rt"] }
+
+# PKCE `code_challenge` is `BASE64URL(SHA256(ASCII(verifier)))` and the verifier
+# itself must be unreserved random text, so the browser-login core needs an RFC
+# 4648 §5 encoder and a CSPRNG. Both crates are already in the graph —
+# `ar-keys`' codec (`base64 0.22`) and `ar-server`'s connection ids (`uuid` v4,
+# which is `getrandom` underneath) — so neither adds a crate to the build. The
+# encoder is the standard library's absence, not a preference: hand-rolling
+# base64 next to a vetted one is the failure mode the guidance warns about.
+base64 = "0.22"
+uuid = { workspace = true }
 
 [dev-dependencies]
 # The OAuth dispatch tests need a mock upstream that *branches* on the bearer it

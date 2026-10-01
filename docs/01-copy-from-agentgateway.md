@@ -45,7 +45,7 @@ Method: `path` dependencies first, fork into `artificial-route/crates/` when you
 ## FEATURE-GATE (default off, P1 on-demand)
 
 * `crates/agentgateway/src/mcp/` 12.7k LOC + `rmcp` tree -> `ar-mcp` optional crate `--features mcp` (default off, +<25MB idle).
-  P0 binary stays lean. P1 essential-8 only (see `06-axi-mcp.md`):
+  P0 binary stays lean. P1 the 12-tool catalog only (see `06-axi-mcp.md`):
   `health, list_combos, switch_combo, check_quota, route_request, cost_report, list_models, explain_route`.
   Skip CCR, oneproxy, web_search, skills, gamification, obsidian/notion in P1.
   MCP wraps same `ar-route|ar-tokens|ar-obs` fns — no second implementation.

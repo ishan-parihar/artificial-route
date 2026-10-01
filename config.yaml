@@ -54,6 +54,36 @@ providers:
 #     headers:
 #       x-api-key: placeholder
 
+# OAuth sessions, one per provider id. The block carries placement only — no
+# token, no secret — so a committed config.yaml cannot leak one through it.
+#
+#   provider:           registry id; one session per id.
+#   refresh_key:        a second row under `keys:` holding the refresh token.
+#                       Without it the session works but cannot renew, so its
+#                       first upstream 401 is terminal.
+#   token_url:          refresh endpoint. Required to renew; never guessed from
+#                       the provider id, because a guessed auth endpoint would
+#                       be an invented wire format.
+#   client_id:          public OAuth client id, when the endpoint wants one.
+#   authorization_url:  authorize endpoint a browser login opens. Without it
+#                       `ar` login cannot start and says so. Never guessed.
+#   redirect_uri:       optional override for the callback. Omit it and the
+#                       login flow's own loopback listener is used; set it and
+#                       it must be https or a loopback http address, so an
+#                       authorization code is never posted in cleartext.
+#   client_secret_key:  a third row under `keys:` holding a static client secret,
+#                       for providers that are confidential clients. Omit it and
+#                       the session is PKCE-only.
+#
+# oauth:
+#   - provider: codex
+#     refresh_key: codex_refresh
+#     token_url: https://auth.example.invalid/token
+#     client_id: your-public-client-id
+#     authorization_url: https://auth.example.invalid/authorize
+#     redirect_uri: http://127.0.0.1:1455/callback
+#     client_secret_key: codex_client_secret
+
 # Routing combos. A client asking for the model `default` gets this chain.
 #
 # Strategies: any of the nineteen ar-route names (priority, round-robin,

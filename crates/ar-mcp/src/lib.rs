@@ -1,13 +1,13 @@
 //! `ar-mcp` — the optional MCP control plane for Artificial Route.
 //!
-//! The essential-8 catalog from `docs/06-axi-mcp.md`, as thin wrappers over the
-//! same `ar-route` / `ar-tokens` / `ar-keys` functions the data plane calls. No
-//! second routing implementation, no second pricing implementation, no second
-//! admission controller.
+//! The essential-12 catalog from `docs/06-axi-mcp.md`, as thin wrappers over the
+//! same `ar-route` / `ar-tokens` / `ar-keys` / `ar-exec` functions the data plane
+//! calls. No second routing implementation, no second pricing implementation, no
+//! second admission controller, no second OAuth wire format.
 //!
 //! [`Tool`] is the catalog and [`tool_search`] the discovery query over it,
 //! `scope` the default-deny check, `audit` the append-only `redb` row per
-//! guarded call, and [`guard`] the **only** entry point into the eight bodies —
+//! guarded call, and [`guard`] the **only** entry point into the bodies —
 //! the bodies themselves are `pub(crate)` and cannot be reached from outside
 //! this crate. The `rmcp` server module is present only with `--features mcp`,
 //! and with it [`transport::serve_stdio`], the wiring `ar mcp` calls.
@@ -16,18 +16,18 @@
 //! no `rmcp`. Everything else compiles and is callable in-process with the SDK
 //! absent, which is what makes it testable without a running server.
 //!
-//! # The catalog is eight; discovery is a function
+//! # The catalog is twelve; discovery is a function
 //!
 //! `docs/06` lists `ar_tool_search` "from day one", so the search exists — as
-//! [`tool_search`], not as a ninth [`Tool`] variant. The enum stays the
-//! essential-8 that `docs/04` and the OmniRoute reference count, and the
-//! transport registers [`tool_search`] alongside it when it lands. Folding it
-//! into the enum would make `Tool::ALL` nine long and every count a host
-//! reports off-by-one against `TOTAL_MCP_TOOL_COUNT`.
+//! [`tool_search`], not as a thirteenth [`Tool`] variant. The enum stays the
+//! twelve that `docs/06` numbers, and the transport registers [`tool_search`]
+//! alongside it. Folding it into the enum would make `Tool::ALL` thirteen long
+//! and every count a host reports off-by-one against `TOTAL_MCP_TOOL_COUNT`.
 
 #![deny(missing_docs)]
 
 mod audit;
+mod login;
 mod scope;
 mod tools;
 
@@ -38,10 +38,11 @@ pub mod transport;
 pub use transport::{Host, HostCombo, STDIO_WIRED, TOOL_SEARCH_NAME, serve_stdio};
 
 pub use audit::{AUDIT_OUTPUT_LIMIT, Audit, AuditError, CallOutcome, input_hash};
+pub use login::{AuthTarget, LOGIN_TTL, PendingLogin, PendingLogins, PendingRow};
 pub use scope::Scope;
 pub use tools::{
     Combo, ComboState, Health, HealthSource, KeyPressure, LaneLoad, Lanes, ModelRow, Quota, Switch, get_health,
-    guard,
+    guard, guard_async,
 };
 
 /// Everything a tool call can fail with.
@@ -66,6 +67,10 @@ pub enum Error {
     /// The usage ledger refused the read.
     #[error("tokens: {0}")]
     Tokens(#[from] ar_tokens::TokenError),
+    /// The encrypted credential store refused a read or a write. Redacted by
+    /// construction: `ar_keys` never names a stored value in its own errors.
+    #[error("store: {0}")]
+    Store(#[from] ar_keys::KeyError),
     /// The audit row could not be written.
     #[error("audit: {0}")]
     Audit(#[from] AuditError),
@@ -110,9 +115,28 @@ pub enum Error {
         /// The missing piece, e.g. `"stdio"`.
         what: &'static str,
     },
+    /// A login the call named is not in the config's `oauth:` blocks, or it has
+    /// no `authorize_url` to send a person to.
+    #[error("auth: {0}")]
+    Auth(#[from] ar_exec::LoginError),
+    /// A pending login id that is unknown, already used, or past its budget.
+    ///
+    /// One variant for all three on purpose: from the host's side they are the
+    /// same fact — this session id cannot be completed — and a caller that could
+    /// tell them apart could probe which ids other logins are holding.
+    #[error("auth: no pending login {0:?}: unknown, already completed, or expired")]
+    NoPendingSession(String),
+    /// A login was redeemed but there is nowhere to put the tokens.
+    ///
+    /// Carries the path rather than a bare "no store", because the fix is a
+    /// specific one — export `$AR_MASTER_KEY`, or point `--config` at a directory
+    /// that holds a `credentials.db` — and a sentence without the path does not
+    /// say which of the two it is.
+    #[error("auth: no credential store at {0}; set $AR_MASTER_KEY, then start a fresh login")]
+    StoreRequired(String),
 }
 
-/// The essential-8 tool catalog, from `docs/06-axi-mcp.md`. Each variant carries
+/// The essential-12 tool catalog, from `docs/06-axi-mcp.md`. Each variant carries
 /// the scope the same table names for it.
 ///
 /// The wire names and the [`Scope`] bit values are **host-visible and frozen**:
@@ -137,12 +161,20 @@ pub enum Tool {
     ListModels,
     /// Provider, model, score, factors, fallbacks.
     ExplainRoute,
+    /// Start a browser login: the authorize URL and a pending session id.
+    AuthLoginUrl,
+    /// Redeem a pasted redirect for tokens and store them.
+    AuthComplete,
+    /// Which logins are pending, and which providers are armed.
+    AuthStatus,
+    /// Forget a provider's stored tokens.
+    AuthLogout,
 }
 
 impl Tool {
     /// The catalog, in the order `docs/06` numbers it. The single source of
     /// truth for the tool count: nothing derives a second list.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 12] = [
         Self::GetHealth,
         Self::ListCombos,
         Self::SwitchCombo,
@@ -151,6 +183,10 @@ impl Tool {
         Self::CostReport,
         Self::ListModels,
         Self::ExplainRoute,
+        Self::AuthLoginUrl,
+        Self::AuthComplete,
+        Self::AuthStatus,
+        Self::AuthLogout,
     ];
 
     /// The wire name, e.g. `"ar_get_health"`.
@@ -164,6 +200,10 @@ impl Tool {
             Self::CostReport => "ar_cost_report",
             Self::ListModels => "ar_list_models",
             Self::ExplainRoute => "ar_explain_route",
+            Self::AuthLoginUrl => "ar_auth_login_url",
+            Self::AuthComplete => "ar_auth_complete",
+            Self::AuthStatus => "ar_auth_status",
+            Self::AuthLogout => "ar_auth_logout",
         }
     }
 
@@ -171,6 +211,13 @@ impl Tool {
     ///
     /// `Scope::EXECUTE` on [`Tool::RouteRequest`] is deliberate even though the
     /// body is a pure pick — see the `ar-mcp/src/tools.rs` module docs.
+    ///
+    /// The four login tools ask for the bare [`Scope::READ`] / [`Scope::WRITE`]
+    /// categories and no domain bit: an authorize URL is public by construction
+    /// (that is what makes it printable on another device), and completing a
+    /// login writes credentials. Naming a per-domain bit for them would add an
+    /// eleventh scope name to the grant grammar for a capability that is exactly
+    /// a read or exactly a write.
     pub fn scope(self) -> Scope {
         match self {
             Self::GetHealth => Scope::READ | Scope::HEALTH,
@@ -181,6 +228,8 @@ impl Tool {
             Self::CostReport => Scope::READ | Scope::USAGE,
             Self::ListModels => Scope::READ | Scope::MODELS,
             Self::ExplainRoute => Scope::READ | Scope::HEALTH | Scope::USAGE,
+            Self::AuthLoginUrl | Self::AuthStatus => Scope::READ,
+            Self::AuthComplete | Self::AuthLogout => Scope::WRITE,
         }
     }
 
@@ -195,6 +244,10 @@ impl Tool {
             Self::CostReport => "spend by session, day, week, month and provider",
             Self::ListModels => "routable model catalog with capabilities and pricing",
             Self::ExplainRoute => "why a provider won: score, factors, fallbacks",
+            Self::AuthLoginUrl => "start a browser login: authorize URL plus a pending session id",
+            Self::AuthComplete => "redeem a pasted redirect URL or bare code and store the tokens",
+            Self::AuthStatus => "which logins are pending and which providers are armed",
+            Self::AuthLogout => "forget a provider's stored access and refresh tokens",
         }
     }
 
@@ -217,6 +270,8 @@ impl Tool {
             Self::CostReport => "read:usage",
             Self::ListModels => "read:models",
             Self::ExplainRoute => "read:health+read:usage",
+            Self::AuthLoginUrl | Self::AuthStatus => "read:*",
+            Self::AuthComplete | Self::AuthLogout => "write:*",
         }
     }
 
@@ -271,7 +326,7 @@ mod tests {
         let mut names: Vec<&str> = Tool::ALL.iter().map(|t| t.name()).collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 8);
+        assert_eq!(names.len(), 12);
     }
 
     #[test]

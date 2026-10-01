@@ -11,6 +11,7 @@
 
 #![deny(missing_docs)]
 
+mod auth;
 mod cli;
 mod commands;
 mod import;

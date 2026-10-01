@@ -22,7 +22,7 @@ have landed; each entry below says what is done and what is not.
 
 ## Findings
 
-### F-CRIT-1: OAuth dispatch — executors landed, browser login did not
+### F-CRIT-1: OAuth dispatch — executors and browser login landed
 `ar` used to catalogue `oauth` authType but not execute it ("P0 is API-key only",
 OAuth paths DROP). The codex/cline/grok-cli sessions — the live system's
 most valuable credentials — were unusable through `ar`. The scoring layer
@@ -32,7 +32,7 @@ already models OAuth availability; the executor could not consume it.
 expiry, one rotation retry on 401, and a per-connection single-flight so a
 concurrent burst cannot trip `refresh_token_reused`. `doctor` fails loudly on
 any `oauth` provider that has no executor instead of listing it as known.
-**Still open:** *browser-session* login (the `*-web` providers). AGENTS.md
+**Browser login also landed:** `ar auth login --provider <id>` prints the PKCE authorize URL (openable on any device), catches the redirect on a single-use `127.0.0.1` listener or reads one pasted redirect line for remote logins, exchanges the code, and persists both rows; `ar auth status|logout` and four MCP tools (`ar_auth_login_url|complete|status|logout`) drive the same flow. AGENTS.md
 forbids inventing provider wire formats, so no refresh endpoint is hardcoded —
 `token_url` is operator-supplied and a session without one reports itself as
 unrenewable rather than guessing. `grok-cli` and `kilocode` are deliberately

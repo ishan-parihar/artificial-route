@@ -3,7 +3,7 @@ name = "ar-mcp"
 version = "0.1.1"
 edition = "2024"
 rust-version = "1.90"
-description = "Optional MCP control plane: essential-8 catalog + tool_search discovery + scope/audit guard, wrapping ar-route/ar-tokens/ar-keys (Artificial Route P1)"
+description = "Optional MCP control plane: 12-tool catalog + tool_search discovery + scope/audit guard, wrapping ar-route/ar-tokens/ar-keys/ar-exec (Artificial Route P1)"
 license = "Apache-2.0"
 
 [lints]
@@ -18,6 +18,11 @@ default = []
 mcp = ["dep:rmcp"]
 
 [dependencies]
+# `ar-config` only for its `Secret`, which is the type `ar_exec`'s token carries
+# and the type the exchange's `client_secret` parameter takes. This crate never
+# parses a config file: an `oauth:` block reaches the transport already resolved
+# as `ar_mcp::AuthTarget`.
+ar-config = { workspace = true }
 ar-route = { workspace = true }
 # `ar-tokens` and `ar-keys` are not in `[workspace.dependencies]`, so they are
 # path deps -- the same call `ar-route` makes for `ar-cache`. Adding them to the
@@ -25,6 +30,18 @@ ar-route = { workspace = true }
 # how two crates end up on two versions of one workspace crate.
 ar-tokens = { path = "../ar-tokens" }
 ar-keys = { path = "../ar-keys" }
+# `ar-exec` is likewise absent from `[workspace.dependencies]`; same reasoning as
+# `ar-tokens`/`ar-keys` above. It is here for `ar_exec`'s PKCE login APIs —
+# `new_authorize_request` / `authorize_url` / `parse_callback_url` /
+# `exchange_code` — which the four login tools delegate to, so this crate owns no
+# OAuth wire format of its own. `ar-config` is deliberately *not* declared
+# twice and the session reaches the transport as `ar_mcp::AuthTarget`.
+ar-exec = { path = "../ar-exec" }
+# Already in `Cargo.lock` via `ar-server` and `ar-exec`, already declared in
+# `[workspace.dependencies]`: naming it here costs no new crate in the graph, and
+# a v4 uuid is how both draw a random handle. The pending-login session id stands
+# in for the PKCE verifier, so it is not a counter.
+uuid = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

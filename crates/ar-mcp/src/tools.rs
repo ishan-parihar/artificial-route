@@ -1,4 +1,4 @@
-//! The essential-8 tool bodies, and the one guard every call goes through.
+//! The twelve tool bodies, and the one guard every call goes through.
 //!
 //! # `guard()` is the only entry point
 //!
@@ -6,8 +6,9 @@
 //! or `ar_mcp::list_models` — they do not resolve from outside the crate, and
 //! the crate-visible doc test at the bottom of this module is what proves it.
 //! [`guard`] is the sole public entry: scope check, then exactly one audit row,
-//! then the body. A transport that wants a tool calls `guard` and passes a
-//! closure; there is no path that skips the check or loses the row.
+//! then the body. A transport that wants a tool calls `guard` — or
+//! [`guard_async`] for the one body that has to await the token exchange — and
+//! passes a closure; there is no path that skips the check or loses the row.
 //!
 //! [`Tool::ALL`] stays public because a host must be able to *list* the
 //! catalog. Listing is not calling.
@@ -101,28 +102,93 @@ pub fn guard<T: Serialize>(
     input: &serde_json::Value,
     f: impl FnOnce() -> Result<T, Error>,
 ) -> Result<T, Error> {
-    let need = tool.scope();
-    if !have.permits(need) {
-        let denied = Error::ScopeDenied { tool: tool.name(), need };
-        write_row(
-            audit,
-            tool.name(),
-            std::time::Duration::ZERO,
-            key_id,
-            &input.to_string(),
-            &denied.to_string(),
-            CallOutcome::Denied,
-        );
-        return Err(denied);
-    }
+    permit(tool, have, audit, key_id, input)?;
     let started = Instant::now();
     let outcome = f();
-    let (body, call) = match &outcome {
-        Ok(v) => (serde_json::to_string(v).unwrap_or_else(|_| "<unserializable>".into()), CallOutcome::Ok),
+    record(audit, tool, key_id, input, started.elapsed(), &outcome);
+    outcome
+}
+
+/// [`guard`] for a body that has to await something — the token exchange in
+/// `ar_auth_complete`.
+///
+/// The same three steps in the same order (scope check, body, exactly one audit
+/// row) rather than a second spelling of them: an async path that did its own
+/// scope check would be a scope check someone can forget to update when a tool
+/// moves between the two, and the failure mode is a write tool reachable under a
+/// read grant. It is a separate function only because [`guard`]'s closure is
+/// `FnOnce() -> Result<T, Error>` and a body that does I/O returns a future.
+///
+/// The exchange is the only awaiting body in the catalog, which is why this is
+/// not a generic `impl Future` guard: there is nothing else to generalise for.
+pub async fn guard_async<T, F, Fut>(
+    tool: Tool,
+    have: Scope,
+    audit: &Audit,
+    key_id: &str,
+    input: &serde_json::Value,
+    f: F,
+) -> Result<T, Error>
+where
+    T: Serialize,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, Error>>,
+{
+    permit(tool, have, audit, key_id, input)?;
+    let started = Instant::now();
+    let outcome = f().await;
+    record(audit, tool, key_id, input, started.elapsed(), &outcome);
+    outcome
+}
+
+/// The scope half of [`guard`], shared with [`guard_async`].
+///
+/// Refused before the body starts, and recorded before the `Err` is returned: a
+/// denial is the event an operator most wants to see and the one most likely to
+/// be the whole point of running the audit. Its duration is `0` because the body
+/// never began — the elapsed time between asking and being told no is not the
+/// tool's cost.
+fn permit(
+    tool: Tool,
+    have: Scope,
+    audit: &Audit,
+    key_id: &str,
+    input: &serde_json::Value,
+) -> Result<(), Error> {
+    let need = tool.scope();
+    if have.permits(need) {
+        return Ok(());
+    }
+    let denied = Error::ScopeDenied { tool: tool.name(), need };
+    write_row(
+        audit,
+        tool.name(),
+        std::time::Duration::ZERO,
+        key_id,
+        &input.to_string(),
+        &denied.to_string(),
+        CallOutcome::Denied,
+    );
+    Err(denied)
+}
+
+/// The audit half of [`guard`], shared with [`guard_async`].
+fn record<T: Serialize>(
+    audit: &Audit,
+    tool: Tool,
+    key_id: &str,
+    input: &serde_json::Value,
+    took: std::time::Duration,
+    outcome: &Result<T, Error>,
+) {
+    let (body, call) = match outcome {
+        Ok(v) => (
+            serde_json::to_string(v).unwrap_or_else(|_| "<unserializable>".into()),
+            CallOutcome::Ok,
+        ),
         Err(e) => (format!("error: {e}"), CallOutcome::Error),
     };
-    write_row(audit, tool.name(), started.elapsed(), key_id, &input.to_string(), &body, call);
-    outcome
+    write_row(audit, tool.name(), took, key_id, &input.to_string(), &body, call);
 }
 
 /// One key's admission state, supplied by a host that runs **without**
@@ -392,7 +458,9 @@ pub(crate) fn explain(
 
 #[cfg(test)]
 mod tests {
-    use super::{ComboState, Health, HealthSource, KeyPressure, get_health, guard, switch_combo};
+    use super::{
+        ComboState, Health, HealthSource, KeyPressure, get_health, guard, guard_async, switch_combo,
+    };
     use crate::audit::{Audit, CallOutcome};
     use crate::scope::Scope;
     use crate::Tool;
@@ -583,7 +651,7 @@ mod tests {
     #[test]
     fn every_tool_in_the_catalog_is_guarded_by_a_scope_check() {
         // Each catalog entry needs at least one bit, so `Scope::NONE` refuses
-        // all eight and the empty scope is the floor.
+        // all twelve and the empty scope is the floor.
         for tool in Tool::ALL {
             let need = tool.scope();
             assert_ne!(need, Scope::NONE, "{} asks for nothing", tool.name());
@@ -596,10 +664,68 @@ mod tests {
         for tool in Tool::ALL {
             let need = tool.scope();
             let privileged = need.0 & (Scope::WRITE.0 | Scope::EXECUTE.0);
-            if tool == Tool::SwitchCombo || tool == Tool::RouteRequest {
+            let named_write = matches!(tool, Tool::SwitchCombo | Tool::RouteRequest);
+            if named_write || need.0 & Scope::READ.0 == 0 {
                 assert_ne!(privileged, 0, "{} lost its privileged bit", tool.name());
             }
         }
+    }
+
+    #[test]
+    fn a_read_grant_cannot_reach_the_two_login_writes() {
+        // The narrow-grant refusal, stated on the catalog rather than on one tool.
+        let read_only = Scope::parse("read:*").expect("known");
+        for tool in [Tool::AuthComplete, Tool::AuthLogout] {
+            assert!(!read_only.permits(tool.scope()), "{} is reachable under read:*", tool.name());
+        }
+    }
+
+    #[tokio::test]
+    async fn guard_async_audits_a_successful_call() {
+        let audit = audit("async-call.redb");
+        let r = guard_async(
+            Tool::AuthStatus,
+            Scope::READ,
+            &audit,
+            "k1",
+            &serde_json::json!({}),
+            || async { Ok::<Vec<super::ModelRow>, crate::Error>(Vec::new()) },
+        )
+        .await;
+        assert!(r.is_ok() && audit.len() == 1);
+    }
+
+    #[tokio::test]
+    async fn guard_async_refuses_before_the_closure_runs() {
+        let audit = audit("async-deny.redb");
+        let r = guard_async::<Vec<super::ModelRow>, _, _>(
+            Tool::AuthComplete,
+            Scope::READ,
+            &audit,
+            "k1",
+            &serde_json::json!({ "session_id": "s1" }),
+            || async {
+                panic!("the body must not run")
+            },
+        )
+        .await;
+        assert!(r.is_err(), "a write tool is refused under a read grant");
+    }
+
+    #[tokio::test]
+    async fn guard_async_leaves_one_row_for_a_failure_too() {
+        let audit = audit("async-error.redb");
+        let r = guard_async::<Vec<super::ModelRow>, _, _>(
+            Tool::AuthComplete,
+            Scope::ALL,
+            &audit,
+            "k1",
+            &serde_json::json!({}),
+            || async { Err(crate::Error::NoPendingSession("s1".into())) },
+        )
+        .await;
+        assert!(r.is_err());
+        assert!(audit.get(0).expect("get").expect("row").contains("|error|"));
     }
 
     #[tokio::test]

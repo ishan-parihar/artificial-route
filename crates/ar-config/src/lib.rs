@@ -67,6 +67,18 @@ pub enum ConfigError {
         /// The key name it referenced.
         key: String,
     },
+    /// An OAuth placement URL is not a shape the login flow can use.
+    #[error("oauth {provider:?} {field} must be {expectation}, got {url:?}")]
+    BadOAuthUrl {
+        /// Provider id whose session holds the offending URL.
+        provider: String,
+        /// Which of the two URL fields was rejected.
+        field: &'static str,
+        /// The shape that field has to have, spelled for the operator.
+        expectation: &'static str,
+        /// The value as written, verbatim.
+        url: String,
+    },
     /// The filesystem watcher could not be installed.
     #[error("cannot watch {path}: {cause}")]
     Watch {
@@ -500,6 +512,18 @@ fn ladder(engine: Engine) -> String {
 /// * `token_url` is operator-supplied. AGENTS.md forbids inventing provider wire
 ///   formats, and a refresh endpoint guessed from a provider id is exactly that
 ///   invention, so this build refuses to refresh rather than guess.
+/// * `authorization_url` is the *other* half of the same rule for browser
+///   login: without it there is no URL to open, so `ar` login reports
+///   `NoAuthorizationUrl` rather than guessing an authorize endpoint. Still
+///   operator-supplied, never a per-provider default.
+/// * `redirect_uri` is only carried here. Absent means the login flow builds a
+///   loopback default of its own (the CLI's listener picks a free port); a
+///   plain-http *remote* callback is refused, because an authorization code
+///   posted over cleartext to anything but localhost is a code leak.
+/// * `client_secret_key` names a *third* credential row — a static
+///   `client_secret`, for the providers that are confidential rather than
+///   public. `None` is the common case and means PKCE-only. Like every other
+///   credential reference here it is a name; the value lives in the store.
 ///
 /// ```
 /// use ar_config::Config;
@@ -508,10 +532,17 @@ fn ladder(engine: Engine) -> String {
 ///     "keys:\n  codex: $CODEX_ACCESS\nproviders:\n  - id: codex\n    key: codex\n",
 ///     "oauth:\n  - provider: codex\n    refresh_key: codex_refresh\n",
 ///     "    token_url: https://auth.example/token\n",
+///     "    authorization_url: https://auth.example/authorize\n",
+///     "    redirect_uri: http://127.0.0.1:1455/callback\n",
+///     "    client_secret_key: codex_client_secret\n",
 /// );
 /// let cfg = Config::parse(yaml, |name| Ok(Some(format!("synthetic-{name}")))).unwrap();
 /// let session = cfg.oauth_for("codex").expect("the session");
 /// assert_eq!(session.refresh_key.as_deref(), Some("codex_refresh"));
+/// assert_eq!(
+///     session.client_secret_key.as_deref(),
+///     Some("codex_client_secret"),
+/// );
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OAuthSession {
@@ -530,9 +561,35 @@ pub struct OAuthSession {
     /// Refresh endpoint. Without one the session cannot renew.
     #[serde(default)]
     pub token_url: Option<String>,
+    /// Browser-facing authorization endpoint, for a login flow (RFC 6749 §3.1).
+    ///
+    /// Operator-supplied for the same reason as [`Self::token_url`]: an authorize
+    /// endpoint guessed from a provider id is an invented wire format. A session
+    /// with none still dispatches with a key it was given; it just cannot be
+    /// logged into, and `ar auth login` names the missing field instead of
+    /// inventing an endpoint.
+    #[serde(default)]
+    pub authorization_url: Option<String>,
+    /// Redirect the provider lands the person on after they authorize.
+    ///
+    /// A loopback URI for a same-machine CLI login, and any URI the provider has
+    /// registered for a remote one. Paired with [`Self::authorization_url`]: a
+    /// login cannot start without both, because the provider refuses a redirect
+    /// it does not recognise. Never carries a secret — a redirect is public by
+    /// construction, which is what lets the URL travel to another device.
+    #[serde(default)]
+    pub redirect_uri: Option<String>,
     /// OAuth client id, when the refresh endpoint requires one (RFC 6749 §6).
     #[serde(default)]
     pub client_id: Option<String>,
+    /// Credential row holding a static `client_secret`.
+    ///
+    /// A *third* row, after the access token and the refresh token, for the
+    /// providers that are confidential clients rather than PKCE-only public
+    /// ones. `None` — the common case — means public client, no secret. The
+    /// secret itself is never in this block; only its name is.
+    #[serde(default)]
+    pub client_secret_key: Option<String>,
     /// Scope requested on refresh, when the provider scopes its tokens.
     #[serde(default)]
     pub scope: Option<String>,
@@ -617,6 +674,28 @@ impl Config {
                 });
             }
         }
+        for s in &self.oauth {
+            if let Some(url) = &s.authorization_url
+                && !http_url_ok(url)
+            {
+                return Err(ConfigError::BadOAuthUrl {
+                    provider: s.provider.clone(),
+                    field: "authorization_url",
+                    expectation: "an http(s) URL with no whitespace",
+                    url: url.clone(),
+                });
+            }
+            if let Some(url) = &s.redirect_uri
+                && !redirect_uri_ok(url)
+            {
+                return Err(ConfigError::BadOAuthUrl {
+                    provider: s.provider.clone(),
+                    field: "redirect_uri",
+                    expectation: "an https URL or a loopback http one",
+                    url: url.clone(),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -657,6 +736,44 @@ impl Config {
     pub fn declares(&self, id: &str) -> bool {
         self.providers.iter().any(|p| p.id == id) || self.custom_providers.iter().any(|c| c.id == id)
     }
+}
+
+/// Whether `url` is an `http`/`https` URL with a non-empty authority and no
+/// embedded whitespace — the same shape [`ar_registry::CustomProvider`]
+/// requires of a base URL, restated because that predicate is a method on a
+/// type this crate does not own.
+fn http_url_ok(url: &str) -> bool {
+    let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    !rest.is_empty() && !rest.starts_with('/') && !url.chars().any(char::is_whitespace)
+}
+
+/// Whether `url` is safe to receive an authorization code on.
+///
+/// `https` anywhere, `http` only on loopback: a cleartext callback to a remote
+/// host hands the code to anyone on the path.
+fn redirect_uri_ok(url: &str) -> bool {
+    if !http_url_ok(url) {
+        return false;
+    }
+    let Some(rest) = url.strip_prefix("http://") else {
+        return true;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = if host.starts_with('[') {
+        host.split_once(']').map_or(host, |(h, _)| h)
+    } else {
+        host.split_once(':').map_or(host, |(h, _)| h)
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// A loaded config plus the ability to swap in a newer one.
@@ -960,6 +1077,123 @@ combos:
         let session = cfg.oauth_for("codex").expect("the session");
         assert_eq!(session.token_url.as_deref(), Some("https://auth.example.invalid/token"));
         assert_eq!(session.expires_at, Some(1_800_000_000));
+    }
+
+    /// A browser-login session: every placement key present at once, so one
+    /// parse proves the whole block is reachable and still secret-free.
+    const BROWSER_LOGIN_YAML: &str = concat!(
+        "keys:\n  codex: $CODEX_ACCESS\nproviders:\n  - id: codex\n    key: codex\n",
+        "oauth:\n  - provider: codex\n    refresh_key: codex_refresh\n",
+        "    token_url: https://auth.example.invalid/token\n",
+        "    client_id: public-client\n",
+        "    authorization_url: https://auth.example.invalid/authorize\n",
+        "    redirect_uri: http://127.0.0.1:1455/callback\n",
+        "    client_secret_key: codex_client_secret\n",
+        "    scope: openid\n    expires_at: 1800000000\n",
+    );
+
+    /// A session with only the refresh half, as every config written before
+    /// browser login existed looks.
+    const OAUTH_REFRESH_ONLY_YAML: &str = concat!(
+        "keys:\n  codex: $CODEX_ACCESS\nproviders:\n  - id: codex\n    key: codex\n",
+        "oauth:\n  - provider: codex\n    refresh_key: codex_refresh\n",
+        "    token_url: https://auth.example.invalid/token\n",
+    );
+
+    fn browser_login_cfg() -> Config {
+        Config::parse(BROWSER_LOGIN_YAML, |name| Ok(Some(format!("synthetic-{name}"))))
+            .expect("the browser-login block must load")
+    }
+
+    #[test]
+    fn reads_the_browser_login_placement_keys_when_declared() {
+        let session = browser_login_cfg().oauth_for("codex").expect("the session").clone();
+        assert_eq!(
+            session.authorization_url.as_deref(),
+            Some("https://auth.example.invalid/authorize"),
+        );
+        assert_eq!(
+            session.redirect_uri.as_deref(),
+            Some("http://127.0.0.1:1455/callback"),
+        );
+        assert_eq!(
+            session.client_secret_key.as_deref(),
+            Some("codex_client_secret"),
+        );
+    }
+
+    #[test]
+    fn defaults_the_browser_login_keys_when_absent() {
+        let cfg = Config::parse(OAUTH_REFRESH_ONLY_YAML, |name| {
+            Ok(Some(format!("synthetic-{name}")))
+        })
+        .expect("a refresh-only block must still load");
+        let session = cfg.oauth_for("codex").expect("the session");
+        assert_eq!(session.authorization_url, None);
+        assert_eq!(session.redirect_uri, None);
+        assert_eq!(session.client_secret_key, None);
+    }
+
+    #[test]
+    fn rejects_an_authorization_url_when_it_is_not_http() {
+        let yaml = BROWSER_LOGIN_YAML.replace(
+            "https://auth.example.invalid/authorize",
+            "ftp://auth.example.invalid/authorize",
+        );
+        assert!(matches!(
+            Config::parse(&yaml, |name| Ok(Some(format!("synthetic-{name}")))),
+            Err(ConfigError::BadOAuthUrl { .. }),
+        ));
+    }
+
+    #[test]
+    fn rejects_an_authorization_url_when_it_carries_whitespace() {
+        let yaml = BROWSER_LOGIN_YAML.replace(
+            "https://auth.example.invalid/authorize",
+            "https://auth.example.invalid/ authorize",
+        );
+        assert!(matches!(
+            Config::parse(&yaml, |name| Ok(Some(format!("synthetic-{name}")))),
+            Err(ConfigError::BadOAuthUrl { .. }),
+        ));
+    }
+
+    #[test]
+    fn rejects_a_remote_redirect_uri_when_it_is_plain_http() {
+        let yaml = BROWSER_LOGIN_YAML
+            .replace("http://127.0.0.1:1455/callback", "http://callbacks.example/callback");
+        assert!(matches!(
+            Config::parse(&yaml, |name| Ok(Some(format!("synthetic-{name}")))),
+            Err(ConfigError::BadOAuthUrl { .. }),
+        ));
+    }
+
+    #[test]
+    fn accepts_a_remote_redirect_uri_when_it_is_https() {
+        let yaml = BROWSER_LOGIN_YAML
+            .replace("http://127.0.0.1:1455/callback", "https://ar.example/callback");
+        assert!(
+            Config::parse(&yaml, |name| Ok(Some(format!("synthetic-{name}")))).is_ok(),
+            "https needs no loopback exemption"
+        );
+    }
+
+    #[test]
+    fn accepts_a_loopback_redirect_uri_when_it_is_plain_http() {
+        let cfg = browser_login_cfg();
+        assert_eq!(
+            cfg.oauth_for("codex").and_then(|s| s.redirect_uri.as_deref()),
+            Some("http://127.0.0.1:1455/callback"),
+        );
+    }
+
+    #[test]
+    fn keeps_the_browser_login_block_free_of_any_credential() {
+        // Same property as `stores_no_token_in_the_oauth_block`, widened: a
+        // client_secret is a *name* here too, or printing this block leaks.
+        let cfg = browser_login_cfg();
+        let rendered = serde_yaml::to_string(&cfg.oauth).expect("serialises");
+        assert!(!rendered.contains("synthetic-"), "names only: {rendered}");
     }
 
     #[test]
