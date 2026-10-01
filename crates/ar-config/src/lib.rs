@@ -24,6 +24,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use ar_compress::{Engine, Intensity, Step};
+use ar_registry::CustomProvider;
 use notify_debouncer_full::notify::{self, RecommendedWatcher, RecursiveMode, Watcher};
 use notify_debouncer_full::{DebouncedEvent, Debouncer, FileIdMap, new_debouncer};
 use serde::{Deserialize, Serialize};
@@ -72,6 +74,38 @@ pub enum ConfigError {
         path: PathBuf,
         /// Underlying watcher failure.
         cause: String,
+    },
+}
+
+/// Ways a `compression:` block can be wrong.
+///
+/// Every arm is a *load* error rather than a silent fallback, because a combo
+/// whose engine spelling is wrong would run nothing and report
+/// `x-ar-compression: default;engines=-` — which reads on the client exactly
+/// like "this combo is not configured to compress".
+#[derive(Debug, thiserror::Error)]
+pub enum CompressionError {
+    /// The engine id is not in the catalog.
+    #[error("compression.engine {id:?} is not one of lite, rtk, caveman")]
+    UnknownEngine {
+        /// The engine id as written.
+        id: String,
+    },
+    /// The engine has one behaviour, so an intensity on it says nothing.
+    #[error("compression.engine {engine} has no intensity dial; drop the `intensity` line")]
+    NoDial {
+        /// The engine that takes no level.
+        engine: &'static str,
+    },
+    /// The engine has a dial, but not at this rung.
+    #[error("compression.engine {engine} takes intensity {levels}, not {id:?}")]
+    UnknownIntensity {
+        /// The engine the level was paired with.
+        engine: &'static str,
+        /// The levels that engine does offer, weakest first.
+        levels: String,
+        /// The level as written.
+        id: String,
     },
 }
 
@@ -314,6 +348,201 @@ pub struct Combo {
     pub strategy: Strategy,
     /// `provider/model` targets, in strategy order.
     pub targets: Vec<String>,
+    /// `provider/model` candidates that feed failover but never win the pick.
+    ///
+    /// The bench, not a second routing table: entries are appended *after* the
+    /// target chain, so a strategy still scores only `targets` and a pool entry
+    /// cannot change which provider serves a healthy request. It widens what
+    /// happens once the targets refuse, which is the whole of audit F-HIGH-2 —
+    /// the live `free-stack` combo lists 2 targets against 7 candidates.
+    ///
+    /// Absent or empty means no bench, which is every config written before this
+    /// field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pool: Vec<String>,
+    /// The engine that compresses this combo's prompts.
+    ///
+    /// Absent means off, which is what omission means everywhere else in this
+    /// schema: no `compression:` block, no compression. A request's
+    /// `x-ar-compression` header still wins over it.
+    #[serde(default)]
+    pub compression: Option<Compression>,
+}
+
+/// A combo's `compression:` block: which engine, and how hard.
+///
+/// The engine id and the level both resolve through `ar-compress`, which owns
+/// the catalog, so this struct keeps no list of its own to drift — the defect
+/// the audit finds in the reference, whose four engine catalogs disagree. The
+/// parse is strict on purpose: a wrong spelling is a load error naming the fix,
+/// never a silent "nothing ran", which reads on the client exactly like a combo
+/// that was never configured to compress.
+///
+/// ```
+/// use ar_config::Config;
+/// use ar_compress::{Engine, Intensity};
+///
+/// let yaml = concat!(
+///     "keys:\n  k: v\ncombos:\n  - id: c\n    strategy: priority\n",
+///     "    targets: [openai/gpt-5.4]\n    compression: { engine: rtk, intensity: aggressive }\n",
+/// );
+/// let cfg = Config::parse(yaml, |_| Ok(Some("v".to_owned()))).unwrap();
+/// let want = (Engine::Rtk, Some(Intensity::Aggressive));
+/// assert_eq!(
+///     cfg.combos[0].compression.map(|c| (c.engine, c.level)),
+///     Some(want),
+/// );
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawCompression", into = "RawCompression")]
+pub struct Compression {
+    /// The engine that runs.
+    pub engine: Engine,
+    /// How hard it works. `None` means the engine's own default.
+    pub level: Option<Intensity>,
+}
+
+impl Compression {
+    /// The plan step this setting resolves to.
+    ///
+    /// No level means the engine's own middle rung, so `engine: lite` alone
+    /// compresses exactly as it did before the dial existed.
+    #[must_use]
+    pub fn step(self) -> Step {
+        match self.level {
+            Some(level) => Step::at(self.engine, level),
+            None => Step::new(self.engine),
+        }
+    }
+}
+
+/// The YAML shape, kept as strings so the error can say *which* spelling is
+/// wrong instead of serde reporting a missing enum variant.
+#[derive(Deserialize, Serialize)]
+struct RawCompression {
+    engine: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    intensity: Option<String>,
+}
+
+impl TryFrom<RawCompression> for Compression {
+    type Error = CompressionError;
+
+    fn try_from(raw: RawCompression) -> Result<Self, Self::Error> {
+        let engine = Engine::from_id(&raw.engine).ok_or_else(|| CompressionError::UnknownEngine {
+            id: raw.engine.clone(),
+        })?;
+        let level = match raw.intensity {
+            None => None,
+            // A no-dial engine with a level is rejected rather than ignored: the
+            // reference accepts `codex-responses`/`omniglyph` modes here and
+            // drops them, which is how an operator ends up believing a dial is
+            // engaged when nothing reads it.
+            Some(_) if engine.levels().is_empty() => {
+                return Err(CompressionError::NoDial {
+                    engine: engine.as_str(),
+                });
+            }
+            Some(id) => {
+                let level = Intensity::from_id(&id).ok_or_else(|| {
+                    CompressionError::UnknownIntensity {
+                        engine: engine.as_str(),
+                        levels: ladder(engine),
+                        id: id.clone(),
+                    }
+                })?;
+                if !engine.levels().contains(&level) {
+                    return Err(CompressionError::UnknownIntensity {
+                        engine: engine.as_str(),
+                        levels: ladder(engine),
+                        id,
+                    });
+                }
+                Some(level)
+            }
+        };
+        Ok(Self { engine, level })
+    }
+}
+
+impl From<Compression> for RawCompression {
+    fn from(c: Compression) -> Self {
+        Self {
+            engine: c.engine.as_str().to_owned(),
+            intensity: c.level.map(|l| l.as_str().to_owned()),
+        }
+    }
+}
+
+/// The levels an engine offers, for an error message.
+fn ladder(engine: Engine) -> String {
+    engine
+        .levels()
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// One OAuth session's *placement*, never its secrets.
+///
+/// AUDIT-REPORT F-CRIT-1's dispatch half. This block says **where** an OAuth
+/// session's tokens live and how to renew them; it holds no token, so a
+/// committed `config.yaml` cannot leak a credential through it — the same
+/// property `keys:` has, and the reason this is not a second `Secret` field.
+///
+/// * The **access** token is the provider's existing `keys:` entry, i.e.
+///   `providers[].key`. No new name is invented for it.
+/// * The **refresh** token is a second row, named by [`Self::refresh_key`]. Two
+///   rows rather than one JSON blob because `ar_keys::CredentialStore` is
+///   name-keyed with a `list_names()` an operator — and `ar doctor` — can read
+///   without decrypting anything.
+/// * `token_url` is operator-supplied. AGENTS.md forbids inventing provider wire
+///   formats, and a refresh endpoint guessed from a provider id is exactly that
+///   invention, so this build refuses to refresh rather than guess.
+///
+/// ```
+/// use ar_config::Config;
+///
+/// let yaml = concat!(
+///     "keys:\n  codex: $CODEX_ACCESS\nproviders:\n  - id: codex\n    key: codex\n",
+///     "oauth:\n  - provider: codex\n    refresh_key: codex_refresh\n",
+///     "    token_url: https://auth.example/token\n",
+/// );
+/// let cfg = Config::parse(yaml, |name| Ok(Some(format!("synthetic-{name}")))).unwrap();
+/// let session = cfg.oauth_for("codex").expect("the session");
+/// assert_eq!(session.refresh_key.as_deref(), Some("codex_refresh"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OAuthSession {
+    /// Registry provider id this session authenticates. One session per id: a
+    /// rotating multi-account setup is several ids, because `ar_route`'s router
+    /// addresses a connection by provider id and an id-addressed list is the
+    /// only shape it can already route to.
+    pub provider: String,
+    /// Credential row holding the refresh token.
+    ///
+    /// `None` (or a row that resolves to nothing) means the session can be
+    /// *used* but not renewed, so its first upstream 401 is terminal. `ar
+    /// doctor` reports that rather than letting the 401 discover it.
+    #[serde(default)]
+    pub refresh_key: Option<String>,
+    /// Refresh endpoint. Without one the session cannot renew.
+    #[serde(default)]
+    pub token_url: Option<String>,
+    /// OAuth client id, when the refresh endpoint requires one (RFC 6749 §6).
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// Scope requested on refresh, when the provider scopes its tokens.
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// Unix seconds at which the access token expires, when the operator knows.
+    ///
+    /// An operator hint, not a claim: it enables *proactive* refresh, and its
+    /// absence costs one round trip on the 401 path rather than the session.
+    /// Nothing reads a machine's clock into this file.
+    #[serde(default)]
+    pub expires_at: Option<u64>,
 }
 
 /// The whole P0 configuration document.
@@ -328,9 +557,21 @@ pub struct Config {
     /// Configured provider instances.
     #[serde(default)]
     pub providers: Vec<ProviderCfg>,
+    /// Providers declared in the file rather than compiled in.
+    ///
+    /// Merged into the catalog at load, so a new endpoint costs a few lines of
+    /// YAML and no rebuild. An `id` that collides with a compiled-in entry is
+    /// refused by [`ar_registry::Registry::merge`], which `ar doctor` reports
+    /// and `ar serve` refuses.
+    #[serde(default)]
+    pub custom_providers: Vec<CustomProvider>,
     /// Routing combos.
     #[serde(default)]
     pub combos: Vec<Combo>,
+    /// OAuth sessions, matched to providers by id. Holds no secrets — see
+    /// [`OAuthSession`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub oauth: Vec<OAuthSession>,
 }
 
 impl Config {
@@ -368,12 +609,53 @@ impl Config {
                 });
             }
         }
+        for c in &self.custom_providers {
+            if !self.keys.contains_key(&c.key_ref) {
+                return Err(ConfigError::UnknownKey {
+                    provider: c.id.clone(),
+                    key: c.key_ref.clone(),
+                });
+            }
+        }
         Ok(())
     }
 
     /// Looks up a declared credential by name, borrowing the caller's name.
     pub fn key(&self, name: &str) -> Option<&Secret> {
         self.keys.get(name)
+    }
+
+    /// The OAuth session declared for `provider`, if any.
+    ///
+    /// Borrowed, so a caller that only wants to *name* the session in a
+    /// diagnostic never touches a token — and there is no token here to touch.
+    /// First declaration wins: a config listing one id twice has made a choice a
+    /// caller cannot predict, and the earlier row is the one the file reads
+    /// top-down.
+    pub fn oauth_for(&self, provider: &str) -> Option<&OAuthSession> {
+        self.oauth.iter().find(|s| s.provider == provider)
+    }
+
+    /// The credential *name* a provider id resolves to, from either provider list.
+    ///
+    /// A compiled-in provider names its key through `providers:`, a custom node
+    /// through `custom_providers:`. One lookup for both is what lets a combo
+    /// target resolve its key without caring which list declared the id. The
+    /// name, not the [`Secret`]: the encrypted store is keyed by it too, so the
+    /// caller resolves it against both sources itself.
+    #[must_use]
+    pub fn key_name(&self, id: &str) -> Option<&str> {
+        self.providers
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.key.as_str())
+            .or_else(|| self.custom_providers.iter().find(|c| c.id == id).map(|c| c.key_ref.as_str()))
+    }
+
+    /// Whether `id` names a provider this config declares, from either list.
+    #[must_use]
+    pub fn declares(&self, id: &str) -> bool {
+        self.providers.iter().any(|p| p.id == id) || self.custom_providers.iter().any(|c| c.id == id)
     }
 }
 
@@ -519,9 +801,36 @@ combos:
       - anthropic/claude-sonnet-4-5
 "#;
 
+    /// One combo carrying a `compression:` block, so a test names only the part
+    /// it is about.
+    fn combo_yaml(compression: &str) -> String {
+        format!(
+            "keys:\n  k: v\ncombos:\n  - id: c\n    strategy: priority\n    \
+             targets: [openai/gpt-5.4]\n    {compression}\n"
+        )
+    }
+
     fn stub_lookup(name: &str) -> Result<Option<String>, String> {
         Ok(Some(format!("secret-for-{name}")))
     }
+
+    /// A file-declared provider, resolved without any network or rebuild.
+    const CUSTOM: &str = r#"
+keys:
+  local: $AR_TEST_LOCAL_KEY
+
+custom_providers:
+  - id: local-gateway
+    protocol: openai-compatible
+    base_url: https://api.example.invalid/v1
+    key_ref: local
+
+combos:
+  - id: default
+    strategy: priority
+    targets:
+      - local-gateway/some-model
+"#;
 
     #[test]
     fn loads_sample_config_when_file_valid() {
@@ -545,6 +854,21 @@ combos:
             Config::parse(yaml, stub_lookup),
             Err(ConfigError::UnknownKey { .. })
         ));
+    }
+
+    #[test]
+    fn keeps_pool_as_a_separate_bench_when_declared() {
+        // The whole F-HIGH-2 shape: 2 targets, more candidates. Targets and pool
+        // are read as different lists, never merged.
+        let yaml = "keys:\n  k: v\ncombos:\n  - id: c\n    strategy: priority\n    targets: [openai/gpt-5.4, openai/gpt-5.4-nano]\n    pool: [groq/llama-3.3-70b]\n";
+        let cfg = Config::parse(yaml, stub_lookup).unwrap();
+        assert_eq!(cfg.combos[0].pool, ["groq/llama-3.3-70b"]);
+    }
+
+    #[test]
+    fn defaults_pool_to_empty_when_absent() {
+        // Every config written before the field existed must load unchanged.
+        assert!(Config::parse(SAMPLE, stub_lookup).unwrap().combos[0].pool.is_empty());
     }
 
     #[test]
@@ -610,5 +934,199 @@ combos:
         let yaml = "keys:\n  k: v\ncombos:\n  - id: c\n    strategy: quota-share-fair\n    targets: [openai/gpt-5.4]\n";
         let cfg = Config::parse(yaml, |_| Ok(Some("v".to_owned()))).unwrap();
         assert_eq!(cfg.combos[0].strategy, Strategy::QuotaShareFair);
+    }
+
+    const OAUTH_YAML: &str = concat!(
+        "keys:\n  codex: $CODEX_ACCESS\nproviders:\n  - id: codex\n    key: codex\n",
+        "oauth:\n  - provider: codex\n    refresh_key: codex_refresh\n",
+        "    token_url: https://auth.example.invalid/token\n    expires_at: 1800000000\n",
+    );
+
+    #[test]
+    fn reads_an_oauth_session_by_provider_id() {
+        let cfg = Config::parse(OAUTH_YAML, |name| Ok(Some(format!("synthetic-{name}")))).unwrap();
+        assert_eq!(cfg.oauth_for("codex").map(|s| s.provider.as_str()), Some("codex"));
+    }
+
+    #[test]
+    fn reports_no_oauth_session_for_an_undeclared_provider() {
+        let cfg = Config::parse(OAUTH_YAML, |name| Ok(Some(format!("synthetic-{name}")))).unwrap();
+        assert!(cfg.oauth_for("cline").is_none());
+    }
+
+    #[test]
+    fn reads_a_token_endpoint_and_an_expiry() {
+        let cfg = Config::parse(OAUTH_YAML, |name| Ok(Some(format!("synthetic-{name}")))).unwrap();
+        let session = cfg.oauth_for("codex").expect("the session");
+        assert_eq!(session.token_url.as_deref(), Some("https://auth.example.invalid/token"));
+        assert_eq!(session.expires_at, Some(1_800_000_000));
+    }
+
+    #[test]
+    fn parses_a_config_with_no_oauth_block() {
+        let cfg = Config::parse(SAMPLE, stub_lookup).unwrap();
+        assert!(cfg.oauth.is_empty(), "omission is not-oauth, exactly like compression");
+    }
+
+    #[test]
+    fn stores_no_token_in_the_oauth_block() {
+        // The property the block exists for: a committed config.yaml cannot leak
+        // a credential through it, because it has no field to put one in.
+        let cfg = Config::parse(OAUTH_YAML, |name| Ok(Some(format!("synthetic-{name}")))).unwrap();
+        let rendered = serde_yaml::to_string(&cfg.oauth).expect("serialises");
+        assert!(!rendered.contains("synthetic-"), "names only: {rendered}");
+    }
+
+    #[test]
+    fn loads_a_custom_provider_when_declared() {
+        let cfg = Config::parse(CUSTOM, stub_lookup).unwrap();
+        assert_eq!(cfg.custom_providers[0].id, "local-gateway");
+    }
+
+    #[test]
+    fn resolves_a_custom_providers_credential_through_its_key_ref() {
+        let cfg = Config::parse(CUSTOM, stub_lookup).unwrap();
+        assert_eq!(cfg.key_name("local-gateway"), Some("local"));
+        assert_eq!(
+            cfg.key(cfg.key_name("local-gateway").unwrap_or_default()).map(Secret::expose),
+            Some("secret-for-AR_TEST_LOCAL_KEY")
+        );
+    }
+
+    #[test]
+    fn rejects_a_custom_provider_when_its_key_ref_is_undeclared() {
+        let yaml = "keys:\n  k: v\ncustom_providers:\n  - id: mine\n    protocol: openai-compatible\n    base_url: https://api.example.invalid/v1\n    key_ref: nope\n";
+        assert!(matches!(
+            Config::parse(yaml, stub_lookup),
+            Err(ConfigError::UnknownKey { .. })
+        ));
+    }
+
+    #[test]
+    fn parses_anthropic_compatible_when_a_custom_provider_declares_it() {
+        let yaml = "keys:\n  k: v\ncustom_providers:\n  - id: mine\n    protocol: anthropic-compatible\n    base_url: https://api.example.invalid\n    key_ref: k\n";
+        let cfg = Config::parse(yaml, stub_lookup).unwrap();
+        assert_eq!(
+            cfg.custom_providers[0].protocol,
+            ar_registry::Protocol::AnthropicCompatible
+        );
+    }
+
+    #[test]
+    fn parses_optional_headers_when_a_custom_provider_declares_them() {
+        let yaml = "keys:\n  k: v\ncustom_providers:\n  - id: mine\n    protocol: openai-compatible\n    base_url: https://api.example.invalid\n    key_ref: k\n    headers:\n      x-api-key: v\n";
+        let cfg = Config::parse(yaml, stub_lookup).unwrap();
+        assert_eq!(
+            cfg.custom_providers[0].headers.get("x-api-key").map(String::as_str),
+            Some("v")
+        );
+    }
+
+    #[test]
+    fn round_trips_a_custom_provider_when_serialised_back() {
+        let cfg = Config::parse(CUSTOM, stub_lookup).unwrap();
+        let out = serde_yaml::to_string(&cfg).unwrap();
+        assert!(out.contains("protocol: openai-compatible"), "{out}");
+        assert!(out.contains("key_ref: local"), "{out}");
+    }
+
+    /// A combo with no `compression:` block is uncompressed, not an error — the
+    /// omission has to keep meaning what it meant before the field existed.
+    #[test]
+    fn reads_a_combo_as_uncompressed_when_no_block_is_present() {
+        let cfg = Config::parse(SAMPLE, stub_lookup).unwrap();
+        assert_eq!(cfg.combos[0].compression, None);
+    }
+
+    #[test]
+    fn defaults_the_level_to_the_engine_when_only_the_engine_is_named() {
+        let cfg = Config::parse(&combo_yaml("compression: { engine: rtk }"), stub_lookup).unwrap();
+        assert_eq!(cfg.combos[0].compression.map(Compression::step), Some(Step::new(Engine::Rtk)));
+    }
+
+    /// Every pair the catalog says is legal must load. This is the pin that keeps
+    /// `Engine::levels` from naming a level the config parser then refuses.
+    #[test]
+    fn resolves_every_level_its_own_engine_offers() {
+        for engine in [Engine::Lite, Engine::Rtk, Engine::Caveman] {
+            for level in engine.levels() {
+                let yaml = combo_yaml(&format!(
+                    "compression: {{ engine: {}, intensity: {} }}",
+                    engine.as_str(),
+                    level.as_str()
+                ));
+                let cfg = Config::parse(&yaml, stub_lookup)
+                    .unwrap_or_else(|e| panic!("{engine}@{level} must load: {e}"));
+                assert_eq!(
+                    cfg.combos[0].compression,
+                    Some(Compression { engine, level: Some(*level) }),
+                    "{engine}@{level}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn refuses_a_combo_when_the_engine_is_not_in_the_catalog() {
+        let err = Config::parse(&combo_yaml("compression: { engine: omniglyph }"), stub_lookup)
+            .expect_err("an unwired engine id must not load");
+        assert!(matches!(err, ConfigError::Yaml { .. }), "{err}");
+    }
+
+    /// The mispair the audit names: the reference accepts a combo override whose
+    /// mode the engine does not have and ignores it, so the operator believes a
+    /// dial is engaged. Here it is a load error instead.
+    #[test]
+    fn refuses_a_combo_when_an_intensity_crosses_engines() {
+        let err = Config::parse(
+            &combo_yaml("compression: { engine: rtk, intensity: ultra }"),
+            stub_lookup,
+        )
+        .expect_err("a caveman level on rtk must not load");
+        assert!(matches!(err, ConfigError::Yaml { .. }), "{err}");
+    }
+
+    #[test]
+    fn refuses_a_combo_when_a_fixed_engine_is_given_an_intensity() {
+        assert!(
+            Config::parse(
+                &combo_yaml("compression: { engine: lite, intensity: standard }"),
+                stub_lookup
+            )
+            .is_err(),
+            "lite has no dial, so an intensity on it is a mistake, not a no-op"
+        );
+    }
+
+    #[test]
+    fn round_trips_a_compression_block_byte_identically() {
+        let cfg = Config::parse(
+            &combo_yaml("compression: { engine: caveman, intensity: lite }"),
+            stub_lookup,
+        )
+        .unwrap();
+        let out = serde_yaml::to_string(&cfg).unwrap();
+        assert!(out.contains("engine: caveman"), "{out}");
+        assert!(out.contains("intensity: lite"), "{out}");
+    }
+
+    /// The mirror template is the file most likely to rot: it is copied, not
+    /// compiled, so nothing else would notice it naming a level the schema
+    /// stopped accepting. `include_str!` keeps the pin honest about the path.
+    #[test]
+    fn parses_the_omni_mirror_when_read_from_this_repo() {
+        let cfg = Config::parse(include_str!("../../../config.omni-mirror.yaml"), stub_lookup)
+            .expect("the mirror template must load");
+        assert_eq!(cfg.combos.len(), 3);
+    }
+
+    /// All three live OmniRoute combos run `compressionMode: lite`. The mirror
+    /// has to say so, or "mirrors the live combos 1:1" is not true.
+    #[test]
+    fn gives_every_mirrored_combo_the_live_lite_engine() {
+        let cfg = Config::parse(include_str!("../../../config.omni-mirror.yaml"), stub_lookup)
+            .expect("the mirror template must load");
+        let engines: Vec<Option<Engine>> = cfg.combos.iter().map(|c| c.compression.map(|k| k.engine)).collect();
+        assert_eq!(engines, [Some(Engine::Lite); 3]);
     }
 }

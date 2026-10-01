@@ -16,10 +16,14 @@
 use std::process::ExitCode;
 
 use ar_compress::eval::{self, SEED_CORPUS};
-use ar_compress::{Combo, Engine, Layers, Plan, Source, registered};
+use ar_compress::{Combo, Engine, Layers, Plan, Source, Step, registered};
 
 /// Engines available to a named combo, in the order they run.
-const STACKED: &[Engine] = &[Engine::Lite, Engine::Rtk, Engine::Caveman];
+const STACKED: &[Step] = &[
+    Step::new(Engine::Lite),
+    Step::new(Engine::Rtk),
+    Step::new(Engine::Caveman),
+];
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
@@ -104,7 +108,7 @@ fn describe(plan: &Plan) -> String {
 
 fn single(engine: Engine) -> Plan {
     Plan {
-        steps: vec![engine],
+        steps: vec![Step::new(engine)],
         source: Source::Default,
     }
 }

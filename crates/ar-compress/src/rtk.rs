@@ -14,6 +14,17 @@
 //! deduplicator.ts::deduplicateRepeatedLines` with the threshold from
 //! `DEFAULT_RTK_CONFIG.deduplicateThreshold`.
 //!
+//! ## Intensity
+//!
+//! The reference's `minimal`/`standard`/`aggressive` scale a *line budget*
+//! (`effectiveMaxLines`: 1.5x / 1.0x / 0.5x) around its truncation filters.
+//! This engine has no truncation — only the dedup pass — so the same dial lands
+//! on the run length it does have: a bigger budget means a longer run is worth
+//! collapsing, so [`Intensity::Minimal`] raises the threshold and
+//! [`Intensity::Aggressive`] lowers it. `standard` is the reference default and
+//! the threshold the crate has always used, so [`rtk`] and
+//! [`rtk_at`]`(_, Intensity::Standard)` are the same function.
+//!
 //! Two deliberate differences from the reference:
 //!
 //! * **One marker, not two.** The reference emits `[line repeated Nx]` *and*
@@ -34,6 +45,7 @@
 
 use std::borrow::Cow;
 
+use crate::plan::Intensity;
 use crate::stats::Stats;
 
 /// How many identical consecutive lines before a run is worth collapsing.
@@ -50,6 +62,30 @@ pub const REPEAT_THRESHOLD: usize = 3;
 /// without repetition costs one read-only scan and zero allocations.
 #[must_use]
 pub fn rtk(text: &str) -> Cow<'_, str> {
+    rtk_below(text, REPEAT_THRESHOLD)
+}
+
+/// [`rtk`] at an explicit intensity.
+///
+/// The run length [`rtk`] collapses at, for each rung of `rtk`'s ladder.
+/// `provisional:` the two off-default values (4 and 2) are the reference's
+/// 1.5x and 0.5x line-budget factors rounded onto a run of three, not fitted
+/// against any corpus in this repo.
+#[must_use]
+pub fn rtk_at(text: &str, level: Intensity) -> Cow<'_, str> {
+    rtk_below(text, run_length(level))
+}
+
+/// How many identical lines `level` needs before a run is worth collapsing.
+const fn run_length(level: Intensity) -> usize {
+    match level {
+        Intensity::Minimal => 4,
+        Intensity::Aggressive => 2,
+        _ => REPEAT_THRESHOLD,
+    }
+}
+
+fn rtk_below(text: &str, threshold: usize) -> Cow<'_, str> {
     let lines: Vec<&str> = text.split('\n').collect();
     let mut out = String::with_capacity(text.len());
     let mut wrote_any = false;
@@ -63,7 +99,7 @@ pub fn rtk(text: &str) -> Cow<'_, str> {
             run += 1;
         }
 
-        if !line.trim().is_empty() && run >= REPEAT_THRESHOLD {
+        if !line.trim().is_empty() && run >= threshold {
             if wrote_any {
                 out.push('\n');
             }
@@ -110,7 +146,8 @@ fn marker(dropped: usize) -> String {
 mod tests {
     use std::borrow::Cow;
 
-    use super::rtk;
+    use super::{rtk, rtk_at};
+    use crate::plan::Intensity;
 
     #[test]
     fn shrinks_when_redundant() {
@@ -131,5 +168,29 @@ mod tests {
     #[test]
     fn marker_names_the_dropped_count() {
         assert!(rtk("x\nx\nx").contains("2 repeats dropped"));
+    }
+
+    /// The dial has to be observable, not decorative: a pair of lines is below
+    /// every off-default rung and above none, so `aggressive` collapses it and
+    /// `minimal` declines. If the two ladders ever merged, this is what notices.
+    #[test]
+    fn collapses_a_pair_only_when_aggressive() {
+        let pair = "warn\nwarn\n";
+        assert_eq!(rtk_at(pair, Intensity::Minimal), Cow::Borrowed(pair));
+        assert!(!rtk_at(pair, Intensity::Aggressive).contains("warn\nwarn"));
+    }
+
+    #[test]
+    fn collapses_a_quadruple_at_every_rung() {
+        let quad = "warn\nwarn\nwarn\nwarn\n";
+        for level in [Intensity::Minimal, Intensity::Standard, Intensity::Aggressive] {
+            assert!(!rtk_at(quad, level).contains("warn\nwarn\nwarn\nwarn"), "{level}");
+        }
+    }
+
+    #[test]
+    fn behaves_like_the_bare_engine_at_the_default_level() {
+        let src = "boom\nboom\nboom\nresult\n";
+        assert_eq!(rtk_at(src, Intensity::Standard), rtk(src));
     }
 }

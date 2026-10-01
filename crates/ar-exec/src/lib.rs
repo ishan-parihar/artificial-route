@@ -22,6 +22,14 @@
 //! keep alive after the response arrives. Aborting during the body phase drops
 //! the `reqwest::Response`, which closes or releases the connection.
 //!
+//! # OAuth
+//!
+//! [`oauth`] adds the token lifecycle on top of this core: token injection,
+//! refresh on expiry, one rotation retry on 401, and a per-connection mutex so a
+//! concurrent burst cannot present the same refresh token twice. It is a P5 item
+//! per `docs/02`, and it consumes an already-obtained access token — the
+//! browser-session login that would *produce* one is out of scope.
+//!
 //! ```
 //! # use ar_config::Secret;
 //! # use ar_exec::ArExec;
@@ -39,6 +47,7 @@
 //!     executor: "default".into(),
 //!     auth_kind: "api_key".into(),
 //!     flat_rate: false,
+//!     headers: Default::default(),
 //! };
 //! let chat = CanonicalChat {
 //!     model: "gpt-5.4".into(),
@@ -51,8 +60,10 @@
 //! // Not awaited: a doctest must not perform network I/O.
 //! let _ = exec.post_chat(&chat, &provider, &Secret::new("sk-x".into()), &abort);
 //! ```
+#![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use ar_config::Secret;
@@ -64,14 +75,33 @@ use futures::Stream;
 use reqwest::StatusCode;
 use tokio_util::sync::CancellationToken;
 
+use crate::oauth::TerminalReport;
 use crate::sse::{DEFAULT_FRAME_CAP, SseDecoder};
 use crate::url::chat_url;
 
 pub use crate::media::{MediaBody, MediaEndpoint, MediaResponse};
 
 pub mod media;
+/// The OAuth taxonomy, its single terminal-status list, and the
+/// grant-and-rotate executor. `Origin::Client` is the only origin a live
+/// dispatch uses; `Origin::Probe` exists so a future health path cannot renew a
+/// rotating token by accident (audit R4).
+///
+/// `DOCS` note: OAuth is a P5 item in `docs/02-port-from-omniroute.md` ("skip …
+/// codex OAuth until P5"), and browser-session login stays out of scope
+/// entirely — this module consumes an already-obtained access token.
+pub mod oauth;
 pub mod sse;
 pub mod url;
+
+// The OAuth surface `ar-server` composes: the executor, the connection TypeState
+// and its refresh seam, plus the taxonomy `ar doctor` reports from. Re-exported
+// because every consumer needs more than one of these, and a path-per-item import
+// list is a second place to forget an item.
+pub use crate::oauth::{
+    Connected, Connection, HttpRefresher, OAuthKind, OAuthToken, Origin, Refresher, RotationPool,
+    Session, TERMINAL_REFRESH_STATUS, Unconnected, terminal_check_constraint,
+};
 
 // `into_sse` yields `SseEvent`, and `ExecError::Sse` wraps `SseError`, so both
 // belong on the crate root too — not only under `ar_exec::sse`.
@@ -191,6 +221,16 @@ pub enum ExecError {
     /// because it is not a JSON object.
     #[error("canonical body is not a JSON object")]
     NotAnObject,
+    /// An OAuth session reached a terminal state: the refresh token is gone,
+    /// revoked, or the provider says the account is closed.
+    ///
+    /// A distinct variant rather than [`Self::Upstream`] because the status is
+    /// the *refresh endpoint's*, not the dispatch's, and because `ar-server` has
+    /// to convert it into a 401 carrying [`TerminalReport::client_body`] — a
+    /// visible terminal for the account, where the transport path would report a
+    /// bare 502 and send the operator to the wrong dashboard (R2).
+    #[error("oauth session is terminal: {0}")]
+    OAuthTerminal(TerminalReport),
 }
 
 /// Pooled upstream client.
@@ -222,6 +262,17 @@ impl ArExec {
         Ok(Self { client })
     }
 
+    /// The pooled client, for a component that has to reuse the *same* pool.
+    ///
+    /// [`crate::oauth::HttpRefresher`] takes one rather than building its own:
+    /// the module docs above make "one pool per role" the rule, and a second
+    /// `reqwest::Client` for token refreshes would be a second pool for the same
+    /// process. Cloning is cheap — the client is an `Arc` over its pool.
+    #[must_use]
+    pub fn client(&self) -> reqwest::Client {
+        self.client.clone()
+    }
+
     /// POSTs `chat` to `provider` and returns the response stream.
     ///
     /// `abort` propagates to both phases: while waiting for headers, and again
@@ -245,6 +296,7 @@ impl ArExec {
             api_key: api_key.expose(),
             upstream_model: &chat.model,
             stream: chat.stream,
+            headers: &provider.headers,
         };
         let encoded = serde_json::to_vec(chat)?;
         let start = self.post(&dispatch, &encoded, abort).await?;
@@ -289,7 +341,7 @@ impl ArExec {
         let start = await_start(
             self.client
                 .post(chat_url(d.base_url))
-                .headers(build_headers(d.api_key, d.stream))
+                .headers(build_headers(d.api_key, d.stream, d.headers))
                 .body(body),
             abort,
             start_timeout(d.stream),
@@ -323,6 +375,33 @@ pub struct Dispatch<'a> {
     pub upstream_model: &'a str,
     /// Whether the client asked for an SSE stream; selects `Accept`.
     pub stream: bool,
+    /// Extra outbound headers from the provider definition, applied between
+    /// `Content-Type` and the auth layer. Empty for every compiled-in entry.
+    pub headers: &'a BTreeMap<String, String>,
+}
+
+impl<'a> Dispatch<'a> {
+    /// This dispatch's shape with its bearer replaced.
+    ///
+    /// The OAuth path's only way to attach a token: `Connection::dispatch`
+    /// receives the *unauthenticated* shape and swaps the bearer here, so there
+    /// is no code path where a session could POST with the config's static key.
+    /// `'b` is the borrow of the replacement credential, which is shorter than
+    /// `'a` — a `Grant`'s token lives on the stack, not for `'a`.
+    #[must_use]
+    pub fn with_api_key<'b>(self, api_key: &'b str) -> Dispatch<'b>
+    where
+        'a: 'b,
+    {
+        Dispatch {
+            base_url: self.base_url,
+            wire_format: self.wire_format,
+            api_key,
+            upstream_model: self.upstream_model,
+            stream: self.stream,
+            headers: self.headers,
+        }
+    }
 }
 
 /// Replaces the top-level `"model"` with the provider's spelling.
@@ -562,16 +641,19 @@ impl ChatStream {
 /// Merges the outbound headers in OmniRoute's precedence order.
 ///
 /// `base.ts:500` sets `Content-Type` first so provider config can override it,
-/// then auth, then `Accept` last so provider config *cannot* override it. P0's
-/// [`ProviderDef`] has no `headers` field, so only the auth and `Accept` layers
-/// exist today; the ordering is preserved so adding that field slots in without
-/// moving anything.
+/// then auth, then `Accept` last so provider config *cannot* override it.
 ///
 /// # TODO(#p0-align)
-/// `ProviderDef` needs `headers` / `auth_header` / `auth_prefix` (all present
-/// in OmniRoute's `RegistryEntry`) before non-`Bearer` providers work:
-/// `gemini`'s `x-goog-api-key`, `azure-ai`'s `api-key`, `clarifai`'s `Key`.
-fn build_headers(api_key: &str, stream: bool) -> reqwest::header::HeaderMap {
+/// `ProviderDef` still needs `auth_header` / `auth_prefix` (both present in
+/// OmniRoute's `RegistryEntry`) before non-`Bearer` providers work without a
+/// hand-written header: `gemini`'s `x-goog-api-key`, `azure-ai`'s `api-key`,
+/// `clarifai`'s `Key`. A file-declared provider covers those today by spelling
+/// the header out; the catalog still cannot.
+fn build_headers(
+    api_key: &str,
+    stream: bool,
+    extra: &BTreeMap<String, String>,
+) -> reqwest::header::HeaderMap {
     headers_for(
         api_key,
         "application/json",
@@ -580,19 +662,21 @@ fn build_headers(api_key: &str, stream: bool) -> reqwest::header::HeaderMap {
         } else {
             "application/json"
         },
+        extra,
     )
 }
 
 /// The shared header merge, parameterised by content type and accept.
 ///
 /// [`build_headers`] is the chat spelling of this; the media family needs the
-/// same auth and `Accept` layers with a different `Content-Type` (multipart for
-/// the audio endpoints), and a second implementation would be a second place
-/// for the auth precedence to drift.
+/// same layers with a different `Content-Type` (multipart for the audio
+/// endpoints), and a second implementation would be a second place for the auth
+/// precedence to drift.
 pub(crate) fn headers_for(
     api_key: &str,
     content_type: &str,
     accept: &str,
+    extra: &BTreeMap<String, String>,
 ) -> reqwest::header::HeaderMap {
     let mut headers = reqwest::header::HeaderMap::with_capacity(3);
     // A content type the caller computed cannot be a static value; an
@@ -601,6 +685,15 @@ pub(crate) fn headers_for(
     if let Ok(value) = reqwest::header::HeaderValue::from_str(content_type) {
         headers.insert(reqwest::header::CONTENT_TYPE, value);
     }
+
+    // A provider-declared header with a name or value reqwest rejects is
+    // dropped for the same reason: the upstream's 4xx names the bad header, and
+    // failing the whole request here would hide which of the two it was.
+    headers.extend(extra.iter().filter_map(|(name, value)| {
+        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes()).ok()?;
+        let value = reqwest::header::HeaderValue::from_str(value).ok()?;
+        Some((name, value))
+    }));
 
     // Exhaustive, not `_`: adding an `AuthClass` variant must fail to compile
     // here rather than silently ship an unauthenticated request.
@@ -700,31 +793,56 @@ mod tests {
             executor: "default".into(),
             auth_kind: "api_key".into(),
             flat_rate: false,
+            headers: Default::default(),
         }
+    }
+
+    fn extra(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()
     }
 
     #[test]
     fn sets_accept_sse_when_streaming() {
-        let headers = build_headers("sk-x", true);
+        let headers = build_headers("sk-x", true, &BTreeMap::new());
         assert_eq!(headers[reqwest::header::ACCEPT], "text/event-stream");
     }
 
     #[test]
     fn sets_accept_json_when_not_streaming() {
-        let headers = build_headers("sk-x", false);
+        let headers = build_headers("sk-x", false, &BTreeMap::new());
         assert_eq!(headers[reqwest::header::ACCEPT], "application/json");
     }
 
     #[test]
     fn sets_bearer_when_api_key_present() {
-        let headers = build_headers("sk-abc", false);
+        let headers = build_headers("sk-abc", false, &BTreeMap::new());
         assert_eq!(headers[reqwest::header::AUTHORIZATION], "Bearer sk-abc");
     }
 
     #[test]
     fn skips_bearer_when_secret_has_illegal_header_byte() {
-        let headers = build_headers("sk\ninjected", false);
+        let headers = build_headers("sk\ninjected", false, &BTreeMap::new());
         assert!(!headers.contains_key(reqwest::header::AUTHORIZATION));
+    }
+
+    #[test]
+    fn sends_a_provider_declared_header_when_one_is_configured() {
+        let headers = build_headers("sk-x", false, &extra(&[("x-api-key", "abc")]));
+        assert_eq!(headers["x-api-key"], "abc");
+    }
+
+    #[test]
+    fn keeps_accept_when_a_provider_declares_its_own() {
+        // The precedence contract: a provider config overrides the content type
+        // but cannot claim to be something other than SSE.
+        let headers = build_headers("sk-x", true, &extra(&[("accept", "application/json")]));
+        assert_eq!(headers[reqwest::header::ACCEPT], "text/event-stream");
+    }
+
+    #[test]
+    fn skips_a_provider_header_when_its_name_is_invalid() {
+        let headers = build_headers("sk-x", false, &extra(&[("bad header", "v")]));
+        assert!(!format!("{headers:?}").contains("bad header"), "{headers:?}");
     }
 
     #[test]
@@ -770,6 +888,7 @@ mod tests {
             api_key: "sk-x",
             upstream_model: "claude-sonnet-4-5",
             stream: true,
+            headers: &BTreeMap::new(),
         };
         let err = futures::executor::block_on(exec.post(
             &d,

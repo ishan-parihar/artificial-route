@@ -15,6 +15,16 @@
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+# The sqlite sidecars a `*.db` credential store can grow mid-write. The stores
+# themselves are encrypted, but the journal is plaintext, and `*.db` does not
+# match `credentials.db-journal`.
+*.db-journal
+*.db-wal
+*.db-shm
+
+# The `ar mcp` control-plane audit trail, written beside the config by
+# `ar mcp`. Append-only, per-invocation, and worthless without a run behind it.
+*.redb
 
 # Profiling / fuzz artifacts
 perf.data*

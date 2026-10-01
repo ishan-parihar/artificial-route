@@ -53,12 +53,19 @@ pub mod text;
 pub mod toon;
 pub mod translate;
 
+// The OAuth taxonomy and its single terminal-status list are re-exported here so
+// `ar doctor` reads the same table the executor classifies against (F-MED-2):
+// three consumers, one list, no second copy to drift.
+pub use ar_exec::oauth::{
+    OAuthKind, TERMINAL_REFRESH_STATUS, classify_refresh, terminal_check_constraint,
+};
+
 pub use app::{
     AppState, BindError, Components, MAX_BODY_BYTES, REQUEST_TIMEOUT, TRACE_HEADER, app, bind_addr,
     server,
 };
 pub use config::{ComboError, ComboTarget, RouteCombo, ServerConfig};
-pub use exec::{HttpExec, ProviderConfig};
+pub use exec::{HttpExec, OAuthAuth, ProviderConfig};
 pub use keys::AuthGate;
 pub use metrics::{Metrics, Outcome};
 pub use models::{MODELS_TTL, ModelCard, ModelCatalog, ModelsCache, StaticCatalog};

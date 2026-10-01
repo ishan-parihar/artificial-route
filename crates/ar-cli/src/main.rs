@@ -14,6 +14,8 @@
 mod cli;
 mod commands;
 mod import;
+#[cfg(feature = "mcp")]
+mod mcp;
 mod serve;
 mod toon;
 mod version;

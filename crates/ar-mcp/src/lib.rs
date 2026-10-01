@@ -9,7 +9,8 @@
 //! `scope` the default-deny check, `audit` the append-only `redb` row per
 //! guarded call, and [`guard`] the **only** entry point into the eight bodies —
 //! the bodies themselves are `pub(crate)` and cannot be reached from outside
-//! this crate. The `rmcp` server module is present only with `--features mcp`.
+//! this crate. The `rmcp` server module is present only with `--features mcp`,
+//! and with it [`transport::serve_stdio`], the wiring `ar mcp` calls.
 //!
 //! `mcp` is off by default, so `cargo tree -e no-dev` on a default build shows
 //! no `rmcp`. Everything else compiles and is callable in-process with the SDK
@@ -32,6 +33,9 @@ mod tools;
 
 #[cfg(feature = "mcp")]
 pub mod transport;
+
+#[cfg(feature = "mcp")]
+pub use transport::{Host, HostCombo, STDIO_WIRED, TOOL_SEARCH_NAME, serve_stdio};
 
 pub use audit::{AUDIT_OUTPUT_LIMIT, Audit, AuditError, CallOutcome, input_hash};
 pub use scope::Scope;
@@ -68,13 +72,39 @@ pub enum Error {
     /// Arguments did not render as JSON.
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    /// A required argument was absent.
+    #[error("missing argument: {name}")]
+    MissingArgument {
+        /// The argument's name.
+        name: &'static str,
+    },
+    /// An argument was present but of a type this tool cannot read. Distinct from
+    /// [`Error::MissingArgument`] because the caller's fix differs: one is "send
+    /// it", the other is "send it as the declared type".
+    #[error("argument {name:?} must be a string, a number or a boolean, not {got}")]
+    BadArgument {
+        /// The argument's name.
+        name: &'static str,
+        /// What the caller actually sent, by name.
+        got: &'static str,
+    },
+    /// A combo the call named is not in the host's table.
+    #[error("unknown combo: {0}")]
+    UnknownCombo(String),
+    /// An `auto/*` variant the call named is not one of the six.
+    #[error("unknown auto variant: {0}")]
+    UnknownVariant(String),
+    /// The transport itself failed: a closed pipe, or a host that is not speaking
+    /// MCP. Carries the SDK's own message rather than "an error occurred", because
+    /// the two cases have different fixes — reconnect, or fix the host config.
+    #[error("mcp transport: {0}")]
+    Transport(String),
     /// A transport is not wired in this build. Carries *what* is missing, so
     /// the message says which one rather than "an error occurred".
     ///
-    /// A typed error rather than `unimplemented!()`: a transport stub is not
-    /// reachable on a live request path, but a panic is a promise that the
-    /// process can die, and the caller of a half-wired control plane deserves
-    /// an `Err` it can map to a 501.
+    /// Reachable only from a build without the `mcp` feature, where
+    /// [`crate::transport`] does not exist at all — which is the point: the
+    /// variant names the gap instead of a stub pretending to serve.
     #[error("transport not wired: {what}")]
     NotWired {
         /// The missing piece, e.g. `"stdio"`.
@@ -165,6 +195,28 @@ impl Tool {
             Self::CostReport => "spend by session, day, week, month and provider",
             Self::ListModels => "routable model catalog with capabilities and pricing",
             Self::ExplainRoute => "why a provider won: score, factors, fallbacks",
+        }
+    }
+
+    /// The scope this tool needs, in `docs/06`'s spelling.
+    ///
+    /// The *requirement* per tool, which is what a reader of the catalog and a
+    /// host's own scope config both want to see. The *grant* is a set of bits
+    /// ([`Scope::parse`]) of which this mask is a composition, so the two are
+    /// deliberately different vocabularies and neither derives the other.
+    ///
+    /// [`Scope::parse`]: crate::Scope::parse
+    #[must_use]
+    pub fn scope_doc(self) -> &'static str {
+        match self {
+            Self::GetHealth => "read:health",
+            Self::ListCombos => "read:combos",
+            Self::SwitchCombo => "write:combos",
+            Self::CheckQuota => "read:quota",
+            Self::RouteRequest => "execute:completions",
+            Self::CostReport => "read:usage",
+            Self::ListModels => "read:models",
+            Self::ExplainRoute => "read:health+read:usage",
         }
     }
 
@@ -277,5 +329,22 @@ mod tests {
     fn not_wired_names_the_missing_piece() {
         let msg = Error::NotWired { what: "stdio" }.to_string();
         assert!(msg.contains("stdio"), "{msg}");
+    }
+
+    #[test]
+    fn a_bad_argument_says_what_it_got() {
+        let msg = Error::BadArgument { name: "active", got: "a string" }.to_string();
+        assert!(msg.contains("active") && msg.contains("a string"), "{msg}");
+    }
+
+    #[test]
+    fn a_missing_argument_names_only_the_argument() {
+        assert_eq!(Error::MissingArgument { name: "name" }.to_string(), "missing argument: name");
+    }
+
+    #[test]
+    fn a_transport_failure_carries_the_sdk_message() {
+        let msg = Error::Transport("broken pipe".into()).to_string();
+        assert!(msg.contains("broken pipe"), "{msg}");
     }
 }

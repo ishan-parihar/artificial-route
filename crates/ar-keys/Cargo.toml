@@ -32,6 +32,10 @@ base64 = "0.22"
 governor = "0.10"
 jsonwebtoken = "9.3"
 redb = "2.6"
+# Already in the graph via `ar-tokens`' ledger and pinned in the workspace as
+# `rusqlite = { version = "0.32", features = ["bundled"] }`. The credential store
+# is the second consumer; `bundled` keeps the static binary self-contained.
+rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 subtle = "2.6"

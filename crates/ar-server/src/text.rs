@@ -28,7 +28,7 @@
 //! module produces is built from those names, so there is no code path from a
 //! raw prompt to a sink, and no path from a matched secret to a log.
 
-use ar_compress::{Layers, Plan, Source, apply_plan, plan_resolution, registered};
+use ar_compress::{Layers, Plan, Source, Step, apply_plan, plan_resolution, registered};
 use ar_guard::{Verdict, inspect, redact_bidi};
 use serde_json::Value;
 
@@ -130,7 +130,7 @@ pub fn guard_body(body: &[u8]) -> Result<(Vec<u8>, GuardVerdict), String> {
         .map_err(|e| format!("cannot re-encode a redacted body: {e}"))
 }
 
-/// Resolves the compression plan for one request from the header.
+/// Resolves the compression plan for one request from the header and the combo.
 ///
 /// `plan_resolution` is `ar-compress`'s total precedence chain, and its header arm
 /// *is* `plan_from_header` — the private spelling of the same `off` / `default` /
@@ -139,18 +139,20 @@ pub fn guard_body(body: &[u8]) -> Result<(Vec<u8>, GuardVerdict), String> {
 /// copy of the header grammar is a second copy of the answer to "what does
 /// `x-ar-compression: engine:bogus` mean".
 ///
-/// The combo table passed in is empty, so the `Combo` precedence layer is always
-/// absent and a header naming a *combo id* resolves to `off` rather than to that
-/// combo's pipeline. That is the state stream E owns: `ar_config::Combo` grows a
-/// `compression:` field, and the lookup becomes one call. Until then an unrecognised
-/// header falling through to `off` is the documented behaviour, not a silent
-/// mismatch — the echo says `default;engines=-`, so a caller can see that nothing
-/// ran.
+/// `combo` is the resolved routing combo's `compression:` block, which
+/// `ServerConfig::from_ar_config` already resolved through `ar-compress`'s
+/// catalog — so an unknown engine never reaches this function, and `ar doctor`
+/// refuses the file at load instead. The named-combo table stays empty: a
+/// header may name a routing combo, but routing and compression are separate
+/// tables, and splicing them together would let a client reach a pipeline the
+/// operator never declared.
 ///
-/// TODO(#p1-compress-combo): pass the combo's engines once the config carries them.
+/// Precedence is the chain's own: `header > combo > off`. The echo says which
+/// layer won, so `combo;engines=rtk@aggressive` is distinguishable from
+/// `default;engines=-` without an operator reproducing the chain.
 #[must_use]
-pub fn compression_plan(header: Option<&str>) -> Plan {
-    plan_resolution(&[], &Layers { header, ..Layers::default() })
+pub fn compression_plan(header: Option<&str>, combo: Option<&[Step]>) -> Plan {
+    plan_resolution(&[], &Layers { header, combo, ..Layers::default() })
 }
 
 /// Applies a compression plan to every message string in a body.
@@ -171,15 +173,17 @@ pub fn compress_body(body: &[u8], plan: &Plan) -> Option<Vec<u8>> {
 
 /// The header value naming the pipeline that ran and which layer chose it.
 ///
-/// `header;engines=lite+caveman` when a header decided, `combo;engines=…` when a
-/// combo did, `off` when nothing ran. It answers "why is my prompt being
+/// `header;engines=lite+caveman` when a header decided, `combo;engines=rtk` when a
+/// combo's `compression:` block did, `off` when nothing ran. An engine at a
+/// non-default level is named `engine@level` (`caveman@ultra`), so the dial is
+/// visible without a second header. It answers "why is my prompt being
 /// rewritten" without an operator having to reproduce the precedence chain.
 #[must_use]
 pub fn compression_echo(plan: &Plan) -> String {
     if plan.is_off() {
         return format!("{};engines=-", Source::Default.as_str());
     }
-    let names: Vec<&str> = plan.steps.iter().map(|e| e.as_str()).collect();
+    let names: Vec<String> = plan.steps.iter().map(|step| step.label()).collect();
     format!("{};engines={}", plan.source.as_str(), names.join("+"))
 }
 
@@ -217,7 +221,7 @@ fn walk_message_text(value: &mut Value, f: &mut dyn FnMut(&mut String)) {
 
 #[cfg(test)]
 mod tests {
-    use ar_compress::{Engine, Plan, Source};
+    use ar_compress::{Engine, Intensity, Plan, Source, Step};
 
     use super::{
         COMPRESSION_ECHO, GuardVerdict, compress_body, compression_echo, compression_plan, guard_body,
@@ -292,41 +296,41 @@ mod tests {
 
     #[test]
     fn resolves_an_engine_header_to_that_engine() {
-        let plan = compression_plan(Some("engine:caveman"));
-        assert_eq!(plan.steps, [Engine::Caveman]);
+        let plan = compression_plan(Some("engine:caveman"), None);
+        assert_eq!(plan.steps, [Step::new(Engine::Caveman)]);
         assert_eq!(plan.source, Source::Header);
     }
 
     #[test]
     fn resolves_off_header_to_no_engines() {
-        assert!(compression_plan(Some("off")).is_off());
+        assert!(compression_plan(Some("off"), None).is_off());
     }
 
     #[test]
     fn treats_an_unrecognised_header_as_no_decision() {
         // The documented fall-through: an unknown value is not an error and not
         // a plan, so the request proceeds uncompressed.
-        assert!(compression_plan(Some("engine:nope")).is_off());
-        assert!(compression_plan(None).is_off());
+        assert!(compression_plan(Some("engine:nope"), None).is_off());
+        assert!(compression_plan(None, None).is_off());
     }
 
     #[test]
     fn echoes_the_layer_that_chose_the_pipeline() {
         assert_eq!(
-            compression_echo(&compression_plan(Some("engine:lite"))),
+            compression_echo(&compression_plan(Some("engine:lite"), None)),
             "header;engines=lite"
         );
     }
 
     #[test]
     fn echoes_off_when_nothing_ran() {
-        assert_eq!(compression_echo(&compression_plan(None)), "default;engines=-");
+        assert_eq!(compression_echo(&compression_plan(None, None)), "default;engines=-");
     }
 
     #[test]
     fn echoes_every_engine_in_order() {
         let plan = Plan {
-            steps: vec![Engine::Lite, Engine::Rtk],
+            steps: vec![Step::new(Engine::Lite), Step::new(Engine::Rtk)],
             source: Source::Header,
         };
         assert_eq!(compression_echo(&plan), "header;engines=lite+rtk");
@@ -339,7 +343,7 @@ mod tests {
 
     #[test]
     fn compresses_message_text_when_a_plan_runs() {
-        let plan = compression_plan(Some("engine:rtk"));
+        let plan = compression_plan(Some("engine:rtk"), None);
         let out = compress_body(&body("keep this line"), &plan);
         assert!(out.is_some(), "an rtk plan must produce a body");
     }
@@ -347,15 +351,71 @@ mod tests {
     #[test]
     fn returns_none_for_an_off_plan_so_the_original_bytes_survive() {
         let raw = body("keep me");
-        assert!(compress_body(&raw, &compression_plan(None)).is_none());
+        assert!(compress_body(&raw, &compression_plan(None, None)).is_none());
     }
 
     #[test]
     fn leaves_the_model_field_untouched_when_compressing() {
         let raw = br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;
-        let plan = compression_plan(Some("engine:caveman"));
+        let plan = compression_plan(Some("engine:caveman"), None);
         let out = compress_body(raw, &plan).expect("plan runs");
         let v: serde_json::Value = serde_json::from_slice(&out).expect("JSON");
         assert_eq!(v["model"], serde_json::json!("gpt-4o"));
+    }
+
+    const COMBO_RTK: &[Step] = &[Step::at(Engine::Rtk, Intensity::Aggressive)];
+
+    /// F-HIGH-1 in one line: the combo's `compression:` block reaches the engine
+    /// on a request that sent no header, which is the whole of the finding.
+    #[test]
+    fn runs_the_combo_pipeline_when_the_request_sends_no_header() {
+        let plan = compression_plan(None, Some(COMBO_RTK));
+        assert_eq!(plan.steps, COMBO_RTK);
+    }
+
+    /// `header > file`. A client's explicit per-request choice outranks the
+    /// operator's standing config, which is the precedence the audit's fix names.
+    #[test]
+    fn prefers_the_header_when_the_combo_also_names_an_engine() {
+        let plan = compression_plan(Some("engine:lite"), Some(COMBO_RTK));
+        assert_eq!(plan.source, Source::Header);
+    }
+
+    /// `file > off`. Without the file half, a config naming an engine produced
+    /// `default;engines=-` and the block was documentation.
+    #[test]
+    fn attributes_the_pipeline_to_the_combo_when_only_the_file_names_one() {
+        let plan = compression_plan(None, Some(COMBO_RTK));
+        assert_eq!(plan.source, Source::Combo);
+    }
+
+    /// An explicit `off` header has to beat the file too, or a client cannot
+    /// turn compression off for one request on a combo that turns it on.
+    #[test]
+    fn prefers_an_off_header_when_the_combo_names_an_engine() {
+        assert!(compression_plan(Some("off"), Some(COMBO_RTK)).is_off());
+    }
+
+    /// A combo with no `compression:` block resolves to nothing at all, which is
+    /// the behaviour every config that predates the field already had.
+    #[test]
+    fn is_off_when_neither_the_header_nor_the_combo_names_an_engine() {
+        assert!(compression_plan(None, None).is_off());
+    }
+
+    /// The dial has to survive the hop from config to echo, or an operator who
+    /// wrote `intensity: aggressive` cannot see that it ran.
+    #[test]
+    fn echoes_the_level_when_the_combo_named_one() {
+        let plan = compression_plan(None, Some(COMBO_RTK));
+        assert_eq!(compression_echo(&plan), "combo;engines=rtk@aggressive");
+    }
+
+    /// A default level is not echoed: every response would otherwise carry a
+    /// dial nobody turned.
+    #[test]
+    fn echoes_no_level_when_the_combo_named_only_the_engine() {
+        let plan = compression_plan(None, Some(&[Step::new(Engine::Rtk)]));
+        assert_eq!(compression_echo(&plan), "combo;engines=rtk");
     }
 }

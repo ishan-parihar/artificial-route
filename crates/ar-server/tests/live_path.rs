@@ -15,6 +15,8 @@
 //! | `refuses_a_prompt_injection_before_dispatch` | a denied prompt never reaches a provider |
 //! | `redacts_a_credential_before_dispatch` | the upstream never sees the secret |
 //! | `requires_a_bearer_token_when_a_master_key_is_set` | `ar-keys` admission |
+//! | `walks_the_bench_only_after_every_target_refuses` | a combo's `pool:` is reached only after every `targets:` entry refused (audit F-HIGH-2) |
+//! | `never_picks_a_bench_entry_over_a_healthy_target` | the bench never wins a healthy request |
 //! | `serves_anthropic_and_ollama_inbound_dialects` | the three added routes reach the upstream as OpenAI chat |
 //! | `refuses_a_public_bind_without_the_flag` | the loopback-only gate |
 //!
@@ -27,9 +29,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use ar_compress::{Engine, Intensity, Step};
 use ar_route::{ProviderId, Strategy};
 use ar_server::{
-    Components, HttpExec, ProviderConfig, RouteCombo, ServerConfig, bind_addr, server,
+    Components, ComboTarget, HttpExec, ProviderConfig, RouteCombo, ServerConfig, bind_addr, server,
 };
 use axum::Router;
 use axum::body::Body;
@@ -195,14 +198,29 @@ fn two_combos(a: &str, b: &str) -> ServerConfig {
         RouteCombo::new(
             "fast",
             Strategy::Priority,
-            vec![ar_server::ComboTarget::new(ProviderId::new("a"), "m-a")],
+            vec![ComboTarget::new(ProviderId::new("a"), "m-a")],
         ),
         RouteCombo::new(
             "careful",
             Strategy::Priority,
-            vec![ar_server::ComboTarget::new(ProviderId::new("b"), "m-b")],
+            vec![ComboTarget::new(ProviderId::new("b"), "m-b")],
         ),
     ];
+    config
+}
+
+/// The audit's `free-stack` shape: 2 targets, 1 bench candidate (audit F-HIGH-2).
+///
+/// The bench needs a dispatch row of its own or the executor cannot resolve its
+/// base URL; the combo targets reuse the two provider rows above.
+fn free_stack_combo(a: &str, b: &str, bench: &str) -> ServerConfig {
+    let mut config = two_combos(a, b);
+    config.combos.truncate(1);
+    config.providers.push(ProviderConfig::new(ProviderId::new("c"), bench, "sk-c").with_model("m-c"));
+    let combo = &mut config.combos[0];
+    combo.id = "free-stack".to_owned();
+    combo.targets.push(ComboTarget::new(ProviderId::new("b"), "m-b"));
+    combo.pool.push(ComboTarget::new(ProviderId::new("c"), "m-c"));
     config
 }
 
@@ -230,6 +248,85 @@ async fn fails_over_to_the_second_provider_when_the_first_refuses() {
         header_of(&headers, "x-ar-usage").contains("attempts=2"),
         "attempt accounting is wrong: {}",
         header_of(&headers, "x-ar-usage")
+    );
+}
+
+#[tokio::test]
+async fn walks_the_bench_only_after_every_target_refuses() {
+    // F-HIGH-2. a and b both 500; the bench's c answers. Order is the contract:
+    // the bench is the third attempt, never the first, because `pick` scores the
+    // targets alone.
+    let (down, down_seen) = counting_upstream_with(StatusCode::INTERNAL_SERVER_ERROR, "").await;
+    let (up, up_seen) = counting_upstream(StatusCode::OK).await;
+    let router = boot(free_stack_combo(&down, &down, &up));
+
+    let body = r#"{"model":"free-stack","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let (status, headers, text) = call(&router, post("/v1/chat/completions", body, &[])).await;
+
+    assert_eq!(status, 200, "the bench did not recover the request: {text}");
+    // Both targets were actually walked: two refusals before the bench is reached.
+    assert_eq!(calls(&down_seen), 2, "the targets were not both tried first");
+    assert_eq!(calls(&up_seen), 1, "the bench was not tried exactly once");
+    assert!(
+        header_of(&headers, "x-ar-decision").contains("provider=c"),
+        "the decision header did not name the bench winner: {}",
+        header_of(&headers, "x-ar-decision")
+    );
+}
+
+#[tokio::test]
+async fn never_picks_a_bench_entry_over_a_healthy_target() {
+    // The other half of F-HIGH-2: a bench that answers fine must still lose to a
+    // healthy target. Both a and c are 200 here, so if the bench were scored
+    // alongside the targets this could pass for the wrong reason — the counter
+    // on the bench is what proves it was never dispatched.
+    let (target, target_seen) = counting_upstream(StatusCode::OK).await;
+    let (bench, bench_seen) = counting_upstream(StatusCode::OK).await;
+    let router = boot(free_stack_combo(&target, &target, &bench));
+
+    let body = r#"{"model":"free-stack","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let (status, headers, text) = call(&router, post("/v1/chat/completions", body, &[])).await;
+
+    assert_eq!(status, 200, "{text}");
+    assert!(calls(&target_seen) > 0, "the target was not served");
+    assert_eq!(calls(&bench_seen), 0, "a bench entry won a healthy request");
+    assert!(
+        header_of(&headers, "x-ar-decision").contains("provider=a"),
+        "the decision header named the bench: {}",
+        header_of(&headers, "x-ar-decision")
+    );
+}
+
+#[tokio::test]
+async fn counts_every_upstream_attempt_when_the_bench_recovers_the_request() {
+    // F-MED-3 at the routing seam: a, b and c were all dispatched for one client
+    // request, so the counter must read 3.
+    let (down, down_seen) = counting_upstream_with(StatusCode::INTERNAL_SERVER_ERROR, "").await;
+    let (up, _up_seen) = counting_upstream(StatusCode::OK).await;
+    let config = free_stack_combo(&down, &down, &up);
+    let exec = HttpExec::new(config.providers.clone()).expect("executor builds");
+    let s = server(Components {
+        cache_bytes: Some(Some(1 << 20)),
+        master_key: None,
+        ..Components::with_exec(config, Arc::new(exec) as Arc<dyn ar_route::ArExec>)
+    });
+
+    let (status, _, text) = call(
+        &s.router,
+        post("/v1/chat/completions", r#"{"model":"free-stack","stream":true,"messages":[{"role":"user","content":"hi"}]}"#, &[]),
+    )
+    .await;
+
+    assert_eq!(status, 200, "the bench did not recover the request: {text}");
+    assert_eq!(
+        calls(&down_seen),
+        2,
+        "the two targets were not both dispatched, so the count is not the one this pins"
+    );
+    assert!(
+        s.state.metrics.render().contains("ar_upstream_attempts_total 3"),
+        "three upstream calls were counted as something else: {}",
+        s.state.metrics.render()
     );
 }
 
@@ -609,4 +706,59 @@ async fn counts_a_cache_hit_as_zero_attempts_upstream() {
         "a cached answer was counted as an attempt"
     );
     assert_eq!(calls(&a_seen), 1);
+}
+
+/// The socket-level half of F-HIGH-1. [`text::tests`](../../../ar_server/text.rs)
+/// pins the precedence chain; this pins that a combo's `compression:` block
+/// reaches the wire at all, which is the part a unit test cannot see — the
+/// engine has to run before the request is cached and forwarded.
+#[tokio::test]
+async fn runs_the_combo_engine_when_the_client_sends_no_header() {
+    let (a, _seen) = counting_upstream(StatusCode::OK).await;
+    let mut config = two_combos(&a, "http://127.0.0.1:1");
+    config.combos[0].compression = Some(Step::at(Engine::Rtk, Intensity::Aggressive));
+    let router = boot(config);
+
+    let body = r#"{"model":"fast","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let (_, headers, _) = call(&router, post("/v1/chat/completions", body, &[])).await;
+
+    assert_eq!(
+        header_of(&headers, "x-ar-compression"),
+        "combo;engines=rtk@aggressive",
+        "the combo's engine never reached the request"
+    );
+}
+
+#[tokio::test]
+async fn prefers_the_header_over_the_combo_engine() {
+    let (a, _seen) = counting_upstream(StatusCode::OK).await;
+    let mut config = two_combos(&a, "http://127.0.0.1:1");
+    config.combos[0].compression = Some(Step::at(Engine::Rtk, Intensity::Aggressive));
+    let router = boot(config);
+
+    let body = r#"{"model":"fast","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let (_, headers, _) = call(
+        &router,
+        post("/v1/chat/completions", body, &[("x-ar-compression", "engine:caveman")]),
+    )
+    .await;
+
+    assert_eq!(
+        header_of(&headers, "x-ar-compression"),
+        "header;engines=caveman",
+        "the client did not outrank the file"
+    );
+}
+
+/// A combo that declares no `compression:` block must stay uncompressed, so
+/// every config written before the field existed keeps behaving as it did.
+#[tokio::test]
+async fn leaves_a_combo_uncompressed_when_it_declares_no_engine() {
+    let (a, _seen) = counting_upstream(StatusCode::OK).await;
+    let router = boot(two_combos(&a, "http://127.0.0.1:1"));
+
+    let body = r#"{"model":"fast","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let (_, headers, _) = call(&router, post("/v1/chat/completions", body, &[])).await;
+
+    assert_eq!(header_of(&headers, "x-ar-compression"), "default;engines=-");
 }

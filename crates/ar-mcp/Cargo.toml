@@ -46,7 +46,7 @@ blake3 = "1.8.7"
 # `default-features = false` keeps the SDK's own `client`, `auth` and reqwest
 # halves out of the graph: this crate is a server. `server` is the only feature
 # that matters until the transports land -- see `src/transport.rs`.
-rmcp = { version = "3.5.0", optional = true, default-features = false, features = ["server"] }
+rmcp = { version = "3.5.0", optional = true, default-features = false, features = ["server", "transport-io"] }
 
 [dev-dependencies]
 # `rt`/`macros` so a test can hold a real `Admission` lease and assert the

@@ -13,6 +13,15 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+# `ar mcp` is the only surface that needs the MCP protocol SDK, so the SDK and
+# the `ar mcp` subcommand are behind one default-off feature together. A default
+# `cargo tree -e no-dev` must contain no `rmcp` (docs/06 accept gate), and this is
+# what keeps that true: `ar-mcp` itself compiles SDK-free, and only its `mcp`
+# feature pulls the tree in.
+[features]
+default = []
+mcp = ["dep:ar-mcp", "ar-mcp/mcp"]
+
 [dependencies]
 ar-config = { workspace = true }
 ar-core = { workspace = true }
@@ -25,6 +34,13 @@ ar-route = { workspace = true }
 # here on `ar serve` delegates to `ar_server::server()` instead of
 # re-implementing a listener, so `ar-server`'s own `[[bin]] ar` is redundant.
 ar-server = { path = "../ar-server" }
+# For the local encrypted credential store `ar doctor` probes and `ar serve`
+# resolves against. Already in the workspace and in `Cargo.lock` via `ar-server`,
+# so this names a second consumer rather than a new dependency.
+ar-keys = { path = "../ar-keys" }
+# `ar mcp`'s control plane. Optional, and only its `mcp` feature turns on the
+# transport, so the default build links the catalog and nothing else.
+ar-mcp = { path = "../ar-mcp", optional = true }
 # For the price table `ServerConfig::from_ar_config` takes, loaded from the
 # compiled-in registry so `cost-optimized` sorts on real prices.
 ar-tokens = { path = "../ar-tokens" }

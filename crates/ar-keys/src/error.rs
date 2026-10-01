@@ -124,8 +124,15 @@ pub enum KeyError {
         cap: usize,
     },
 
-    /// The redb revocation store refused a read or a write.
-    #[error("revocation store: {0}")]
+    /// A local store refused a read or a write — the redb revocation ledger
+    /// ([`crate::Revocation`]) or the sqlite credential table
+    /// ([`crate::CredentialStore`]).
+    ///
+    /// Carries SQLite's or redb's own message as text rather than the error
+    /// itself: `KeyError` promises `Clone`/`PartialEq`, and neither library's
+    /// error type offers them. The text is the library's, never a value read out
+    /// of the store.
+    #[error("store: {0}")]
     Store(String),
 
     /// The master key could not be loaded from its source.

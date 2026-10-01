@@ -68,6 +68,7 @@ fn provider(base_url: &str) -> ProviderDef {
         executor: ar_core::Strng::from("default"),
         auth_kind: ar_core::Strng::from("api_key"),
         flat_rate: false,
+        headers: Default::default(),
     }
 }
 

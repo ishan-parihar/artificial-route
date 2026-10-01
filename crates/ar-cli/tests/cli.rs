@@ -199,6 +199,140 @@ fn states_zero_definitively_when_no_combos() {
     assert_eq!(stdout(&out), "combo: 0 combos found\n");
 }
 
+/// A config whose only provider is a file-declared node: the id is in no
+/// compiled-in catalog, so anything that works here proves the no-rebuild path.
+const CUSTOM_ONLY_CONFIG: &str = r#"keys:
+  local: sk-test-local
+
+custom_providers:
+  - id: local-gateway
+    protocol: openai-compatible
+    base_url: https://api.example.invalid/v1
+    key_ref: local
+
+combos:
+  - id: default
+    strategy: priority
+    targets:
+      - local-gateway/some-model
+"#;
+
+fn with_custom_config(name: &str, yaml: &str) -> PathBuf {
+    let dir = empty_dir(name);
+    std::fs::write(dir.join("config.yaml"), yaml).expect("the fixture writes");
+    dir
+}
+
+fn ar_in(dir: &Path, args: &[&str]) -> Output {
+    Command::new(BIN).args(args).current_dir(dir).output().expect("the ar binary runs")
+}
+
+#[test]
+fn passes_doctor_when_a_custom_provider_is_declared() {
+    let dir = with_custom_config("custom-ok", CUSTOM_ONLY_CONFIG);
+
+    let out = ar_in(&dir, &["doctor"]);
+
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("custom/local-gateway,ok"), "{text}");
+    assert!(text.contains("target/local-gateway/some-model,ok,routable"), "{text}");
+}
+
+#[test]
+fn routes_a_custom_provider_when_no_combo_target_names_a_catalog_id() {
+    let dir = with_custom_config("custom-combo", CUSTOM_ONLY_CONFIG);
+
+    let out = ar_in(&dir, &["combo"]);
+
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    // The compiled-in-only grammar would render this row's provider as
+    // `default`, which is the id no combo or provider here declares.
+    assert!(text.contains("default,local-gateway,active"), "{text}");
+}
+
+#[test]
+fn lists_a_custom_provider_when_it_is_declared() {
+    let dir = with_custom_config("custom-providers", CUSTOM_ONLY_CONFIG);
+
+    let out = ar_in(&dir, &["providers"]);
+
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("local-gateway,openai,custom"), "{}", stdout(&out));
+}
+
+#[test]
+fn fails_check_when_a_custom_provider_id_collides_with_the_catalog() {
+    // The colliding node is not the combo's provider, so the collision is the
+    // only thing wrong and the single `fail` row can be named.
+    let dir = with_custom_config(
+        "custom-collision",
+        "keys:\n  openai: sk-test\ncustom_providers:\n  - id: openai\n    protocol: openai-compatible\n    base_url: https://api.example.invalid/v1\n    key_ref: openai\ncombos:\n  - id: default\n    strategy: priority\n    targets:\n      - openai/gpt-5.4\n",
+    );
+
+    let out = ar_in(&dir, &["doctor"]);
+
+    assert_eq!(code(&out), 1, "stdout: {}", stdout(&out));
+    let text = stdout(&out);
+    assert!(text.contains("1 check(s) failed"), "{text}");
+    assert!(text.contains("custom,fail"), "the collision is the named row: {text}");
+    assert!(text.contains("\"openai\" is already in the registry"), "{text}");
+}
+
+#[test]
+fn fails_check_when_a_custom_providers_base_url_has_no_scheme() {
+    let dir = with_custom_config(
+        "custom-bad-url",
+        &CUSTOM_ONLY_CONFIG.replace("https://api.example.invalid/v1", "api.example.invalid/v1"),
+    );
+
+    let out = ar_in(&dir, &["doctor"]);
+
+    assert_eq!(code(&out), 1);
+    assert!(stdout(&out).contains("not an http(s) URL"), "{}", stdout(&out));
+}
+
+#[test]
+fn reports_the_credential_store_as_skipped_when_there_is_none() {
+    // No store is the pre-store configuration: `$VAR` alone still works, so this
+    // must not turn `ar doctor` red.
+    let out = ar(&["doctor"]);
+    let text = stdout(&out);
+    assert!(text.contains("store,skip,"), "{text}");
+    assert!(text.contains("credentials.db"), "{text}");
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+}
+
+#[test]
+fn fails_check_when_the_credential_store_cannot_be_read() {
+    // A store on disk that `ar` cannot open is a silent loss of every credential
+    // it holds, which is the one credential state worth failing on.
+    let dir = empty_dir("bad-store");
+    std::fs::write(
+        dir.join("config.yaml"),
+        "keys:\n  k: v\nproviders:\n  - id: openai\n    key: k\ncombos:\n  - id: c\n    strategy: priority\n    targets:\n      - openai/gpt-5.4\n",
+    )
+    .expect("the fixture writes");
+    std::fs::write(dir.join("credentials.db"), b"not a sqlite file at all").expect("the fixture writes");
+
+    let out = Command::new(BIN).args(["doctor"]).current_dir(&dir).output().expect("the ar binary runs");
+
+    let text = stdout(&out);
+    assert!(text.contains("store,fail,"), "{text}");
+    assert!(text.contains("AR_MASTER_KEY"), "the reason names the fix: {text}");
+    assert_eq!(code(&out), 1);
+}
+
+#[test]
+fn names_the_credential_source_without_printing_any_value() {
+    // `ar doctor` output is something people paste into issues, so the source of a
+    // credential is reportable and its value is not.
+    let text = stdout(&ar(&["doctor"]));
+    assert!(text.contains("key/openai,ok,resolved from keys:"), "{text}");
+    assert!(!text.contains("sk-test-openai"), "{text}");
+}
+
 /// A directory under the crate's own target tree holding nothing but whatever the
 /// caller writes into it.
 ///
@@ -206,9 +340,14 @@ fn states_zero_definitively_when_no_combos() {
 /// process, and two tests sharing a `config.yaml` clobber each other. Hand-rolled
 /// rather than a `tempfile` dev-dependency — it is one `mkdir`, and adding a crate
 /// to assert `ar` will not read `config.yaml` is not a trade worth making.
+///
+/// `credentials.db` goes too, for the same reason: it is the credential store
+/// `ar doctor` now probes for, and a leftover from a neighbouring test would turn
+/// this one's `store` row into someone else's verdict.
 fn empty_dir(name: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
     std::fs::create_dir_all(&dir).expect("the temp dir is created");
     let _ = std::fs::remove_file(dir.join("config.yaml"));
+    let _ = std::fs::remove_file(dir.join("credentials.db"));
     dir
 }

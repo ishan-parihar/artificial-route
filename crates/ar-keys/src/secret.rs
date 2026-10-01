@@ -411,7 +411,11 @@ impl fmt::Debug for MasterKey {
 /// `openssl rand -base64 32` and Node's `randomBytes(32).toString("hex")` (what
 /// OmniRoute's desktop bootstrap writes). Guessing a third format would only
 /// reject a file the operator can plainly read.
-fn decode_key_material(raw: &str) -> Result<Vec<u8>, KeyError> {
+///
+/// `pub(crate)` because [`crate::CredentialStore`] reads the same three formats
+/// out of `$AR_MASTER_KEY`; one decoder for "wherever the master key came from"
+/// is the point.
+pub(crate) fn decode_key_material(raw: &str) -> Result<Vec<u8>, KeyError> {
     // Hex first: 64 characters. A 44-character base64 string is not a valid hex
     // length, so the length check keeps the two attempts from shadowing each
     // other.

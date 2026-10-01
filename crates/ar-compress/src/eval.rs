@@ -536,13 +536,13 @@ mod tests {
         CompressError, ContentKind, EvalCase, SEED_CORPUS, fidelity, load_corpus, looks_like_pii,
         report_table, run, savings,
     };
-    use crate::plan::{Engine, Plan, Source, Transform, registered};
+    use crate::plan::{Engine, Plan, Source, Step, Transform, registered};
 
     /// An engine that discards everything, to prove the fidelity column moves.
     struct Wreck;
 
     impl Transform for Wreck {
-        fn apply<'a>(&self, _engine: Engine, _text: &'a str) -> Cow<'a, str> {
+        fn apply<'a>(&self, _step: Step, _text: &'a str) -> Cow<'a, str> {
             Cow::Owned(String::new())
         }
     }
@@ -551,12 +551,13 @@ mod tests {
     struct Halve;
 
     impl Transform for Halve {
-        fn apply<'a>(&self, _engine: Engine, text: &'a str) -> Cow<'a, str> {
+        fn apply<'a>(&self, _step: Step, text: &'a str) -> Cow<'a, str> {
             Cow::Owned(text.chars().step_by(2).collect())
         }
     }
 
     fn plan(steps: Vec<Engine>) -> Plan {
+        let steps = steps.into_iter().map(Step::new).collect();
         Plan {
             steps,
             source: Source::Default,

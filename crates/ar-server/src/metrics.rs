@@ -75,9 +75,16 @@ impl Metrics {
         self.failed_over.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Counts one upstream attempt, successful or not.
-    pub fn observe_attempt(&self) {
-        self.attempts.fetch_add(1, Ordering::Relaxed);
+    /// Counts `n` upstream attempts dispatched, successful or not.
+    ///
+    /// Takes a count rather than one call per attempt because the attempt site is
+    /// the router's loop, not the request handler: the loop owns `tried` and the
+    /// handler only holds its verdict. Adding the verdict's own `attempts()` here
+    /// is what makes `ar_upstream_attempts_total` count attempts (audit F-MED-3)
+    /// rather than requests — the old single `fetch_add(1)` sat one layer above
+    /// the loop and could not see the difference.
+    pub fn observe_attempts(&self, n: u64) {
+        self.attempts.fetch_add(n, Ordering::Relaxed);
     }
 
     /// Counts one `/v1/models` revalidation pass.
@@ -162,6 +169,22 @@ mod tests {
         m.observe_failover();
         m.observe_failover();
         assert!(m.render().contains("ar_route_failovers_total 2"));
+    }
+
+    #[test]
+    fn sums_upstream_attempts_when_one_request_spends_several() {
+        // The F-MED-3 cardinality fact: a 3-attempt request must add 3, not 1.
+        let m = Metrics::new();
+        m.observe_attempts(3);
+        assert!(m.render().contains("ar_upstream_attempts_total 3"));
+    }
+
+    #[test]
+    fn accumulates_across_requests() {
+        let m = Metrics::new();
+        m.observe_attempts(2);
+        m.observe_attempts(1);
+        assert!(m.render().contains("ar_upstream_attempts_total 3"));
     }
 
     #[test]

@@ -16,18 +16,96 @@
 //! a provider that says 400 must reach the router differently, and only the
 //! router knows the difference.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use ar_registry::WireFormat;
 use ar_route::{ArExec as ArRouteExec, CanonicalRequest, ExecError, ProviderId, Upstream};
+use axum::http::StatusCode;
 use bytes::Bytes;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use ar_exec::Dispatch;
+use ar_exec::oauth::{
+    Connected, Connection, HttpRefresher, OAuthKind, OAuthToken, Refresher, RotationPool, Session,
+};
+
+/// One configured upstream provider's OAuth credentials, resolved and ready.
+///
+/// Holds two bearer strings, so it is **not** `Debug`-derived even though
+/// [`ProviderConfig`] is: a derived `Debug` would put an access token in whatever
+/// printed a provider. [`Debug`] here prints only whether a refresh path is
+/// armed, which is the fact an operator diagnosing a 401 actually needs.
+///
+/// The token material is already decrypted when this is built — the credential
+/// store's job, done once in `ar-server`'s config reader — so nothing here
+/// reaches back into a database on the request path.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OAuthAuth {
+    /// Which provider, which carve-out table, and where to refresh.
+    pub session: Session,
+    access: String,
+    refresh: String,
+    expires_at: Option<u64>,
+}
+
+impl OAuthAuth {
+    /// Builds a resolved session. `refresh` empty means "useable but not
+    /// renewable", which is a legitimate state the doctor reports rather than an
+    /// error.
+    #[must_use]
+    pub fn new(
+        session: Session,
+        access: impl Into<String>,
+        refresh: impl Into<String>,
+        expires_at: Option<u64>,
+    ) -> Self {
+        Self { session, access: access.into(), refresh: refresh.into(), expires_at }
+    }
+
+    /// Whether this session can renew: a refresh token *and* an endpoint.
+    #[must_use]
+    pub fn can_refresh(&self) -> bool {
+        self.session.can_refresh(&self.token())
+    }
+
+    /// Whether this session can authenticate at all.
+    ///
+    /// An empty access token is the difference between a session and a hole, and
+    /// `ProviderConfig::is_dispatchable` asks this rather than discovering it at
+    /// the socket.
+    #[must_use]
+    pub fn is_usable(&self) -> bool {
+        !self.access.trim().is_empty()
+    }
+
+    /// The token `ar-exec` connects with.
+    #[must_use]
+    pub fn token(&self) -> OAuthToken {
+        let mut token = OAuthToken::new(ar_config::Secret::new(&self.access));
+        if !self.refresh.trim().is_empty() {
+            token = token.with_refresh(ar_config::Secret::new(&self.refresh));
+        }
+        if let Some(at) = self.expires_at {
+            token = token.with_expiry(at);
+        }
+        token
+    }
+}
+
+impl std::fmt::Debug for OAuthAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthAuth")
+            .field("provider", &self.session.provider())
+            .field("kind", &self.session.kind())
+            .field("access", &self.access.trim().is_empty().to_string())
+            .field("can_refresh", &self.can_refresh())
+            .finish_non_exhaustive()
+    }
+}
 
 /// One configured upstream provider.
 ///
@@ -61,6 +139,25 @@ pub struct ProviderConfig {
     /// Current quota window, when one is known. `None` sorts a candidate after
     /// every metered one rather than dropping it.
     pub quota: Option<ar_route::QuotaWindow>,
+    /// Extra outbound headers, copied from the provider definition.
+    ///
+    /// Empty for every compiled-in provider; a file-declared one fills it.
+    pub headers: BTreeMap<String, String>,
+    /// OAuth credentials, when this provider authenticates by OAuth.
+    ///
+    /// `None` for every API-key provider, which is the overwhelming majority.
+    /// `Some` means the dispatch goes through `ar_exec::oauth`'s grant-and-rotate
+    /// path and `api_key` is never read.
+    pub oauth: Option<OAuthAuth>,
+    /// Whether the catalog labels this provider `authType: oauth`.
+    ///
+    /// A separate fact from [`Self::oauth`] because they answer different
+    /// questions: `oauth` says "a session is configured", this says "one has to
+    /// be". A provider labelled `oauth` with no session is still undispatchable —
+    /// it has no way to authenticate — and without this flag nothing here could
+    /// tell that apart from a keyless provider. Set from the registry entry by
+    /// `ar-server`'s config reader.
+    pub needs_oauth_executor: bool,
 }
 
 impl ProviderConfig {
@@ -77,6 +174,9 @@ impl ProviderConfig {
             rank: 0,
             weight: 1,
             quota: None,
+            headers: BTreeMap::new(),
+            oauth: None,
+            needs_oauth_executor: false,
         }
     }
 
@@ -123,14 +223,65 @@ impl ProviderConfig {
         self
     }
 
+    /// Sets the extra outbound headers.
+    #[must_use]
+    pub fn with_headers(mut self, headers: BTreeMap<String, String>) -> Self {
+        self.headers = headers;
+        self
+    }
+
+    /// Attaches resolved OAuth credentials.
+    #[must_use]
+    pub fn with_oauth(mut self, oauth: OAuthAuth) -> Self {
+        self.oauth = Some(oauth);
+        self
+    }
+
+    /// Records that the catalog labels this provider `authType: oauth`.
+    #[must_use]
+    pub fn with_needs_oauth_executor(mut self, needs: bool) -> Self {
+        self.needs_oauth_executor = needs;
+        self
+    }
+
+    /// The OAuth executor this provider's id permits, if any.
+    ///
+    /// The single place "can this build authenticate that provider at all" is
+    /// answered. [`Self::is_dispatchable`] and `HttpExec::new` both ask it rather
+    /// than each spelling the rule: a provider that is undispatchable but still
+    /// gets a live connection is the silent known-listing F-CRIT-1 is about.
+    #[must_use]
+    pub fn oauth_executor(&self) -> Option<OAuthKind> {
+        OAuthKind::parse(self.id.as_str())
+    }
+
     /// Whether this build can actually POST to this provider.
     ///
     /// Checked at config-build time so an unspeakable provider never enters a
     /// candidate list and never burns one of the three attempt slots on a
     /// guaranteed wrong-wire request.
+    ///
+    /// An OAuth session is a second gate. A provider the catalog labels `oauth`
+    /// with no executor in this build has **no** way to authenticate, so admitting
+    /// it would send the `api_key` — an empty string for a session that has none
+    /// — as a bearer and report the provider's own 401 as a transport failure.
+    /// Red-team R1's `kilocode` is exactly that case and must stay out of every
+    /// candidate list until its mechanism is understood.
     #[must_use]
     pub fn is_dispatchable(&self) -> bool {
-        self.wire_format == WireFormat::Openai
+        if self.wire_format != WireFormat::Openai {
+            return false;
+        }
+        match &self.oauth {
+            Some(auth) => {
+                auth.is_usable()
+                    && self.oauth_executor().is_some_and(|kind| auth.session.kind() == kind)
+            }
+            // No session declared. A pasted access token in `keys:` still works
+            // and simply cannot renew — unless the catalog says this provider needs
+            // an OAuth executor, which is the case no fallback can paper over.
+            None => !(self.needs_oauth_executor && self.oauth_executor().is_none()),
+        }
     }
 
     /// The `ar-exec` dispatch bundle for this provider, borrowed.
@@ -141,6 +292,7 @@ impl ProviderConfig {
             api_key: &self.api_key,
             upstream_model: &self.upstream_model,
             stream,
+            headers: &self.headers,
         }
     }
 }
@@ -154,17 +306,25 @@ pub struct HttpExec {
     core: Arc<ar_exec::ArExec>,
     providers: Vec<ProviderConfig>,
     by_id: HashMap<ProviderId, ProviderConfig>,
+    /// Live OAuth connections, one per provider that authenticates by OAuth.
+    ///
+    /// `Arc` because a connection *is* the shared state: the per-connection
+    /// refresh mutex and the terminal slot are the point of it, so a per-request
+    /// copy would be a per-request mutex and no circuit at all.
+    oauth: HashMap<ProviderId, Arc<Connection<Connected>>>,
 }
 
 impl Clone for HttpExec {
     fn clone(&self) -> Self {
         // `ar_exec::ArExec` is `Clone` (one `reqwest::Client` holding the pool);
         // the provider tables are small and `Copy`-enough to be worth sharing
-        // over re-deriving from config.
+        // over re-deriving from config. The connections are `Arc`-shared, which
+        // is what keeps a clone from losing the single-flight guarantee.
         Self {
             core: Arc::clone(&self.core),
             providers: self.providers.clone(),
             by_id: self.by_id.clone(),
+            oauth: self.oauth.clone(),
         }
     }
 }
@@ -173,16 +333,62 @@ impl HttpExec {
     /// Builds an executor over `providers`. The first entry is the default when
     /// a request names no routable candidate.
     ///
+    /// OAuth sessions are connected here rather than at config-build time,
+    /// because this is where the one `reqwest` client lives: the refresher reuses
+    /// [`ar_exec::ArExec::client`] instead of opening a second pool, which
+    /// `ar-exec`'s module docs make the rule.
+    ///
+    /// A session whose access token will not connect is reported on stderr and
+    /// left out of the table. It is not an error the server cannot start over —
+    /// one dead account should not take a proxy with nine live ones down — and
+    /// `ar doctor` is where the operator sees it (stderr, not stdout:
+    /// `docs/06`).
+    ///
     /// # Errors
+    ///
     /// When the `reqwest` client cannot be constructed (TLS backend missing).
     pub fn new(providers: Vec<ProviderConfig>) -> Result<Self, String> {
         let core = ar_exec::ArExec::new().map_err(|e| format!("reqwest client: {e}"))?;
         let by_id = providers.iter().cloned().map(|p| (p.id.clone(), p)).collect();
-        Ok(Self {
-            core: Arc::new(core),
-            providers,
-            by_id,
-        })
+
+        // One pool for the whole process: connections share it because they are
+        // keyed by token hash, and two connections sharing a *pool* is fine
+        // where two connections sharing a *refresh token* is the bug F-HIGH-4
+        // names.
+        let pool = Arc::new(RotationPool::new());
+        let refresher: Arc<dyn Refresher> = Arc::new(HttpRefresher::new(core.client()));
+        let mut oauth = HashMap::new();
+        for p in &providers {
+            // `let Some(..) else { continue }` rather than a `.filter(..)` plus an
+            // `expect`: the filter would make the invariant a runtime check, and
+            // AGENTS.md forbids `expect` outside tests.
+            let Some(auth) = &p.oauth else { continue };
+            // The executor has to match the provider id. A session hand-built for a
+            // provider this build has no executor for is refused rather than
+            // connected: R1's `kilocode` would otherwise get a guessed carve-out
+            // table and a live connection nobody traced.
+            if p.oauth_executor() != Some(auth.session.kind()) {
+                eprintln!(
+                    "ar: oauth session for {} DISABLED — this build has no executor for it; \
+                     `ar doctor` reports why",
+                    p.id.as_str()
+                );
+                continue;
+            }
+            match Connection::pending(auth.session.clone(), Arc::clone(&pool), Arc::clone(&refresher))
+                .connect(auth.token())
+            {
+                Ok(conn) => {
+                    oauth.insert(p.id.clone(), Arc::new(conn));
+                }
+                Err(e) => eprintln!(
+                    "ar: oauth session for {} DISABLED — {e}; `ar doctor` reports why",
+                    p.id.as_str()
+                ),
+            }
+        }
+
+        Ok(Self { core: Arc::new(core), providers, by_id, oauth })
     }
 
     /// Configured providers, in fallback order.
@@ -196,14 +402,25 @@ impl HttpExec {
     pub fn provider(&self, id: &ProviderId) -> Option<&ProviderConfig> {
         self.by_id.get(id)
     }
+
+    /// The live OAuth connection for `id`, when it has one.
+    ///
+    /// `None` for every API-key provider, and for a provider whose session failed
+    /// to connect — which is why the connection table is built once at boot
+    /// rather than looked up per request.
+    #[must_use]
+    pub fn oauth(&self, id: &ProviderId) -> Option<&Arc<Connection<Connected>>> {
+        self.oauth.get(id)
+    }
 }
 
 impl std::fmt::Debug for HttpExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // `ProviderConfig` carries `api_key`, and `Debug` on it would print the
-        // credential. Count the table instead.
+        // credential. Count the tables instead.
         f.debug_struct("HttpExec")
             .field("providers", &self.providers.len())
+            .field("oauth", &self.oauth.len())
             .finish_non_exhaustive()
     }
 }
@@ -232,11 +449,30 @@ impl ArRouteExec for HttpExec {
             // client disconnect aborts the upstream read instead of waiting for
             // the response-start budget.
             let abort = CancellationToken::new();
-            let stream = self
-                .core
-                .post(&cfg.dispatch(canonical.stream), &canonical.body, &abort)
-                .await
-                .map_err(flatten)?;
+            let shape = cfg.dispatch(canonical.stream);
+            // An OAuth provider goes through `ar_exec::oauth`'s grant-and-rotate
+            // path, which owns the refresh-on-401 retry and the terminal
+            // quarantine. The API-key path is the same `core.post` it has always
+            // been — one dispatch core, two ways of choosing a bearer.
+            let stream = match self.oauth.get(provider) {
+                Some(conn) => conn.dispatch(&self.core, &shape, &canonical.body, &abort).await,
+                None => self.core.post(&shape, &canonical.body, &abort).await,
+            };
+            let stream = match stream {
+                Ok(stream) => stream,
+                // R2: a terminal session is a 401 that *names the account*, not a
+                // bare 502. The router classifies a 401 as a failover candidate
+                // (another chain may still work) and the client gets a body it can
+                // branch on.
+                Err(ar_exec::ExecError::OAuthTerminal(report)) => {
+                    return Ok(Upstream::failure(
+                        StatusCode::UNAUTHORIZED,
+                        report.client_body(),
+                        None,
+                    ));
+                }
+                Err(e) => return Err(flatten(e)),
+            };
 
             let status = stream.status();
             let retry_after = stream.retry_after();
@@ -291,14 +527,20 @@ fn flatten(e: ar_exec::ExecError) -> ExecError {
 const _: () = {
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<HttpExec>();
+    assert_send_sync::<OAuthAuth>();
 };
 
 #[cfg(test)]
 mod tests {
     use ar_registry::WireFormat;
-    use ar_route::{ProviderId, QuotaWindow};
+    // The trait `HttpExec` implements. Aliased as in the parent module, so
+    // `post_chat` resolves here without a second name for one type.
+    use ar_route::{ArExec as ArRouteExec, ProviderId, QuotaWindow};
+    use axum::http::StatusCode;
+    use bytes::Bytes;
 
-    use super::{HttpExec, ProviderConfig};
+    use super::{HttpExec, OAuthAuth, ProviderConfig};
+    use crate::exec::{OAuthKind, Session};
 
     fn cfg(id: &str) -> ProviderConfig {
         ProviderConfig::new(ProviderId::new(id), "https://x/v1", "k")
@@ -346,6 +588,12 @@ mod tests {
     }
 
     #[test]
+    fn carries_provider_headers_into_the_dispatch_bundle() {
+        let p = cfg("p").with_headers([("x-api-key".to_owned(), "v".to_owned())].into());
+        assert_eq!(p.dispatch(false).headers.get("x-api-key").map(String::as_str), Some("v"));
+    }
+
+    #[test]
     fn looks_a_provider_up_by_id() {
         let exec = HttpExec::new(vec![cfg("a"), cfg("b")]).expect("executor builds");
         assert_eq!(
@@ -371,5 +619,140 @@ mod tests {
     fn debug_renders_no_credential() {
         let exec = HttpExec::new(vec![cfg("a")]).expect("executor builds");
         assert!(!format!("{exec:?}").contains('k'));
+    }
+
+    /// An `oauth:` session's resolved credentials. Synthetic tokens only.
+    fn auth(kind: OAuthKind, access: &str, refresh: &str, url: Option<&str>) -> OAuthAuth {
+        let mut session = Session::new(kind.as_str(), kind);
+        if let Some(url) = url {
+            session = session.with_token_url(url);
+        }
+        OAuthAuth::new(session, access, refresh, Some(2_000_000_000))
+    }
+
+    #[test]
+    fn connects_an_oauth_session_from_resolved_credentials() {
+        let exec = HttpExec::new(vec![ProviderConfig::new(ProviderId::new("codex"), "https://x/v1", "")
+            .with_oauth(auth(OAuthKind::Codex, "synthetic-access", "synthetic-refresh", Some("https://a/t")))])
+            .expect("executor builds");
+        assert!(exec.oauth(&ProviderId::new("codex")).is_some(), "a connected session");
+    }
+
+    #[test]
+    fn omits_an_oauth_session_whose_access_token_is_empty() {
+        // One dead account must not take a proxy with nine live ones down, and it
+        // must not become an unauthenticated upstream call either.
+        let exec = HttpExec::new(vec![ProviderConfig::new(ProviderId::new("codex"), "https://x/v1", "")
+            .with_oauth(auth(OAuthKind::Codex, "  ", "", Some("https://a/t")))])
+            .expect("executor builds");
+        assert!(exec.oauth(&ProviderId::new("codex")).is_none());
+    }
+
+    #[test]
+    fn omits_an_oauth_session_for_a_provider_this_build_cannot_authenticate() {
+        // R1: kilocode keeps no connection rather than a guessed one.
+        let exec = HttpExec::new(vec![ProviderConfig::new(ProviderId::new("kilocode"), "https://x/v1", "")
+            .with_oauth(auth(OAuthKind::Cline, "synthetic-access", "", Some("https://a/t")))])
+            .expect("executor builds");
+        assert!(exec.oauth(&ProviderId::new("kilocode")).is_none());
+    }
+
+    #[test]
+    fn reports_a_keyless_provider_without_an_executor_as_dispatchable() {
+        // The other half of the same flag: a provider the catalog does *not* label
+        // `oauth` is unaffected, or every keyless provider would be dropped.
+        assert!(ProviderConfig::new(ProviderId::new("ollama"), "https://x/v1", "").is_dispatchable());
+    }
+
+    #[test]
+    fn reports_a_provider_with_a_matching_executor_and_session_as_dispatchable() {
+        let p = ProviderConfig::new(ProviderId::new("codex"), "https://x/v1", "")
+            .with_needs_oauth_executor(true)
+            .with_oauth(auth(OAuthKind::Codex, "synthetic-access", "synthetic-refresh", Some("https://a/t")));
+        assert!(p.is_dispatchable());
+    }
+
+    #[test]
+    fn reports_an_armed_oauth_session_as_dispatchable() {
+        let p = ProviderConfig::new(ProviderId::new("codex"), "https://x/v1", "")
+            .with_oauth(auth(OAuthKind::Codex, "synthetic-access", "synthetic-refresh", Some("https://a/t")));
+        assert!(p.is_dispatchable());
+    }
+
+    #[test]
+    fn reports_an_oauth_session_with_no_access_token_as_undispatchable() {
+        let p = ProviderConfig::new(ProviderId::new("codex"), "https://x/v1", "")
+            .with_oauth(auth(OAuthKind::Codex, "", "synthetic-refresh", Some("https://a/t")));
+        assert!(!p.is_dispatchable(), "an empty bearer must not enter the candidate list");
+    }
+
+    #[test]
+    fn reports_an_oauth_provider_with_no_known_executor_as_undispatchable() {
+        // The F-CRIT-1 gate: an `oauthType` provider this build cannot
+        // authenticate is not dispatchable, so it never burns an attempt slot.
+        let p = ProviderConfig::new(ProviderId::new("kimi-coding"), "https://x/v1", "synthetic-access")
+            .with_needs_oauth_executor(true);
+        assert!(!p.is_dispatchable(), "no executor, so no way to authenticate");
+    }
+
+    #[test]
+    fn reports_a_session_without_a_refresh_path_as_usable_but_not_renewable() {
+        let a = auth(OAuthKind::Cline, "synthetic-access", "", None);
+        assert!(a.is_usable());
+        assert!(!a.can_refresh(), "a token with no refresh and no endpoint cannot renew");
+    }
+
+    #[test]
+    fn keeps_the_access_token_out_of_the_oauth_debug_output() {
+        let rendered = format!(
+            "{:?}",
+            auth(OAuthKind::Codex, "synthetic-access", "synthetic-refresh", Some("https://a/t"))
+        );
+        assert!(!rendered.contains("synthetic-access"), "{rendered}");
+    }
+
+    #[test]
+    fn carries_an_expiry_onto_the_token_it_hands_over() {
+        let token = auth(OAuthKind::Codex, "synthetic-access", "synthetic-refresh", Some("https://a/t")).token();
+        assert!(token.can_refresh());
+        assert_eq!(token.access().expose(), "synthetic-access");
+        assert!(!token.is_expiring(0), "an expiry in the future is not stale");
+    }
+    #[test]
+    fn hands_over_a_token_with_no_refresh_row_as_unrenewable() {
+        let token = auth(OAuthKind::Cline, "synthetic-access", "", None).token();
+        assert!(!token.can_refresh(), "an empty refresh row is no refresh row");
+    }
+
+    #[tokio::test]
+    async fn carries_the_session_token_on_an_oauth_dispatch() {
+        // R2's client-visible half: `ar-server` turns the terminal error into a
+        // 401 whose body names the dead account. Asserted here because the
+        // conversion lives at the boundary where the typed error becomes an
+        // `Upstream`, and nowhere else.
+        let exec = HttpExec::new(vec![ProviderConfig::new(ProviderId::new("cline"), "https://x/v1", "")
+            .with_needs_oauth_executor(true)
+            .with_oauth(auth(OAuthKind::Cline, "synthetic-access", "synthetic-refresh", Some("https://a/t")))])
+            .expect("executor builds");
+        let conn = exec.oauth(&ProviderId::new("cline")).expect("a live connection");
+        conn.quarantine(ar_exec::oauth::TerminalReport {
+            provider: "cline".to_owned(),
+            refresh_status: 400,
+            reason: "invalid_grant",
+        })
+        .await;
+
+        let outcome = exec
+            .post_chat(
+                &ProviderId::new("cline"),
+                &ar_route::CanonicalRequest::new("m", Bytes::from_static(b"{}")),
+            )
+            .await
+            .expect("a verdict, not an error");
+
+        assert_eq!(outcome.status, StatusCode::UNAUTHORIZED, "a terminal session is a 401, not a 502");
+        let text = String::from_utf8(outcome.error_body.to_vec()).expect("utf-8 json");
+        assert!(text.contains("oauth_terminal"), "{text}");
+        assert!(text.contains("cline"), "{text}");
     }
 }

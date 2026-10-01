@@ -135,7 +135,7 @@ impl crate::ArExec {
         api_key: &Secret,
         abort: &CancellationToken,
     ) -> Result<MediaResponse, ExecError> {
-        let headers = crate::headers_for(api_key.expose(), body.content_type, "application/json");
+        let headers = crate::headers_for(api_key.expose(), body.content_type, "application/json", &provider.headers);
         let response = crate::await_start(
             self.client
                 .post(crate::url::endpoint_url(&provider.base_url, endpoint.path()))

@@ -10,17 +10,17 @@
 //! fact instead of inferred.
 //!
 //! ```
-//! use ar_compress::{Engine, Layers, Plan, Source, plan_resolution};
+//! use ar_compress::{Engine, Layers, Plan, Source, Step, plan_resolution};
 //!
 //! let plan = plan_resolution(
 //!     &[],
 //!     &Layers {
 //!         header: Some("engine:rtk"),
-//!         combo: Some(&[Engine::Lite]),
+//!         combo: Some(&[Step::new(Engine::Lite)]),
 //!         ..Layers::default()
 //!     },
 //! );
-//! assert_eq!(plan.steps, [Engine::Rtk]);
+//! assert_eq!(plan.steps, [Step::new(Engine::Rtk)]);
 //! assert_eq!(plan.source, Source::Header);
 //! assert!(!plan.is_off());
 //! ```
@@ -31,6 +31,24 @@
 //! the panel `enginesExplicit` flag are dropped: `Layers` is already the
 //! resolved set of layers, and there is no legacy install to be byte-for-byte
 //! compatible with.
+//!
+//! # Intensity is a dial, not an engine
+//!
+//! The reference ships twelve engine ids across four disagreeing catalogs and
+//! `omniglyph`/`ionizer` are registered but unreachable (audit F-MED-1). This
+//! crate keeps the three it can actually run and adds [`Intensity`] instead: a
+//! dial on behaviour that already exists, so the reachable surface is
+//! `3 engines x their own ladders` rather than `12 half-wired ids`.
+//!
+//! Each engine declares its own ladder in [`Engine::levels`], and every other
+//! fact — which levels exist, what a bare engine id means, where a level sits —
+//! is derived from that one declaration. `rtk` offers `minimal`/`standard`/
+//! `aggressive`; `caveman` offers `lite`/`full`/`ultra`; `lite` offers none,
+//! because one behaviour has no dial. A level an engine does not offer is a
+//! *config* error ([`Engine::rung`] falls back rather than panicking, because a
+//! library call is not a place to refuse text), which is deliberately the
+//! opposite of the reference, where a combo override naming a mode the engine
+//! does not have is accepted and silently ignored.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -80,6 +98,11 @@ impl fmt::Display for Source {
 /// implementations are owned by the sibling transform module, which supplies
 /// the [`Transform`] impl. Adding a variant here makes every match in the
 /// crate a compile error, which is the intended coordination signal.
+///
+/// It is also the single list of engine ids in this workspace: a config's
+/// `compression.engine` resolves through [`Engine::from_id`], so there is no
+/// second table to drift — the defect the audit names in the reference, whose
+/// four catalogs disagree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Engine {
     /// Whitespace and image-URL trimming; the latency-light baseline.
@@ -124,11 +147,186 @@ impl Engine {
             None
         }
     }
+
+    /// The intensity levels this engine offers, weakest first.
+    ///
+    /// The one declaration every other fact derives from: [`Intensity::from_id`]
+    /// walks [`Intensity::ALL`], [`Engine::default_level`] indexes this, and
+    /// [`Engine::rung`] searches it. `&[]` is a real answer, not a placeholder —
+    /// it means the engine has exactly one behaviour, so it has no dial.
+    #[must_use]
+    pub const fn levels(self) -> &'static [Intensity] {
+        match self {
+            Self::Lite => &[],
+            Self::Rtk => &[Intensity::Minimal, Intensity::Standard, Intensity::Aggressive],
+            Self::Caveman => &[Intensity::Lite, Intensity::Full, Intensity::Ultra],
+        }
+    }
+
+    /// The level a bare engine id means: the middle rung.
+    ///
+    /// Middle, not weakest, so a config that names only an engine keeps the
+    /// behaviour it had before the dial existed — and the middle rung is the
+    /// reference's own default for both engines that have one
+    /// (`DEFAULT_RTK_CONFIG.intensity`, `getRulesForContext`'s `= "full"`).
+    ///
+    /// `const` so a `Step` can be built in a `const`: the test tables and the
+    /// eval example would otherwise have to spell the level out, and a spelled
+    /// out default is a second copy of this answer.
+    #[must_use]
+    pub const fn default_level(self) -> Intensity {
+        let levels = self.levels();
+        if levels.len() > 1 {
+            levels[1]
+        } else {
+            Intensity::Standard
+        }
+    }
+
+    /// `level` as a rung on this engine's ladder, weakest `0`.
+    ///
+    /// A level this engine does not offer, on an engine with no dial at all,
+    /// resolves to the engine's own default rather than panicking: a library
+    /// call is not a place to refuse text, and refusing would turn a cosmetic
+    /// mispair into a failed request. Config is where the pair is *rejected* —
+    /// see `ar_config::CompressionError::NoDial` — because a file is a place
+    /// where telling the operator is free.
+    #[must_use]
+    pub fn rung(self, level: Intensity) -> u8 {
+        let find = |l: Intensity| self.levels().iter().position(|x| *x == l);
+        find(level)
+            .or_else(|| find(self.default_level()))
+            .and_then(|i| u8::try_from(i).ok())
+            .unwrap_or(0)
+    }
 }
 
 impl fmt::Display for Engine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// How hard an engine works.
+///
+/// Two disjoint ladders in one enum, because that is what the three engines
+/// actually have: `rtk` scales a repeat threshold
+/// (`minimal`/`standard`/`aggressive`, from `effectiveMaxLines`'s 1.5/1.0/0.5
+/// budget factor), and `caveman` gates its rule table by rank
+/// (`lite`/`full`/`ultra`, from `cavemanRules.ts`'s `INTENSITY_RANK`). There is
+/// no global order — `Minimal` is weaker than `Lite` on one engine and means
+/// nothing on the other — so an `Ord` derive here would be a lie, and
+/// [`Engine::rung`] is the only way to compare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Intensity {
+    /// `rtk`: collapse a run of four or more identical lines.
+    Minimal,
+    /// `rtk`: three or more — the reference default. The `lite` engine's
+    /// neutral marker, since it has no ladder to sit on.
+    Standard,
+    /// `rtk`: two or more.
+    Aggressive,
+    /// `caveman`: referent-free noise only, the rules that cannot remove
+    /// something a later turn needed.
+    Lite,
+    /// `caveman`: every filler rule — the reference default, and what this
+    /// crate ran before the dial existed.
+    Full,
+    /// `caveman`: `full`, plus the reference's noun-abbreviation table.
+    Ultra,
+}
+
+impl Intensity {
+    /// Every spelling, in one table.
+    ///
+    /// [`Intensity::from_id`] derives from it, so adding a level is a change
+    /// here and in the owning engine's [`Engine::levels`] — never in a second
+    /// parser.
+    const ALL: [Self; 6] = [
+        Self::Minimal,
+        Self::Standard,
+        Self::Aggressive,
+        Self::Lite,
+        Self::Full,
+        Self::Ultra,
+    ];
+
+    /// The level's stable lowercase id, as written in `config.yaml`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Standard => "standard",
+            Self::Aggressive => "aggressive",
+            Self::Lite => "lite",
+            Self::Full => "full",
+            Self::Ultra => "ultra",
+        }
+    }
+
+    /// Parses a level id, case-insensitively.
+    #[must_use]
+    pub fn from_id(id: &str) -> Option<Self> {
+        let id = id.trim();
+        Self::ALL.into_iter().find(|l| l.as_str().eq_ignore_ascii_case(id))
+    }
+}
+
+impl fmt::Display for Intensity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One engine running at one intensity.
+///
+/// The pipeline element, and the unit an `engine@intensity` id names. A step
+/// built with [`Step::new`] is at its engine's own default level, so every
+/// engine-only spelling — the header grammar, the named-combo table, an
+/// `engine: rtk` config with no `intensity:` line — is unchanged behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Step {
+    /// The engine that runs.
+    pub engine: Engine,
+    /// How hard it works.
+    pub level: Intensity,
+}
+
+impl Step {
+    /// `engine` at its own default level.
+    #[must_use]
+    pub const fn new(engine: Engine) -> Self {
+        Self {
+            engine,
+            level: engine.default_level(),
+        }
+    }
+
+    /// `engine` at an explicitly named level.
+    #[must_use]
+    pub const fn at(engine: Engine, level: Intensity) -> Self {
+        Self { engine, level }
+    }
+
+    /// The engine id, suffixed `@level` only when the level is not the
+    /// engine's default.
+    ///
+    /// An echo that always printed `@standard` would make every response header
+    /// carry a dial nobody turned, and the suffix is the whole signal that a
+    /// non-default level ran.
+    #[must_use]
+    pub fn label(self) -> String {
+        if self.level == self.engine.default_level() {
+            self.engine.as_str().to_owned()
+        } else {
+            format!("{}@{}", self.engine.as_str(), self.level.as_str())
+        }
+    }
+}
+
+impl fmt::Display for Step {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.label())
     }
 }
 
@@ -140,7 +338,7 @@ impl fmt::Display for Engine {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
     /// The pipeline, in execution order. Empty means no compression.
-    pub steps: Vec<Engine>,
+    pub steps: Vec<Step>,
     /// The precedence layer that produced `steps`.
     pub source: Source,
 }
@@ -173,7 +371,7 @@ pub struct Combo<'a> {
     /// combo is addressable only by id.
     pub name: Option<&'a str>,
     /// The combo's pipeline.
-    pub steps: &'a [Engine],
+    pub steps: &'a [Step],
 }
 
 /// The precedence layers, highest first. Absent means "not set at this layer".
@@ -181,14 +379,14 @@ pub struct Combo<'a> {
 pub struct Layers<'a> {
     /// Per-request `x-ar-compression` header value.
     pub header: Option<&'a str>,
-    /// Routing-combo override.
-    pub combo: Option<&'a [Engine]>,
+    /// Routing-combo override: the combo's `compression:` block.
+    pub combo: Option<&'a [Step]>,
     /// Active named profile.
-    pub profile: Option<&'a [Engine]>,
+    pub profile: Option<&'a [Step]>,
     /// Adaptive context-budget dial.
-    pub adaptive: Option<&'a [Engine]>,
+    pub adaptive: Option<&'a [Step]>,
     /// Panel default.
-    pub default: Option<&'a [Engine]>,
+    pub default: Option<&'a [Step]>,
 }
 
 /// Resolves the plan for one request across the precedence chain
@@ -205,16 +403,17 @@ pub struct Layers<'a> {
 /// | anything else | unrecognized — fall through to `combo` |
 ///
 /// ```
-/// use ar_compress::{Combo, Engine, Layers, Source, plan_resolution};
+/// use ar_compress::{Combo, Engine, Intensity, Layers, Source, Step, plan_resolution};
 ///
-/// let combos = [Combo { id: "c1", name: Some("Balanced"), steps: &[Engine::Lite, Engine::Caveman] }];
+/// let steps = [Step::new(Engine::Lite), Step::at(Engine::Caveman, Intensity::Lite)];
+/// let combos = [Combo { id: "c1", name: Some("Balanced"), steps: &steps }];
 /// let by_name = plan_resolution(&combos, &Layers { header: Some("balanced"), ..Default::default() });
-/// assert_eq!(by_name.steps, [Engine::Lite, Engine::Caveman]);
+/// assert_eq!(by_name.steps, steps);
 ///
 /// // An unrecognized header is not a decision: the chain continues.
 /// let unknown = plan_resolution(
 ///     &combos,
-///     &Layers { header: Some("nope"), profile: Some(&[Engine::Rtk]), ..Default::default() },
+///     &Layers { header: Some("nope"), profile: Some(&[Step::new(Engine::Rtk)]), ..Default::default() },
 /// );
 /// assert_eq!(unknown.source, Source::Profile);
 /// ```
@@ -274,7 +473,7 @@ fn plan_from_header(combos: &[Combo<'_>], layers: &Layers<'_>, header: &str) -> 
         && prefix.eq_ignore_ascii_case("engine")
     {
         return Engine::from_id(id).map(|engine| Plan {
-            steps: vec![engine],
+            steps: vec![Step::new(engine)],
             source: Source::Header,
         });
     }
@@ -307,13 +506,14 @@ fn plan_from_header(combos: &[Combo<'_>], layers: &Layers<'_>, header: &str) -> 
 /// per-token path. The late-bound lifetime keeps the trait object-safe, which
 /// is what lets an engine hand back a borrow of its input.
 pub trait Transform {
-    /// Applies `engine` to `text`.
+    /// Applies `step` to `text`.
     ///
     /// An implementation must return [`Cow::Borrowed`] when it declines to
     /// rewrite, and must never return more text than it received: a
     /// "compression" that inflates is a bug, and [`crate::budget`] will not
-    /// catch it because the input was already within budget.
-    fn apply<'a>(&self, engine: Engine, text: &'a str) -> Cow<'a, str>;
+    /// catch it because the input was already within budget. `step.level` is
+    /// advisory for an engine with no dial and binding for one that has it.
+    fn apply<'a>(&self, step: Step, text: &'a str) -> Cow<'a, str>;
 }
 
 /// Runs `plan`'s pipeline over `text`.
@@ -324,13 +524,13 @@ pub trait Transform {
 /// a fresh buffer, and only its *final* output is handed back.
 ///
 /// ```
-/// use ar_compress::{Engine, Plan, Source, apply_plan, registered};
+/// use ar_compress::{Engine, Plan, Source, Step, apply_plan, registered};
 ///
 /// let off = Plan::off(Source::Default);
 /// assert!(matches!(apply_plan(&off, "keep me", registered()), std::borrow::Cow::Borrowed(_)));
 ///
 /// // A single engine that declines to rewrite (clean input) stays borrowed.
-/// let lite_only = Plan { steps: vec![Engine::Lite], source: Source::Default };
+/// let lite_only = Plan { steps: vec![Step::new(Engine::Lite)], source: Source::Default };
 /// assert_eq!(apply_plan(&lite_only, "let x = 1;", registered()), "let x = 1;");
 /// ```
 #[must_use]
@@ -345,8 +545,8 @@ pub fn apply_plan<'a>(plan: &Plan, text: &'a str, transforms: &dyn Transform) ->
     // Steps 1..n own their intermediate, because the next step borrows it
     // while producing a new buffer. Only the last result escapes.
     let mut acc = transforms.apply(*first, text).into_owned();
-    for engine in rest {
-        acc = transforms.apply(*engine, &acc).into_owned();
+    for step in rest {
+        acc = transforms.apply(*step, &acc).into_owned();
     }
     Cow::Owned(acc)
 }
@@ -359,11 +559,11 @@ pub fn apply_plan<'a>(plan: &Plan, text: &'a str, transforms: &dyn Transform) ->
 pub struct Engines;
 
 impl Transform for Engines {
-    fn apply<'a>(&self, engine: Engine, text: &'a str) -> Cow<'a, str> {
-        match engine {
+    fn apply<'a>(&self, step: Step, text: &'a str) -> Cow<'a, str> {
+        match step.engine {
             Engine::Lite => crate::lite::lite(text),
-            Engine::Rtk => crate::rtk::rtk(text),
-            Engine::Caveman => crate::caveman::caveman(text),
+            Engine::Rtk => crate::rtk::rtk_at(text, step.level),
+            Engine::Caveman => crate::caveman::caveman_at(text, step.level),
         }
     }
 }
@@ -382,10 +582,16 @@ mod tests {
     use std::borrow::Cow;
 
     use super::{
-        Combo, Engine, Layers, Plan, Source, Transform, apply_plan, plan_resolution, registered,
+        Combo, Engine, Intensity, Layers, Plan, Source, Step, Transform, apply_plan, plan_resolution,
+        registered,
     };
 
-    const BALANCED: &[Engine] = &[Engine::Lite, Engine::Caveman];
+    const BALANCED: &[Step] = &[Step::new(Engine::Lite), Step::new(Engine::Caveman)];
+
+    const RTK_ONLY: &[Step] = &[Step::new(Engine::Rtk)];
+    const CAVEMAN_ONLY: &[Step] = &[Step::new(Engine::Caveman)];
+    const LITE_ONLY: &[Step] = &[Step::new(Engine::Lite)];
+    const RTK_THEN_LITE: &[Step] = &[Step::new(Engine::Rtk), Step::new(Engine::Lite)];
 
     fn combos() -> [Combo<'static>; 1] {
         [Combo {
@@ -398,10 +604,10 @@ mod tests {
     fn all_layers_set() -> Layers<'static> {
         Layers {
             header: Some("balanced"),
-            combo: Some(&[Engine::Rtk]),
-            profile: Some(&[Engine::Caveman]),
-            adaptive: Some(&[Engine::Lite]),
-            default: Some(&[Engine::Rtk, Engine::Lite]),
+            combo: Some(RTK_ONLY),
+            profile: Some(CAVEMAN_ONLY),
+            adaptive: Some(LITE_ONLY),
+            default: Some(RTK_THEN_LITE),
         }
     }
 
@@ -501,7 +707,7 @@ mod tests {
                 ..all_layers_set()
             },
         );
-        assert_eq!(plan.steps, [Engine::Rtk, Engine::Lite]);
+        assert_eq!(plan.steps, [Step::new(Engine::Rtk), Step::new(Engine::Lite)]);
     }
 
     #[test]
@@ -510,7 +716,7 @@ mod tests {
             &combos(),
             &Layers { header: Some("engine:caveman"), ..all_layers_set() },
         );
-        assert_eq!(plan.steps, [Engine::Caveman]);
+        assert_eq!(plan.steps, [Step::new(Engine::Caveman)]);
     }
 
     #[test]
@@ -611,13 +817,19 @@ mod tests {
         struct Trace;
 
         impl Transform for Trace {
-            fn apply<'a>(&self, engine: Engine, text: &'a str) -> Cow<'a, str> {
-                Cow::Owned(format!("{text}{}", engine.as_str()))
+            fn apply<'a>(&self, step: Step, text: &'a str) -> Cow<'a, str> {
+                Cow::Owned(format!("{text}{}", step.label()))
             }
         }
 
-        let plan = Plan { steps: vec![Engine::Rtk, Engine::Caveman], source: Source::Combo };
-        assert_eq!(apply_plan(&plan, "x", &Trace), "xrtkcaveman");
+        let plan = Plan {
+            steps: vec![
+                Step::new(Engine::Rtk),
+                Step::at(Engine::Caveman, Intensity::Ultra),
+            ],
+            source: Source::Combo,
+        };
+        assert_eq!(apply_plan(&plan, "x", &Trace), "xrtkcaveman@ultra");
     }
 
     #[test]
@@ -628,22 +840,92 @@ mod tests {
 
     #[test]
     fn borrows_input_when_single_engine_declines() {
-        let plan = Plan { steps: vec![Engine::Lite], source: Source::Default };
+        let plan = Plan { steps: vec![Step::new(Engine::Lite)], source: Source::Default };
         assert!(matches!(apply_plan(&plan, "let x = 1;", registered()), Cow::Borrowed(_)));
     }
 
     #[test]
     fn rewrites_when_single_engine_acts() {
-        let plan = Plan { steps: vec![Engine::Caveman], source: Source::Default };
+        let plan = Plan { steps: vec![Step::new(Engine::Caveman)], source: Source::Default };
         let out = apply_plan(&plan, "It seems like the cache is basically re-validating.", registered());
         assert!(out.len() < 56, "caveman did not shrink: {out}");
     }
 
     #[test]
     fn collapses_repeated_lines_when_rtk_runs() {
-        let plan = Plan { steps: vec![Engine::Rtk], source: Source::Default };
+        let plan = Plan { steps: vec![Step::new(Engine::Rtk)], source: Source::Default };
         let out = apply_plan(&plan, "same\nsame\nsame\nsame\n", registered());
         assert!(out.contains("same"), "{out}");
+    }
+
+    /// The intensity axis: each engine's ladder is *its own*, so a level that
+    /// belongs to `rtk` must not silently become a `caveman` rung. `rung` is
+    /// total by design (a library call must not refuse text), which makes this
+    /// test the thing that keeps the fallback honest.
+    #[test]
+    fn maps_each_level_to_the_rung_of_its_own_engine() {
+        assert_eq!(Engine::Rtk.rung(Intensity::Minimal), 0);
+        assert_eq!(Engine::Rtk.rung(Intensity::Standard), 1);
+        assert_eq!(Engine::Rtk.rung(Intensity::Aggressive), 2);
+        assert_eq!(Engine::Caveman.rung(Intensity::Lite), 0);
+        assert_eq!(Engine::Caveman.rung(Intensity::Full), 1);
+        assert_eq!(Engine::Caveman.rung(Intensity::Ultra), 2);
+    }
+
+    #[test]
+    fn falls_back_to_the_default_rung_when_an_engine_does_not_offer_a_level() {
+        assert_eq!(
+            Engine::Rtk.rung(Intensity::Ultra),
+            Engine::Rtk.rung(Intensity::Standard),
+            "a caveman level must not become an rtk rung"
+        );
+    }
+
+    /// `lite` is the one engine with no dial, so every level collapses onto the
+    /// same rung. `Engine::levels` returning `&[]` is what makes that true
+    /// without a special case in each transform.
+    #[test]
+    fn pins_a_fixed_engine_to_one_rung_for_every_level() {
+        for level in [Intensity::Minimal, Intensity::Standard, Intensity::Ultra] {
+            assert_eq!(Engine::Lite.rung(level), 0, "{level}");
+        }
+    }
+
+    #[test]
+    fn defaults_a_bare_engine_to_the_middle_of_its_own_ladder() {
+        for engine in [Engine::Lite, Engine::Rtk, Engine::Caveman] {
+            let expected = engine.levels().get(1).copied().unwrap_or(Intensity::Standard);
+            assert_eq!(Step::new(engine).level, expected, "{engine}");
+        }
+    }
+
+    #[test]
+    fn labels_a_non_default_level_so_an_echo_can_show_the_dial() {
+        assert_eq!(Step::new(Engine::Rtk).label(), "rtk");
+        assert_eq!(Step::at(Engine::Rtk, Intensity::Aggressive).label(), "rtk@aggressive");
+        assert_eq!(Step::at(Engine::Caveman, Intensity::Lite).label(), "caveman@lite");
+    }
+
+    #[test]
+    fn parses_intensity_ids_case_insensitively() {
+        assert_eq!(Intensity::from_id("  ULTRA "), Some(Intensity::Ultra));
+    }
+
+    #[test]
+    fn rejects_an_intensity_id_no_engine_offers() {
+        assert_eq!(Intensity::from_id("maximum"), None);
+    }
+
+    /// Every level spelling resolves, so `Engine::levels` cannot name a level
+    /// the parser has never heard of — the drift the audit found in the
+    /// reference's four disagreeing engine lists.
+    #[test]
+    fn parses_every_level_named_by_an_engine_ladder() {
+        for engine in [Engine::Lite, Engine::Rtk, Engine::Caveman] {
+            for level in engine.levels() {
+                assert_eq!(Intensity::from_id(level.as_str()), Some(*level), "{engine}");
+            }
+        }
     }
 
     #[test]

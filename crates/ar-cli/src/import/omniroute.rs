@@ -732,6 +732,10 @@ fn to_def(entry: &Entry, consts: &Consts, root: &Tree) -> Option<ProviderDef> {
         executor: Strng::from(executor.unwrap_or_else(|| "default".to_owned()).as_str()),
         auth_kind: Strng::from(auth.unwrap_or_else(|| "apikey".to_owned()).as_str()),
         flat_rate: false,
+        // `RegistryEntry.headers` is read into the layered entry above; the
+        // generated catalog carries them so a custom node and an imported one
+        // dispatch through the same merge.
+        headers: BTreeMap::new(),
     })
 }
 
@@ -1136,6 +1140,11 @@ fn combos(defs: &BTreeMap<Strng, ProviderDef>) -> Vec<Combo> {
                 id: format!("{id}/{model}"),
                 strategy: Strategy::Priority,
                 targets: vec![format!("{id}/{model}")],
+                // One target per combo is what this importer makes: it folds a
+                // provider catalog, not OmniRoute's combo files, so it has no
+                // candidate pool to read and must not fabricate one.
+                pool: Vec::new(),
+                compression: None,
             });
         }
     }

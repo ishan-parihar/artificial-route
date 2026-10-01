@@ -16,6 +16,10 @@
 #   so routing is the same; multi-provider auto pools fall back to config
 #   order (request-time auto scoring engages only for literal `auto/*`
 #   model names).
+# - All three live combos carry `compressionMode: lite`, mirrored as
+#   `compression: { engine: lite }`. No `intensity:` line: `lite` is the one
+#   engine with no dial, and naming a level on it is a load error rather than a
+#   silent no-op.
 # - Port differs (22128 vs 20129) so both servers run side by side.
 # - Keys stay in the environment; dummy values boot/serve, real values route.
 #
@@ -53,12 +57,16 @@ providers:
 combos:
   - id: free-stack
     strategy: least-used
+    compression:
+      engine: lite
     targets:
       - nvidia/z-ai/glm-5.3
       - nvidia/moonshotai/kimi-k3
 
   - id: small-stack
     strategy: priority
+    compression:
+      engine: lite
     targets:
       - cline/stealth/space-bunny-alpha
       - kilocode/stealth/space-bunny-alpha
@@ -77,6 +85,8 @@ combos:
 
   - id: paper-stack
     strategy: auto
+    compression:
+      engine: lite
     targets:
       - zenmux-free/z-ai/glm-5.3-flash
       - zenmux-free/deepseek/deepseek-v4.1-flash

@@ -12,7 +12,9 @@
 //!
 //! [`audit`] and [`secret`] are the two cross-cutting pieces: a bounded ring that
 //! structurally cannot hold a credential, and a zeroizing buffer with one
-//! redacting `Debug`.
+//! redacting `Debug`. [`store`] is where the encrypted envelopes land: a
+//! gitignored sqlite table, one row per credential name, re-derivable across a
+//! restart.
 //!
 //! ```
 //! # #[tokio::main(flavor = "current_thread")]
@@ -68,6 +70,7 @@ mod error;
 mod hash;
 mod revoke;
 mod secret;
+mod store;
 mod token;
 
 // Re-exported so `hash.rs` and `secret.rs` can spell the encoders as
@@ -82,6 +85,7 @@ pub use error::KeyError;
 pub use hash::{HashParams, LEGACY_PREFIX, NONCE_LEN, PREFIX, SALT_LEN, TAG_LEN, VERSION, decrypt, encrypt, verify};
 pub use revoke::{DEFAULT_CAP, Revocation};
 pub use secret::{KeyMeta, MasterKey, MasterKeySource, Salt, Secret, KEY_LEN};
+pub use store::{CredentialStore, MASTER_KEY_VAR};
 pub use token::{
     ACCESS_TTL, DEFAULT_LEEWAY, Issue, Issued, REFRESH_TTL, Scope, ScopeSet, Tokens, Verified,
 };

@@ -31,6 +31,29 @@ providers:
   - id: anthropic
     key: anthropic
 
+# Providers the compiled-in registry does not carry: a self-hosted gateway, a
+# vendor compat shim, a local model server. Declaring one here makes it routable
+# with no rebuild — the id resolves exactly like a catalog provider's.
+#
+#   protocol:   openai-compatible | anthropic-compatible. Only the OpenAI wire
+#               is dispatched in this build; an anthropic-compatible node is
+#               accepted and named by `ar doctor`, but refused at dispatch.
+#   base_url:   the endpoint root, without a trailing slash.
+#   key_ref:    a name under `keys:` above, never a value.
+#   headers:    optional extra outbound headers, for a gateway that wants
+#               something other than a bearer token. `ar doctor` checks the shape.
+#
+# An `id` that already exists in the compiled-in catalog is refused, loudly,
+# rather than shadowing it.
+#
+# custom_providers:
+#   - id: my-gateway
+#     protocol: openai-compatible
+#     base_url: https://gateway.internal.example/v1
+#     key_ref: my_gateway
+#     headers:
+#       x-api-key: placeholder
+
 # Routing combos. A client asking for the model `default` gets this chain.
 #
 # Strategies: any of the nineteen ar-route names (priority, round-robin,

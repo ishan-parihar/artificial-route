@@ -10,7 +10,12 @@ license = "Apache-2.0"
 workspace = true
 
 [dependencies]
+ar-compress = { path = "../ar-compress" }
 ar-core = { workspace = true }
+# `Config::custom_providers` *is* `ar_registry::CustomProvider`, so the two shapes
+# cannot drift; the alternative is a second struct plus a mapping function in
+# every consumer.
+ar-registry = { workspace = true }
 arc-swap = { workspace = true }
 notify-debouncer-full = { workspace = true }
 serde = { workspace = true }

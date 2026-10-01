@@ -6,7 +6,8 @@
 //! * [`ServerConfig::from_ar_config`] reads the File-mode `config.yaml` through
 //!   `ar-config` and builds one [`RouteCombo`] per configured combo, so a
 //!   `combos:` list with two providers per combo routes across both. This is
-//!   what `ar serve` does.
+//!   what `ar serve` does. Credentials resolve `store -> $VAR -> error`; see
+//!   [`ServerConfig::from_ar_config`].
 //! * [`ServerConfig::from_provider`] builds a single unnamed combo from
 //!   environment variables. Kept whole: a `File`-only config is the destination,
 //!   but the env path is how a test, a one-off `curl`, and every CI job in this
@@ -35,12 +36,15 @@
 //! in a table and it *is* the source. Two tables merged here would be a second
 //! place registry prices are translated, and the two would drift.
 
-use ar_config::{Config, Secret};
+use ar_compress::Step;
+use ar_config::Config;
+use ar_exec::oauth::{OAuthKind, Session};
+use ar_keys::CredentialStore;
 use ar_registry::WireFormat;
 use ar_route::{Candidate, ProviderId, QuotaWindow, Strategy};
 use ar_tokens::{NormalizedUsage, PricingTable};
 
-use crate::exec::ProviderConfig;
+use crate::exec::{OAuthAuth, ProviderConfig};
 use crate::models::ModelCard;
 
 /// Default listen port, matching the OmniRoute-compatible `127.0.0.1:20128`.
@@ -118,6 +122,25 @@ pub struct RouteCombo {
     pub strategy: Strategy,
     /// Targets, in strategy order for rank-based strategies.
     pub targets: Vec<ComboTarget>,
+    /// The bench: candidates appended after `targets`, in declaration order.
+    ///
+    /// Never eligible for the winner — [`crate::routes::resolve`] picks over
+    /// `targets` alone and only then extends the chain with these — so a pool
+    /// entry cannot make a cheap provider win a healthy request. It exists to
+    /// widen *failover*, which is audit F-HIGH-2: the live `free-stack` combo
+    /// lists 2 targets against 7 candidates, and the 5 extras were only ever
+    /// reachable by failing over.
+    ///
+    /// Empty on every config written before the field existed.
+    pub pool: Vec<ComboTarget>,
+    /// The engine that compresses this combo's prompts, at the level the config
+    /// named. `None` means off, which is what a combo with no `compression:`
+    /// block means.
+    ///
+    /// One `Step` rather than a pipeline because a combo block names one engine;
+    /// a multi-engine pipeline is the header's and the panel's business, and
+    /// `ar-compress` composes the two.
+    pub compression: Option<Step>,
 }
 
 impl RouteCombo {
@@ -125,7 +148,27 @@ impl RouteCombo {
     /// declaration order, which is why the vector is the order.
     #[must_use]
     pub fn new(id: impl Into<String>, strategy: Strategy, targets: Vec<ComboTarget>) -> Self {
-        Self { id: id.into(), strategy, targets }
+        Self {
+            id: id.into(),
+            strategy,
+            targets,
+            pool: Vec::new(),
+            compression: None,
+        }
+    }
+
+    /// Sets the bench that feeds failover after `targets` is exhausted.
+    #[must_use]
+    pub fn with_pool(mut self, pool: Vec<ComboTarget>) -> Self {
+        self.pool = pool;
+        self
+    }
+
+    /// Sets the engine that compresses this combo's prompts.
+    #[must_use]
+    pub fn with_compression(mut self, step: Step) -> Self {
+        self.compression = Some(step);
+        self
     }
 }
 
@@ -199,65 +242,81 @@ impl ServerConfig {
     /// `model` — `ar serve` binds before any request arrives — serves exactly
     /// what `config.yaml` lists first.
     ///
+    /// `store` is the local encrypted credential table, consulted before the
+    /// config's `$VAR`-expanded `keys:` map. `None` means "there is no store on
+    /// this host", which is the pre-store configuration and still works: every
+    /// credential then resolves from `keys:` alone. It is a parameter rather
+    /// than an environment read because the resolution order is the security
+    /// property, and a caller that cannot name the store cannot be trusted to
+    /// have chosen the order.
+    ///
+    /// Every target resolves against the compiled-in catalog *plus* the config's
+    /// `custom_providers:`, so a file-declared node routes on the same terms as a
+    /// compiled-in one and needs no rebuild.
+    ///
     /// # Errors
     ///
-    /// - a combo target names a provider that is not in the compiled-in
-    ///   registry, so there is no base URL or wire format to dispatch to;
-    /// - a combo declares no targets, which would make it unroutable.
+    /// - a combo target names a provider that is in neither, so there is no base
+    ///   URL or wire format to dispatch to;
+    /// - a combo target or pool entry names such a provider (same rule);
+    /// - a combo declares no targets, which would make it unroutable;
+    /// - a provider's credential is in neither the store nor `keys:`, or the
+    ///   store holds it and would not decrypt it;
+    /// - a custom provider's id collides with a compiled-in one.
     pub fn from_ar_config(
         cfg: &Config,
         port: Option<u16>,
         prices: Option<PricingTable>,
         public: bool,
+        store: Option<&CredentialStore>,
     ) -> Result<Self, ComboError> {
         let mut providers: Vec<ProviderConfig> = Vec::new();
         let mut combos = Vec::with_capacity(cfg.combos.len());
         let table = prices.unwrap_or_else(PricingTable::global);
-
+        let catalog = ar_registry::global().merge(&cfg.custom_providers)?;
 
         for (i, combo) in cfg.combos.iter().enumerate() {
             if combo.targets.is_empty() {
                 return Err(ComboError::EmptyCombo { id: combo.id.clone() });
             }
+            let weight = u32::try_from(i + 1).unwrap_or(u32::MAX);
             let mut targets = Vec::with_capacity(combo.targets.len());
             for (rank, target) in combo.targets.iter().enumerate() {
-                let (provider, model) = split_target_known(target, |id| {
-                    ar_registry::global().get(id).is_some()
-                });
-                let def = ar_registry::global().get(provider).ok_or_else(|| ComboError::UnknownProvider {
-                    target: target.clone(),
-                    provider: provider.to_owned(),
-                })?;
-
-                // One entry per provider id: two combos naming `openai` must not
-                // produce two dispatch rows, or the executor's `by_id` lookup
-                // would keep whichever came last.
-                if !providers.iter().any(|p| p.id.as_str() == provider) {
-                    let key = cfg
-                        .providers
-                        .iter()
-                        .find(|p| p.id == provider)
-                        .and_then(|p| cfg.key(&p.key))
-                        .map_or("", Secret::expose);
-                    let mut entry = ProviderConfig::new(ProviderId::new(provider), &def.base_url, key)
-                        .with_wire_format(def.wire_format);
-                    // The flat table's model is a display default only; a combo
-                    // target always carries its own spelling.
-                    entry.upstream_model = model.to_owned();
-                    entry.rank = u32::try_from(rank).unwrap_or(u32::MAX);
-                    providers.push(entry);
-                }
-
-                targets.push(
-                    ComboTarget::new(ProviderId::new(provider), model)
-                        .with_weight(u32::try_from(i + 1).unwrap_or(u32::MAX)),
-                );
+                targets.push(resolve_target(
+                    target,
+                    u32::try_from(rank).unwrap_or(u32::MAX),
+                    weight,
+                    &catalog,
+                    cfg,
+                    store,
+                    &mut providers,
+                )?);
             }
-            combos.push(RouteCombo::new(
+            // The bench resolves on exactly the terms a target does, at load: a
+            // pool entry that only failed at request time would cost a round trip
+            // per occurrence instead of refusing the file.
+            let mut pool = Vec::with_capacity(combo.pool.len());
+            for (offset, target) in combo.pool.iter().enumerate() {
+                pool.push(resolve_target(
+                    target,
+                    u32::try_from(targets.len() + offset).unwrap_or(u32::MAX),
+                    weight,
+                    &catalog,
+                    cfg,
+                    store,
+                    &mut providers,
+                )?);
+            }
+            let mut route = RouteCombo::new(
                 combo.id.clone(),
                 Strategy::parse(combo.strategy.as_str()),
                 targets,
-            ));
+            )
+            .with_pool(pool);
+            if let Some(compression) = combo.compression {
+                route.compression = Some(compression.step());
+            }
+            combos.push(route);
         }
 
         Ok(Self {
@@ -303,6 +362,20 @@ impl ServerConfig {
         }
     }
 
+    /// The default chain's `compression:` step, for the `auto/*` path that
+    /// resolves an alias over the default combo's candidates.
+    ///
+    /// An `auto/*` alias names no combo of its own, so the default chain's
+    /// engine is the only one it could mean. `None` on the flat path: the
+    /// environment provider list declares no compression at all.
+    #[must_use]
+    pub fn default_compression(&self) -> Option<Step> {
+        match self.default_combo() {
+            DefaultChain::Combo(combo) => combo.compression,
+            DefaultChain::Flat => None,
+        }
+    }
+
     /// Routable candidates for `combo`, in strategy order.
     ///
     /// Rebuilt per request rather than cached: it is a `Vec` of ten-field structs
@@ -335,6 +408,23 @@ impl ServerConfig {
                 })
                 .collect(),
         }
+    }
+
+    /// The combo's `pool:` entries, dispatchable, in declaration order.
+    ///
+    /// An iterator rather than a `Vec<Candidate>`: the chain in
+    /// [`crate::routes::resolve`] already owns one buffer per request, and a
+    /// second vector would be a second allocation the bench does not need. It is
+    /// also never turned into candidates at all — a pool entry is not scored, so
+    /// materialising a `Candidate` for one would be a struct built to be read
+    /// once and thrown away.
+    ///
+    /// Providers this build cannot dispatch to are dropped for the same reason
+    /// [`Self::candidates`] drops them: spending an attempt slot on a provider
+    /// the executor refuses before the socket is a transport failure that never
+    /// was one.
+    pub fn pool<'c>(&'c self, combo: &'c RouteCombo) -> impl Iterator<Item = &'c ComboTarget> {
+        combo.pool.iter().filter(move |t| self.dispatchable(t))
     }
 
     /// Model list derived from every combo target, plus every dispatchable
@@ -520,7 +610,8 @@ pub enum DefaultChain<'a> {
 /// Why a `config.yaml` combo could not become a routable chain.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum ComboError {
-    /// A target named a provider the compiled-in registry does not carry.
+    /// A target named a provider neither the compiled-in catalog nor the
+    /// config's `custom_providers:` carries.
     #[error("combo target {target:?} names provider {provider:?}, which is not in the registry")]
     UnknownProvider {
         /// The target string as written.
@@ -534,6 +625,165 @@ pub enum ComboError {
         /// The combo id.
         id: String,
     },
+
+    /// A provider's credential is in neither the credential store nor `keys:`.
+    ///
+    /// A miss, not an empty string. `ProviderConfig::api_key` documents empty as
+    /// "keyless provider", and a provider that *has* an entry resolving to
+    /// nothing is that — but a name with no entry at all is a hole in the
+    /// config, and it used to become an unauthenticated upstream call.
+    #[error("provider {provider:?} references key {key:?}, which is in neither the credential store nor `keys:`")]
+    UnresolvedKey {
+        /// The provider that holds the dangling reference.
+        provider: String,
+        /// The key name it referenced.
+        key: String,
+    },
+
+    /// The store holds the key and would not hand it over: wrong
+    /// `AR_MASTER_KEY`, a row written under another provider, or an unreadable
+    /// database.
+    ///
+    /// Never falls through to `$VAR`. A silently downgraded credential is how a
+    /// proxy ends up dispatching the wrong key and reporting it as a provider
+    /// 401, so a store that cannot be read is an error the operator sees.
+    #[error("provider {provider:?} cannot read key {key:?} from the credential store: {reason}")]
+    UnreadableKey {
+        /// The provider whose credential could not be read.
+        provider: String,
+        /// The key name it referenced.
+        key: String,
+        /// `ar-keys`' own reason, which is redacted by construction.
+        reason: String,
+    },
+
+    /// A `custom_providers:` node could not be merged into the catalog.
+    #[error(transparent)]
+    CustomProvider(#[from] ar_registry::MergeError),
+}
+
+/// Resolves one `provider/model` string into a routable target, registering its
+/// dispatch row on first sight of the provider id.
+///
+/// The single grammar for a `targets:` entry and a `pool:` entry. Shared on
+/// purpose: a bench that resolved on different terms would be the one place in
+/// the config where `doctor` says ok and dispatch cannot happen, which is the
+/// failure `doctor` exists to prevent.
+///
+/// `providers` gains at most one row per provider id — two combos naming
+/// `openai`, or a combo naming it as both target and pool, must not produce two
+/// dispatch rows, or the executor's `by_id` lookup keeps whichever came last.
+///
+/// `rank` positions the entry in the combo's route-then-bench order and `weight`
+/// is the combo's `Strategy::Weighted` share, which is per-combo and therefore
+/// identical for every entry in it.
+///
+/// # Errors
+///
+/// [`ComboError::UnknownProvider`] when the provider half is in neither the
+/// compiled-in catalog nor the config's `custom_providers:`, and the credential
+/// errors from [`resolve_key`].
+fn resolve_target(
+    target: &str,
+    rank: u32,
+    weight: u32,
+    catalog: &ar_registry::Registry,
+    cfg: &Config,
+    store: Option<&CredentialStore>,
+    providers: &mut Vec<ProviderConfig>,
+) -> Result<ComboTarget, ComboError> {
+    let (provider, model) = split_target_known(target, |id| catalog.get(id).is_some());
+    let def = catalog
+        .get(provider)
+        .ok_or_else(|| ComboError::UnknownProvider {
+            target: target.to_owned(),
+            provider: provider.to_owned(),
+        })?;
+
+    if !providers.iter().any(|p| p.id.as_str() == provider) {
+        let key_name = cfg.key_name(provider).unwrap_or(provider);
+        let key = resolve_key(cfg, provider, key_name, store)?;
+        let mut entry = ProviderConfig::new(ProviderId::new(provider), &def.base_url, key)
+            .with_wire_format(def.wire_format)
+            .with_headers(def.headers.clone())
+            // The catalog's `authType`, carried so `is_dispatchable` can tell a
+            // provider that *needs* an OAuth executor from one that merely has a
+            // session configured. Without it, `oauth: None` would mean both
+            // "keyless" and "labelled oauth, and this build cannot do it".
+            .with_needs_oauth_executor(def.auth_kind.as_ref() == "oauth");
+        if let Some(auth) = resolve_oauth(cfg, provider, key_name, store)? {
+            entry = entry.with_oauth(auth);
+        }
+        // The flat table's model is a display default only; a combo target always
+        // carries its own spelling.
+        entry.upstream_model = model.to_owned();
+        entry.rank = rank;
+        providers.push(entry);
+    }
+
+    Ok(ComboTarget::new(ProviderId::new(provider), model).with_weight(weight))
+}
+
+/// Resolves a provider's OAuth session, when the config declares one.
+///
+/// The single place token material is read out of the credential store for OAuth
+/// (F-CRIT-2's store, F-CRIT-1's executor). It reuses [`resolve_key`], so the
+/// resolution *order* is literally the same function the API-key path uses — a
+/// second order here would be a second security property, and this one governs a
+/// rotating bearer.
+///
+/// `access_name` is the provider's own `keys:` entry: the access token needs no
+/// second name. The refresh token is the second row, named by the session block.
+///
+/// # Errors
+///
+/// As [`resolve_key`]: a declared `refresh_key` that resolves in neither the store
+/// nor `keys:` is a config hole, and a store that holds it and will not decrypt it
+/// is an error the operator must see rather than a session that quietly cannot
+/// renew.
+///
+/// `Ok(None)` when the config declares no session, or names a provider this build
+/// has no executor for. The latter is deliberately *not* an error: red-team R1's
+/// `kilocode` must keep failing loudly at `ar doctor` while still letting the
+/// rest of a config serve, and `ProviderConfig::is_dispatchable` is what keeps it
+/// out of the candidate list.
+fn resolve_oauth(
+    cfg: &Config,
+    provider: &str,
+    access_name: &str,
+    store: Option<&CredentialStore>,
+) -> Result<Option<OAuthAuth>, ComboError> {
+    let Some(declared) = cfg.oauth_for(provider) else {
+        return Ok(None);
+    };
+    let Some(kind) = OAuthKind::parse(provider) else {
+        tracing::warn!(
+            provider,
+            "oauth session declared but this build has no executor for the provider; it will not route"
+        );
+        return Ok(None);
+    };
+
+    let access = resolve_key(cfg, provider, access_name, store)?;
+    let refresh = match declared.refresh_key.as_deref() {
+        Some(name) => resolve_key(cfg, provider, name, store)?,
+        // No row named: the session is useable but not renewable, which is a
+        // state the executor models and the doctor reports — not a load error.
+        None => String::new(),
+    };
+
+    let mut session = Session::new(provider, kind);
+    if let Some(url) = &declared.token_url {
+        session = session.with_token_url(url);
+    }
+    if let Some(client_id) = &declared.client_id {
+        session = session.with_client_id(client_id);
+    }
+    if let Some(scope) = &declared.scope {
+        session = session.with_scope(scope);
+    }
+
+    Ok(Some(OAuthAuth::new(session, access, refresh, declared.expires_at)))
 }
 
 /// Splits a `provider/model` target at the longest provider-looking prefix.
@@ -580,8 +830,47 @@ fn env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
 }
 
+/// Resolves one provider's credential: credential store, then `$VAR`, then an
+/// error.
+///
+/// The store first because a name it holds is the encrypted at-rest value, and
+/// `$VAR` is the fallback that predates the store — the order the audit's F-CRIT-2
+/// fix asks for, and the one `ar doctor` reports per key so the two cannot
+/// disagree.
+///
+/// An **empty** value is not a miss. `ProviderConfig::api_key` reads empty as
+/// "keyless provider" and several registry entries are that, so `keys: {ollama:
+/// ""}` is how an operator writes one and it must keep dispatching. A *missing*
+/// name is the error: nothing declares it, and dispatching on an undeclared
+/// credential is the unauthenticated upstream call this replaces.
+fn resolve_key(
+    cfg: &Config,
+    provider: &str,
+    name: &str,
+    store: Option<&CredentialStore>,
+) -> Result<String, ComboError> {
+    if let Some(store) = store
+        && let Some(text) = store
+            .get_text(name)
+            .map_err(|e| ComboError::UnreadableKey {
+                provider: provider.to_owned(),
+                key: name.to_owned(),
+                reason: e.to_string(),
+            })?
+    {
+        return Ok(text);
+    }
+    cfg.key(name).map_or_else(
+        || {
+            Err(ComboError::UnresolvedKey { provider: provider.to_owned(), key: name.to_owned() })
+        },
+        |secret| Ok(secret.expose().to_owned()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    use ar_keys::{CredentialStore, Secret as StoreSecret};
     use ar_route::{QuotaWindow, Strategy};
 
     use super::{ComboError, ComboTarget, DefaultChain, RouteCombo, ServerConfig, split_target};
@@ -688,21 +977,21 @@ combos:
     #[test]
     fn builds_one_combo_per_configured_combo() {
         let cfg = parse(TWO_COMBO_YAML).expect("config parses");
-        let server = ServerConfig::from_ar_config(&cfg, None, None, false).expect("combos build");
+        let server = ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
         assert_eq!(server.combo_ids(), ["default", "cheap"]);
     }
 
     #[test]
     fn reads_the_port_from_the_file_config() {
         let cfg = parse(TWO_COMBO_YAML).expect("config parses");
-        let server = ServerConfig::from_ar_config(&cfg, None, None, false).expect("combos build");
+        let server = ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
         assert_eq!(server.port, 20128);
     }
 
     #[test]
     fn honours_a_port_override() {
         let cfg = parse(TWO_COMBO_YAML).expect("config parses");
-        let server = ServerConfig::from_ar_config(&cfg, Some(9999), None, false).expect("combos build");
+        let server = ServerConfig::from_ar_config(&cfg, Some(9999), None, false, None).expect("combos build");
         assert_eq!(server.port, 9999);
     }
 
@@ -713,14 +1002,14 @@ combos:
         // defaults to closed whatever the YAML says — which is the direction
         // that fails safe.
         let cfg = parse(TWO_COMBO_YAML).expect("config parses");
-        let server = ServerConfig::from_ar_config(&cfg, None, None, false).expect("combos build");
+        let server = ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
         assert!(!server.public);
     }
 
     #[test]
     fn carries_an_explicit_public_flag() {
         let cfg = parse(TWO_COMBO_YAML).expect("config parses");
-        let server = ServerConfig::from_ar_config(&cfg, None, None, true).expect("combos build");
+        let server = ServerConfig::from_ar_config(&cfg, None, None, true, None).expect("combos build");
         assert!(server.public);
     }
 
@@ -733,7 +1022,7 @@ combos:
         // `drops_an_undispatchable_target_from_the_candidate_list` and
         // `builds_a_multi_provider_chain_from_two_dispatchable_targets`.
         let cfg = parse(TWO_COMBO_YAML).expect("config parses");
-        let server = ServerConfig::from_ar_config(&cfg, None, None, false).expect("combos build");
+        let server = ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
         let combo = server.combo("default").expect("default combo exists");
         assert_eq!(combo.targets.len(), 2, "both targets are declared in the file");
     }
@@ -765,7 +1054,7 @@ combos:
     #[test]
     fn resolves_each_combo_to_its_own_targets() {
         let cfg = parse(TWO_COMBO_YAML).expect("config parses");
-        let server = ServerConfig::from_ar_config(&cfg, None, None, false).expect("combos build");
+        let server = ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
         let cheap = server.combo("cheap").expect("cheap combo exists");
         assert_eq!(server.candidates(Some(cheap)).len(), 1);
     }
@@ -773,14 +1062,14 @@ combos:
     #[test]
     fn carries_the_per_combo_strategy() {
         let cfg = parse(TWO_COMBO_YAML).expect("config parses");
-        let server = ServerConfig::from_ar_config(&cfg, None, None, false).expect("combos build");
+        let server = ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
         assert_eq!(server.combo("cheap").map(|c| c.strategy), Some(Strategy::CostOptimized));
     }
 
     #[test]
     fn takes_the_first_combo_as_the_default_chain() {
         let cfg = parse(TWO_COMBO_YAML).expect("config parses");
-        let server = ServerConfig::from_ar_config(&cfg, None, None, false).expect("combos build");
+        let server = ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
         assert!(matches!(
             server.default_combo(),
             DefaultChain::Combo(c) if c.id == "default"
@@ -792,7 +1081,7 @@ combos:
         // `openai` appears in both combos; two dispatch rows would make the
         // executor's `by_id` keep whichever came last.
         let cfg = parse(TWO_COMBO_YAML).expect("config parses");
-        let server = ServerConfig::from_ar_config(&cfg, None, None, false).expect("combos build");
+        let server = ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
         let openai = server
             .providers
             .iter()
@@ -806,7 +1095,7 @@ combos:
         let yaml = "keys:\n  a: k\nproviders:\n  - id: a\n    key: a\ncombos:\n  - id: c\n    strategy: priority\n    targets:\n      - nope/gpt-4o\n";
         let cfg = parse(yaml).expect("config parses");
         assert!(matches!(
-            ServerConfig::from_ar_config(&cfg, None, None, false),
+            ServerConfig::from_ar_config(&cfg, None, None, false, None),
             Err(ComboError::UnknownProvider { .. })
         ));
     }
@@ -819,7 +1108,7 @@ combos:
         let yaml = "keys:\n  nvidia: k\nproviders:\n  - id: nvidia\n    key: nvidia\ncombos:\n  - id: free-stack\n    strategy: least-used\n    targets:\n      - nvidia/moonshotai/kimi-k3\n      - nvidia/z-ai/glm-5.3\n";
         let cfg = parse(yaml).expect("config parses");
         let server =
-            ServerConfig::from_ar_config(&cfg, None, None, false).expect("combos build");
+            ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
         let combo = server.combo("free-stack").expect("combo exists");
         let got: Vec<(String, String)> = server
             .candidates(Some(combo))
@@ -843,7 +1132,7 @@ combos:
         let yaml = "keys:\n  aihorde: k\nproviders:\n  - id: aihorde\n    key: aihorde\ncombos:\n  - id: c\n    strategy: priority\n    targets:\n      - aihorde/aphrodite/TheDrummer/Cydonia-24B-v4.3\n";
         let cfg = parse(yaml).expect("config parses");
         let server =
-            ServerConfig::from_ar_config(&cfg, None, None, false).expect("combos build");
+            ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
         let combo = server.combo("c").expect("combo exists");
         let got: Vec<(String, String)> = server
             .candidates(Some(combo))
@@ -861,7 +1150,7 @@ combos:
         let yaml = "keys:\n  a: k\nproviders:\n  - id: a\n    key: a\ncombos:\n  - id: c\n    strategy: priority\n    targets: []\n";
         let cfg = parse(yaml).expect("config parses");
         assert!(matches!(
-            ServerConfig::from_ar_config(&cfg, None, None, false),
+            ServerConfig::from_ar_config(&cfg, None, None, false, None),
             Err(ComboError::EmptyCombo { .. })
         ));
     }
@@ -871,7 +1160,7 @@ combos:
         // `anthropic` is in the registry with a non-OpenAI wire, so this build
         // cannot POST to it. It must not occupy one of three attempt slots.
         let cfg = parse(TWO_COMBO_YAML).expect("config parses");
-        let server = ServerConfig::from_ar_config(&cfg, None, None, false).expect("combos build");
+        let server = ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
         let combo = server.combo("default").expect("default combo exists");
         let ids: Vec<String> = server
             .candidates(Some(combo))
@@ -884,7 +1173,7 @@ combos:
     #[test]
     fn lists_combo_ids_as_the_routable_models() {
         let cfg = parse(TWO_COMBO_YAML).expect("config parses");
-        let server = ServerConfig::from_ar_config(&cfg, None, None, false).expect("combos build");
+        let server = ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
         let ids: Vec<String> = server.model_cards().into_iter().map(|c| c.id).collect();
         assert_eq!(ids, ["default", "cheap"]);
     }
@@ -959,5 +1248,159 @@ combos:
     fn env_path_defaults_to_loopback_only() {
         let c = ServerConfig::from_env();
         assert!(!c.public, "an env-configured server must not be public");
+    }
+
+    fn store_with(entries: &[(&str, &str, &str)]) -> CredentialStore {
+        let store = CredentialStore::open_in_memory(&StoreSecret::generate()).expect("store opens");
+        for (provider, name, value) in entries {
+            store.insert(provider, name, &StoreSecret::new(value.as_bytes().to_vec())).expect("insert");
+        }
+        store
+    }
+
+    /// The key `TWO_COMBO_YAML`'s `openai` provider resolves to.
+    fn openai_key(server: &ServerConfig) -> &str {
+        server.providers.iter().find(|p| p.id.as_str() == "openai").expect("openai row").api_key.as_str()
+    }
+
+    #[test]
+    fn prefers_the_store_when_a_name_is_in_both_places() {
+        // The order F-CRIT-2 asks for. A store that lost to `$VAR` would make the
+        // encrypted copy decorative.
+        let cfg = parse(TWO_COMBO_YAML).expect("config parses");
+        let store = store_with(&[("openai", "openai", "sk-from-store")]);
+        let server =
+            ServerConfig::from_ar_config(&cfg, None, None, false, Some(&store)).expect("combos build");
+        assert_eq!(openai_key(&server), "sk-from-store");
+    }
+
+    #[test]
+    fn falls_back_to_the_var_when_the_store_has_no_row() {
+        let cfg = parse(TWO_COMBO_YAML).expect("config parses");
+        let store = store_with(&[("groq", "groq", "sk-unrelated")]);
+        let server =
+            ServerConfig::from_ar_config(&cfg, None, None, false, Some(&store)).expect("combos build");
+        // `TWO_COMBO_YAML` declares literals, so the fallback value is the
+        // literal, not an expanded `$VAR`.
+        assert_eq!(openai_key(&server), "k-openai");
+    }
+
+    #[test]
+    fn keeps_a_keyless_provider_dispatchable_when_the_key_is_declared_empty() {
+        // Empty is the documented way to write a keyless provider, so an empty
+        // entry must still reach the executor rather than become a resolve error.
+        let yaml = "keys:\n  openai: \"\"\nproviders:\n  - id: openai\n    key: openai\ncombos:\n  - id: c\n    strategy: priority\n    targets:\n      - openai/gpt-5.4\n";
+        let cfg = parse(yaml).expect("config parses");
+        let server = ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
+        assert!(openai_key(&server).is_empty());
+    }
+
+    #[test]
+    fn refuses_a_provider_when_its_credential_resolves_nowhere() {
+        // A combo target naming a provider the file never declared. It used to
+        // become an unauthenticated upstream call.
+        let yaml = "keys:\n  openai: k\nproviders:\n  - id: openai\n    key: openai\ncombos:\n  - id: c\n    strategy: priority\n    targets:\n      - openai/gpt-5.4\n      - groq/llama-3.3-70b\n";
+        let cfg = parse(yaml).expect("config parses");
+        assert!(matches!(
+            ServerConfig::from_ar_config(&cfg, None, None, false, None),
+            Err(ComboError::UnresolvedKey { .. })
+        ));
+    }
+
+    #[test]
+    fn refuses_to_fall_back_to_the_var_when_the_store_cannot_decrypt() {
+        // A store that is present, holds the name, and will not hand it over.
+        // Falling through to `$VAR` here would dispatch a *different* credential
+        // and report the mismatch as a provider 401.
+        let path = std::env::temp_dir().join(format!("ar-server-unreadable-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let writer =
+                CredentialStore::open_with_material(&path, &StoreSecret::generate()).expect("open");
+            writer.insert("openai", "openai", &StoreSecret::new(b"sk-stored".to_vec())).expect("insert");
+        }
+        // Same file, another install's master: the row is there and unreadable.
+        let store = CredentialStore::open_with_material(&path, &StoreSecret::generate()).expect("reopen");
+        let cfg = parse(TWO_COMBO_YAML).expect("config parses");
+        assert!(matches!(
+            ServerConfig::from_ar_config(&cfg, None, None, false, Some(&store)),
+            Err(ComboError::UnreadableKey { .. })
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A file-declared node, routed on the same terms as a compiled-in one.
+    const CUSTOM_YAML: &str = r#"
+keys:
+  local: k-local
+
+custom_providers:
+  - id: local-gateway
+    protocol: openai-compatible
+    base_url: https://api.example.invalid/v1
+    key_ref: local
+    headers:
+      x-api-key: hdr
+
+combos:
+  - id: default
+    strategy: priority
+    targets:
+      - local-gateway/some-model
+"#;
+
+    #[test]
+    fn routes_a_custom_provider_target_when_the_file_declares_it() {
+        // The no-rebuild path end to end: an id that is in no compiled-in
+        // catalog resolves, dispatches to, and is a candidate.
+        let cfg = parse(CUSTOM_YAML).expect("config parses");
+        let server =
+            ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("the node merges");
+        assert_eq!(server.combo("default").expect("the combo").targets[0].provider.as_str(), "local-gateway");
+    }
+
+    #[test]
+    fn carries_a_custom_providers_base_url_when_it_dispatches() {
+        let cfg = parse(CUSTOM_YAML).expect("config parses");
+        let server =
+            ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("the node merges");
+        assert_eq!(server.providers[0].base_url, "https://api.example.invalid/v1");
+    }
+
+    #[test]
+    fn carries_a_custom_providers_headers_when_it_dispatches() {
+        let cfg = parse(CUSTOM_YAML).expect("config parses");
+        let server =
+            ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("the node merges");
+        assert_eq!(server.providers[0].headers.get("x-api-key").map(String::as_str), Some("hdr"));
+    }
+
+    #[test]
+    fn resolves_a_custom_providers_credential_through_its_key_ref() {
+        let cfg = parse(CUSTOM_YAML).expect("config parses");
+        let server =
+            ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("the node merges");
+        assert_eq!(server.providers[0].api_key, "k-local");
+    }
+
+    #[test]
+    fn refuses_a_custom_provider_when_its_id_collides_with_the_catalog() {
+        let yaml = CUSTOM_YAML.replace("id: local-gateway", "id: openai");
+        let cfg = parse(&yaml).expect("config parses");
+        assert!(matches!(
+            ServerConfig::from_ar_config(&cfg, None, None, false, None),
+            Err(ComboError::CustomProvider(ar_registry::MergeError::Collides { .. }))
+        ));
+    }
+
+    #[test]
+    fn drops_a_custom_provider_from_candidates_when_it_is_not_openai_compatible() {
+        // `ar-exec` refuses an Anthropic body on the wire, so listing it as a
+        // candidate would burn an attempt slot on a request guaranteed to fail.
+        let yaml = CUSTOM_YAML.replace("openai-compatible", "anthropic-compatible");
+        let cfg = parse(&yaml).expect("config parses");
+        let server =
+            ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("the node merges");
+        assert!(server.candidates(None).is_empty());
     }
 }

@@ -4,10 +4,11 @@
 //! decode -- with no network and no real provider. `axum` is a dev-dependency
 //! only; nothing here reaches the binary's dependency tree.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use ar_config::Secret;
-use ar_exec::{ArExec, ChatStream, ExecError, SseEvent};
+use ar_exec::{ArExec, ChatStream, Dispatch, ExecError, SseEvent};
 use ar_registry::{AuthClass, ProviderDef, WireFormat};
 use ar_translate::{CanonicalChat, Msg, Role};
 use axum::Router;
@@ -88,6 +89,7 @@ fn provider(base_url: &str) -> ProviderDef {
         executor: ar_core::Strng::from("default"),
         auth_kind: ar_core::Strng::from("api_key"),
         flat_rate: false,
+        headers: Default::default(),
     }
 }
 
@@ -240,6 +242,35 @@ async fn joins_url_when_base_ends_in_slashes() {
         )
         .await
         .expect("trailing slashes are trimmed before joining");
+    server.abort();
+
+    assert_eq!(stream.status(), StatusCode::OK);
+}
+
+/// A 401-then-200 pair over one connection: the OAuth rotation path.
+///
+/// Lives here rather than in `oauth.rs`'s unit tests because it needs the same
+/// `spawn_upstream` every other integration test uses, and duplicating that
+/// harness to reach it would be a second copy to drift.
+#[tokio::test]
+async fn carries_the_callers_bearer_on_an_oauth_dispatch() {
+    // A static script, unlike the branching mock `oauth.rs` needs: this asserts
+    // the *header* reached the socket, not the retry count.
+    let (base_url, server) = spawn_upstream(Mock::sse()).await;
+    let exec = ArExec::new().expect("client builds");
+    let shape = Dispatch {
+        base_url: &base_url,
+        wire_format: WireFormat::Openai,
+        api_key: "synthetic-oauth-access",
+        upstream_model: "test-model",
+        stream: true,
+        headers: &BTreeMap::new(),
+    };
+
+    let stream = exec
+        .post(&shape, br#"{"model":"test-model"}"#, &CancellationToken::new())
+        .await
+        .expect("mock upstream answers 200");
     server.abort();
 
     assert_eq!(stream.status(), StatusCode::OK);

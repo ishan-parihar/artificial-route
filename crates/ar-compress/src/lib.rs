@@ -15,7 +15,7 @@
 //! together, and it is the only place an [`Engine`] meets an implementation.
 //!
 //! ```
-//! use ar_compress::{Engine, Layers, Plan, Source, clamp_to_budget, eval, plan_resolution, registered};
+//! use ar_compress::{Engine, Layers, Plan, Source, Step, clamp_to_budget, eval, plan_resolution, registered};
 //!
 //! // 1. The transforms, borrowed when they decline.
 //! assert_eq!(ar_compress::lite("let x = 1;"), "let x = 1;");
@@ -25,7 +25,7 @@
 //!     &[],
 //!     &Layers {
 //!         header: Some("engine:caveman"),
-//!         combo: Some(&[Engine::Lite]),
+//!         combo: Some(&[Step::new(Engine::Lite)]),
 //!         ..Layers::default()
 //!     },
 //! );
@@ -87,14 +87,15 @@ pub mod rtk;
 pub mod stats;
 
 pub use budget::{Clamp, clamp_to_budget, is_anchor};
-pub use caveman::{caveman, caveman_with_stats};
+pub use caveman::{caveman, caveman_at, caveman_at_with_stats, caveman_with_stats};
 pub use error::CompressError;
 pub use eval::{
     CaseReport, ContentKind, EvalCase, Savings, fidelity, load_corpus, report_table, run, savings,
 };
 pub use lite::{lite, lite_with_stats};
 pub use plan::{
-    Combo, Engine, Engines, Layers, Plan, Source, Transform, apply_plan, plan_resolution, registered,
+    Combo, Engine, Engines, Intensity, Layers, Plan, Source, Step, Transform, apply_plan,
+    plan_resolution, registered,
 };
-pub use rtk::{rtk, rtk_with_stats};
+pub use rtk::{rtk, rtk_at, rtk_with_stats};
 pub use stats::{CHARS_PER_TOKEN, Stats};

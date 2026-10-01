@@ -211,6 +211,9 @@ fn assemble(rows: Vec<Row>) -> anyhow::Result<Imported> {
             executor: Strng::from(known.map_or("default", |d| d.executor.as_ref())),
             auth_kind: Strng::from(known.map_or("apikey", |d| d.auth_kind.as_ref())),
             flat_rate: known.is_some_and(|d| d.flat_rate),
+            // A LiteLLM row has no header block; the compiled-in entry's is the
+            // only one there is.
+            headers: known.map(|d| d.headers.clone()).unwrap_or_default(),
         });
         def.models.push(Strng::from(row.model.as_str()));
         targets.entry(row.alias.clone()).or_default().insert(format!("{}/{}", row.provider, row.model));
@@ -225,7 +228,16 @@ fn assemble(rows: Vec<Row>) -> anyhow::Result<Imported> {
 
     let combos = targets
         .into_iter()
-        .map(|(alias, set)| Ok(Combo { id: check_alias(&alias)?, strategy: Strategy::Priority, targets: set.into_iter().collect() }))
+        .map(|(alias, set)| Ok(Combo {
+            id: check_alias(&alias)?,
+            strategy: Strategy::Priority,
+            targets: set.into_iter().collect(),
+            // The LiteLLM export has no candidate-pool concept, so an import never
+            // invents one: a bench that is not in the source is not in the file,
+            // and an operator adds `pool:` by hand.
+            pool: Vec::new(),
+            compression: None,
+        }))
         .collect::<anyhow::Result<Vec<_>>>()?;
     let config_yaml = render_yaml(&registry, &combos);
     Ok(Imported { registry, combos, config_yaml })

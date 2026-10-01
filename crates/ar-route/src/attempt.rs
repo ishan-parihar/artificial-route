@@ -42,6 +42,12 @@ pub enum AttemptOutcome {
         after: Duration,
         /// Provider that produced the last rate-limit verdict.
         provider: ProviderId,
+        /// How many providers were tried.
+        ///
+        /// Carried because a throttled chain *did* spend attempts: reporting zero
+        /// here made `ar_upstream_attempts_total` add nothing for exactly the
+        /// requests that made the most upstream calls (audit F-MED-3).
+        tried: u16,
     },
     /// The chain ran out after a non-rate-limit failure (5xx, transport, or an
     /// auth refusal on every key). A different chain might still succeed, so
@@ -86,13 +92,17 @@ impl AttemptOutcome {
         }
     }
 
-    /// Attempts spent, for `x-ar-usage`.
+    /// Attempts spent, for `x-ar-usage` and `ar_upstream_attempts_total`.
+    ///
+    /// Every terminal arm reports what the loop actually dispatched, the
+    /// throttled one included.
     #[must_use]
     pub fn attempts(&self) -> u16 {
         match self {
             Self::Succeeded { attempts, .. } => *attempts,
-            Self::Failover { tried, .. } | Self::Abort(AbortReport { tried, .. }) => *tried,
-            Self::Retry { .. } => 0,
+            Self::Failover { tried, .. }
+            | Self::Retry { tried, .. }
+            | Self::Abort(AbortReport { tried, .. }) => *tried,
         }
     }
 }
@@ -307,7 +317,7 @@ fn terminate(
             .or(Some(cooldown))
             .unwrap_or(Duration::from_secs(1))
             .max(Duration::from_millis(1));
-        return AttemptOutcome::Retry { after, provider: throttled };
+        return AttemptOutcome::Retry { after, provider: throttled, tried };
     }
     AttemptOutcome::Failover { status, provider, tried }
 }
@@ -459,13 +469,13 @@ mod tests {
         ]);
         let r = Resilience::new();
         let got = block(attempt_loop(&req(), &chain(&["p1", "p2"]), &exec, &r));
-        let Ok(AttemptOutcome::Retry { after, provider }) = got else {
+        let Ok(AttemptOutcome::Retry { after, provider, tried }) = got else {
             panic!("expected retry, got {got:?}");
         };
         // Backoff is per key and p2 has no prior failure, so p1 cools for
         // max(base=3s, 9s)=9s and p2 for max(3s, 4s)=4s. The client is told
-        // the soonest, not the latest.
-        assert_eq!((after, provider.as_str()), (Duration::from_secs(4), "p2"));
+        // the soonest, not the latest — and both were tried, so `tried` is 2.
+        assert_eq!((after, provider.as_str(), tried), (Duration::from_secs(4), "p2", 2));
     }
 
     #[test]
@@ -478,11 +488,11 @@ mod tests {
         ]);
         let r = Resilience::new();
         let got = block(attempt_loop(&req(), &chain(&["p1", "p2"]), &exec, &r));
-        let Ok(AttemptOutcome::Retry { after, provider }) = got else {
+        let Ok(AttemptOutcome::Retry { after, provider, tried }) = got else {
             panic!("expected retry, got {got:?}");
         };
         // p1 said 30s; p2 only got our own 3s guess, which must not shorten it.
-        assert_eq!((after, provider.as_str()), (Duration::from_secs(30), "p1"));
+        assert_eq!((after, provider.as_str(), tried), (Duration::from_secs(30), "p1", 2));
     }
 
     #[test]

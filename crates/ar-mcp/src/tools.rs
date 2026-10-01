@@ -324,7 +324,6 @@ pub struct ModelRow {
 }
 
 /// `ar_list_combos`. Distinct providers in the candidate set, first-seen order.
-#[cfg_attr(not(test), expect(dead_code, reason = "no transport yet (TODO(P1-mcp-stdio)); tests are the only callers"))]
 pub(crate) fn list_combos(name: &str, strategy: &Strategy, candidates: &[Candidate]) -> Combo {
     let mut providers: Vec<String> = Vec::new();
     for c in candidates {
@@ -338,7 +337,6 @@ pub(crate) fn list_combos(name: &str, strategy: &Strategy, candidates: &[Candida
 
 /// `ar_switch_combo`. Idempotent: re-activating the live combo is a no-op
 /// reporting `changed: false`, never an error.
-#[cfg_attr(not(test), expect(dead_code, reason = "no transport yet (TODO(P1-mcp-stdio)); tests are the only callers"))]
 pub(crate) fn switch_combo(state: &mut ComboState, name: &str, active: bool) -> Switch {
     let want = active.then(|| name.to_string());
     let changed = state.active != want;
@@ -349,14 +347,12 @@ pub(crate) fn switch_combo(state: &mut ComboState, name: &str, active: bool) -> 
 }
 
 /// `ar_check_quota`. Reads the ledger; it decides nothing.
-#[cfg_attr(not(test), expect(dead_code, reason = "no transport yet (TODO(P1-mcp-stdio)); tests are the only callers"))]
 pub(crate) fn check_quota(ledger: &Ledger, key_id: &str) -> Result<Quota, TokenError> {
     Ok(Quota { spend: ledger.spend(key_id)?, cap: ledger.cap(key_id)? })
 }
 
 /// `ar_route_request`. Pure delegation to the router. `execute:*`-gated by
 /// design — see the module docs.
-#[cfg_attr(not(test), expect(dead_code, reason = "no transport yet (TODO(P1-mcp-stdio)); tests are the only callers"))]
 pub(crate) fn route_request(
     strategy: Strategy,
     session: Option<&str>,
@@ -368,14 +364,12 @@ pub(crate) fn route_request(
 }
 
 /// `ar_cost_report`. Pure delegation to the usage ledger.
-#[cfg_attr(not(test), expect(dead_code, reason = "no transport yet (TODO(P1-mcp-stdio)); tests are the only callers"))]
 pub(crate) fn cost_report(ledger: &Ledger, limit: usize) -> Result<CostReport, TokenError> {
     ledger.report(limit)
 }
 
 /// `ar_list_models`. The routable catalog is the candidate set; there is no
 /// second catalog to consult.
-#[cfg_attr(not(test), expect(dead_code, reason = "no transport yet (TODO(P1-mcp-stdio)); tests are the only callers"))]
 pub(crate) fn list_models(candidates: &[Candidate]) -> Vec<ModelRow> {
     candidates
         .iter()
@@ -388,7 +382,6 @@ pub(crate) fn list_models(candidates: &[Candidate]) -> Vec<ModelRow> {
 
 /// `ar_explain_route`. Pure delegation, with the neutral task-fitness value the
 /// `ar-route` docs prescribe.
-#[cfg_attr(not(test), expect(dead_code, reason = "no transport yet (TODO(P1-mcp-stdio)); tests are the only callers"))]
 pub(crate) fn explain(
     combo: &AutoCombo,
     pool: &[AutoCandidate],

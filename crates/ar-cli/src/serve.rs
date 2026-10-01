@@ -27,7 +27,12 @@ use crate::toon;
 /// client's `model` against the combo ids. Failures name the exact thing that is
 /// wrong — a target whose provider is not in the registry fails here rather than
 /// as a 502 three layers down.
-fn components(cfg: &Config, port: Option<u16>, want: Option<&str>) -> anyhow::Result<Components> {
+fn components(
+    cli: &Cli,
+    cfg: &Config,
+    port: Option<u16>,
+    want: Option<&str>,
+) -> anyhow::Result<Components> {
     if let Some(id) = want
         && !cfg.combos.iter().any(|c| c.id == id)
     {
@@ -46,13 +51,19 @@ fn components(cfg: &Config, port: Option<u16>, want: Option<&str>) -> anyhow::Re
     // Loopback only: P0 has no credential gate, so a routable bind would publish
     // an unauthenticated LLM proxy. `ar-server::bind_addr` enforces the same
     // rule for the socket this hands to.
-    let config = ar_server::ServerConfig::from_ar_config(cfg, port, Some(PricingTable::global()), false)
-        .map_err(|e| {
-            commands::fail(
-                e,
-                "run `ar doctor`; a target whose provider is not in the compiled-in registry cannot be dispatched to",
-            )
-        })?;
+    let config = ar_server::ServerConfig::from_ar_config(
+        cfg,
+        port,
+        Some(PricingTable::global()),
+        false,
+        commands::credential_store(cli).as_ref(),
+    )
+    .map_err(|e| {
+        commands::fail(
+            e,
+            "run `ar doctor`; a target whose provider is not in the compiled-in registry cannot be dispatched to",
+        )
+    })?;
 
     // `HttpExec::new` takes the list by value and `ServerConfig` needs its own
     // copy; one clone of a handful of four-field structs at boot is cheaper than
@@ -67,7 +78,7 @@ fn components(cfg: &Config, port: Option<u16>, want: Option<&str>) -> anyhow::Re
 /// Boots the listener and blocks until interrupted.
 pub async fn serve(cli: &Cli, args: &ServeArgs) -> anyhow::Result<()> {
     let cfg = commands::load(cli)?;
-    let server = ar_server::server(components(&cfg, args.port, None)?);
+    let server = ar_server::server(components(cli, &cfg, args.port, None)?);
     let count = server.state.config.providers.len();
     let port = server.state.config.port;
     let addr = ar_server::app::bind_addr(&cfg.server.host, port, false).map_err(|e| {
@@ -148,7 +159,7 @@ pub async fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<()> {
             .ok_or_else(|| commands::fail("no combo is configured", "pass --model <ID>, or add a combo to the config"))?,
     };
 
-    let server = ar_server::server(components(&cfg, None, Some(&model))?);
+    let server = ar_server::server(components(cli, &cfg, None, Some(&model))?);
     let payload = serde_json::json!({
         "model": model,
         "stream": false,
@@ -204,7 +215,7 @@ mod tests {
     fn candidates_for(yaml: &str, combo: &str) -> Vec<ar_route::Candidate> {
         let cfg = Config::parse(yaml, |_| Ok(Some("v".to_owned()))).expect("the fixture parses");
         let config =
-            ar_server::ServerConfig::from_ar_config(&cfg, None, Some(PricingTable::global()), false)
+            ar_server::ServerConfig::from_ar_config(&cfg, None, Some(PricingTable::global()), false, None)
                 .expect("every target is in the registry");
         let combo = config.combo(combo).expect("the combo exists").clone();
         config.candidates(Some(&combo))

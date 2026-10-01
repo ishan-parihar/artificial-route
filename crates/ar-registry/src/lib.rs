@@ -34,6 +34,64 @@ use serde::{Deserialize, Serialize};
 /// repo file. Pretty-print it on demand with `ar import` + `python3 -m json.tool`.
 const CATALOG_JSON: &str = include_str!("registry.json");
 
+/// When this binary was linked, in seconds since the Unix epoch.
+///
+/// Stamped by `build.rs`. The *snapshot* is at least this old, never younger —
+/// a build cannot predate the file it embeds — so [`age_days`] is a floor on the
+/// drift, not an estimate of it. See [`age_days`] for the warning that uses it.
+pub const BUILT_AT: u64 = match option_env!("AR_REGISTRY_BUILT_AT") {
+    Some(v) => parse_u64(v),
+    // `build.rs` always sets it, so this arm is unreachable in a normal build. It
+    // exists because a `const` cannot fall back at runtime, and a `0` here would
+    // silently make every build look infinitely old.
+    None => 0,
+};
+
+/// Decides [`BUILT_AT`]'s value at compile time; a `const fn` because a `const`
+/// initializer cannot call [`str::parse`].
+const fn parse_u64(v: &str) -> u64 {
+    let bytes = v.as_bytes();
+    let mut n = 0u64;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b < b'0' || b > b'9' {
+            return 0;
+        }
+        n = n * 10 + (b - b'0') as u64;
+        i += 1;
+    }
+    n
+}
+
+/// Whole days between [`BUILT_AT`] and `now`, saturating at 0 for a clock set
+/// before the build.
+///
+/// What `ar doctor` reports as the catalog's age. A fractional age reads as `0`,
+/// so a build from yesterday does not claim to be a day stale.
+#[must_use]
+pub fn age_days(now: u64) -> u64 {
+    now.saturating_sub(BUILT_AT) / 86_400
+}
+
+/// How old the compiled-in catalog may get before `ar doctor` warns.
+///
+/// Seven days: long enough that a weekly rebuild is never nagged, short enough
+/// that a month-old snapshot — the case F-HIGH-3 is about, where a provider has
+/// rotated a model and the proxy 404s a name the user read in an upstream
+/// catalog — is caught. `provisional:` no telemetry exists to fit this to; it is
+/// the rotation cadence a human notices, not a measured constant.
+pub const SNAPSHOT_TTL_DAYS: u64 = 7;
+
+/// Whether the compiled-in catalog is older than [`SNAPSHOT_TTL_DAYS`] at `now`.
+///
+/// `>=` matches [`crate::discovery::LiveCatalog::is_stale`], which treats its ttl
+/// as a boundary rather than a suggestion: a build exactly at the ttl is due.
+#[must_use]
+pub fn is_stale(now: u64) -> bool {
+    age_days(now) >= SNAPSHOT_TTL_DAYS
+}
+
 /// How a provider proves who it is.
 ///
 /// P0 is API-key only. OAuth / browser-session providers (`claude-web`,
@@ -178,6 +236,14 @@ pub struct ProviderDef {
     /// pre-flight estimates; only the charge collapses to zero.
     #[serde(default, skip_serializing_if = "is_false")]
     pub flat_rate: bool,
+    /// Extra outbound headers this provider needs.
+    ///
+    /// Empty for every compiled-in entry; a [`CustomProvider`] is the only
+    /// source of one. Applied between `Content-Type` and the auth layer, so a
+    /// provider config can override the content type but cannot forge the
+    /// credential.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
 }
 
 /// `skip_serializing_if` helper: keeps `flat_rate: false` out of the JSON.
@@ -185,12 +251,109 @@ fn is_false(v: &bool) -> bool {
     !*v
 }
 
+/// The dialect a file-declared provider speaks, in `config.yaml` spelling.
+///
+/// Narrower than [`WireFormat`] on purpose: only the two shapes a gateway in
+/// front of a model actually speaks, because a third spelling would be a name
+/// `ar-exec` refuses anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Protocol {
+    /// OpenAI chat-completions shape — the dialect `ar-exec` dispatches.
+    OpenaiCompatible,
+    /// Anthropic messages shape — refused by `ar-exec`'s wire gate, exactly
+    /// like the compiled-in `anthropic`.
+    AnthropicCompatible,
+}
+
+impl Protocol {
+    /// The registry dialect this protocol means.
+    #[must_use]
+    pub fn wire_format(self) -> WireFormat {
+        match self {
+            Self::OpenaiCompatible => WireFormat::Openai,
+            Self::AnthropicCompatible => WireFormat::Anthropic,
+        }
+    }
+}
+
+/// A provider node declared in `config.yaml` rather than compiled in.
+///
+/// The `provider_nodes` equivalent (AUDIT-REPORT F-CRIT-3): an endpoint outside
+/// the compiled-in catalog becomes routable by writing a few lines of YAML
+/// instead of regenerating `registry.json` and rebuilding the binary.
+///
+/// `key_ref` is a *name* into the config's `keys:` map, never a value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomProvider {
+    /// Provider id, routable as `<id>/<model>`.
+    pub id: String,
+    /// Dialect the endpoint speaks.
+    pub protocol: Protocol,
+    /// Upstream API root. A trailing slash is trimmed at merge.
+    pub base_url: String,
+    /// Name of the entry in `keys:` holding this node's credential.
+    pub key_ref: String,
+    /// Extra outbound headers, for gateways that need more than a bearer token.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+}
+
+impl CustomProvider {
+    /// The catalog entry this node contributes.
+    ///
+    /// `models` and `prices` stay empty: an empty model list is the catalog's
+    /// existing spelling for "not known here" (every passthrough provider), and
+    /// an invented price would corrupt `cost-optimized` and hard budgets.
+    fn node(&self) -> ProviderDef {
+        ProviderDef {
+            base_url: self.base_url.trim_end_matches('/').to_owned(),
+            wire_format: self.protocol.wire_format(),
+            auth: AuthClass::ApiKey,
+            env_hint: String::new(),
+            models: Vec::new(),
+            prices: BTreeMap::new(),
+            executor: Strng::from("default"),
+            auth_kind: Strng::from("apikey"),
+            flat_rate: false,
+            headers: self.headers.clone(),
+        }
+    }
+
+    /// Whether [`CustomProvider::base_url`] has the shape a request can be
+    /// posted to: an `http`/`https` scheme, a non-empty authority, no embedded
+    /// whitespace. All three are visible without a network call, which is what
+    /// makes this a `doctor` check rather than a first-request surprise.
+    #[must_use]
+    pub fn base_url_ok(&self) -> bool {
+        let Some(rest) = self
+            .base_url
+            .strip_prefix("https://")
+            .or_else(|| self.base_url.strip_prefix("http://"))
+        else {
+            return false;
+        };
+        !rest.is_empty() && !rest.starts_with('/') && !self.base_url.chars().any(char::is_whitespace)
+    }
+}
+
+/// Why file-declared nodes could not be merged into the catalog.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MergeError {
+    /// A custom id is already taken — by a compiled-in entry, or by an earlier node.
+    #[error("custom provider id {id:?} is already in the registry; rename it so it does not shadow a compiled-in provider")]
+    Collides {
+        /// The colliding provider id.
+        id: String,
+    },
+}
+
 /// Provider definitions keyed by provider id, in sorted-id order.
 ///
 /// Sorted rather than hashed so a regenerated `registry.json` is byte-stable:
 /// two imports of the same upstream tree produce the same file, which is what
 /// makes it reviewable in a diff.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Registry {
     defs: BTreeMap<Strng, ProviderDef>,
 }
@@ -239,6 +402,31 @@ impl Registry {
     /// Every provider id billed at a flat rate.
     pub fn flat_rate_providers(&self) -> impl Iterator<Item = &str> {
         self.defs.iter().filter(|(_, d)| d.flat_rate).map(|(id, _)| id.as_ref())
+    }
+
+    /// A catalog with `custom` merged on top of the compiled-in set.
+    ///
+    /// A copy, not a mutation: [`global`] is process-wide and read by every
+    /// request, so a config-declared node must not become visible to a thread
+    /// holding a different config. The copy is 276 interned definitions and 187
+    /// price rows, built once per config load and dropped with it — the custom
+    /// node itself is the thing that is expensive to express (a rebuild), not
+    /// this.
+    ///
+    /// # Errors
+    ///
+    /// [`MergeError::Collides`] when a node's id is already taken. Shadowing a
+    /// compiled-in entry is refused rather than resolved: that entry is a fact
+    /// about a real provider, and quietly replacing it would make the catalog
+    /// stop describing the world.
+    pub fn merge(&self, custom: &[CustomProvider]) -> Result<Registry, MergeError> {
+        let mut defs = self.defs.clone();
+        for c in custom {
+            if defs.insert(Strng::from(c.id.as_str()), c.node()).is_some() {
+                return Err(MergeError::Collides { id: c.id.clone() });
+            }
+        }
+        Ok(Registry { defs })
     }
 }
 
@@ -320,10 +508,138 @@ mod tests {
     }
 
     #[test]
+    fn dates_the_build_so_doctor_can_report_the_snapshot_age() {
+        // `build.rs` stamps it; a 0 would make every build look infinitely old,
+        // which is the failure this assertion exists to catch.
+        assert_ne!(BUILT_AT, 0, "build.rs did not stamp the build time");
+    }
+
+    #[test]
+    fn reads_a_stamp_without_a_runtime_parse() {
+        assert_eq!(parse_u64("1700000000"), 1_700_000_000);
+    }
+
+    #[test]
+    fn refuses_a_stamp_that_is_not_digits() {
+        // An unreadable stamp must not become a plausible date.
+        assert_eq!(parse_u64("17e5"), 0);
+    }
+
+    #[test]
+    fn reads_a_build_made_today_as_fresh() {
+        assert!(!is_stale(BUILT_AT));
+    }
+
+    #[test]
+    fn warns_when_the_build_is_past_the_ttl() {
+        assert!(is_stale(BUILT_AT + (SNAPSHOT_TTL_DAYS + 1) * 86_400));
+    }
+
+    #[test]
+    fn age_never_goes_negative_for_a_clock_set_before_the_build() {
+        assert_eq!(age_days(0), 0);
+    }
+
+    #[test]
+    fn age_counts_whole_days_only() {
+        // Yesterday's build is not yet a day old, which is what keeps a rebuild
+        // from being nagged on the morning after.
+        assert_eq!(age_days(BUILT_AT + 86_399), 0);
+    }
+
+    #[test]
     fn keeps_flat_rate_providers_marked() {
         let flat: Vec<&str> = global().flat_rate_providers().collect();
         assert!(flat.contains(&"claude"), "the Claude Code plan is flat-rate: {flat:?}");
         // An explicitly excluded metered provider: `byteplus` is per-token.
         assert!(!flat.contains(&"byteplus"), "{flat:?}");
+    }
+
+    fn node(id: &str) -> CustomProvider {
+        CustomProvider {
+            id: id.to_owned(),
+            protocol: Protocol::OpenaiCompatible,
+            base_url: "https://api.example.invalid/v1/".to_owned(),
+            key_ref: "k".to_owned(),
+            headers: BTreeMap::from([("x-api-key".to_owned(), "$AR_TEST_X".to_owned())]),
+        }
+    }
+
+    #[test]
+    fn merges_a_custom_node_when_the_id_is_new() {
+        let merged = global().merge(&[node("local-gateway")]).expect("no collision");
+        let def = merged.get("local-gateway").expect("the node is in the merged catalog");
+        assert_eq!(def.base_url, "https://api.example.invalid/v1");
+    }
+
+    #[test]
+    fn carries_a_custom_nodes_protocol_into_its_wire_format() {
+        let mut anthropic = node("local-claude");
+        anthropic.protocol = Protocol::AnthropicCompatible;
+        let merged = global().merge(&[anthropic]).expect("no collision");
+        assert_eq!(
+            merged.get("local-claude").map(|d| d.wire_format),
+            Some(WireFormat::Anthropic)
+        );
+    }
+
+    #[test]
+    fn carries_a_custom_nodes_headers_into_its_definition() {
+        let merged = global().merge(&[node("local-gateway")]).expect("no collision");
+        let def = merged.get("local-gateway").expect("the node is in the merged catalog");
+        assert_eq!(
+            def.headers.get("x-api-key").map(String::as_str),
+            Some("$AR_TEST_X")
+        );
+    }
+
+    #[test]
+    fn keeps_the_compiled_catalog_when_a_custom_node_is_merged() {
+        let merged = global().merge(&[node("local-gateway")]).expect("no collision");
+        assert_eq!(merged.len(), global().len() + 1);
+    }
+
+    #[test]
+    fn rejects_a_custom_id_when_it_collides_with_the_catalog() {
+        let err = global().merge(&[node("openai")]).err();
+        assert_eq!(err, Some(MergeError::Collides { id: "openai".to_owned() }));
+    }
+
+    #[test]
+    fn rejects_a_custom_id_when_two_nodes_share_it() {
+        let err = global().merge(&[node("twice"), node("twice")]).err();
+        assert_eq!(err, Some(MergeError::Collides { id: "twice".to_owned() }));
+    }
+
+    #[test]
+    fn leaves_the_process_wide_catalog_unchanged_after_a_merge() {
+        let _ = global().merge(&[node("local-gateway")]).expect("no collision");
+        assert!(global().get("local-gateway").is_none(), "the merge must not touch `global`");
+    }
+
+    #[test]
+    fn accepts_a_base_url_when_it_has_an_http_scheme_and_authority() {
+        assert!(node("ok").base_url_ok());
+    }
+
+    #[test]
+    fn rejects_a_base_url_when_the_scheme_is_missing() {
+        let mut n = node("bad");
+        n.base_url = "api.example.invalid/v1".to_owned();
+        assert!(!n.base_url_ok());
+    }
+
+    #[test]
+    fn rejects_a_base_url_when_the_authority_is_empty() {
+        let mut n = node("bad");
+        n.base_url = "https:///v1".to_owned();
+        assert!(!n.base_url_ok());
+    }
+
+    #[test]
+    fn rejects_a_base_url_when_it_holds_whitespace() {
+        let mut n = node("bad");
+        n.base_url = "https://api.example.invalid/v 1".to_owned();
+        assert!(!n.base_url_ok());
     }
 }

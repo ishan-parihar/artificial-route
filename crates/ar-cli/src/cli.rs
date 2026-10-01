@@ -105,6 +105,22 @@ pub enum Command {
     ///   ar import --from omniroute --out-dir ./config
     #[command(verbatim_doc_comment)]
     Import(ImportArgs),
+
+    /// Serve the MCP control plane over stdio (8 tools + tool_search).
+    ///
+    /// Needs `--features mcp`; without it this verb does not exist, so a host
+    /// cannot discover a transport that was never linked in. Point an MCP client
+    /// at `ar mcp`; `--list` prints the catalog without touching the config.
+    ///
+    /// `AR_MCP_SCOPE` narrows what this process may call (`read:*`,
+    /// `write:combos`, …); unset means everything.
+    ///
+    /// Examples:
+    ///   ar mcp --list
+    ///   AR_MCP_SCOPE='read:*' ar mcp
+    #[cfg(feature = "mcp")]
+    #[command(verbatim_doc_comment)]
+    Mcp(McpArgs),
 }
 
 /// Options for `ar serve`.
@@ -149,6 +165,15 @@ pub struct ConfigureArgs {
     /// Exit 1 when any check fails, instead of only reporting.
     #[arg(long)]
     pub check: bool,
+}
+
+/// Options for `ar mcp`.
+#[cfg(feature = "mcp")]
+#[derive(Debug, Args)]
+pub struct McpArgs {
+    /// Print the tool catalog and exit, without serving or reading the config.
+    #[arg(long)]
+    pub list: bool,
 }
 
 /// Options for `ar import`.

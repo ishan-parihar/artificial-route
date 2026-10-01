@@ -5,6 +5,9 @@ edition = "2024"
 rust-version = "1.90"
 description = "Compile-time provider catalog: id -> base URL, wire format, auth class"
 license = "Apache-2.0"
+# Dates the build so `BUILT_AT` exists; see `build.rs` for why the date lives
+# here and not in `registry.json`.
+build = "build.rs"
 
 [lints]
 workspace = true

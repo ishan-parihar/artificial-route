@@ -18,6 +18,9 @@
 //!    bypasses, and says so.
 //! 7. **attempt loop** — `ar_route::attempt_loop`, then `decorate`.
 //!
+//! A combo's `pool:` bench rides at the tail of its chain, so step 7 walks the
+//! bench only once every target has refused.
+//!
 //! Route shape follows `../OmniRoute/src/app/api/v1/chat/completions/route.ts`:
 //! validate, translate, resolve a provider, run the attempt loop, relay, stamp
 //! decision headers.
@@ -25,6 +28,7 @@
 use std::sync::Arc;
 
 use ar_cache::{Cache, CacheKey, CacheState};
+use ar_compress::Step;
 use ar_route::{
     AttemptOutcome, AutoCandidate, AutoSelector, CanonicalRequest, Candidate, ProviderId, RouteError,
     Strng, Strategy, attempt_loop, pick, simulate_route, virtual_combo,
@@ -38,7 +42,7 @@ use futures::StreamExt;
 use serde::Serialize;
 
 use crate::app::AppState;
-use crate::config::DefaultChain;
+use crate::config::{DefaultChain, RouteCombo};
 use crate::text::{
     COMPRESSION_ECHO, COMPRESSION_HEADER, GUARD_HEADER, GuardVerdict, compression_echo,
     compression_plan, compress_body, guard_body,
@@ -138,8 +142,10 @@ async fn handle_chat(
 
     // Compression runs after the guard, so a rewrite cannot un-redact anything,
     // and before the cache lookup, so the key covers exactly what is dispatched.
-    let compression =
-        compression_plan(headers.get(COMPRESSION_HEADER).and_then(|v| v.to_str().ok()));
+    let compression = compression_plan(
+        headers.get(COMPRESSION_HEADER).and_then(|v| v.to_str().ok()),
+        plan.compression.as_ref().map(std::slice::from_ref),
+    );
     if let Some(rewritten) = compress_body(&canonical.body, &compression) {
         canonical.body = Bytes::from(rewritten);
     }
@@ -172,7 +178,7 @@ async fn handle_chat(
         Err(e) => return route_error(e).with_guard(guard_verdict),
     };
 
-    state.metrics.observe_attempt();
+    state.metrics.observe_attempts(u64::from(outcome.attempts()));
     if matches!(outcome, AttemptOutcome::Failover { .. }) {
         state.metrics.observe_failover();
     }
@@ -236,11 +242,17 @@ enum RouteReject {
 ///
 /// They travel together because `x-ar-decision` names the strategy, and a combo's
 /// strategy is not the server's — `config.yaml`'s `cheap` is `cost-optimized`
-/// while `default` is `lkgp`.
+/// while `default` is `lkgp`. The combo's `compression:` step rides along for
+/// the same reason: compression is per-combo, and a client asking for `cheap`
+/// must not inherit `default`'s engine. The chain carries the combo's `pool:`
+/// bench at its tail for the third: that is this combo's failover depth, not
+/// another combo's.
 #[derive(Clone, Debug, PartialEq)]
 struct RoutePlan {
     chain: Vec<ProviderId>,
     strategy: Strategy,
+    /// The resolved combo's compression setting, if it declared one.
+    compression: Option<Step>,
 }
 
 /// Checks the bearer credential when an [`crate::keys::AuthGate`] is configured.
@@ -290,7 +302,11 @@ fn resolve(state: &AppState, canonical: &CanonicalRequest) -> Result<RoutePlan, 
     let model = canonical.model.as_ref();
 
     if let Some(chain) = auto_chain(state, model) {
-        return Ok(RoutePlan { chain, strategy: state.config.strategy });
+        return Ok(RoutePlan {
+            chain,
+            strategy: state.config.strategy,
+            compression: state.config.default_compression(),
+        });
     }
 
     match state.config.default_combo() {
@@ -298,16 +314,40 @@ fn resolve(state: &AppState, canonical: &CanonicalRequest) -> Result<RoutePlan, 
         // a client error, not a hint.
         DefaultChain::Combo(_) => match state.config.combo(model) {
             Some(combo) => Ok(RoutePlan {
-                chain: order(state, state.config.candidates(Some(combo))),
+                chain: chain(state, combo),
                 strategy: combo.strategy,
+                compression: combo.compression,
             }),
             None => Err(RouteReject::UnknownModel(unknown_model(model, &state.config.combo_ids()))),
         },
         DefaultChain::Flat => Ok(RoutePlan {
             chain: order(state, state.config.candidates(None)),
             strategy: state.config.strategy,
+            compression: None,
         }),
     }
+}
+
+/// Winner-first chain over the combo's targets, then its `pool:` bench.
+///
+/// The order is the contract (audit F-HIGH-2, `docs/04` §route): `pick` sees
+/// the targets alone, so a cheaper bench entry cannot win a healthy request, and
+/// the bench is appended afterwards where the existing attempt loop already
+/// knows how to walk it. Nothing here scores a pool entry or reorders the
+/// targets — a pool widens *what is tried after a failure*, which is the whole
+/// difference between the 2 targets and the 7 candidates the live `free-stack`
+/// combo declares.
+///
+/// A pool provider already in the chain is skipped: the loop must not spend two
+/// of its three attempt slots on one endpoint.
+fn chain(state: &AppState, combo: &RouteCombo) -> Vec<ProviderId> {
+    let mut chain = order(state, state.config.candidates(Some(combo)));
+    for target in state.config.pool(combo) {
+        if !chain.contains(&target.provider) {
+            chain.push(target.provider.clone());
+        }
+    }
+    chain
 }
 
 /// `pick`, then the rest of the candidates in config order.

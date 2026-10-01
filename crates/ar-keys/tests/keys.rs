@@ -72,7 +72,7 @@ fn expires_when_stolen() {
     // separately in `token::tests::the_default_leeway_extends_the_effective_lifetime`.
     let tokens = Tokens::new(&master()).with_leeway(Duration::ZERO);
     let issued = tokens
-        .issue(Issue { key_id: "key-1", scopes: ScopeSet::all(), device_id: None, ttl: Some(Duration::from_millis(400)) })
+        .issue(Issue { key_id: "key-1", scopes: ScopeSet::all(), device_id: None, ttl: Some(Duration::from_secs(1)) })
         .expect("issue");
 
     // The attacker's copy: taken while the token is still live, so it is a
@@ -83,8 +83,13 @@ fn expires_when_stolen() {
         "precondition: the stolen copy starts valid"
     );
 
-    // Past `exp`.
-    std::thread::sleep(Duration::from_millis(700));
+    // Past `exp`. Two whole seconds of slack, not one: `exp` is
+    // `now + ttl.as_secs()` (a sub-second TTL truncates to zero, leaving the
+    // token alive for exactly the second it was minted in) and expiry is a
+    // strict `exp < now`, so the verify has to land in the *second after* `exp`.
+    // One second of sleep cleared that for 90% of sub-second offsets and failed
+    // for the rest; 2100ms is deterministic for every one of them.
+    std::thread::sleep(Duration::from_millis(2_100));
 
     let err = tokens.verify(&stolen, Scope::ReadAll, &revocations).expect_err("an expired token must be refused");
     assert!(matches!(err, KeyError::Expired), "{err}");

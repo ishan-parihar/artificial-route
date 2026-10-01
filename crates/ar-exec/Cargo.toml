@@ -23,6 +23,17 @@ reqwest = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+# `oauth.rs` logs a retired session and a swallowed rotation at `warn`/`error`.
+# Already in the graph via `ar-server`, so this names a consumer rather than
+# adding a crate to the build.
+tracing = { workspace = true }
+# SHA-256 of an access token, which keys the rotation cache so the map never
+# holds key material. Justified rather than incidental: the audit asks for a
+# token-hash key specifically, and this is the digest OmniRoute's `enc:v1`
+# derivation already hashes, so the two rotation maps stay comparable. Its own
+# dependencies (`digest`, `cfg-if`, `cpufeatures`) are all already built for
+# `ar-keys`' argon2/aes-gcm, so this adds exactly one small crate.
+sha2 = "0.10"
 
 # Not in `[workspace.dependencies]`; declare inline to avoid racing the sibling
 # agents editing that file. All three are already in the dependency graph
@@ -33,5 +44,8 @@ tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["rt"] }
 
 [dev-dependencies]
+# The OAuth dispatch tests need a mock upstream that *branches* on the bearer it
+# was handed; `tests/mock_upstream.rs`'s harness replies from a fixed script, so
+# `oauth.rs` spawns its own. Already in the graph via `ar-server`.
 axum = { workspace = true }
 tokio = { workspace = true }
