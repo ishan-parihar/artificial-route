@@ -246,6 +246,7 @@ version = "0.1.1"
 dependencies = [
  "aes-gcm",
  "ar-core",
+ "ar-exec",
  "argon2",
  "base64 0.22.1",
  "governor",

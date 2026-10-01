@@ -3,9 +3,24 @@
 //!
 //! This is the answer to F-CRIT-2 in `AUDIT-REPORT.md` — "no local credential
 //! store" — and it is deliberately a *narrow* one. The store holds the same
-//! `keys:` map `config.yaml` already declares, encrypted at rest, and nothing
-//! else. No OAuth sessions (that is F-CRIT-1, a separate stream), no refresh
-//! tokens, no quota rows, no rotation bookkeeping.
+//! `keys:` map `config.yaml` already declares, encrypted at rest, plus one
+//! non-secret table beside it. No token material outside `credentials`, no
+//! quota rows, no rotation bookkeeping.
+//!
+//! # The second table: `oauth_sessions`
+//!
+//! F-MED-2 generated a terminal-status CHECK clause
+//! ([`ar_exec::oauth::terminal_check_constraint`]) with nowhere to sit — this
+//! is the table it goes in. A row answers two questions about one provider: which
+//! `credentials` row its session token lives behind ([`OAuthSession::access_key`],
+//! a *name*, never the secret), and whether a refresh has retired it
+//! ([`OAuthSession::terminal_status`]). That is the whole table: placement plus
+//! status. Nothing here decrypts anything, so a leaked `credentials.db` copy
+//! leaks no more session material than a leaked `config.yaml` does.
+//!
+//! The three session kinds ([`SessionKind`]) — refresh, device, anonymous — are
+//! all accepted from day one, so the sibling device/anonymous streams do not need
+//! a migration to add their rows.
 //!
 //! # Envelope discipline, and which half of v1 was copied
 //!
@@ -80,9 +95,36 @@ use crate::secret::{KeyMeta, MasterKey, Secret, decode_key_material};
 /// thing [`crate::MasterKeySource::File`] exists to refuse.
 pub const MASTER_KEY_VAR: &str = "AR_MASTER_KEY";
 
-/// `store_meta` holds exactly one row, so the id is pinned to 1 by a CHECK
-/// rather than left to a convention nobody would notice breaking.
-const SCHEMA: &str = "
+/// The `CHECK (kind IN (...))` list, built from [`SessionKind::ALL`] rather
+/// than written out, so a fourth session kind cannot be added to the enum and
+/// forgotten here.
+fn session_kind_check() -> String {
+    format!("CHECK (kind IN ({}))", SessionKind::ALL.map(|k| format!("'{}'", k.as_str())).join(", "))
+}
+
+/// The whole schema, with the terminal CHECK **generated**.
+///
+/// The one hand-written part is deliberate: `store_meta` holds exactly one row,
+/// so the id is pinned to 1 by a CHECK rather than left to a convention nobody
+/// would notice breaking.
+///
+/// The `oauth_sessions` clause is
+/// [`ar_exec::oauth::terminal_check_constraint`]'s output verbatim, so the
+/// database cannot hold a status the classifier would call retryable. Two
+/// consequences of taking the generator's output as-is:
+///
+/// * it constrains `terminal_status` **and** `terminal_reason` together, because
+///   the pair is what a provider sends — so the table carries both columns even
+///   though the status is the interesting half;
+/// * `terminal_status` is `INTEGER`, not the `TEXT` the clause's literal `400`
+///   comparisons might suggest. The literals are integers, and a text column
+///   would match them only through SQLite's affinity conversion.
+///
+/// `CREATE TABLE IF NOT EXISTS` throughout: opening a store written before this
+/// table existed adds it, which is the whole upgrade path.
+fn schema() -> String {
+    format!(
+        "
 CREATE TABLE IF NOT EXISTS store_meta (
     id   INTEGER PRIMARY KEY CHECK (id = 1),
     meta TEXT    NOT NULL
@@ -92,7 +134,20 @@ CREATE TABLE IF NOT EXISTS credentials (
     provider TEXT NOT NULL,
     envelope TEXT NOT NULL
 );
-";
+CREATE TABLE IF NOT EXISTS oauth_sessions (
+    provider        TEXT PRIMARY KEY,
+    kind            TEXT    NOT NULL {kind_check},
+    access_key      TEXT    NULL,
+    terminal_status INTEGER NULL,
+    terminal_reason TEXT    NULL,
+    CHECK (kind <> 'anonymous' OR access_key IS NULL),
+    {terminal}
+);
+",
+        kind_check = session_kind_check(),
+        terminal = ar_exec::oauth::terminal_check_constraint(),
+    )
+}
 
 const SELECT_META: &str = "SELECT meta FROM store_meta WHERE id = 1";
 const INSERT_META: &str = "INSERT OR REPLACE INTO store_meta (id, meta) VALUES (1, ?1)";
@@ -106,6 +161,183 @@ const SELECT_CREDENTIAL: &str = "SELECT provider, envelope FROM credentials WHER
 const SELECT_NAMES: &str = "SELECT name FROM credentials ORDER BY name";
 
 const DELETE_CREDENTIAL: &str = "DELETE FROM credentials WHERE name = ?1";
+
+const UPSERT_SESSION: &str = "
+INSERT INTO oauth_sessions (provider, kind, access_key, terminal_status, terminal_reason)
+VALUES (?1, ?2, ?3, ?4, ?5)
+ON CONFLICT(provider) DO UPDATE SET
+    kind = ?2, access_key = ?3, terminal_status = ?4, terminal_reason = ?5
+";
+
+const SELECT_SESSION: &str = "
+SELECT provider, kind, access_key, terminal_status, terminal_reason
+FROM oauth_sessions WHERE provider = ?1
+";
+
+const DELETE_SESSION: &str = "DELETE FROM oauth_sessions WHERE provider = ?1";
+
+const COUNT_SESSIONS: &str = "SELECT count(*) FROM oauth_sessions";
+
+/// Which of the three shapes an OAuth session takes.
+///
+/// # Why this is not `ar_exec::oauth::OAuthKind`
+///
+/// That enum is the *provider family* — codex / cline / claude / gemini-cli /
+/// cursor — which drives the carve-out table. This is the *mechanism* axis, and
+/// the two cross: a `cursor` session can be any of the three below. `ar-exec`
+/// exposes no session-kind vocabulary, so these three spellings are this crate's
+/// own; they are generated into the table's CHECK, which is what makes a fourth
+/// kind a compile error rather than a silent hole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionKind {
+    /// Holds a refresh token, behind a credential row, and can renew itself.
+    ///
+    /// A missing `access_key` is legal and deliberate, not an oversight: audit
+    /// red-team R1 records two live `kilocode` sessions with no stored refresh
+    /// token that are nonetheless active, so the table has to be able to record
+    /// "a refresh session whose credential is not in this store".
+    Refresh,
+    /// Authorization came from a device-code poll rather than a browser redirect.
+    ///
+    /// The poll state is **not** a column, and the reason is specific rather than
+    /// cautious: RFC 8628 §3.5's four poll codes (`authorization_pending`,
+    /// `slow_down`, `expired_token`, `access_denied`) are matched by
+    /// `ar_exec::oauth`'s private `DeviceReply` enum, which exposes no accessor
+    /// and no list — so there is no vocabulary here to constrain a column against,
+    /// and writing one by hand is the exact drift
+    /// [`ar_exec::oauth::terminal_check_constraint`] exists to prevent.
+    ///
+    /// TODO(#F-MED-2-device): add a `poll_state TEXT NULL` column once
+    /// `DeviceReply` is public (or gains a generator of its own, as
+    /// `terminal_check_constraint` does). Until then a device row records its
+    /// outcome as a terminal status — `expired_token` and `access_denied` are
+    /// terminal, and the two loop codes are not failures at all.
+    Device,
+    /// A browser session with no refresh token and no stored credential.
+    Anonymous,
+}
+
+impl SessionKind {
+    /// Every kind, so the CHECK and any caller enumerate one list.
+    pub const ALL: [Self; 3] = [Self::Refresh, Self::Device, Self::Anonymous];
+
+    /// The spelling stored in, and read from, the `kind` column.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Refresh => "refresh",
+            Self::Device => "device",
+            Self::Anonymous => "anonymous",
+        }
+    }
+
+    /// The kind for a stored spelling, or `None` for a column this build does
+    /// not know.
+    ///
+    /// Over [`Self::ALL`] rather than a string `match`, so a new variant with no
+    /// parse arm fails to compile instead of quietly answering `None`.
+    #[must_use]
+    pub fn parse(kind: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.as_str() == kind)
+    }
+
+    /// Whether a session of this kind may point at a credential row.
+    ///
+    /// False for [`Self::Anonymous`]: there is no stored secret to point at, so
+    /// a placement claims a protection that does not exist.
+    #[must_use]
+    pub fn allows_credential(self) -> bool {
+        !matches!(self, Self::Anonymous)
+    }
+}
+
+/// One `oauth_sessions` row: placement plus status, never a secret.
+///
+/// Build it with [`Self::new`] and add what is known — a session exists from the
+/// moment a login lands, and its terminal status arrives later, from a refresh
+/// that failed unrecoverably. A half-written row is therefore normal state, not a
+/// mistake, which is why every field past `kind` is optional.
+///
+/// `Debug` is derived and safe: every field is a provider id, a kind, a
+/// `keys:` label, or a numeric status and reason string. None of them is
+/// decryptable, which is the reason this type is not a [`crate::Secret`] — see
+/// [`Self::access_key`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OAuthSession {
+    provider: String,
+    kind: SessionKind,
+    access_key: Option<String>,
+    terminal_status: Option<u16>,
+    terminal_reason: Option<String>,
+}
+
+impl OAuthSession {
+    /// A session of `kind` for `provider`, with nothing recorded yet beyond that.
+    #[must_use]
+    pub fn new(provider: impl Into<String>, kind: SessionKind) -> Self {
+        Self { provider: provider.into(), kind, access_key: None, terminal_status: None, terminal_reason: None }
+    }
+
+    /// Records which `credentials` row holds the session's token.
+    ///
+    /// A *name*, not the secret: the session table stores where the token lives,
+    /// and the token itself stays in `credentials` under the same master key and
+    /// the same `enc:v2:` envelope as any other row. Rejected for
+    /// [`SessionKind::Anonymous`] by [`crate::CredentialStore::insert_session`],
+    /// as [`KeyError::AnonymousCredential`].
+    #[must_use]
+    pub fn with_access_key(mut self, name: impl Into<String>) -> Self {
+        self.access_key = Some(name.into());
+        self
+    }
+
+    /// Records that a refresh retired the session.
+    ///
+    /// Both halves together and always: the generated CHECK matches a
+    /// `(status, reason)` pair, so a status with no reason — or a reason with no
+    /// status — matches no row and is refused by the database. Keeping them in
+    /// one builder means the public API cannot construct one.
+    ///
+    /// A `(status, reason)` the classifier would call *transient* is refused here
+    /// too, by the same CHECK. Retiring a session on a transient is the failure
+    /// F-HIGH-4 warns about, so the store is not willing to record it.
+    #[must_use]
+    pub fn terminal(mut self, status: u16, reason: impl Into<String>) -> Self {
+        self.terminal_status = Some(status);
+        self.terminal_reason = Some(reason.into());
+        self
+    }
+
+    /// The registry provider id this session belongs to.
+    #[must_use]
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    /// Which of the three session shapes this is.
+    #[must_use]
+    pub fn kind(&self) -> SessionKind {
+        self.kind
+    }
+
+    /// The `credentials` name holding this session's token, when it has one.
+    #[must_use]
+    pub fn access_key(&self) -> Option<&str> {
+        self.access_key.as_deref()
+    }
+
+    /// The refresh-endpoint status that retired the session, when it has one.
+    #[must_use]
+    pub fn terminal_status(&self) -> Option<u16> {
+        self.terminal_status
+    }
+
+    /// The reason paired with [`Self::terminal_status`].
+    #[must_use]
+    pub fn terminal_reason(&self) -> Option<&str> {
+        self.terminal_reason.as_deref()
+    }
+}
 
 /// A sqlite-backed table of `enc:` credential envelopes.
 ///
@@ -139,7 +371,7 @@ impl CredentialStore {
     /// schema cannot be opened.
     pub fn open_with_material(path: &Path, material: &Secret) -> Result<Self, KeyError> {
         let conn = Connection::open(path).map_err(sql)?;
-        conn.execute_batch(SCHEMA).map_err(sql)?;
+        conn.execute_batch(&schema()).map_err(sql)?;
         let master = match read_meta(&conn)? {
             Some(meta) => MasterKey::new(material.to_owned_secret(), meta)?,
             None => {
@@ -174,7 +406,7 @@ impl CredentialStore {
     /// As [`Self::open_with_material`], minus the file half.
     pub fn open_in_memory(material: &Secret) -> Result<Self, KeyError> {
         let conn = Connection::open_in_memory().map_err(sql)?;
-        conn.execute_batch(SCHEMA).map_err(sql)?;
+        conn.execute_batch(&schema()).map_err(sql)?;
         let master = MasterKey::new(material.to_owned_secret(), KeyMeta::generate())?;
         Ok(Self { conn, master })
     }
@@ -267,6 +499,116 @@ impl CredentialStore {
         let rows = stmt.query_map([], |row| row.get::<_, String>(0)).map_err(sql)?;
         rows.collect::<Result<Vec<String>, _>>().map_err(sql)
     }
+
+    /// Records `session`, replacing any row of the same provider.
+    ///
+    /// Replace rather than merge, exactly as [`Self::insert`] does for a
+    /// credential name: the row is the current state of one session, so a caller
+    /// that knows less than the stored row writes what it knows. That is also why
+    /// an upsert — the usual reason to reach for one is recording a terminal
+    /// status some time after the login landed.
+    ///
+    /// Nothing is encrypted here and nothing needs to be: every field is a label
+    /// or a status, so the session row is readable by anyone holding the file.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyError::AnonymousCredential`] when an [`SessionKind::Anonymous`] row
+    /// carries an access key — checked here so the caller learns which rule it
+    /// broke, with the table's CHECK as the invariant behind it.
+    /// [`KeyError::Store`] when the generated terminal CHECK refuses the
+    /// `(status, reason)` pair, which is how a transient status is kept out of a
+    /// durable retirement.
+    pub fn insert_session(&self, session: &OAuthSession) -> Result<(), KeyError> {
+        if let (SessionKind::Anonymous, Some(placement)) = (session.kind, session.access_key.as_deref()) {
+            return Err(KeyError::AnonymousCredential { placement: placement.to_owned() });
+        }
+        self.conn
+            .execute(
+                UPSERT_SESSION,
+                params![
+                    session.provider,
+                    session.kind.as_str(),
+                    session.access_key,
+                    session.terminal_status,
+                    session.terminal_reason,
+                ],
+            )
+            .map_err(sql)?;
+        Ok(())
+    }
+
+    /// The session recorded for `provider`, or `None` when the store holds none.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyError::Store`] on a read failure, including a `kind` column this build
+    /// does not recognise — which the CHECK makes unreachable through the API and
+    /// only an out-of-band edit could produce.
+    pub fn get_session(&self, provider: &str) -> Result<Option<OAuthSession>, KeyError> {
+        let row = self
+            .conn
+            .query_row(SELECT_SESSION, [provider], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })
+            .optional()
+            .map_err(sql)?;
+        row.map(read_session).transpose()
+    }
+
+    /// Forgets the session row for `provider`, reporting whether one was there.
+    ///
+    /// [`Self::remove`]'s reasoning applies unchanged: a session that is logged
+    /// out must leave no row, or the next login is refused by a leftover
+    /// placement or a leftover terminal status.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyError::Store`] on a write failure.
+    pub fn remove_session(&self, provider: &str) -> Result<bool, KeyError> {
+        self.conn.execute(DELETE_SESSION, [provider]).map(|n| n > 0).map_err(sql)
+    }
+
+    /// How many session rows the store holds, for `ar doctor`'s `store` row.
+    ///
+    /// A count and not a list on purpose: doctor already reports the credential
+    /// names it can act on, and the session rows are placement the operator
+    /// cannot change from there — the useful question is "are there any, and how
+    /// many are retired", not what each one says.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyError::Store`] on a read failure.
+    pub fn session_count(&self) -> Result<usize, KeyError> {
+        self.conn.query_row(COUNT_SESSIONS, [], |row| row.get::<_, i64>(0)).map(|n| n.max(0) as usize).map_err(sql)
+    }
+}
+
+/// Rebuilds a session from a row of [`SELECT_SESSION`].
+///
+/// A `u16` the schema cannot hold is a store error rather than a saturating cast:
+/// the column only ever received a `u16` through this API, so a wider value means
+/// the file was edited by something that is not this build.
+fn read_session(row: (String, String, Option<String>, Option<i64>, Option<String>)) -> Result<OAuthSession, KeyError> {
+    let (provider, kind, access_key, terminal_status, terminal_reason) = row;
+    let kind = SessionKind::parse(&kind)
+        .ok_or_else(|| KeyError::Store(format!("oauth session {provider:?} has unknown kind {kind:?}")))?;
+    let terminal_status = terminal_status
+        .map(|status| u16::try_from(status).map_err(|_| KeyError::Store(format!("oauth session {provider:?} has status {status}"))))
+        .transpose()?;
+    Ok(OAuthSession {
+        provider,
+        kind,
+        access_key,
+        terminal_status,
+        terminal_reason,
+    })
 }
 
 impl std::fmt::Debug for CredentialStore {
@@ -301,7 +643,7 @@ const _: () = {
 
 #[cfg(test)]
 mod tests {
-    use super::{CredentialStore, MASTER_KEY_VAR, sql};
+    use super::{CredentialStore, MASTER_KEY_VAR, OAuthSession, SessionKind, sql};
     use crate::codec::hex;
     use crate::error::KeyError;
     use crate::secret::Secret;
@@ -440,5 +782,186 @@ mod tests {
         let e = s.get("openai").expect("get");
         assert!(e.is_none());
         assert!(!format!("{e:?}").contains("sk"), "a miss must not render key material");
+    }
+
+    // `oauth_sessions` — the table F-MED-2's generated CHECK was waiting for.
+
+    #[test]
+    fn refuses_a_row_when_the_terminal_status_is_not_in_the_generated_list() {
+        let s = store();
+        // Raw SQL, not the store API: the claim under test is that the *database*
+        // refuses it, so going through the API would test the wrong layer.
+        let e = s
+            .conn
+            .execute(
+                "INSERT INTO oauth_sessions (provider, kind, terminal_status, terminal_reason) \
+                 VALUES ('codex', 'refresh', 418, 'teapot')",
+                [],
+            )
+            .expect_err("not a terminal row");
+        assert!(matches!(e, rusqlite::Error::SqliteFailure(..)), "{e}");
+    }
+
+    #[test]
+    fn refuses_a_row_when_the_status_and_reason_are_mismatched() {
+        let s = store();
+        // `token_revoked` is terminal at 401 and at 410 — never at 400. A reason
+        // checked without its status would let this through.
+        let e = s
+            .conn
+            .execute(
+                "INSERT INTO oauth_sessions (provider, kind, terminal_status, terminal_reason) \
+                 VALUES ('codex', 'refresh', 400, 'token_revoked')",
+                [],
+            )
+            .expect_err("half of a pair");
+        assert!(matches!(e, rusqlite::Error::SqliteFailure(..)), "{e}");
+    }
+
+    #[test]
+    fn refuses_a_row_when_the_kind_is_unknown() {
+        let s = store();
+        let e = s
+            .conn
+            .execute("INSERT INTO oauth_sessions (provider, kind) VALUES ('codex', 'device_code')", [])
+            .expect_err("not one of the three kinds");
+        assert!(matches!(e, rusqlite::Error::SqliteFailure(..)), "{e}");
+    }
+
+    #[test]
+    fn stores_an_anonymous_session_when_it_carries_no_credential() {
+        let s = store();
+        s.insert_session(&OAuthSession::new("cursor", SessionKind::Anonymous)).expect("insert");
+        assert_eq!(s.get_session("cursor").expect("get").expect("a row").kind(), SessionKind::Anonymous);
+    }
+
+    #[test]
+    fn refuses_an_anonymous_session_when_it_carries_a_credential() {
+        let s = store();
+        let e = s
+            .insert_session(&OAuthSession::new("cursor", SessionKind::Anonymous).with_access_key("cursor"))
+            .expect_err("an anonymous session has no secret to point at");
+        assert!(
+            matches!(&e, KeyError::AnonymousCredential { placement } if placement == "cursor"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn refuses_an_anonymous_credential_when_the_row_is_written_out_of_band() {
+        let s = store();
+        // The API refuses with a typed error; the CHECK is what holds when the
+        // row arrives by some other route.
+        let e = s
+            .conn
+            .execute("INSERT INTO oauth_sessions (provider, kind, access_key) VALUES ('cursor', 'anonymous', 'cursor')", [])
+            .expect_err("CHECK holds too");
+        assert!(matches!(e, rusqlite::Error::SqliteFailure(..)), "{e}");
+    }
+
+    #[test]
+    fn round_trips_a_refresh_session_when_the_row_is_written() {
+        let s = store();
+        let session = OAuthSession::new("codex", SessionKind::Refresh).with_access_key("codex_refresh");
+        s.insert_session(&session).expect("insert");
+        assert_eq!(s.get_session("codex").expect("get").expect("a row"), session);
+    }
+
+    #[test]
+    fn round_trips_a_device_session_when_the_row_is_written() {
+        let s = store();
+        let session = OAuthSession::new("gemini-cli", SessionKind::Device).with_access_key("gemini_cli");
+        s.insert_session(&session).expect("insert");
+        assert_eq!(s.get_session("gemini-cli").expect("get").expect("a row"), session);
+    }
+
+    #[test]
+    fn round_trips_a_terminal_status_when_the_pair_matches_the_generated_list() {
+        let s = store();
+        let session = OAuthSession::new("claude", SessionKind::Refresh).with_access_key("claude_refresh").terminal(400, "invalid_grant");
+        s.insert_session(&session).expect("insert");
+        assert_eq!(
+            s.get_session("claude").expect("get").expect("a row").terminal_status(),
+            Some(400)
+        );
+    }
+
+    #[test]
+    fn refuses_a_transient_status_when_the_row_is_written() {
+        let s = store();
+        // 503 is what a transient refresh failure reports; recording it would
+        // retire a session the classifier explicitly called retryable.
+        let e = s
+            .insert_session(&OAuthSession::new("codex", SessionKind::Refresh).terminal(503, "refresh-endpoint-unavailable"))
+            .expect_err("transient is not terminal");
+        assert!(matches!(e, KeyError::Store(_)), "{e}");
+    }
+
+    #[test]
+    fn reports_no_session_when_the_provider_is_absent() {
+        assert!(store().get_session("nope").expect("get").is_none());
+    }
+
+    #[test]
+    fn forgets_a_session_when_the_provider_is_removed() {
+        let s = store();
+        s.insert_session(&OAuthSession::new("codex", SessionKind::Refresh)).expect("insert");
+        assert!(s.remove_session("codex").expect("remove"));
+    }
+
+    #[test]
+    fn reports_no_removal_when_the_provider_is_absent() {
+        assert!(!store().remove_session("nope").expect("remove"));
+    }
+
+    #[test]
+    fn counts_every_session_row_for_doctor() {
+        let s = store();
+        s.insert_session(&OAuthSession::new("codex", SessionKind::Refresh)).expect("insert");
+        s.insert_session(&OAuthSession::new("cursor", SessionKind::Anonymous)).expect("insert");
+        assert_eq!(s.session_count().expect("count"), 2);
+    }
+
+    #[test]
+    fn replaces_a_session_when_the_same_provider_is_written_again() {
+        let s = store();
+        s.insert_session(&OAuthSession::new("codex", SessionKind::Refresh)).expect("insert");
+        s.insert_session(&OAuthSession::new("codex", SessionKind::Refresh).terminal(401, "token_revoked"))
+            .expect("insert");
+        assert_eq!(s.session_count().expect("count"), 1);
+    }
+
+    #[test]
+    fn keeps_session_rows_beside_credential_rows() {
+        let s = store();
+        s.insert("codex", "codex", &Secret::generate()).expect("credential");
+        s.insert_session(&OAuthSession::new("codex", SessionKind::Refresh).with_access_key("codex")).expect("session");
+        assert_eq!(s.list_names().expect("names"), ["codex"]);
+        assert_eq!(s.session_count().expect("count"), 1);
+    }
+
+    #[test]
+    fn opens_a_store_written_before_the_sessions_table_existed() {
+        // The upgrade path is `CREATE TABLE IF NOT EXISTS` and nothing else, so a
+        // file carrying only the two original tables must gain the third.
+        let path = std::env::temp_dir().join(format!("ar-keys-pre-sessions-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let material = Secret::generate();
+        let first = CredentialStore::open_with_material(&path, &material).expect("open");
+        first.insert("codex", "codex", &Secret::new(b"sk-old".to_vec())).expect("insert");
+        first.conn.execute("DROP TABLE oauth_sessions", []).expect("simulate the pre-table file");
+        drop(first);
+
+        let second = CredentialStore::open_with_material(&path, &material).expect("reopen");
+        assert_eq!(second.get("codex").expect("get").expect("a row").as_bytes(), b"sk-old");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn renders_no_secret_when_a_session_row_is_printed() {
+        let s = store();
+        s.insert_session(&OAuthSession::new("codex", SessionKind::Refresh).with_access_key("codex_refresh")).expect("insert");
+        let rendered = format!("{:?}", s.get_session("codex").expect("get").expect("a row"));
+        assert!(!rendered.contains("sk-"), "{rendered}");
     }
 }

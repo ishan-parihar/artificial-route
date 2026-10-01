@@ -13,7 +13,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ar_keys::{CredentialStore, KeyError, Secret};
+use ar_keys::{CredentialStore, KeyError, OAuthSession, Secret, SessionKind};
 
 /// A unique database path per call site.
 ///
@@ -101,4 +101,28 @@ fn reads_the_credential_as_header_text() {
 fn reports_no_text_when_the_name_is_absent() {
     let store = CredentialStore::open_in_memory(&Secret::generate()).expect("open");
     assert!(store.get_text("nope").expect("text").is_none());
+}
+
+#[test]
+fn round_trips_a_session_through_the_public_re_exports() {
+    let store = CredentialStore::open_in_memory(&Secret::generate()).expect("open");
+    let session = OAuthSession::new("codex", SessionKind::Refresh).with_access_key("codex_refresh");
+    store.insert_session(&session).expect("insert session");
+    assert_eq!(store.get_session("codex").expect("get").expect("a row"), session);
+}
+
+#[test]
+fn refuses_an_anonymous_credential_through_the_public_error() {
+    let store = CredentialStore::open_in_memory(&Secret::generate()).expect("open");
+    let e = store
+        .insert_session(&OAuthSession::new("cursor", SessionKind::Anonymous).with_access_key("cursor"))
+        .expect_err("anonymous holds no credential");
+    assert!(matches!(e, KeyError::AnonymousCredential { .. }), "{e}");
+}
+
+#[test]
+fn counts_sessions_for_doctor_through_the_public_api() {
+    let store = CredentialStore::open_in_memory(&Secret::generate()).expect("open");
+    store.insert_session(&OAuthSession::new("cursor", SessionKind::Anonymous)).expect("insert session");
+    assert_eq!(store.session_count().expect("count"), 1);
 }

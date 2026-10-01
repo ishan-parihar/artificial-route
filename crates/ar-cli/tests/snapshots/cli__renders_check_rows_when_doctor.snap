@@ -7,7 +7,7 @@ checks[11]{check,status,detail}:
   config,ok,config.yaml (2 providers + 0 custom + 2 combos)
   registry,ok,276 providers compiled in + snapshot 0d old
   store,skip,no store at credentials.db; $VAR only
-  terminal-status,ok,9 terminal row(s); store CHECK from ar_exec::oauth::terminal_check_constraint(); executors: codex+cline+claude+gemini-cli+cursor
+  terminal-status,ok,9 terminal row(s); store CHECK from ar_exec::oauth::terminal_check_constraint(); executors: codex+cline+claude+gemini-cli+cursor+grok-cli
   provider/openai,ok,in registry
   provider/anthropic,ok,in registry
   key/anthropic,ok,resolved from keys: (for anthropic)

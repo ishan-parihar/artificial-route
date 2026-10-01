@@ -158,6 +158,15 @@ pub struct ProviderConfig {
     /// tell that apart from a keyless provider. Set from the registry entry by
     /// `ar-server`'s config reader.
     pub needs_oauth_executor: bool,
+    /// Whether this dispatch rides the provider's anonymous free tier.
+    ///
+    /// The one mechanism that needs no credential *and* no OAuth executor, which
+    /// is what makes it the escape hatch for a provider this build otherwise
+    /// cannot authenticate (red-team R1's `kilocode`). When set, [`Self::api_key`
+    /// ] already holds the gateway's constant anonymous token and
+    /// [`Self::headers`] already carries its editor header, both written by the
+    /// config reader from the session's `anonymous:` block.
+    pub anonymous: bool,
 }
 
 impl ProviderConfig {
@@ -177,6 +186,7 @@ impl ProviderConfig {
             headers: BTreeMap::new(),
             oauth: None,
             needs_oauth_executor: false,
+            anonymous: false,
         }
     }
 
@@ -244,6 +254,13 @@ impl ProviderConfig {
         self
     }
 
+    /// Records that this provider dispatches on its anonymous free tier.
+    #[must_use]
+    pub fn with_anonymous(mut self, anonymous: bool) -> Self {
+        self.anonymous = anonymous;
+        self
+    }
+
     /// The OAuth executor this provider's id permits, if any.
     ///
     /// The single place "can this build authenticate that provider at all" is
@@ -271,6 +288,14 @@ impl ProviderConfig {
     pub fn is_dispatchable(&self) -> bool {
         if self.wire_format != WireFormat::Openai {
             return false;
+        }
+        // The free tier answers before the OAuth gate is consulted: it carries a
+        // constant credential of its own, so there is no session to be missing
+        // and no executor that could be required. Without this arm the only
+        // mechanism a provider needs no account for is also the only one this
+        // build refuses, which is the whole of R1's `kilocode`.
+        if self.anonymous {
+            return true;
         }
         match &self.oauth {
             Some(auth) => {
@@ -693,6 +718,27 @@ mod tests {
         let p = ProviderConfig::new(ProviderId::new("kimi-coding"), "https://x/v1", "synthetic-access")
             .with_needs_oauth_executor(true);
         assert!(!p.is_dispatchable(), "no executor, so no way to authenticate");
+    }
+
+    #[test]
+    fn reports_an_anonymous_free_tier_as_dispatchable_without_an_executor() {
+        // R1's kilocode: catalogued `oauth`, no executor, and — before the free
+        // tier — therefore permanently unroutable. The anonymous mechanism is the
+        // one that needs no executor, so it is the only one this gate may admit.
+        let p = ProviderConfig::new(ProviderId::new("kilocode"), "https://x/v1", "anonymous")
+            .with_needs_oauth_executor(true)
+            .with_anonymous(true);
+        assert!(p.is_dispatchable());
+    }
+
+    #[test]
+    fn reports_an_anonymous_provider_on_a_non_openai_wire_as_undispatchable() {
+        // The free tier does not buy a second dialect: the wire gate is first for
+        // a reason and the anonymous arm deliberately sits below it.
+        let p = ProviderConfig::new(ProviderId::new("kilocode"), "https://x/v1", "anonymous")
+            .with_wire_format(WireFormat::Anthropic)
+            .with_anonymous(true);
+        assert!(!p.is_dispatchable());
     }
 
     #[test]

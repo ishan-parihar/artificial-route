@@ -124,6 +124,23 @@ pub enum KeyError {
         cap: usize,
     },
 
+    /// An `anonymous` OAuth session was handed a credential reference.
+    ///
+    /// `Anonymous` is the kind with no credential at all: the browser-session
+    /// case, where the provider's token lives in a cookie this proxy never holds
+    /// and there is nothing to point a row at. Pointing one at a `credentials`
+    /// row asserts the opposite — that a secret this process can decrypt backs
+    /// the session — so both the store API and the table's CHECK refuse it.
+    ///
+    /// Carries the offending *name*, which is a `keys:` label and therefore
+    /// already public in `config.yaml`; [`crate::CredentialStore::list_names`]
+    /// hands the same strings to `ar doctor` unencrypted.
+    #[error("an `anonymous` session holds no credential; drop the reference to `{placement}` or change the session kind")]
+    AnonymousCredential {
+        /// The credential name the caller tried to attach.
+        placement: String,
+    },
+
     /// A local store refused a read or a write — the redb revocation ledger
     /// ([`crate::Revocation`]) or the sqlite credential table
     /// ([`crate::CredentialStore`]).

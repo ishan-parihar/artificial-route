@@ -87,6 +87,19 @@ pub enum ConfigError {
         /// Underlying watcher failure.
         cause: String,
     },
+    /// An OAuth session declares two things at once that cannot both be true.
+    ///
+    /// A load error rather than a runtime `if`, because each of these reads as a
+    /// working config in YAML and behaves as something else on the wire: a
+    /// session that both refreshes and dispatches anonymously sends a free-tier
+    /// request while holding a refresh token it never uses.
+    #[error("oauth {provider:?}: {reason}")]
+    ContradictoryOAuth {
+        /// Provider id whose session holds the contradiction.
+        provider: String,
+        /// The two fields that disagree, spelled for the operator.
+        reason: &'static str,
+    },
 }
 
 /// Ways a `compression:` block can be wrong.
@@ -600,6 +613,40 @@ pub struct OAuthSession {
     /// Nothing reads a machine's clock into this file.
     #[serde(default)]
     pub expires_at: Option<u64>,
+    /// Endpoint that mints a device grant (RFC 8628 §3.1).
+    ///
+    /// Operator-supplied for the same reason as [`Self::token_url`]. Its
+    /// presence — together with [`Self::device_poll_url`] — is what makes this a
+    /// *device* session, so `ar auth login` picks its mechanism from the config
+    /// rather than from a per-provider table.
+    #[serde(default)]
+    pub device_auth_url: Option<String>,
+    /// Endpoint that exchanges a device grant for tokens (RFC 8628 §3.4).
+    ///
+    /// Paired with [`Self::device_auth_url`]; [`Config::validate`] refuses one
+    /// without the other, since a poll URL with nothing to poll surfaces only as
+    /// a login timeout.
+    #[serde(default)]
+    pub device_poll_url: Option<String>,
+    /// Dispatch on the provider's anonymous free tier instead of an account.
+    ///
+    /// Some gateways serve a free model set to an unauthenticated caller against
+    /// a constant credential they name themselves (`Bearer anonymous` for Kilo).
+    /// With this set the session needs **no** store rows, because there is no
+    /// account to hold one — which is the point, the free tier is the tier an
+    /// operator reaches for *because* they have no account.
+    ///
+    /// Refused at load alongside [`Self::refresh_key`] or an authorization
+    /// endpoint; requires [`Self::anonymous_editor`].
+    #[serde(default)]
+    pub anonymous: bool,
+    /// Editor name sent on the gateway's editor header when [`Self::anonymous`].
+    ///
+    /// Not a secret — it is the product name the upstream logs next to a
+    /// free-tier request. Still never printed: a value in a config file is no
+    /// licence for a log line, and `ar doctor` names the field, not its contents.
+    #[serde(default)]
+    pub anonymous_editor: Option<String>,
 }
 
 /// The whole P0 configuration document.
@@ -660,6 +707,12 @@ impl Config {
     fn validate(&self) -> Result<(), ConfigError> {
         for p in &self.providers {
             if !self.keys.contains_key(&p.key) {
+                // An anonymous free tier holds no credential, so demanding a name
+                // for one would make a `keys:` entry mandatory for exactly the
+                // install the mechanism exists to serve: the one with no account.
+                if self.oauth.iter().any(|s| s.provider == p.id && s.anonymous) {
+                    continue;
+                }
                 return Err(ConfigError::UnknownKey {
                     provider: p.id.clone(),
                     key: p.key.clone(),
@@ -694,6 +747,51 @@ impl Config {
                     expectation: "an https URL or a loopback http one",
                     url: url.clone(),
                 });
+            }
+            for (field, url) in
+                [("device_auth_url", &s.device_auth_url), ("device_poll_url", &s.device_poll_url)]
+            {
+                if let Some(url) = url
+                    && !http_url_ok(url)
+                {
+                    return Err(ConfigError::BadOAuthUrl {
+                        provider: s.provider.clone(),
+                        field,
+                        expectation: "an http(s) URL with no whitespace",
+                        url: url.clone(),
+                    });
+                }
+            }
+            // Half a device flow is not a slower device flow: one endpoint with no
+            // other is a hole the operator only discovers as a login that waits
+            // out its whole timeout for a poll that was never going to happen.
+            if s.device_auth_url.is_some() != s.device_poll_url.is_some() {
+                return Err(ConfigError::ContradictoryOAuth {
+                    provider: s.provider.clone(),
+                    reason: "a device login needs both device_auth_url and device_poll_url, or neither",
+                });
+            }
+            if s.anonymous {
+                if s.anonymous_editor.as_deref().is_none_or(str::is_empty) {
+                    return Err(ConfigError::ContradictoryOAuth {
+                        provider: s.provider.clone(),
+                        reason: "anonymous: true needs an anonymous_editor name; the gateway rejects the request without that header",
+                    });
+                }
+                // A free-tier request has no account behind it, so every account
+                // affordance in the same block is dead weight that reads as live.
+                if s.refresh_key.is_some() || s.client_secret_key.is_some() {
+                    return Err(ConfigError::ContradictoryOAuth {
+                        provider: s.provider.clone(),
+                        reason: "anonymous: true dispatches on the free tier and holds no account, so refresh_key/client_secret_key cannot be declared",
+                    });
+                }
+                if s.authorization_url.is_some() {
+                    return Err(ConfigError::ContradictoryOAuth {
+                        provider: s.provider.clone(),
+                        reason: "anonymous: true asks no one for consent, so authorization_url cannot be declared",
+                    });
+                }
             }
         }
         Ok(())
@@ -1362,5 +1460,97 @@ combos:
             .expect("the mirror template must load");
         let engines: Vec<Option<Engine>> = cfg.combos.iter().map(|c| c.compression.map(|k| k.engine)).collect();
         assert_eq!(engines, [Some(Engine::Lite); 3]);
+    }
+
+    /// A free-tier block with no `keys:` row, which is the whole point: there is
+    /// no account, so there is nothing to declare a name for.
+    const ANON: &str = concat!(
+        "keys: {}\n",
+        "providers:\n  - id: kilocode\n    key: kilocode\n",
+        "oauth:\n  - provider: kilocode\n    anonymous: true\n",
+        "    anonymous_editor: artificial-route\n",
+    );
+
+    fn anon_cfg() -> Config {
+        Config::parse(ANON, stub_lookup).expect("the anonymous fixture parses")
+    }
+
+    #[test]
+    fn defaults_anonymous_to_false_when_the_block_omits_it() {
+        let cfg = Config::parse(
+            "keys:\n  grok: $G\nproviders:\n  - id: grok-cli\n    key: grok\noauth:\n  - provider: grok-cli\n",
+            stub_lookup,
+        )
+        .expect("parses");
+        assert!(!cfg.oauth_for("grok-cli").expect("declared").anonymous);
+    }
+
+    #[test]
+    fn loads_an_anonymous_session_with_no_key_row_declared() {
+        // The mechanism's whole promise: an install with no account needs no
+        // `keys:` entry, and requiring one would exclude exactly that install.
+        assert!(!anon_cfg().oauth.iter().any(|s| s.refresh_key.is_some()));
+    }
+
+    #[test]
+    fn refuses_an_anonymous_session_that_declares_a_refresh_row() {
+        let yaml = ANON.replace("    anonymous_editor: artificial-route", "    anonymous_editor: artificial-route\n    refresh_key: kilocode_refresh");
+        let err = Config::parse(&yaml, stub_lookup).expect_err("no account to refresh");
+        assert!(err.to_string().contains("holds no account"), "{err}");
+    }
+
+    #[test]
+    fn refuses_an_anonymous_session_with_no_editor_name() {
+        let yaml = ANON.replace("    anonymous_editor: artificial-route\n", "");
+        let err = Config::parse(&yaml, stub_lookup).expect_err("the gateway needs the header");
+        assert!(err.to_string().contains("anonymous_editor"), "{err}");
+    }
+
+    #[test]
+    fn refuses_an_anonymous_session_that_also_declares_an_authorize_endpoint() {
+        let yaml = ANON.replace(
+            "    anonymous: true\n",
+            "    anonymous: true\n    authorization_url: https://auth.example.invalid/authorize\n",
+        );
+        let err = Config::parse(&yaml, stub_lookup).expect_err("no one consents on the free tier");
+        assert!(err.to_string().contains("asks no one for consent"), "{err}");
+    }
+
+    #[test]
+    fn refuses_a_device_login_that_declares_only_one_endpoint() {
+        let yaml = concat!(
+            "keys:\n  grok: $G\n",
+            "providers:\n  - id: grok-cli\n    key: grok\n",
+            "oauth:\n  - provider: grok-cli\n",
+            "    device_auth_url: https://auth.example.invalid/device\n",
+        );
+        let err = Config::parse(yaml, stub_lookup).expect_err("nothing to poll");
+        assert!(err.to_string().contains("device_auth_url and device_poll_url"), "{err}");
+    }
+
+    #[test]
+    fn loads_a_device_login_when_both_endpoints_are_declared() {
+        let yaml = concat!(
+            "keys:\n  grok: $G\n",
+            "providers:\n  - id: grok-cli\n    key: grok\n",
+            "oauth:\n  - provider: grok-cli\n",
+            "    device_auth_url: https://auth.example.invalid/device\n",
+            "    device_poll_url: https://auth.example.invalid/poll\n",
+        );
+        let cfg = Config::parse(yaml, stub_lookup).expect("both halves are declared");
+        assert!(cfg.oauth_for("grok-cli").expect("declared").device_poll_url.is_some());
+    }
+
+    #[test]
+    fn refuses_a_device_endpoint_that_is_not_an_http_url() {
+        let yaml = concat!(
+            "keys:\n  grok: $G\n",
+            "providers:\n  - id: grok-cli\n    key: grok\n",
+            "oauth:\n  - provider: grok-cli\n",
+            "    device_auth_url: not-a-url\n",
+            "    device_poll_url: https://auth.example.invalid/poll\n",
+        );
+        let err = Config::parse(yaml, stub_lookup).expect_err("an endpoint is never inferred");
+        assert!(err.to_string().contains("device_auth_url"), "{err}");
     }
 }

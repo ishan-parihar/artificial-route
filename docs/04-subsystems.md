@@ -39,6 +39,94 @@ will not decrypt is an error, never a silent downgrade to `$VAR`. `ar doctor` ad
 Accept: close-and-reopen reads back; a wrong master refuses; no value reaches stdout, `Debug`, or
 `Display`.
 
+**Session store** (audit F-MED-2): `oauth_sessions` beside `credentials` in the same file, opened by
+the same `CREATE TABLE IF NOT EXISTS` — no migration. One row per provider: `kind` (CHECK-limited to
+`refresh` / `device` / `anonymous`, so the device and anonymous streams add rows without a schema
+change), `access_key` (the `keys:` *name* holding the session token, never the token), and
+`terminal_status` + `terminal_reason`, whose CHECK is `ar_exec::oauth::terminal_check_constraint()`'s
+output verbatim — generated, not transcribed, so the DB cannot hold a status the classifier calls
+retryable. An `anonymous` row may not name a credential (`KeyError::AnonymousCredential`, CHECK
+behind it): there is no secret to point at. Device poll state is deliberately absent —
+`ar_exec::oauth` keeps RFC 8628 §3.5's codes in a private enum, so there is no vocabulary to
+constrain against. Accept: an unknown status or kind is refused by the database; a transient pair
+cannot be recorded; refresh and device rows round-trip.
+
+## oauth (`ar-exec`, `ar-config`, `ar-keys`)
+
+Two login mechanisms, chosen by what the *config* declares, never by a per-provider
+table. A session that sets `device_auth_url` + `device_poll_url` is a device
+session; a session that sets `authorization_url` is a browser session; one that
+sets neither is dispatch-only and reports itself unrenewable. `Config::validate`
+pairs the two device fields and refuses one without the other, because half a
+device flow is not a slower device flow — it is a hole the operator discovers as a
+login that waits out its whole timeout for a poll that was never going to happen.
+
+Device flow is RFC 8628 §3.2/§3.4 (`initiate_device`, `poll_device`), and it exists
+because of red-team R1, not for symmetry: the live provider named there publishes
+`oauth.initiateUrl` / `oauth.pollUrlBase` and no authorization and no refresh
+endpoint, which is why its sessions are active with no stored refresh token. Three
+properties it holds to, same as the browser half: no endpoint is inferred from a
+provider id (`Session::with_device_auth_url` / `with_device_poll_url`, an absent one
+is a `LoginError`); no refresh-token shaping (§3.4 returns what the provider
+returns, and a provider with no refresh grant gets none — the token records that by
+having no refresh half, and `Session::can_refresh` reports it); and failures share
+the taxonomy, because a poll failure goes through `classify_refresh` too.
+`authorization_pending` and `slow_down` are handled *before* the classifier — §3.5
+makes them "keep asking", not verdicts — and the only two device-flow terminal
+conditions are §3.5's `access_denied` and `expired_token`. Poll interval defaults to
+§3.2's 5s, walks up by §3.5's 5s on `slow_down`, and is capped at 30s so a provider
+answering `slow_down` repeatedly reports its own rate limit rather than an expiry.
+The device code is the flow's only secret and is never printed: it lives in
+`DevicePending` behind a `Secret`, split from the printable `DeviceGrant` so the
+two cannot be logged together.
+
+Neither mechanism needs an `OAuthKind`: a device session logs in and a free tier
+never does, so the provider id is the only thing that would want one, and the
+provider named by R1 has no transcribed dispatch wire to attach it to. What that
+costs is `ar doctor`'s vocabulary, and it is paid in the fix rather than the
+status: an `oauth/<id>` row for a provider with no kind reads *mechanism-aware*, so
+a block declaring `anonymous: true` gets an `ok` row (the free tier needs no
+credential, so it is **armed by design**, not merely usable) and a block declaring
+`device_auth_url` gets the honest "the mechanism is here, the kind is not" — instead
+of a bare refusal that reads as "this provider is impossible".
+
+`anonymous: true` is the third session shape, and it is a *dispatch* mode rather
+than a login mode: some gateways serve a free model set to an unauthenticated caller
+against a constant credential they name themselves. A session declaring it needs
+**no** store rows, because there is no account to hold one — which is the point,
+since the free tier is the tier an operator reaches for *because* they have no
+account. `Config::validate` refuses it alongside `refresh_key`,
+`client_secret_key` or `authorization_url`: a session that both refreshes and
+dispatches anonymously sends a free-tier request while holding a refresh token it
+never uses, and every one of those fields reads as a working config in YAML while
+behaving as something else on the wire. `anonymous_editor` is required alongside it
+(the gateway rejects the request without that header) and is never printed — a value
+in a config file is no licence for a log line, and `ar doctor` names the field, not
+its contents.
+
+`SessionKind` in `ar-keys` is the store's `kind` column vocabulary —
+`refresh` / `device` / `anonymous` — and it is deliberately *not*
+`ar_exec::oauth::OAuthKind`: the two do not cross. A `cursor` session can be any of
+the three below, and `ar-exec` has no session-kind vocabulary to resolve against.
+It is generated into the table's CHECK from `SessionKind::ALL`, so a fourth kind is
+a compile error rather than a silent hole. Two arms carry deliberate asymmetries:
+`SessionKind::Refresh` permits a missing `access_key` (R1's two live sessions are
+refresh-shaped with no credential in this store), and `SessionKind::Anonymous`
+forbids one, enforced at the API (`KeyError::AnonymousCredential`) and by a CHECK
+behind it.
+
+The device poll state (`pending` / `authorized` / `expired` / `denied`) is **not** a
+column, because `ar-exec` keeps §3.5's four codes in a private `DeviceReply` enum
+and a hand-written list is the drift F-MED-2 exists to kill. Until that enum is
+public or given a generator like `terminal_check_constraint`, a device row records
+its outcome as a terminal status, which is the one thing every device flow
+eventually produces.
+
+Accept: a config declaring one device endpoint is a **load** error naming both; a
+200 device response with no `user_code` is a named `LoginError`, not a poll loop;
+`authorize_url` for a provider whose access token is already stale returns the
+cached token without refreshing *or* writing the rotation pool.
+
 ## route (`ar-route`, `ar-config`)
 
 A combo's `targets:` is the chain; an optional `pool:` is the **bench** (audit

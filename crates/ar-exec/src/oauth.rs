@@ -79,6 +79,38 @@
 //!   (Claude's transient `invalid_grant`) applies to a login too. One list, one
 //!   meaning.
 //!
+//! # Device login: the RFC 8628 half
+//!
+//! Some providers have no browser redirect at all — Kilo Code publishes
+//! `oauth.initiateUrl` / `oauth.pollUrlBase` and no authorization or refresh
+//! endpoint, because it authenticates by RFC 8628 device flow: the client asks
+//! for a short user code, a human types that code into a provider page on
+//! another device, and the client polls until the approval lands.
+//!
+//! `initiate_device` is the §3.1 request and `poll_device` the §3.4 poll.
+//! Three properties this half holds to, same as the browser half above:
+//!
+//! * **No endpoint is ever inferred.** `device_auth_url` and `device_poll_url`
+//!   are operator-supplied ([`Session::with_device_auth_url`],
+//!   [`Session::with_device_poll_url`]); an absent one is [`LoginError`], never a
+//!   guess. A device-flow URL guessed from a provider id would be the same
+//!   invention §3.1 refuses to make.
+//! * **No refresh-token shaping.** RFC 8628 §3.4 returns whatever the provider
+//!   returns, and a provider with no refresh grant gets none — the token records
+//!   that by having no refresh half, and `Session::can_refresh` reports it. There
+//!   is no path here that invents one.
+//! * **Failures share the taxonomy.** A poll failure is classified by
+//!   `classify_refresh`, so a terminal verdict here is the same `RefreshFault` the
+//!   refresh path produces. §3.5's `authorization_pending`
+//!   and `slow_down` are handled *before* the classifier, because the RFC makes
+//!   them "keep asking" rather than verdicts; its `access_denied` and
+//!   `expired_token` are reported as [`LoginError::LoginDenied`] and
+//!   [`LoginError::LoginExpired`].
+//!
+//! The device code is the flow's only secret, and it is the one thing here that
+//! is never printed: it lives in a `DevicePending` behind a [`Secret`], so it
+//! cannot reach a log through `Debug` even by accident.
+//!
 //! The socket is unauthenticated for its entire life, so it is bound to the
 //! loopback address and never to `0.0.0.0`, it serves exactly one request, and it
 //! is dropped the moment that request is answered or the deadline passes. A
@@ -131,6 +163,31 @@ const REFRESH_BODY_SCAN: usize = 2 * 1024;
 /// path.
 const TOKEN_ENDPOINT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// RFC 8628 §3.2's default poll interval, used when the provider names none
+    /// (or names zero).
+    ///
+    /// §3.2 says a client that omits `interval` waits this long, and it is a floor
+    /// on *our* politeness in both directions: an endpoint that wants more
+    /// cadence than 5s should have said so, and one that says nothing cannot make
+    /// this build into a hot loop.
+    const DEVICE_DEFAULT_INTERVAL_SECS: u64 = 5;
+
+/// How much §3.5's `slow_down` adds to the wait, per its own wording.
+///
+/// "Increase the polling interval by 5 seconds for this and all subsequent
+/// requests" — restated rather than derived, so a provider that widens its own
+/// cadence is followed exactly instead of approximately.
+const SLOW_DOWN_STEP_SECS: u64 = 5;
+
+/// Ceiling on the wait between device polls.
+///
+/// A cap because `slow_down` is the one §3.5 code that widens the wait without
+/// bound: repeated, it would push the next poll past the human's patience and
+/// past the grant's own `expires_in`, so the login would report an expiry rather
+/// than the provider's own rate limit. A constant, not a knob — the ceiling's
+/// only job is to stay inside the grant's lifetime.
+const DEVICE_POLL_INTERVAL_CEILING_SECS: u64 = 30;
+
 /// RFC 7636 §4.1's floor on `code_verifier` length.
 ///
 /// The RFC permits 43..=128 and this build always produces 64, so the test
@@ -156,11 +213,13 @@ pub enum Origin {
 /// refuses to authenticate, and [`OAuthKind::parse`] returning `None` is what
 /// makes `ar doctor` say so instead of listing it as known (F-CRIT-1).
 ///
-/// # Why `Cursor` is a variant
+/// # Why `Cursor` and `GrokCli` are variants
 ///
-/// It is not in the four-provider minimum. It is here because F-MED-2's carve-out
-/// list names Cursor's `expired` as *retryable*, and a carve-out with no variant
-/// to hang off is a comment rather than code.
+/// Neither is in the four-provider minimum. They are here because F-MED-2's
+/// carve-out list names Cursor's `expired` as *retryable*, and the reference
+/// `grok-cli` executor carries a refresh verdict this build's shared list does
+/// not — and a carve-out with no variant to hang off is a comment rather than
+/// code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum OAuthKind {
     /// OpenAI's coding-agent account, over the Responses wire.
@@ -173,16 +232,44 @@ pub enum OAuthKind {
     GeminiCli,
     /// Cursor's account.
     Cursor,
+    /// xAI's Grok Build account, reached as the Grok CLI.
+    ///
+    /// # Authentication only
+    ///
+    /// The registry row is `authType: oauth` with `authHeader: bearer`, so this
+    /// variant is the whole of what it needs: a bearer goes in, a refresh brings
+    /// a new one back. Nothing about the *wire* is transcribed — the Responses
+    /// body, the `x-grok-*` client headers and the model defaults belong to the
+    /// dispatch layer, not here.
+    ///
+    /// # Nothing about the endpoints is hardcoded
+    ///
+    /// The reference registry points `tokenUrl` at `{ISSUER}/oauth2/token` on a
+    /// Grok Build issuer. That shape is recorded here as documentation only: the
+    /// endpoint arrives through [`Session::with_token_url`] from the operator,
+    /// because an auth endpoint inferred from a provider id is exactly the
+    /// invented wire format AGENTS.md forbids.
+    ///
+    /// # The client id is public, so it is a config value and not a secret
+    ///
+    /// The reference registry reads `clientIdEnv: GROK_OAUTH_CLIENT_ID` and
+    /// falls back to a compiled-in *public* credential under the key name
+    /// `grok_id`. A public-client id is not a credential — RFC 6749 §2.3.1 puts it
+    /// in every authorization request in the clear — so it is supplied through
+    /// [`Session::with_client_id`] like any other public value. No secret is
+    /// compiled in and none is read from the environment here.
+    GrokCli,
 }
 
 impl OAuthKind {
     /// Every kind, so a caller can enumerate coverage without a second list.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Codex,
         Self::Cline,
         Self::Claude,
         Self::GeminiCli,
         Self::Cursor,
+        Self::GrokCli,
     ];
 
     /// The registry provider id this kind drives.
@@ -194,11 +281,27 @@ impl OAuthKind {
             Self::Claude => "claude",
             Self::GeminiCli => "gemini-cli",
             Self::Cursor => "cursor",
+            Self::GrokCli => "grok-cli",
         }
     }
 
-    /// The kind for a registry provider id, or `None` when this build has no
-    /// executor for it.
+    /// The registry `alias` the same provider also answers to, when it has one.
+    ///
+    /// A second name for the same account, not a second provider: an alias
+    /// resolves to the kind whose [`Self::as_str`] is the canonical id, so the
+    /// carve-out table cannot end up with two rows for one session.
+    fn alias(self) -> Option<&'static str> {
+        match self {
+            Self::GrokCli => Some("gc"),
+            _ => None,
+        }
+    }
+
+    /// The kind for a registry provider id — or for the `alias` a registry entry
+    /// carries beside it — or `None` when this build has no executor for it.
+    ///
+    /// The canonical id is checked first, so an alias can never shadow a real
+    /// provider id.
     ///
     /// `None` is the answer for most of the 21 `oauth` entries in the compiled-in
     /// catalog, and for `kilocode` in particular. Red-team R1 records two live
@@ -209,16 +312,21 @@ impl OAuthKind {
     pub fn parse(provider: &str) -> Option<Self> {
         // Over `ALL`, not a `match` on strings, so a new variant with no parse
         // arm fails to compile rather than quietly answering `None`.
-        Self::ALL.into_iter().find(|k| k.as_str() == provider)
+        Self::ALL
+            .into_iter()
+            .find(|k| k.as_str() == provider || k.alias() == Some(provider))
     }
 
     /// Provider-specific overrides of [`TERMINAL_REFRESH_STATUS`], consulted
     /// *before* it.
     ///
-    /// Both carve-outs F-MED-2 names point the same way — from "this looks
-    /// terminal" toward "retry" — which is the safe direction: the cost of a
-    /// wrong terminal verdict is a dead account, the cost of a wrong transient
-    /// verdict is one wasted round trip.
+    /// Most of them point from "this looks terminal" toward "retry", which is the
+    /// safe direction: the cost of a wrong terminal verdict is a dead account, the
+    /// cost of a wrong transient verdict is one wasted round trip. [`Self::GrokCli`]
+    /// is the exception and is deliberately the only one, because the verdict it
+    /// ports is terminal for that provider and nothing else: naming the same row
+    /// terminal everywhere would retire accounts over an error only Grok Build is
+    /// known to send.
     #[must_use]
     pub fn carve_out(self, reason: &str) -> Option<RefreshFault> {
         match (self, reason) {
@@ -234,6 +342,19 @@ impl OAuthKind {
             // afternoon, which is the failure mode F-MED-2 warns about.
             (Self::Claude, "invalid_grant") => {
                 Some(RefreshFault::Transient("claude-invalid-grant-survives"))
+            }
+            // Grok Build's token endpoint carries its own terminal set,
+            // `invalid_grant` + `invalid_client`. `invalid_grant` is already a row
+            // in [`TERMINAL_REFRESH_STATUS`], so only the second one differs — and
+            // it is the reason this variant exists. A client id the issuer does
+            // not recognise cannot become valid by refreshing again, so reading it
+            // as retryable would spend the router's whole attempt budget on a
+            // refresh that can never succeed. The status is the one RFC 6749 §5.2
+            // registers for `invalid_client`, and it is listed in
+            // [`CARVE_OUT_TERMINAL_STATUS`] so `reason_in` can find the reason in a
+            // body and the generated CHECK can admit the row.
+            (Self::GrokCli, "invalid_client") => {
+                Some(RefreshFault::Unrecoverable { status: 401, reason: "invalid_client" })
             }
             _ => None,
         }
@@ -351,6 +472,25 @@ pub const TERMINAL_REFRESH_STATUS: &[(u16, &str)] = &[
     (410, "token_revoked"),
 ];
 
+/// Terminal rows a provider's [`OAuthKind::carve_out`] can produce that
+/// [`TERMINAL_REFRESH_STATUS`] does not list.
+///
+/// A carve-out is normally a *narrowing* — it moves a listed row toward retry — so
+/// this list is empty for every provider but Grok Build, which the reference
+/// executor retires on an `invalid_client` nobody else is known to send. Listing it
+/// separately rather than widening the shared table keeps the other five kinds'
+/// verdicts exactly as they were.
+///
+/// It is read in two places, and both need it: [`reason_in`] scans for these
+/// reasons so [`classify_refresh`] can hand one to [`OAuthKind::carve_out`] at all
+/// (a carve-out otherwise never sees a reason the shared scan did not already
+/// find), and [`terminal_check_constraint`] generates its CHECK from the union —
+/// otherwise the classifier could produce a terminal row the store would refuse to
+/// hold. Finding one is the only new behaviour for a kind that has no carve-out
+/// for it: such a reason is not in [`TERMINAL_REFRESH_STATUS`] either, so it still
+/// lands on the transient fallthrough, under the same reason as before.
+const CARVE_OUT_TERMINAL_STATUS: &[(u16, &str)] = &[(401, "invalid_client")];
+
 /// The `CHECK` clause a credential store's terminal column must carry.
 ///
 /// Generated from [`TERMINAL_REFRESH_STATUS`] rather than hand-written, so the
@@ -358,10 +498,15 @@ pub const TERMINAL_REFRESH_STATUS: &[(u16, &str)] = &[
 /// class of bug F-MED-2 describes. A function and not a `const` because a
 /// `const fn` cannot build a `String`, and the list is small enough that building
 /// it per call is free next to the sqlite open that consumes it.
+///
+/// The carve-out-only rows are chained in for the same reason: the clause has to
+/// admit every terminal pair [`classify_refresh`] can emit, for *any* kind.
 #[must_use]
 pub fn terminal_check_constraint() -> String {
     let mut sql = String::from("CHECK (terminal_status IS NULL OR (");
-    for (i, (status, reason)) in TERMINAL_REFRESH_STATUS.iter().enumerate() {
+    for (i, (status, reason)) in
+        TERMINAL_REFRESH_STATUS.iter().chain(CARVE_OUT_TERMINAL_STATUS).enumerate()
+    {
         if i > 0 {
             sql.push_str(" OR ");
         }
@@ -429,12 +574,16 @@ fn is_transient_status(status: u16) -> bool {
 /// returning `None`: the classifier needs *a* reason to compare against, and
 /// `"unauthorized"` is not in the terminal list, which lands on the transient
 /// fallthrough — the safe direction.
+///
+/// The shared list is scanned first and the carve-out-only rows second, so a body
+/// naming both keeps the shared verdict: precedence for a listed row is unchanged.
 fn reason_in(body: &str) -> &str {
     let lower = body.to_ascii_lowercase();
     let end = lower.len().min(REFRESH_BODY_SCAN);
     let head = &lower[..end];
     TERMINAL_REFRESH_STATUS
         .iter()
+        .chain(CARVE_OUT_TERMINAL_STATUS)
         .find(|(_, reason)| head.contains(*reason))
         .map_or("unauthorized", |(_, reason)| *reason)
 }
@@ -612,6 +761,8 @@ pub struct Session {
     kind: OAuthKind,
     authorization_url: Option<String>,
     token_url: Option<String>,
+    device_auth_url: Option<String>,
+    device_poll_url: Option<String>,
     client_id: Option<String>,
     scope: Option<String>,
 }
@@ -625,6 +776,8 @@ impl Session {
             kind,
             authorization_url: None,
             token_url: None,
+            device_auth_url: None,
+            device_poll_url: None,
             client_id: None,
             scope: None,
         }
@@ -645,6 +798,25 @@ impl Session {
     #[must_use]
     pub fn with_token_url(mut self, url: impl Into<String>) -> Self {
         self.token_url = Some(url.into());
+        self
+    }
+
+    /// Sets the RFC 8628 §3.1 device-authorization endpoint.
+    ///
+    /// Separate from `token_url` because a device-flow provider may publish one
+    /// and not the other: Kilo Code declares only `initiateUrl`/`pollUrlBase`,
+    /// so a session that reused `token_url` here would either demand an endpoint
+    /// the provider does not have or point at the wrong path.
+    #[must_use]
+    pub fn with_device_auth_url(mut self, url: impl Into<String>) -> Self {
+        self.device_auth_url = Some(url.into());
+        self
+    }
+
+    /// Sets the RFC 8628 §3.4 endpoint the pending code is polled at.
+    #[must_use]
+    pub fn with_device_poll_url(mut self, url: impl Into<String>) -> Self {
+        self.device_poll_url = Some(url.into());
         self
     }
 
@@ -684,6 +856,18 @@ impl Session {
     #[must_use]
     pub fn token_url(&self) -> Option<&str> {
         self.token_url.as_deref()
+    }
+
+    /// The device-authorization endpoint, when one is configured.
+    #[must_use]
+    pub fn device_auth_url(&self) -> Option<&str> {
+        self.device_auth_url.as_deref()
+    }
+
+    /// The device-poll endpoint, when one is configured.
+    #[must_use]
+    pub fn device_poll_url(&self) -> Option<&str> {
+        self.device_poll_url.as_deref()
     }
 
     /// The client id, when configured.
@@ -1273,8 +1457,11 @@ pub fn unix_now() -> u64 {
 /// ([`CallbackListener`], [`parse_callback_url`]) produces the four
 /// redirect variants; [`authorize_url`] produces [`Self::NoAuthorizationUrl`]
 /// and [`Self::InvalidRedirectUri`]; [`exchange_code`] produces
-/// [`Self::NoTokenUrl`] and [`Self::ExchangeFailed`]. A caller matches on the
-/// variant, never on the string.
+/// [`Self::NoTokenUrl`] and [`Self::ExchangeFailed`]. The device-flow half
+/// ([`initiate_device`], [`poll_device`]) adds the two endpoint-absence
+/// variants and reuses [`Self::LoginDenied`] and [`Self::LoginExpired`] for
+/// §3.5's two terminal codes. A caller matches on the variant, never on the
+/// string.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum LoginError {
     /// The provider refused: §4.1.2 answered with `?error=…` instead of a code.
@@ -1315,6 +1502,14 @@ pub enum LoginError {
     /// authorization code.
     #[error("no token endpoint is configured; set token_url")]
     NoTokenUrl,
+    /// The session declares no device-authorization endpoint, so §3.1 has
+    /// nowhere to ask for a user code.
+    #[error("no device authorization endpoint is configured; set device_auth_url")]
+    NoDeviceAuthUrl,
+    /// The session declares no device-poll endpoint, so §3.4 has nowhere to ask
+    /// whether the human approved.
+    #[error("no device poll endpoint is configured; set device_poll_url")]
+    NoDevicePollUrl,
     /// The redirect URI is not an absolute URL, so §4.1.2 would send the
     /// provider's answer somewhere this client cannot read.
     ///
@@ -1840,6 +2035,392 @@ pub async fn exchange_code(
     Ok(token)
 }
 
+/// What a human has to do to approve a device grant, and how long they have.
+///
+/// Everything in this type is *meant* for a person to read: the user code is
+/// typed into another device, the URI is the page it is typed into. That is why
+/// the fields are public and [`Debug`] is derived — a redacted grant would be
+/// useless to the one caller that matters.
+///
+/// The secret half of the grant lives in [`DevicePending`], not here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceGrant {
+    /// The short code the human types, §3.2's `user_code`.
+    ///
+    /// User-facing by design: a person reads this aloud or pastes it, so it
+    /// prints and logs like any other display value. It is not a credential —
+    /// §3.2's security argument is that it is useless without the bound device
+    /// code.
+    pub user_code: String,
+    /// Where the human enters it, §3.2's `verification_uri`.
+    ///
+    /// User-facing for the same reason as the code. RFC 8628 §3.2 allows a
+    /// pre-filled `verification_uri_complete` instead; a provider that sends only
+    /// that one still has to hand out a URI to open, so this is required and the
+    /// complete form is not read.
+    pub verification_uri: String,
+    /// Seconds the grant stays pollable, §3.2's `expires_in`.
+    ///
+    /// The grant's own budget. [`poll_device`] never waits past it, so a human
+    /// who abandons the code cannot pin a poll loop open.
+    pub expires_in_secs: u64,
+    /// Seconds to wait between polls, §3.2's `interval`.
+    ///
+    /// Defaults to the RFC 8628 §3.2 default when the provider omits it.
+    pub interval_secs: u64,
+}
+
+/// The secret half of a pending device grant: the code the polls carry.
+///
+/// Split from [`DeviceGrant`] so the two cannot be logged together by accident.
+/// Every field is private and the only way out is [`Self::device_code`], which
+/// exists so [`poll_device`] can post it; [`Debug`] is hand-written to name the
+/// field and print nothing for it, the same treatment [`Grant`] and
+/// [`TokenHash`] give key material.
+#[derive(Clone)]
+pub struct DevicePending {
+    device_code: Secret,
+    interval_secs: u64,
+    expires_at: u64,
+}
+
+impl DevicePending {
+    /// The §3.4 poll credential. Never printed, never logged.
+    #[must_use]
+    pub fn device_code(&self) -> &Secret {
+        &self.device_code
+    }
+
+    /// The seconds to wait before the first poll.
+    ///
+    /// Public because a caller printing "checking again in Ns" needs it, and it
+    /// is the provider's number rather than a secret.
+    #[must_use]
+    pub fn interval_secs(&self) -> u64 {
+        self.interval_secs
+    }
+
+    /// Unix second at which the grant stops being pollable.
+    #[must_use]
+    pub fn expires_at(&self) -> u64 {
+        self.expires_at
+    }
+}
+
+impl std::fmt::Debug for DevicePending {
+    /// Prints the interval and the deadline, and nothing for the device code.
+    ///
+    /// Same rule and same reason as [`AuthorizeRequest`]'s own `Debug`: the device
+    /// code is the whole security of this flow, so a type that holds it says so
+    /// in its `Debug` rather than trusting nobody to print it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DevicePending")
+            .field("device_code", &"<withheld>")
+            .field("interval_secs", &self.interval_secs)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+/// Asks the provider for a device grant: the RFC 8628 §3.1 request.
+///
+/// A `POST` with no grant fields — §3.2 defines nothing to send here beyond
+/// `client_id`, and `scope` when the operator configured one. Standards-shaped
+/// rather than provider-shaped, for the same reason [`HttpRefresher`] is: a
+/// per-provider body would be an invented wire format (AGENTS.md).
+///
+/// Returns the grant and the pending half together because a caller cannot use
+/// one without the other — the grant is what it shows the human, the pending is
+/// what it polls with — and pairing them at construction is what stops a caller
+/// polling a code it got from a different grant.
+///
+/// `core`'s client is the one that already pools connections for these hosts, so
+/// a login opens no second pool.
+///
+/// # Errors
+///
+/// [`LoginError::NoDeviceAuthUrl`] when the session declares no
+/// `device_auth_url`, or declares one that is not a URL — never a guessed
+/// endpoint. [`LoginError::ExchangeFailed`] otherwise: a transport failure or an
+/// unreadable body arrives as [`RefreshFault::Transient`], and a non-success
+/// status is classified by [`classify_refresh`] like any other auth POST.
+pub async fn initiate_device(
+    core: &ArExec,
+    session: &Session,
+) -> Result<(DeviceGrant, DevicePending), LoginError> {
+    let Some(url) = session.device_auth_url() else {
+        return Err(LoginError::NoDeviceAuthUrl);
+    };
+    // Validity gate only; §3.1 posts to this endpoint either way.
+    Url::parse(url).map_err(|_| LoginError::NoDeviceAuthUrl)?;
+
+    let mut form: Vec<(&str, &str)> = Vec::new();
+    if let Some(client_id) = session.client_id() {
+        form.push(("client_id", client_id));
+    }
+    if let Some(scope) = session.scope() {
+        form.push(("scope", scope));
+    }
+
+    let response = match core
+        .client()
+        .post(url)
+        .form(&form)
+        .timeout(TOKEN_ENDPOINT_TIMEOUT)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        // A transport failure is transient by definition: no verdict was
+        // produced, so nothing was learned about the account.
+        Err(e) => return Err(LoginError::ExchangeFailed(RefreshFault::Transient(transport_reason(&e)))),
+    };
+
+    let status = response.status().as_u16();
+    let success = response.status().is_success();
+    let raw = response.bytes().await.unwrap_or_default();
+    let body = String::from_utf8_lossy(&raw[..raw.len().min(REFRESH_BODY_SCAN)]).into_owned();
+    if !success {
+        return Err(LoginError::ExchangeFailed(classify_refresh(session.kind(), status, &body)));
+    }
+
+    let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|_| {
+        LoginError::ExchangeFailed(RefreshFault::Transient("unreadable-device-response"))
+    })?;
+
+    // Every one of these is required, and a missing one is named rather than
+    // defaulted: a grant without the device code cannot be polled, one without
+    // the user code cannot be displayed, and one without the URI leaves the human
+    // nothing to open. A half-grant would be a login that looks started and then
+    // fails minutes later, with the user code already typed into the void.
+    let missing = |field: &'static str| LoginError::ExchangeFailed(RefreshFault::Transient(field));
+    let device_code = string_field(&parsed, "device_code")
+        .ok_or_else(|| missing("device-response-has-no-device-code"))?;
+    let user_code =
+        string_field(&parsed, "user_code").ok_or_else(|| missing("device-response-has-no-user-code"))?;
+    let verification_uri = string_field(&parsed, "verification_uri")
+        .ok_or_else(|| missing("device-response-has-no-verification-uri"))?;
+
+    // §3.2 makes `expires_in` required and `interval` optional; the default is
+    // the RFC's own floor, so an absent interval is 5s rather than "as fast as
+    // possible". `expires_in` is required rather than defaulted for the same
+    // reason the code is: it is the grant's budget, and a login that invented
+    // one would poll a code the provider had already discarded.
+    // §3.2 makes `expires_in` required and `interval` optional; the default is
+    // the RFC's own floor, so an absent interval is 5s rather than "as fast as
+    // possible". `expires_in` is required rather than defaulted for the same
+    // reason the code is: it is the grant's budget, and a login that invented
+    // one would poll a code the provider had already discarded.
+    let Some(expires_in_secs) = parsed.get("expires_in").and_then(serde_json::Value::as_u64)
+    else {
+        return Err(missing("device-response-has-no-expiry"));
+    };
+    let interval_secs = parsed
+        .get("interval")
+        .and_then(serde_json::Value::as_u64)
+        // Zero is not a faster poll, it is a missing field: §3.2's default is
+        // the only safe reading, because the alternative is a hot loop against an
+        // endpoint that named no cadence at all.
+        .filter(|secs| *secs > 0)
+        .unwrap_or(DEVICE_DEFAULT_INTERVAL_SECS);
+
+    Ok((
+        DeviceGrant {
+            user_code,
+            verification_uri,
+            expires_in_secs,
+            interval_secs,
+        },
+        DevicePending {
+            device_code: Secret::new(&device_code),
+            interval_secs,
+            expires_at: unix_now().saturating_add(expires_in_secs),
+        },
+    ))
+}
+
+/// A non-empty string field, or `None`.
+///
+/// Empty counts as absent: a provider answering `"verification_uri": ""` has not
+/// configured the field, and handing an empty URI to a human is worse than
+/// naming the missing one. Returns owned because every caller keeps the value
+/// past the [`serde_json::Value`] it came from.
+fn string_field(parsed: &serde_json::Value, key: &str) -> Option<String> {
+    parsed
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+/// Polls a pending device grant until the human approves it: RFC 8628 §3.4.
+///
+/// One `async fn`, for the same reason [`exchange_code`] is: a device login
+/// happens once per account, so the [`Refresher`] trait's shape would buy
+/// nothing.
+///
+/// The loop's three outcomes, and the spec's own words for each:
+///
+/// * **Approval** — a token response, parsed exactly as [`exchange_code`]
+///   parses one. `refresh_token` is optional and its absence means no renewal.
+/// * **`access_denied`** — [`LoginError::LoginDenied`], terminal. The human said
+///   no; polling again cannot change that.
+/// * **`expired_token`** — [`LoginError::LoginExpired`], terminal. §3.5 makes it
+///   the code for "the grant is over".
+///
+/// `authorization_pending` and `slow_down` are not verdicts and never leave this
+/// loop: the first keeps waiting, the second also widens the interval (§3.5's
+/// "+5 seconds") up to `DEVICE_POLL_INTERVAL_CEILING_SECS`, so the next poll
+/// still lands inside the grant's own lifetime. Every other
+/// non-approval answer — one whose `error` code §3.5 does not name, or a
+/// *transient* HTTP failure where the provider produced no answer about the human
+/// at all — is classified by [`classify_refresh`], the same classifier the
+/// refresh path uses: transient keeps the loop trying inside `timeout`, and a
+/// terminal row ends it with the fault that names it.
+///
+/// `timeout` is the caller's own budget, checked against both the wall clock and
+/// the grant's `expires_in`, so the loop cannot outlive the code the human is
+/// holding.
+///
+/// # Errors
+///
+/// [`LoginError::NoDevicePollUrl`] when the session declares no
+/// `device_poll_url`. Otherwise a terminal [`LoginError::LoginDenied`] or
+/// [`LoginError::LoginExpired`] for §3.5's two terminal codes and for the
+/// loop's own deadline, and [`LoginError::ExchangeFailed`] carrying a
+/// [`RefreshFault`] from [`classify_refresh`] for a poll failure the classifier
+/// calls terminal.
+pub async fn poll_device(
+    core: &ArExec,
+    session: &Session,
+    pending: &DevicePending,
+    timeout: Duration,
+) -> Result<OAuthToken, LoginError> {
+    let Some(url) = session.device_poll_url() else {
+        return Err(LoginError::NoDevicePollUrl);
+    };
+
+    let mut wait = Duration::from_secs(pending.interval_secs);
+    // One deadline for both budgets: the caller's `timeout` is the outer bound,
+    // the grant's `expires_in` the inner one, and the login must not outlive
+    // either. Two `Instant::now()` calls would let the two bounds drift by the
+    // time between them.
+    let now = tokio::time::Instant::now();
+    let deadline = std::cmp::min(
+        now + timeout,
+        now + Duration::from_secs(pending.expires_at.saturating_sub(unix_now())),
+    );
+
+    loop {
+        // §3.2 hands back a `user_code` the human has to read and type, so a
+        // poll before the first wait is a guaranteed `authorization_pending`.
+        // Clamped to the remaining budget so a long interval cannot overshoot
+        // the deadline on its own.
+        tokio::time::sleep(wait.min(deadline.saturating_duration_since(tokio::time::Instant::now())))
+            .await;
+        if tokio::time::Instant::now() >= deadline {
+            // The caller's budget or the grant's `expires_in`, whichever came
+            // first. `LoginExpired` rather than an exchange fault: no provider
+            // verdict exists, only a human who did not finish in time.
+            return Err(LoginError::LoginExpired);
+        }
+
+        let mut form: Vec<(&str, &str)> = vec![
+            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+            ("device_code", pending.device_code.expose()),
+        ];
+        if let Some(client_id) = session.client_id() {
+            form.push(("client_id", client_id));
+        }
+
+        let response = match core
+            .client()
+            .post(url)
+            .form(&form)
+            .timeout(TOKEN_ENDPOINT_TIMEOUT)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(_) => {
+                // Transport: the provider never answered, so nothing was learned
+                // about the human and the loop keeps asking inside its budget.
+                continue;
+            }
+        };
+
+        let status = response.status().as_u16();
+        let success = response.status().is_success();
+        let raw = response.bytes().await.unwrap_or_default();
+        let body = String::from_utf8_lossy(&raw[..raw.len().min(REFRESH_BODY_SCAN)]).into_owned();
+
+        // Read the §3.5 codes from the parsed body rather than from the status:
+        // `authorization_pending` and `slow_down` arrive as 400, so a status-only
+        // read would report a successful request as a refusal.
+        let code = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| string_field(&v, "error"));
+
+        match (success, code.as_deref()) {
+            // Approval: the token response, parsed by the same rules as
+            // `exchange_code`, so a provider cannot answer the two flows with
+            // two different shapes without the difference showing here.
+            (true, _) => return token_from_body(&body),
+            (_, Some("access_denied")) => {
+                return Err(LoginError::LoginDenied("access_denied".to_owned()));
+            }
+            (_, Some("expired_token")) => return Err(LoginError::LoginExpired),
+            // §3.5's two loop states: neither is a verdict about the human.
+            (_, Some("authorization_pending")) => {}
+            (_, Some("slow_down")) => {
+                // §3.5's own step, capped so the next poll still lands inside the
+                // grant's lifetime rather than being overtaken by the expiry.
+                wait = (wait + Duration::from_secs(SLOW_DOWN_STEP_SECS)).min(Duration::from_secs(
+                    DEVICE_POLL_INTERVAL_CEILING_SECS,
+                ));
+            }
+            // Any other answer, including one whose `error` code §3.5 does not
+            // name, goes to the shared classifier rather than straight back into
+            // the loop. The reason is the terminal list: a 400 `invalid_grant`
+            // here means the provider is finished with this grant, and reading it
+            // as "keep asking" would poll a dead code until the deadline. The
+            // classifier's fallthrough is transient, so a code this build does
+            // not recognise still keeps waiting — an unknown condition never
+            // retires anything.
+            _ => {
+                let fault = classify_refresh(session.kind(), status, &body);
+                if fault.is_terminal() {
+                    return Err(LoginError::ExchangeFailed(fault));
+                }
+            }
+        }
+    }
+}
+
+/// The §5.1 token response, shared by the code exchange and the device poll.
+///
+/// Both flows answer with the same shape, so they share one parser: a provider
+/// that returns an access token without a refresh token means "there is no
+/// renewal" either way, and two parsers would let that drift.
+fn token_from_body(body: &str) -> Result<OAuthToken, LoginError> {
+    let parsed: serde_json::Value = serde_json::from_str(body)
+        .map_err(|_| LoginError::ExchangeFailed(RefreshFault::Transient("unreadable-refresh-response")))?;
+    let Some(access) = string_field(&parsed, "access_token") else {
+        return Err(LoginError::ExchangeFailed(RefreshFault::Transient(
+            "refresh-response-has-no-access-token",
+        )));
+    };
+
+    let mut token = OAuthToken::new(Secret::new(&access)).with_expiry(expiry_at(&parsed, unix_now()));
+    // §5.1: optional, and its absence means this session cannot be renewed —
+    // the first 401 is then terminal, which `Session::can_refresh` reports
+    // rather than a later dispatch discovering. No path here invents one.
+    if let Some(refresh) = string_field(&parsed, "refresh_token") {
+        token = token.with_refresh(Secret::new(&refresh));
+    }
+    Ok(token)
+}
+
 // A connection is shared across request tasks and holds two locks; the rotation
 // pool is shared across connections. Prove it at compile time rather than
 // discovering it from a spawn error on the first concurrent request (ch.9).
@@ -1865,11 +2446,12 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        CallbackListener, Connected, Dispatch, EXPIRY_SKEW_SECS, ExecError,
-        LoginError, OAuthKind, OAuthToken, Origin, PKCE_VERIFIER_MIN_LEN, RefreshFault, Refresher,
-        RotationPool, Session, TERMINAL_REFRESH_STATUS, TerminalReport, Unconnected, authorize_url,
-        classify_refresh, code_challenge_for, exchange_code, new_authorize_request,
-        parse_callback_url, terminal_check_constraint, token_hash, unix_now,
+        CallbackListener, Connected, DEVICE_DEFAULT_INTERVAL_SECS, Dispatch, EXPIRY_SKEW_SECS,
+        ExecError, HttpRefresher, LoginError, OAuthKind, OAuthToken, Origin, PKCE_VERIFIER_MIN_LEN,
+        RefreshFault, Refresher, RotationPool, Session, TERMINAL_REFRESH_STATUS, TerminalReport,
+        Unconnected, authorize_url, classify_refresh, code_challenge_for, exchange_code,
+        initiate_device, new_authorize_request, parse_callback_url, poll_device,
+        terminal_check_constraint, token_hash, unix_now,
     };
     use crate::oauth::Connection;
 
@@ -1969,8 +2551,31 @@ mod tests {
     }
 
     #[test]
+    fn resolves_the_grok_cli_registry_alias_to_the_same_executor() {
+        // The registry entry carries `alias: "gc"` beside its id; both name one
+        // account, so both must reach one carve-out table.
+        assert_eq!(OAuthKind::parse("gc"), Some(OAuthKind::GrokCli));
+    }
+
+    #[test]
     fn treats_a_named_terminal_row_as_terminal() {
         assert!(classify_refresh(OAuthKind::Cline, 400, r#"{"error":"invalid_grant"}"#).is_terminal());
+    }
+
+    #[test]
+    fn keeps_a_grok_cli_invalid_client_terminal() {
+        // The reference executor's own terminal set, ported. Without the carve-out
+        // this falls through to the transient default and retries a refresh that
+        // can never succeed.
+        assert!(classify_refresh(OAuthKind::GrokCli, 401, r#"{"error":"invalid_client"}"#).is_terminal());
+    }
+
+    #[test]
+    fn keeps_an_unlisted_provider_retryable_on_the_same_body() {
+        // The carve-out is scoped: the shared scan now finds `invalid_client`, but a
+        // kind with no arm for it still lands on the transient fallthrough, exactly
+        // as it did before the reason became findable.
+        assert!(!classify_refresh(OAuthKind::Codex, 401, r#"{"error":"invalid_client"}"#).is_terminal());
     }
 
     #[test]
@@ -2032,6 +2637,23 @@ mod tests {
     #[test]
     fn check_constraint_is_null_tolerant() {
         assert!(terminal_check_constraint().starts_with("CHECK (terminal_status IS NULL"));
+    }
+
+    #[test]
+    fn admits_the_grok_cli_carve_out_row_in_the_generated_check() {
+        // The classifier can emit this pair, so a store that took the generated
+        // clause has to be able to hold it: a terminal verdict the CHECK refuses
+        // would be dropped rather than recorded.
+        let fault = OAuthKind::GrokCli.carve_out("invalid_client").expect("grok-cli's terminal row");
+        let sql = terminal_check_constraint();
+        assert!(
+            sql.contains(&format!(
+                "terminal_status = {} AND terminal_reason = '{}'",
+                fault.status(),
+                fault.reason()
+            )),
+            "{sql}"
+        );
     }
 
     #[test]
@@ -2760,6 +3382,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn keeps_the_old_refresh_token_when_a_grok_cli_refresh_omits_one() {
+        // The reference executor answers a grok-cli refresh without a
+        // `refresh_token` when it does not rotate. RFC 6749 §5.1 makes the field
+        // optional and its absence mean "keep using the one you have", so a
+        // grok-cli session must survive its own refresh rather than lose the row
+        // that renews it.
+        let (base, _seen) =
+            token_endpoint((StatusCode::OK, r#"{"access_token":"at-2","expires_in":3600}"#)).await;
+        let session = Session::new("grok-cli", OAuthKind::GrokCli)
+            .with_token_url(format!("{base}/token"))
+            .with_client_id("grok-public-client");
+        let current = expired_token().with_refresh(Secret::new("rt-grok-1"));
+        let refresher = HttpRefresher::new(reqwest::Client::new());
+
+        let token = refresher
+            .refresh(&session, &current)
+            .await
+            .expect("the mock grants the refresh");
+
+        assert_eq!(token.refresh().map(|refresh| refresh.expose()), Some("rt-grok-1"));
+    }
+
+    #[tokio::test]
+    async fn posts_the_grok_cli_refresh_as_the_rfc6749_refresh_form() {
+        // The reference executor's body, field for field: the shared §6 refresher
+        // already emits exactly this, which is why grok-cli needs no wire of its own.
+        let (base, seen) =
+            token_endpoint((StatusCode::OK, r#"{"access_token":"at-2","refresh_token":"rt-2"}"#))
+                .await;
+        let session = Session::new("grok-cli", OAuthKind::GrokCli)
+            .with_token_url(format!("{base}/token"))
+            .with_client_id("grok-public-client");
+        let refresher = HttpRefresher::new(reqwest::Client::new());
+
+        refresher
+            .refresh(&session, &expired_token().with_refresh(Secret::new("rt-grok-1")))
+            .await
+            .expect("the mock grants the refresh");
+
+        let pairs = urlencoded_pairs(&seen.lock().unwrap_or_else(|p| p.into_inner()));
+        for (name, value) in [
+            ("grant_type", "refresh_token"),
+            ("client_id", "grok-public-client"),
+            ("refresh_token", "rt-grok-1"),
+        ] {
+            assert!(
+                pairs.iter().any(|(n, v)| n == name && v == value),
+                "{name}={value} is missing from {pairs:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn sends_the_client_secret_when_the_operator_supplied_one() {
         // A confidential client's secret is a third store row, handed in already
         // decrypted — the same seam an access token uses.
@@ -2935,6 +3610,466 @@ mod tests {
             })
             .to_string(),
             "oauth exchange failed: terminal (refresh returned 400: invalid_grant)"
+        );
+    }
+
+    /// A device-flow session: both endpoints a device provider has to declare,
+    /// plus the client id §3.2 sends. No `token_url`, because the provider this
+    /// is written for publishes none — reusing it here would demand an endpoint
+    /// kilocode does not have.
+    fn device_session(base: &str) -> Session {
+        Session::new("kilocode", OAuthKind::Codex)
+            .with_device_auth_url(format!("{base}/codes"))
+            .with_device_poll_url(format!("{base}/poll"))
+            .with_client_id("client-synthetic")
+    }
+
+/// A device endpoint serving both halves: a fixed grant body at `POST /codes`
+    /// and a queue of replies at `POST /poll`, with the poll count handed back.
+    ///
+    /// Two routes rather than one queue because the halves have to be told
+    /// apart: a device login's whole behaviour is *what happens on the second
+    /// and third poll* — it must survive a `pending` and a 500 before it can be
+    /// approved — and a single shared queue would spend the first poll's answer
+    /// on the initiate. The count is how the retry tests assert the loop kept
+    /// asking rather than returning the first failure.
+    async fn device_endpoint(
+        grant: (StatusCode, &'static str),
+        polls: Vec<(StatusCode, &'static str)>,
+    ) -> (String, Arc<Mutex<usize>>) {
+        let asked: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let counter = Arc::clone(&asked);
+        let queue = Arc::new(Mutex::new(polls.into_iter()));
+        let slot = Arc::clone(&queue);
+
+        async fn pull(
+            counter: Arc<Mutex<usize>>,
+            queue: Arc<Mutex<std::vec::IntoIter<(StatusCode, &'static str)>>>,
+        ) -> (StatusCode, &'static str) {
+            *counter.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+            // The last reply repeats, so a test that outlives its queue still gets
+            // a deterministic answer rather than a handler panic.
+            queue
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .next()
+                .unwrap_or((StatusCode::BAD_REQUEST, r#"{"error":"authorization_pending"}"#))
+        }
+
+        let issues = Arc::new((grant.0, grant.1.to_owned()));
+        let issued = Arc::clone(&issues);
+        let app = axum::Router::new()
+            .route(
+                "/codes",
+                // `Arc` rather than a moved capture: an axum handler must be `Fn`, so it
+                // cannot consume what it captured. The `Arc` owns the body because
+                // an `async` block may not hand back a borrow of its own capture.
+                axum::routing::post(move || {
+                    let issued = Arc::clone(&issued);
+                    async move {
+                        let (status, body) = issued.as_ref();
+                        (*status, body.clone())
+                    }
+                }),
+            )
+            .route(
+                "/poll",
+                axum::routing::post(move || {
+                    let counter = Arc::clone(&counter);
+                    let slot = Arc::clone(&slot);
+                    async move { pull(counter, slot).await }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback binds");
+        let addr = listener.local_addr().expect("bound socket has an address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), asked)
+    }
+
+    /// A §3.2 grant body carrying the literals an RFC 8628 provider sends.
+    ///
+    /// `interval` of 1 is the smallest value a real poll loop can use, and the
+    /// reason: these tests sleep for real (no paused clock in this crate), so
+    /// §3.2's 5s default would add five seconds per poll.
+    const DEVICE_GRANT_BODY: &str = r#"{"device_code":"dc-secret","user_code":"WXYZ-1234","verification_uri":"https://auth.test/device","expires_in":900,"interval":1}"#;
+
+    /// The same grant with a nonsensical `interval`, for the fallback assertion.
+    const DEVICE_GRANT_NO_INTERVAL: &str = r#"{"device_code":"dc-secret","user_code":"WXYZ-1234","verification_uri":"https://auth.test/device","expires_in":900,"interval":0}"#;
+
+    /// A grant whose lifetime has already elapsed, for the deadline assertion.
+    const DEVICE_GRANT_EXPIRED: &str = r#"{"device_code":"dc-secret","user_code":"WXYZ-1234","verification_uri":"https://auth.test/device","expires_in":0,"interval":1}"#;
+
+    #[tokio::test]
+    async fn parses_the_device_grant_when_the_provider_answers_rfc8628_fields() {
+        let (base, _) = device_endpoint(
+            (StatusCode::OK, DEVICE_GRANT_BODY),
+            vec![(StatusCode::BAD_REQUEST, r#"{"error":"authorization_pending"}"#)],
+        )
+        .await;
+        let core = crate::ArExec::new().expect("client");
+        let session = device_session(&base);
+
+        let (grant, pending) = initiate_device(&core, &session)
+            .await
+            .expect("the mock issues a grant");
+
+        assert_eq!(grant.user_code, "WXYZ-1234", "§3.2's user_code is the code a human types");
+        assert_eq!(
+            grant.verification_uri, "https://auth.test/device",
+            "§3.2's verification_uri is where it is typed"
+        );
+        assert_eq!(grant.interval_secs, 1, "§3.2's interval is the provider's own cadence");
+        assert!(
+            grant.expires_in_secs > 0,
+            "§3.2's expires_in is the grant's budget and must survive parsing"
+        );
+        assert_eq!(pending.interval_secs(), grant.interval_secs, "the poll waits what the grant says");
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_the_rfc_default_when_the_provider_names_no_interval() {
+        let (base, _) = device_endpoint((StatusCode::OK, DEVICE_GRANT_NO_INTERVAL), vec![]).await;
+        let core = crate::ArExec::new().expect("client");
+
+        let (grant, _) = initiate_device(&core, &device_session(&base))
+            .await
+            .expect("the mock issues a grant");
+
+        // An `interval` of 0 is nonsense from a provider, and §3.2's own default
+        // is the answer: the poll must not become a hot loop because one field
+        // was garbage.
+        assert_eq!(
+            grant.interval_secs, DEVICE_DEFAULT_INTERVAL_SECS,
+            "a zero interval falls back to the RFC's default, not to a hot loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn prints_no_device_code_from_a_pending_debug() {
+        let (base, _) = device_endpoint((StatusCode::OK, DEVICE_GRANT_BODY), vec![]).await;
+        let core = crate::ArExec::new().expect("client");
+
+        let (_, pending) =
+            initiate_device(&core, &device_session(&base)).await.expect("the mock issues a grant");
+
+        assert!(
+            !format!("{pending:?}").contains("dc-secret"),
+            "the device code is the flow's secret and must not reach a log through Debug"
+        );
+    }
+
+    #[tokio::test]
+    async fn returns_the_token_when_the_device_is_approved() {
+        let (base, asked) = device_endpoint(
+            (StatusCode::OK, DEVICE_GRANT_BODY),
+            vec![
+                (StatusCode::BAD_REQUEST, r#"{"error":"authorization_pending"}"#),
+                (
+                    StatusCode::OK,
+                    r#"{"access_token":"at-1","token_type":"Bearer","expires_in":3600}"#,
+                ),
+            ],
+        )
+        .await;
+        let core = crate::ArExec::new().expect("client");
+        let session = device_session(&base);
+        let (_, pending) = initiate_device(&core, &session).await.expect("grant");
+
+        let token = poll_device(&core, &session, &pending, Duration::from_secs(30))
+            .await
+            .expect("the mock approves the device");
+
+        assert_eq!(token.access().expose(), "at-1", "the approved poll returns the access token");
+        assert_eq!(
+            *asked.lock().unwrap_or_else(|p| p.into_inner()),
+            2,
+            "an authorization_pending is a loop state, so the login asked again and then succeeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn records_no_refresh_half_when_the_device_grant_returns_no_refresh_token() {
+        let (base, _) = device_endpoint(
+            (StatusCode::OK, DEVICE_GRANT_BODY),
+            vec![(StatusCode::OK, r#"{"access_token":"at-1","expires_in":3600}"#)],
+        )
+        .await;
+        let core = crate::ArExec::new().expect("client");
+        let session = device_session(&base);
+        let (_, pending) = initiate_device(&core, &session).await.expect("grant");
+
+        let token = poll_device(&core, &session, &pending, Duration::from_secs(30))
+            .await
+            .expect("approval");
+
+        // kilocode has no refresh grant, so nothing here may invent one: the
+        // token records "no renewal" by having no refresh half, and
+        // `can_refresh` reports it instead of the first 401 discovering it.
+        assert!(!token.can_refresh(), "a device grant with no refresh_token is not renewable");
+    }
+
+    #[tokio::test]
+    async fn treats_a_denial_as_terminal_when_the_provider_answers_access_denied() {
+        let (base, asked) = device_endpoint(
+            (StatusCode::OK, DEVICE_GRANT_BODY),
+            vec![(
+                StatusCode::BAD_REQUEST,
+                r#"{"error":"access_denied","error_description":"The user declined"}"#,
+            )],
+        )
+        .await;
+        let core = crate::ArExec::new().expect("client");
+        let session = device_session(&base);
+        let (_, pending) = initiate_device(&core, &session).await.expect("grant");
+
+        let err = poll_device(&core, &session, &pending, Duration::from_secs(30))
+            .await
+            .err();
+
+        assert_eq!(
+            err,
+            Some(LoginError::LoginDenied("access_denied".to_owned())),
+            "§3.5's denial is the human's verdict and polling cannot change it"
+        );
+        assert_eq!(
+            *asked.lock().unwrap_or_else(|p| p.into_inner()),
+            1,
+            "a denial ends the loop on the first answer rather than re-asking"
+        );
+    }
+
+    #[tokio::test]
+    async fn treats_an_expiry_as_terminal_when_the_provider_answers_expired_token() {
+        let (base, asked) = device_endpoint(
+            (StatusCode::OK, DEVICE_GRANT_BODY),
+            vec![(StatusCode::BAD_REQUEST, r#"{"error":"expired_token"}"#)],
+        )
+        .await;
+        let core = crate::ArExec::new().expect("client");
+        let session = device_session(&base);
+        let (_, pending) = initiate_device(&core, &session).await.expect("grant");
+
+        let err = poll_device(&core, &session, &pending, Duration::from_secs(30))
+            .await
+            .err();
+
+        assert_eq!(
+            err,
+            Some(LoginError::LoginExpired),
+            "§3.5's expired_token is the grant being over, which reuses the login's own expiry"
+        );
+        assert_eq!(
+            *asked.lock().unwrap_or_else(|p| p.into_inner()),
+            1,
+            "an expiry ends the loop on the first answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn keeps_polling_when_the_provider_answers_a_transient_500() {
+        let (base, asked) = device_endpoint(
+            (StatusCode::OK, DEVICE_GRANT_BODY),
+            vec![
+                (StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"server_error"}"#),
+                (StatusCode::SERVICE_UNAVAILABLE, "gateway busy"),
+                (StatusCode::OK, r#"{"access_token":"at-1","expires_in":3600}"#),
+            ],
+        )
+        .await;
+        let core = crate::ArExec::new().expect("client");
+        let session = device_session(&base);
+        let (_, pending) = initiate_device(&core, &session).await.expect("grant");
+
+        let token = poll_device(&core, &session, &pending, Duration::from_secs(60))
+            .await
+            .expect("a transient failure is not a verdict, so the loop keeps asking");
+
+        assert_eq!(token.access().expose(), "at-1", "the eventual approval still lands");
+        assert_eq!(
+            *asked.lock().unwrap_or_else(|p| p.into_inner()),
+            3,
+            "both transient failures were retried rather than returned as the login's outcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_to_initiate_when_the_session_declares_no_device_auth_url() {
+        let core = crate::ArExec::new().expect("client");
+        let session = Session::new("kilocode", OAuthKind::Codex);
+
+        let err = initiate_device(&core, &session).await.err();
+
+        assert_eq!(
+            err,
+            Some(LoginError::NoDeviceAuthUrl),
+            "an absent endpoint is named, never inferred from the provider id"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_to_poll_when_the_session_declares_no_device_poll_url() {
+        let (base, _) = device_endpoint((StatusCode::OK, DEVICE_GRANT_BODY), vec![]).await;
+        let core = crate::ArExec::new().expect("client");
+        let session = device_session(&base);
+        let (_, pending) = initiate_device(&core, &session).await.expect("grant");
+
+        let err = poll_device(
+            &core,
+            &Session::new("kilocode", OAuthKind::Codex),
+            &pending,
+            Duration::from_secs(30),
+        )
+        .await
+        .err();
+
+        assert_eq!(
+            err,
+            Some(LoginError::NoDevicePollUrl),
+            "an absent poll endpoint is named, never inferred"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_to_initiate_when_the_device_response_omits_the_device_code() {
+        let (base, _) = device_endpoint(
+            (
+                StatusCode::OK,
+                r#"{"user_code":"WXYZ-1234","verification_uri":"https://auth.test/device","expires_in":900}"#,
+            ),
+            vec![],
+        )
+        .await;
+        let core = crate::ArExec::new().expect("client");
+
+        let err = initiate_device(&core, &device_session(&base)).await.err();
+
+        // Transient, not terminal: the endpoint answered, it just answered
+        // incompletely. A half-grant must never read as a verdict on the account.
+        assert_eq!(
+            err,
+            Some(LoginError::ExchangeFailed(RefreshFault::Transient(
+                "device-response-has-no-device-code"
+            ))),
+            "a grant with no device_code cannot be polled, so the user_code would be a string typed for nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_to_initiate_when_the_session_declares_a_relative_device_auth_url() {
+        let core = crate::ArExec::new().expect("client");
+        let session = Session::new("kilocode", OAuthKind::Codex)
+            .with_device_auth_url("/api/device-auth/codes");
+
+        let err = initiate_device(&core, &session).await.err();
+
+        assert_eq!(
+            err,
+            Some(LoginError::NoDeviceAuthUrl),
+            "a relative endpoint would send the request nowhere, so it is named rather than posted"
+        );
+    }
+
+    #[tokio::test]
+    async fn stops_polling_when_the_grants_own_lifetime_passes() {
+        // `expires_in` of 0 means the grant is already over: the loop must end on
+        // its own budget rather than sleeping out a human who never arrives.
+        let (base, asked) = device_endpoint((StatusCode::OK, DEVICE_GRANT_EXPIRED), vec![]).await;
+        let core = crate::ArExec::new().expect("client");
+        let session = device_session(&base);
+        let (_, pending) = initiate_device(&core, &session).await.expect("grant");
+
+        let err = poll_device(&core, &session, &pending, Duration::from_secs(60))
+            .await
+            .err();
+
+        assert_eq!(err, Some(LoginError::LoginExpired), "an elapsed grant is an expiry");
+        assert_eq!(
+            *asked.lock().unwrap_or_else(|p| p.into_inner()),
+            0,
+            "the grant's own budget is checked before the first poll, so nothing is asked"
+        );
+    }
+
+    #[tokio::test]
+    async fn stops_polling_when_the_callers_own_budget_passes() {
+        // The caller caps its own wait below the grant's lifetime; the login has
+        // to honour the tighter of the two rather than outliving its budget.
+        let (base, _) = device_endpoint(
+            (StatusCode::OK, DEVICE_GRANT_BODY),
+            vec![(StatusCode::BAD_REQUEST, r#"{"error":"authorization_pending"}"#)],
+        )
+        .await;
+        let core = crate::ArExec::new().expect("client");
+        let session = device_session(&base);
+        let (_, pending) = initiate_device(&core, &session).await.expect("grant");
+
+        let err = poll_device(&core, &session, &pending, Duration::ZERO).await.err();
+
+        assert_eq!(err, Some(LoginError::LoginExpired), "a zero budget ends the loop at once");
+    }
+
+    #[tokio::test]
+    async fn widens_the_poll_interval_when_the_provider_answers_slow_down() {
+        let (base, _) = device_endpoint(
+            (StatusCode::OK, DEVICE_GRANT_BODY),
+            vec![
+                (StatusCode::BAD_REQUEST, r#"{"error":"slow_down"}"#),
+                (StatusCode::OK, r#"{"access_token":"at-1","expires_in":3600}"#),
+            ],
+        )
+        .await;
+        let core = crate::ArExec::new().expect("client");
+        let session = device_session(&base);
+        let (_, pending) = initiate_device(&core, &session).await.expect("grant");
+
+        let token = poll_device(&core, &session, &pending, Duration::from_secs(60))
+            .await
+            .expect("slow_down is a loop state, not a failure");
+
+        assert_eq!(
+            token.access().expose(), "at-1",
+            "§3.5's slow_down delays the next ask rather than ending the login"
+        );
+    }
+
+    #[tokio::test]
+    async fn ends_the_poll_when_the_provider_answers_a_terminal_refresh_row() {
+        // The classifier is shared with the refresh path, so a terminal status it
+        // knows ends a device login too — as the same typed fault, not as prose.
+        let (base, _) = device_endpoint(
+            (StatusCode::OK, DEVICE_GRANT_BODY),
+            vec![(StatusCode::BAD_REQUEST, r#"{"error":"invalid_grant"}"#)],
+        )
+        .await;
+        let core = crate::ArExec::new().expect("client");
+        let session = device_session(&base);
+        let (_, pending) = initiate_device(&core, &session).await.expect("grant");
+
+        let err = poll_device(&core, &session, &pending, Duration::from_secs(30))
+            .await
+            .err();
+
+        assert_eq!(
+            err,
+            Some(LoginError::ExchangeFailed(RefreshFault::Unrecoverable {
+                status: 400,
+                reason: "invalid_grant"
+            })),
+            "one terminal-status list governs the poll as well as the refresh"
+        );
+    }
+
+    #[test]
+    fn renders_the_device_endpoint_absence_variants_as_the_operator_sentence() {
+        assert_eq!(
+            LoginError::NoDeviceAuthUrl.to_string(),
+            "no device authorization endpoint is configured; set device_auth_url"
+        );
+        assert_eq!(
+            LoginError::NoDevicePollUrl.to_string(),
+            "no device poll endpoint is configured; set device_poll_url"
         );
     }
 }

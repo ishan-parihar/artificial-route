@@ -14,8 +14,12 @@ have landed; each entry below says what is done and what is not.
   Savings"), 0 assignments. Candidate pools: free-stack 7 providers for
   2 targets (pool ≠ targets — the pool is the fallback bench).
 - OAuth sessions active with stored refresh: cline ×2, codex ×2, grok-cli ×1.
-  **Anomaly:** kilocode ×2 OAuth with *no* stored refresh token, kimi-coding
-  expired. How kilocode authenticates is unexplained — red-team item R1.
+  **Mechanism (was an anomaly — red-team R1, now resolved):** kilocode ×2 OAuth
+  rows with *no* stored refresh token were not a mystery. The provider publishes
+  `oauth.initiateUrl` / `oauth.pollUrlBase` and **no** authorization and **no**
+  refresh endpoint: it authenticates by RFC 8628 device flow, so a live session
+  legitimately holds a bearer with no refresh half behind it. See R1 below.
+  kimi-coding expired with no refresh, which is expected-terminal (R2).
 - API-key connections: 49 across 19 groups, incl. 2 custom
   `openai-compatible-*` nodes plus `clinepass`, `yolo-auto` (custom nodes
   outside the 276 registry). 6 client API keys.
@@ -35,9 +39,42 @@ any `oauth` provider that has no executor instead of listing it as known.
 **Browser login also landed:** `ar auth login --provider <id>` prints the PKCE authorize URL (openable on any device), catches the redirect on a single-use `127.0.0.1` listener or reads one pasted redirect line for remote logins, exchanges the code, and persists both rows; `ar auth status|logout` and four MCP tools (`ar_auth_login_url|complete|status|logout`) drive the same flow. AGENTS.md
 forbids inventing provider wire formats, so no refresh endpoint is hardcoded —
 `token_url` is operator-supplied and a session without one reports itself as
-unrenewable rather than guessing. `grok-cli` and `kilocode` are deliberately
-executor-less: `grok-cli` because its endpoint is not yet transcribed, `kilocode`
-because of R1.
+unrenewable rather than guessing.
+
+**The two rows that were open, closed separately:**
+
+*`grok-cli` — closed as an OAuth kind, wire still deferred.* `OAuthKind::GrokCli`
+is a variant (`as_str` → `grok-cli`, alias `gc`), so the provider is no longer
+"catalogued but unexecutable" — `doctor` builds a session for it and it resolves
+through the same `resolve_oauth` path as the other five. The variant is
+**authentication-only**: the registry row is `authType: oauth` /
+`authHeader: bearer`, so a bearer goes in and a refresh brings a new one back.
+Nothing about the *dispatch* wire is transcribed — the Responses body, the
+`x-grok-*` client headers and the model defaults are the dispatch layer's, not the
+token layer's. Its refresh verdict is the one place the shared list needed
+extending: the reference grok executor carries a terminal set of
+`{invalid_grant, invalid_client}`, and only the second differs from
+`TERMINAL_REFRESH_STATUS`, so it landed as a `carve_out` arm plus a
+carve-out-only row in `CARVE_OUT_TERMINAL_STATUS` rather than as a second copy of
+the shared list. A public client id is a config value, not a secret — RFC 6749
+§2.3.1 puts it in every authorization request in the clear — and none is compiled
+in.
+
+*`kilocode` — no `OAuthKind`, but its two mechanisms no longer need one.* R1
+resolved: the provider is an RFC 8628 **device-flow** provider, not a
+refresh-token one, and it also serves a free tier that answers an unauthenticated
+caller. Neither mechanism is an OAuth *executor*:
+`initiate_device` / `poll_device` are the RFC 8628 §3.2/§3.4 pair with both
+endpoints operator-supplied and only §3.5's `access_denied` / `expired_token`
+terminal (`authorization_pending` / `slow_down` are "keep asking", handled before
+the classifier), and `anonymous: true` + `anonymous_editor:` dispatches on the free
+tier with no credential row at all, because there is no account to hold one. So
+`OAuthKind::parse("kilocode")` is still `None` — its *dispatch* wire is not
+transcribed — and an `oauth/kilocode` row with neither mechanism declared is still a
+`fail`. What changed is the fix that row carries: it names the YAML for either
+mechanism instead of only refusing, because "no executor" is no longer the same as
+"no way to authenticate". The store's `SessionKind` has a `device` and an
+`anonymous` arm for the rows those two produce.
 
 ### F-CRIT-2: No local credential store
 Provider keys resolve from env vars only. There is nowhere to port the 49
@@ -141,17 +178,56 @@ OmniRoute's terminal `test_status` sets diverge across 4 sites
 (broadest 4, narrowest 2) with no DB constraint. `ar` must define one
 terminal set with a CHECK constraint from day one, plus the carve-outs
 (Cursor `expired` is retryable; Claude refresh tokens survive transient
-`invalid_grant`).
+`invalid_grant`; grok-cli's `invalid_client` is terminal). **Row-for-row
+cross-check against the reference taxonomy: `docs/audit-notes.md`** — 4
+we-terminal/they-transient rows (one a confirmed account-bricker, `(403,
+permission_denied)`), 3 the other way, 2 detection gaps where our snake_case
+tokens cannot match the reference's phrase-form signals, and 15 agreements.
 **Now:** `ar_exec::oauth::TERMINAL_REFRESH_STATUS` is the only copy. The
 classifier reads it, `ar doctor` reports its size and the carve-outs from it, and
 `terminal_check_constraint()` *generates* the store's CHECK clause from it so the
-fourth copy cannot drift. Both carve-outs are honoured by
+fourth copy cannot drift. All three carve-outs are honoured by
 `OAuthKind::carve_out`, which runs **before** the list — the only way to become
 terminal is to be named, and the classifier's fallthrough is transient, because
 reading a transient as terminal bricks a working account.
-**Not yet:** the store column itself. `ar-keys`' credential store holds the
-`keys:` map and nothing else; the CHECK has no table to sit in until F-CRIT-2
-grows an oauth table.
+
+**Carve-out table (as built).** Two point away from retiring; the third came from
+the grok-cli row of F-CRIT-1 and is the only one that moves *toward* terminal.
+
+| kind | reason | verdict | why |
+|---|---|---|---|
+| `cursor` | `expired`, `token_expired` | transient (`cursor-expired-is-retryable`) | means "this token is old", not "this account is dead" — the refresh path still works |
+| `claude` | `invalid_grant` | transient (`claude-invalid-grant-survives`) | an IdP hiccup answers `invalid_grant` for a token that is still good |
+| `grok-cli` | `invalid_client` | **terminal** (`unrecoverable`, status 401) | a client id the issuer does not recognise cannot become valid by refreshing again; retrying spends the whole attempt budget on a refresh that can never succeed |
+
+That third row is why there are two lists. `CARVE_OUT_TERMINAL_STATUS` holds
+`(401, "invalid_client")` and feeds `reason_in` and the generated CHECK, while
+`classify_refresh`'s membership test still reads only `TERMINAL_REFRESH_STATUS` —
+so a carve-out-only reason is terminal *only* where a `carve_out` arm names it, and
+one shared list stays the only copy of the shared rows. Precedence is unchanged:
+the shared list is scanned first, so a body naming both a shared row and a
+carve-out-only row keeps the shared verdict. Both halves are pinned by
+`keeps_a_grok_cli_invalid_client_terminal`, including that `codex` on the same body
+stays transient.
+
+**Known gap:** the `doctor` cell cannot spell a carve-out-only reason.
+`ar-cli`'s `terminal_reason` resolves against `TERMINAL_REFRESH_STATUS` alone, so
+the one reason the generated CHECK admits and the classifier can return is the one
+an operator-facing row cannot name. Filed as finding B1' in
+`docs/audit-notes.md`; not fixed here.
+**Also now:** the table it sits in. `ar-keys`' `oauth_sessions`
+(`provider` PK, `kind`, `access_key`, `terminal_status`, `terminal_reason`) is
+`credentials`-adjacent and holds placement plus status only — a `keys:` *name*,
+never a secret — and it carries the generated clause verbatim, so a transient
+`(status, reason)` cannot be recorded as a retirement. `kind` is
+CHECK-limited to all three session kinds from day one (`refresh` / `device` /
+`anonymous`), so the device and anonymous streams need no migration; an anonymous
+row may not name a credential (`KeyError::AnonymousCredential` from the API, the
+CHECK behind it).
+**Not yet:** the device-flow poll state. `ar_exec::oauth` keeps RFC 8628 §3.5's four
+poll codes in a private `DeviceReply` enum, so `oauth_sessions` has no vocabulary to
+constrain a `poll_state` column against; adding one means making that enum public (or
+giving it a generator, as `terminal_check_constraint` does), not transcribing the codes.
 
 ### F-MED-3: Counter under-count — **FIXED**
 `ar_upstream_attempts_total` incremented once per request, not per attempt. It
@@ -160,13 +236,25 @@ not see before: `AttemptOutcome::Retry` reported `attempts() == 0`, so a fully
 throttled chain — the case where every attempt happened — would have added
 nothing. `Retry` carries `tried` now. Name and exposition unchanged.
 
-## Red-team items (anomalies, not yet gaps)
+## Red-team items (anomalies, or mechanisms once explained)
 
-- **R1:** kilocode OAuth ×2 with no stored refresh token yet `is_active`.
-  Mechanism unknown — trace before porting kilocode. **Still open.** `ar doctor`
-  now fails it loudly (`oauth/kilocode`: "no executor for it") and
-  `ProviderConfig::is_dispatchable` keeps it out of every candidate list, so it
-  costs no attempt slot and no rotation.
+- **R1: RESOLVED — anomaly → mechanism.** The observation was kilocode OAuth ×2
+  with no stored refresh token yet `is_active`. The mechanism is **RFC 8628 device
+  flow**: the provider publishes `oauth.initiateUrl` / `oauth.pollUrlBase` and no
+  authorization and no refresh endpoint, so the client asks for a short user code,
+  a human approves it on another device, and the client polls. The refresh-token
+  column is empty *because there is no refresh grant to hold* — the row was never
+  broken, and there was no second mechanism to find. Nothing about kilocode's
+  *dispatch* wire is transcribed, so the accounting is unchanged where it matters:
+  `OAuthKind::parse("kilocode")` is still `None` (pinned by
+  `refuses_a_provider_this_build_has_no_executor_for`), `ar doctor` still fails it
+  loudly, and `ProviderConfig::is_dispatchable` keeps it out of every candidate
+  list. What changed is the *reason*: the mechanism is understood and ported where
+  it belongs — `initiate_device` / `poll_device` in `ar-exec`, the two device
+  endpoints as operator-supplied config, and `SessionKind::Device` in the store's
+  CHECK-constrained `kind` column. A device session legitimately has no refresh
+  half, and the store's `SessionKind::Refresh` arm documents the same asymmetry
+  from the credential side.
 - **R2:** kimi-coding OAuth expired with no refresh. Expected terminal;
   confirm `ar` reports equivalent visibility, not a bare 502.
   **Now visible:** a terminal session answers `401` with

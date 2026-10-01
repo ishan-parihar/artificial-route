@@ -737,10 +737,25 @@ fn registry_row_at(unroutable: usize, now: u64) -> Row {
 /// session can be armed here and unloggable there, and collapsing the two would
 /// report a working session as broken.
 pub fn oauth_row(provider: &str, cfg: &Config, store: &StoreProbe<'_>) -> (String, String) {
+    // Mechanism first, executor second: an anonymous session is armed *by
+    // design* — there is no account, no row and nothing to renew — so asking
+    // whether its access token resolves would report the absence of a credential
+    // as a failure to produce one. And it is the one shape that needs no
+    // executor at all, which is what makes it the answer for a provider this
+    // build otherwise cannot authenticate (red-team R1's `kilocode`).
+    if let Some(declared) = cfg.oauth_for(provider)
+        && declared.anonymous
+    {
+        let (status, reason) = anonymous_row(declared);
+        return (status, reason);
+    }
     let Some(kind) = ar_server::OAuthKind::parse(provider) else {
         return (
             "fail".to_owned(),
-            "catalog authType is oauth but this build has no executor for it, so it cannot authenticate and will not route (AUDIT-REPORT F-CRIT-1, red-team R1)".to_owned(),
+            format!(
+                "catalog authType is oauth but this build has no executor for it, so it cannot authenticate and will not route (AUDIT-REPORT F-CRIT-1, red-team R1){}",
+                no_executor_fix(cfg, provider),
+            ),
         );
     };
     let Some(declared) = cfg.oauth_for(provider) else {
@@ -754,7 +769,7 @@ pub fn oauth_row(provider: &str, cfg: &Config, store: &StoreProbe<'_>) -> (Strin
     if !resolves(access_name, cfg, store) {
         return (
             "fail".to_owned(),
-            format!("access token {access_name:?} is in neither the credential store nor keys:"),
+            format!("access token {access_name:?} is in neither the credential store nor keys:{}", relogin(provider)),
         );
     }
 
@@ -784,6 +799,50 @@ pub fn oauth_row(provider: &str, cfg: &Config, store: &StoreProbe<'_>) -> (Strin
     }
 }
 
+/// The `oauth/<id>` row for an anonymous free-tier session.
+///
+/// `ok`, and armed rather than merely usable: there is no account, so there is
+/// nothing to expire, nothing to refresh and nothing an operator could log in to
+/// renew. Calling it `unarmed` would send someone looking for a token that the
+/// design says must not exist.
+///
+/// The editor header is named by *field*, never by value. It is not a secret —
+/// it is the product name the upstream logs — but a row that renders config
+/// values is a row that will render a credential the moment someone copies the
+/// pattern.
+fn anonymous_row(declared: &ar_config::OAuthSession) -> (String, String) {
+    let editor = if declared.anonymous_editor.as_deref().is_some_and(|e| !e.is_empty()) {
+        "anonymous_editor set"
+    } else {
+        "anonymous_editor is empty"
+    };
+    (
+        "ok".to_owned(),
+        format!(
+            "anonymous free tier; armed by design with no credential row; dispatches `Bearer anonymous` plus {editor}",
+        ),
+    )
+}
+
+/// The mechanism-aware fix clause for an `oauth` provider with no executor.
+///
+/// One string, because the whole point of the row is that the next command is on
+/// it. A provider with *any* workable mechanism gets the YAML that turns the
+/// mechanism on; one with neither gets the honest refusal. `kilocode` is the
+/// reason this exists: R1 recorded it active with no stored refresh and no traced
+/// mechanism, and the free tier is now a mechanism this build can drive without
+/// an executor at all.
+fn no_executor_fix(cfg: &Config, provider: &str) -> String {
+    match cfg.oauth_for(provider) {
+        None => "; it can still work without one — add an `oauth:` block with `anonymous: true` and an `anonymous_editor:` for the free tier".to_owned(),
+        Some(declared) if declared.anonymous => String::new(),
+        Some(declared) if declared.device_auth_url.is_some() => format!(
+            "; the block declares a device login (device_auth_url + device_poll_url), which needs no executor, but this build has no oauth kind for {provider}"
+        ),
+        Some(_) => "; if it has a device flow or a free tier, declare `device_auth_url` + `device_poll_url`, or `anonymous: true` + `anonymous_editor:`, in its `oauth:` block".to_owned(),
+    }
+}
+
 /// Login readiness for one declared session: whether `ar auth login` can run it.
 ///
 /// Separate from [`oauth_row`] on purpose. `oauth_row` answers "does this session
@@ -807,6 +866,37 @@ pub fn login_readiness(
             "no `oauth:` block declares this provider".to_owned(),
         );
     };
+    // A free-tier session has nothing to authorise and nothing to wait for, so
+    // `needs-login` would be a lie about a credential that by design never
+    // exists. The three states below are all about producing a token.
+    if declared.anonymous {
+        let (_, detail) = anonymous_row(declared);
+        return ("armed-by-design".to_owned(), detail);
+    }
+    // A device session is authorised by typing a code somewhere else, so its
+    // readiness question is "are both endpoints declared", not "is there a URL
+    // to open here". Same three verdicts, different question — and the answer
+    // has to differ, because a device provider with no `authorization_url` is a
+    // working login and reporting it `unavailable` would be exactly backwards.
+    if declared.device_auth_url.is_some() {
+        return match (declared.device_auth_url.as_deref(), declared.device_poll_url.as_deref()) {
+            (Some(auth), Some(_)) => {
+                let armed = resolves(cfg.key_name(provider).unwrap_or(provider), cfg, store);
+                let relogin = relogin(provider);
+                (
+                    if armed { "armed".to_owned() } else { "needs-login".to_owned() },
+                    format!(
+                        "device login at {auth}; no browser is opened here, a code is entered on any device; access {}{relogin}",
+                        if armed { "resolves" } else { "does not resolve yet" },
+                    ),
+                )
+            }
+            _ => (
+                "unavailable".to_owned(),
+                "a device login needs both device_auth_url and device_poll_url in the `oauth:` block".to_owned(),
+            ),
+        };
+    }
     let Some(endpoint) = declared.authorization_url.as_deref() else {
         return (
             "unavailable".to_owned(),

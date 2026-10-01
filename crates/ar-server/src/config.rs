@@ -683,6 +683,22 @@ pub enum ComboError {
 /// [`ComboError::UnknownProvider`] when the provider half is in neither the
 /// compiled-in catalog nor the config's `custom_providers:`, and the credential
 /// errors from [`resolve_key`].
+/// The bearer a free-tier gateway accepts from an unauthenticated caller.
+///
+/// Recorded from the provider registry rather than derived: `kilocode` publishes
+/// this exact string, and a value inferred from a provider id would be an
+/// invented wire format (AGENTS.md). A gateway that names its anonymous tier
+/// differently is not served by this constant — it uses an ordinary API-key row.
+const ANONYMOUS_API_KEY: &str = "anonymous";
+
+/// The header a free-tier gateway requires alongside that bearer.
+///
+/// Also recorded, not inferred: the value is the *editor's* name, which is what
+/// the gateway logs next to a free-tier request. `anonymous_editor` in the
+/// `oauth:` block supplies it, because the name is the operator's to choose and a
+/// wrong-but-present one is harder to notice than a missing one.
+const ANONYMOUS_EDITOR_HEADER: &str = "X-KILOCODE-EDITORNAME";
+
 fn resolve_target(
     target: &str,
     rank: u32,
@@ -701,19 +717,30 @@ fn resolve_target(
         })?;
 
     if !providers.iter().any(|p| p.id.as_str() == provider) {
-        let key_name = cfg.key_name(provider).unwrap_or(provider);
-        let key = resolve_key(cfg, provider, key_name, store)?;
-        let mut entry = ProviderConfig::new(ProviderId::new(provider), &def.base_url, key)
-            .with_wire_format(def.wire_format)
-            .with_headers(def.headers.clone())
-            // The catalog's `authType`, carried so `is_dispatchable` can tell a
-            // provider that *needs* an OAuth executor from one that merely has a
-            // session configured. Without it, `oauth: None` would mean both
-            // "keyless" and "labelled oauth, and this build cannot do it".
-            .with_needs_oauth_executor(def.auth_kind.as_ref() == "oauth");
-        if let Some(auth) = resolve_oauth(cfg, provider, key_name, store)? {
-            entry = entry.with_oauth(auth);
-        }
+        let mut entry = match anonymous_entry(cfg, provider, def) {
+            // The free tier brings its own credential, so nothing is resolved:
+            // no store row is read, no `keys:` entry has to exist, and no OAuth
+            // session is connected. That is the whole promise of the flag, and
+            // resolving first would break it for the install it exists for —
+            // one with no account and therefore nothing to put in `keys:`.
+            Some(entry) => entry,
+            None => {
+                let key_name = cfg.key_name(provider).unwrap_or(provider);
+                let key = resolve_key(cfg, provider, key_name, store)?;
+                let mut entry = ProviderConfig::new(ProviderId::new(provider), &def.base_url, key)
+                    .with_wire_format(def.wire_format)
+                    .with_headers(def.headers.clone())
+                    // The catalog's `authType`, carried so `is_dispatchable` can tell a
+                    // provider that *needs* an OAuth executor from one that merely has a
+                    // session configured. Without it, `oauth: None` would mean both
+                    // "keyless" and "labelled oauth, and this build cannot do it".
+                    .with_needs_oauth_executor(def.auth_kind.as_ref() == "oauth");
+                if let Some(auth) = resolve_oauth(cfg, provider, key_name, store)? {
+                    entry = entry.with_oauth(auth);
+                }
+                entry
+            }
+        };
         // The flat table's model is a display default only; a combo target always
         // carries its own spelling.
         entry.upstream_model = model.to_owned();
@@ -722,6 +749,38 @@ fn resolve_target(
     }
 
     Ok(ComboTarget::new(ProviderId::new(provider), model).with_weight(weight))
+}
+
+/// The dispatch row for an anonymous free-tier session, when the config asks for one.
+///
+/// Built whole rather than patched onto an existing row, because the ordering is
+/// the contract: an anonymous session has no credential to resolve and no OAuth
+/// connection to make, and a row that went through either step first would have
+/// already demanded a store row the operator does not have.
+///
+/// `needs_oauth_executor` stays set even though the row dispatches without one,
+/// because that flag is a statement about the *catalog* and `is_dispatchable`
+/// consults [`ProviderConfig::anonymous`] first.
+fn anonymous_entry(
+    cfg: &Config,
+    provider: &str,
+    def: &ar_registry::ProviderDef,
+) -> Option<ProviderConfig> {
+    let declared = cfg.oauth_for(provider)?;
+    if !declared.anonymous {
+        return None;
+    }
+    let mut headers = def.headers.clone();
+    if let Some(editor) = declared.anonymous_editor.as_deref().filter(|e| !e.is_empty()) {
+        headers.insert(ANONYMOUS_EDITOR_HEADER.to_owned(), editor.to_owned());
+    }
+    Some(
+        ProviderConfig::new(ProviderId::new(provider), &def.base_url, ANONYMOUS_API_KEY)
+            .with_wire_format(def.wire_format)
+            .with_headers(headers)
+            .with_needs_oauth_executor(def.auth_kind.as_ref() == "oauth")
+            .with_anonymous(true),
+    )
 }
 
 /// Resolves a provider's OAuth session, when the config declares one.
@@ -875,6 +934,67 @@ mod tests {
 
     use super::{ComboError, ComboTarget, DefaultChain, RouteCombo, ServerConfig, split_target};
     use crate::exec::ProviderConfig;
+
+    /// A free-tier kilocode block: no `keys:` row at all, because there is no
+    /// account to put one in.
+    const ANON_YAML: &str = r#"
+keys: {}
+providers:
+  - id: kilocode
+    key: kilocode
+combos:
+  - id: free
+    strategy: priority
+    targets:
+      - kilocode/openrouter/free
+oauth:
+  - provider: kilocode
+    anonymous: true
+    anonymous_editor: artificial-route
+"#;
+
+    #[test]
+    fn sends_the_constant_credential_and_the_editor_header_for_an_anonymous_free_tier() {
+        // The two halves of the mechanism, and neither is derived: the credential
+        // is the one the gateway publishes, the header value is the operator's.
+        let cfg = ServerConfig::from_ar_config(
+            &ar_config::Config::parse(ANON_YAML, |_| Ok(Some(String::new()))).expect("parses"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .expect("the free tier builds");
+        let row = cfg.providers.first().expect("one dispatch row");
+        assert_eq!(row.api_key, "anonymous");
+        assert_eq!(
+            row.headers.get("X-KILOCODE-EDITORNAME").map(String::as_str),
+            Some("artificial-route")
+        );
+    }
+
+    #[test]
+    fn admits_an_anonymous_free_tier_to_the_candidate_list_without_an_executor() {
+        // R1's kilocode, end to end: the config a free-tier operator writes must
+        // actually route, or the mechanism is decoration.
+        let cfg = ServerConfig::from_ar_config(
+            &ar_config::Config::parse(ANON_YAML, |_| Ok(Some(String::new()))).expect("parses"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .expect("the free tier builds");
+        let row = cfg.providers.first().expect("one dispatch row");
+        assert!(row.is_dispatchable());
+    }
+
+    #[test]
+    fn refuses_a_session_that_declares_both_anonymous_and_a_refresh_row() {
+        let yaml = ANON_YAML.replace("    anonymous_editor: artificial-route", "    anonymous_editor: artificial-route\n    refresh_key: kilocode_refresh");
+        let err = ar_config::Config::parse(&yaml, |_| Ok(Some(String::new()))).expect_err("contradictory");
+        assert!(err.to_string().contains("holds no account"), "{err}");
+    }
 
     const TWO_COMBO_YAML: &str = r#"
 server:

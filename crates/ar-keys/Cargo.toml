@@ -19,6 +19,14 @@ keyring = ["dep:keyring"]
 
 [dependencies]
 ar-core = { workspace = true }
+# `store.rs`'s `oauth_sessions` CHECK is *generated* by
+# `ar_exec::oauth::terminal_check_constraint()`, never transcribed, so a second
+# copy of `TERMINAL_REFRESH_STATUS` cannot drift from the one the classifier
+# reads. A path dep rather than `[workspace.dependencies]`, for the reason in the
+# note below. `ar-exec` does not depend on `ar-keys`, so this is acyclic; every
+# crate it pulls (reqwest, futures, tokio) is already in the graph through
+# `ar-cli`, and `ar-keys` already links tokio.
+ar-exec = { path = "../ar-exec" }
 
 # Versions are the ones pinned in `docs/03-crates-and-deps.md`. Declared inline
 # rather than added to `[workspace.dependencies]`, following the precedent in

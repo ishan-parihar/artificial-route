@@ -85,7 +85,7 @@ pub use error::KeyError;
 pub use hash::{HashParams, LEGACY_PREFIX, NONCE_LEN, PREFIX, SALT_LEN, TAG_LEN, VERSION, decrypt, encrypt, verify};
 pub use revoke::{DEFAULT_CAP, Revocation};
 pub use secret::{KeyMeta, MasterKey, MasterKeySource, Salt, Secret, KEY_LEN};
-pub use store::{CredentialStore, MASTER_KEY_VAR};
+pub use store::{CredentialStore, MASTER_KEY_VAR, OAuthSession, SessionKind};
 pub use token::{
     ACCESS_TTL, DEFAULT_LEEWAY, Issue, Issued, REFRESH_TTL, Scope, ScopeSet, Tokens, Verified,
 };
