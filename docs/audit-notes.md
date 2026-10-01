@@ -137,3 +137,91 @@ Reported, not fixed. `file:line` against the tree as read at the end of this pas
 | **C2** | `crates/ar-exec/src/oauth.rs:459` | `invalid_token` cannot match `OAUTH_INVALID_TOKEN_SIGNALS` (`accountFallback.ts:272`), also phrase-form (`invalid credentials`, `invalid authentication credentials`, …). |
 | **B1'** | `crates/ar-cli/src/commands.rs` (`terminal_reason`) | Reads only `TERMINAL_REFRESH_STATUS`, so it cannot resolve `(401, "invalid_client")` from `CARVE_OUT_TERMINAL_STATUS` even though the generated CHECK admits it. A doctor cell cannot spell a reason the store would accept. |
 | **A2/A3/A4** | `oauth.rs:459–461` | The three 401 rows are terminal for every kind except Cursor's `token_expired`. The reference records 401 as refresh-available rather than retiring. Rows stay flagged pending a decision; they are the rows a wrong verdict bricks. |
+
+## Fix record
+
+Appended after the survey above, which is left as written — that is the record of
+what was found, and this is the record of what was changed about it. Verdicts moved
+in `crates/ar-exec/src/oauth.rs`; reference lines cited below are OmniRoute's, read
+at the same tree as everything above.
+
+**Scope of the two halves.** Everything above is the *pre-fix* survey and keeps its
+own numbers: the row count, the Class A and Class C counts, and every per-row verdict
+there describe the tree as it stood when the survey was read, and are deliberately
+not rewritten. The current state is this section. Where the two disagree, the
+verdicts above are superseded as recorded below — `A1`/`A2`/`A4` are demoted, `A3` is
+kept on purpose, `C1`/`C2` are closed, and the list is 6 rows plus 1 carve-out-only
+row rather than the 9 rows the survey counted.
+
+### End state
+
+`TERMINAL_REFRESH_STATUS` is exactly **6 rows**:
+
+| # | (status, reason) |
+|---|---|
+| 1 | `(400, "invalid_grant")` |
+| 2 | `(400, "unauthorized_client")` |
+| 3 | `(400, "no_refresh_token")` |
+| 4 | `(401, "token_revoked")` |
+| 5 | `(403, "account_disabled")` |
+| 6 | `(410, "token_revoked")` |
+
+plus **one carve-out-only row**: `(401, "invalid_client")` in
+`CARVE_OUT_TERMINAL_STATUS`, terminal only for `GrokCli` because its `carve_out` arm
+names it. 6 + 1 is the whole terminal surface — six rows in the shared list, one
+reachable only through the carve-out, and nothing else can retire an account.
+
+**Demoted to transient (3):** `(401, "invalid_token")`, `(401, "token_expired")`,
+`(403, "permission_denied")`. The Cursor `token_expired` carve-out is **pruned as
+dead**: it existed only to un-retire that row, and with the row gone there is nothing
+left for it to override.
+
+**`account_disabled` is reachable.** It now also matches the reference's phrase forms
+verbatim, so a genuinely deactivated account reads terminal instead of falling through.
+
+`ar-cli`'s `terminal_reason` now resolves the **union** of `TERMINAL_REFRESH_STATUS`
+and `CARVE_OUT_TERMINAL_STATUS` (finding B1'), so the doctor cell can name the one
+reason the generated CHECK admits and the classifier can return.
+
+### Per finding
+
+| id | disposition | on what evidence |
+|---|---|---|
+| **A1** `(403, permission_denied)` | **demoted to transient** | `errorClassifier.ts:536-545` puts `PERMISSION_DENIED` in `recoverableProject403` → `PROJECT_ROUTE_ERROR`, and `chatCore.ts:4064-4072` records that verdict and warns "not banning" — no cooldown, no `isActive:false`. The strongest row in the survey, and the only confirmed account-bricker; it is gone. Detection already agreed (we lowercase the body), so demotion moves the verdict without touching matching. |
+| **A2** `(401, invalid_token)` | **demoted to transient** | The reference's 401 branch (`errorClassifier.ts:436-452`) gives `oauthInvalid` precedence — `:437-439` returns `OAUTH_INVALID_TOKEN` *before* the `accountDeactivated` test at `:450` — and `chatCore.ts:4055-4063` handles that verdict as record-only: `lastErrorType` / `lastError` / `errorCode`, then a warn that "token refresh available". No ban, no cooldown. Our side was durable where theirs is one refresh away from fine, and the surface caveat in the survey is now moot in the safe direction. |
+| **A4** `(401, token_expired)` | **demoted to transient** | No reference row names an expired token as terminal — the survey recorded this as a divergence without a contradicting verdict. Nothing to keep it terminal on, and the Cursor `token_expired` carve-out that used to un-retire it is pruned with it. |
+| **A3** `(401, token_revoked)` | **KEPT terminal, on first sighting** | The one row left on purpose, and the only remaining we-terminal/they-transient row. `grok-cli.ts:211-216` computes `isTerminal` as `attempt === GROK_BUILD_REFRESH_MAX_ATTEMPTS \|\| errorCode ∈ {invalid_grant, invalid_client}`; `token_revoked` is in neither, so grok returns `undefined` and retries until the 3rd attempt. Both sides retire the account — the disagreement is **timing only**, and we own it explicitly rather than pretending it away. Rationale for keeping it axiomatic: a revoked token is not a project-config or IdP hiccup, it is a grant the issuer has withdrawn, and it is the one row where retiring on first sighting costs nothing a later sighting would have saved. |
+| **C1** `account_disabled` | **closed by phrase aliases** | `ACCOUNT_DEACTIVATED_SIGNALS` (`accountFallback.ts:209`) is natural-language, so `reason_in` now also matches those phrases verbatim — `account_deactivated`, `account has been deactivated`, `account has been disabled`, `your account has been suspended`, `this account is deactivated`, `this service has been disabled in this account for violation`, `this service has been disabled in this account` — alongside our snake_case token. The row stays terminal and a real deactivated account now reaches it. |
+| **C2** `invalid_token` | **closed by demotion** | With `(401, "invalid_token")` demoted there is no terminal row left to reach, so the detection gap no longer has a consequence: `OAUTH_INVALID_TOKEN_SIGNALS` (`accountFallback.ts:272`) is phrase-form (`invalid credentials`, `invalid authentication credentials`, `valid authentication credential`, `oauth 2`, `login cookie`, `re-authenticate your cline account`), none of which our underscore token matched, and the literal `invalid_token` matches nothing on the reference dispatch surface either. Such bodies now fall through to transient, which is exactly the reference's recoverable verdict. |
+
+`B1'`, the doctor helper, is closed by the union lookup described above.
+
+### Accepted divergences
+
+Three, recorded so the next reader does not mistake them for unfixed findings:
+
+**(a) Case sensitivity on `PERMISSION_DENIED` — safe direction.** The reference
+matches it case-sensitively (`bodyStr.includes("PERMISSION_DENIED")`,
+`errorClassifier.ts:540`) while our `reason_in` lowercases the body before matching.
+Our transient match is therefore a superset of the reference's: we also demote
+`permission_denied` where the reference would have kept reading the body for other
+403 signals. That is the direction to err — a wrong transient costs one retry, a
+wrong terminal costs an account — so the divergence is accepted, not closed.
+
+**(b) No-refresh-token retirement cannot be mirrored at the classifier.** The
+reference retires immediately when there is no refresh token to spend, before any
+HTTP (`grok-cli.ts:293-296` returns `null` when `!credentials.refreshToken`), and
+carries that as a terminal outcome. `classify_refresh` sees only a `(status, reason)`
+pair returned by the token endpoint — it never sees credential state — so there is
+no signal at this layer to mirror it on. It is enforced one level up, where the
+credential row is actually read, and `no_refresh_token` stays a row for the issuer's
+own answer to the same condition.
+
+**(c) Runtime custom ban signals vs a compile-time CHECK.** The reference merges
+operator-supplied phrases at runtime — `getMergedBannedSignals()`
+(`accountFallback.ts:229`, consulted at `:480`) folds DB-loaded custom signals into
+the deactivated check. Our terminal surface is a compile-time list generating a
+static SQL CHECK, so it cannot absorb runtime configuration. Accepted as a property
+of the design rather than a gap: the store constraint is what stops a transient
+`(status, reason)` being recorded as a retirement, and that only holds if the set is
+closed at build time.

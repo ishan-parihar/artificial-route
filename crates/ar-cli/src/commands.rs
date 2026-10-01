@@ -927,15 +927,23 @@ fn relogin(provider: &str) -> String {
     format!("; run `ar auth login --provider {provider}`")
 }
 
-/// The canonical spelling of a terminal reason, read from the one list the
-/// executor classifies against.
+/// The canonical spelling of a terminal reason, read from the lists the executor
+/// classifies against.
 ///
-/// `None` for a reason the list does not carry. Every caller passes a literal, so
-/// a `None` is a drift between two copies rather than a runtime path — which is
+/// The union of [`ar_server::TERMINAL_REFRESH_STATUS`] and the carve-out-only
+/// rows, because that union is what `terminal_check_constraint` generates the
+/// store's CHECK from: reading the shared table alone would make `ar doctor` unable
+/// to name a reason the store would accept, which is the fourth-copy drift F-MED-2
+/// describes. Ordered shared-first so a listed row keeps precedence, exactly as
+/// `reason_in` scans them.
+///
+/// `None` for a reason neither list carries. Every caller passes a literal, so a
+/// `None` is a drift between two copies rather than a runtime path — which is
 /// why the fallback at the call site is the same string.
 fn terminal_reason(status: u16, reason: &str) -> Option<&'static str> {
     ar_server::TERMINAL_REFRESH_STATUS
         .iter()
+        .chain(ar_exec::oauth::CARVE_OUT_TERMINAL_STATUS)
         .find(|(s, r)| *s == status && *r == reason)
         .map(|(_, r)| *r)
 }
@@ -1552,6 +1560,23 @@ mod tests {
         let rows = checks(ONE_PROVIDER, &no_store());
         let detail = &row(&rows, "terminal-status")[2];
         assert!(detail.contains(&ar_server::TERMINAL_REFRESH_STATUS.len().to_string()), "{detail}");
+    }
+
+    #[test]
+    fn spells_a_carve_out_only_reason_the_shared_table_does_not_carry() {
+        // F-MED-2: `terminal_check_constraint` admits (401, "invalid_client") via
+        // the carve-out union, so a `terminal_reason` that read only the shared
+        // table could not name a reason the store would accept — and would fall
+        // back to the literal at the call site, reintroducing the copy this exists
+        // to delete.
+        assert_eq!(terminal_reason(401, "invalid_client"), Some("invalid_client"));
+    }
+
+    #[test]
+    fn spells_nothing_for_a_reason_neither_table_carries() {
+        // The `None` the call sites fall back on. A status no table lists at all,
+        // so this holds whichever rows the two tables carry.
+        assert_eq!(terminal_reason(418, "teapot"), None);
     }
 
     fn probe(names: &[&str]) -> StoreProbe<'static> {

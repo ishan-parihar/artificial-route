@@ -56,7 +56,14 @@ extending: the reference grok executor carries a terminal set of
 `{invalid_grant, invalid_client}`, and only the second differs from
 `TERMINAL_REFRESH_STATUS`, so it landed as a `carve_out` arm plus a
 carve-out-only row in `CARVE_OUT_TERMINAL_STATUS` rather than as a second copy of
-the shared list. A public client id is a config value, not a secret — RFC 6749
+the shared list. That shared list is now **6 rows** — `(400, invalid_grant)`,
+`(400, unauthorized_client)`, `(400, no_refresh_token)`, `(401, token_revoked)`,
+`(403, account_disabled)`, `(410, token_revoked)` — so the terminal surface is those
+6 rows plus that 1 carve-out-only row, and the row-for-row cross-check now reports
+**zero** we-terminal/they-transient divergences except one explicitly owned
+first-sighting timing divergence on `(401, token_revoked)`: both sides retire that
+account, but `grok-cli.ts:211-216` spends two round trips first. A public client id
+is a config value, not a secret — RFC 6749
 §2.3.1 puts it in every authorization request in the clear — and none is compiled
 in.
 
@@ -179,10 +186,13 @@ OmniRoute's terminal `test_status` sets diverge across 4 sites
 terminal set with a CHECK constraint from day one, plus the carve-outs
 (Cursor `expired` is retryable; Claude refresh tokens survive transient
 `invalid_grant`; grok-cli's `invalid_client` is terminal). **Row-for-row
-cross-check against the reference taxonomy: `docs/audit-notes.md`** — 4
-we-terminal/they-transient rows (one a confirmed account-bricker, `(403,
-permission_denied)`), 3 the other way, 2 detection gaps where our snake_case
-tokens cannot match the reference's phrase-form signals, and 15 agreements.
+cross-check against the reference taxonomy: `docs/audit-notes.md`** — **0**
+we-terminal/they-transient rows except one explicitly owned first-sighting timing
+divergence on `(401, token_revoked)` (both sides retire; the reference spends two
+round trips first), 3 the other way, and 15 agreements. The 4 former Class A rows
+and both Class C detection gaps are closed: A1/A2/A4 demoted to transient, C1 closed
+by verbatim phrase aliases, C2 closed by demotion. Per-finding verdicts and the three
+accepted divergences are in `docs/audit-notes.md` § Fix record.
 **Now:** `ar_exec::oauth::TERMINAL_REFRESH_STATUS` is the only copy. The
 classifier reads it, `ar doctor` reports its size and the carve-outs from it, and
 `terminal_check_constraint()` *generates* the store's CHECK clause from it so the
@@ -193,10 +203,12 @@ reading a transient as terminal bricks a working account.
 
 **Carve-out table (as built).** Two point away from retiring; the third came from
 the grok-cli row of F-CRIT-1 and is the only one that moves *toward* terminal.
+Cursor's `token_expired` arm is pruned as dead — it existed only to un-retire a row
+that is now demoted — so it is the one carve-out reason that went away.
 
 | kind | reason | verdict | why |
 |---|---|---|---|
-| `cursor` | `expired`, `token_expired` | transient (`cursor-expired-is-retryable`) | means "this token is old", not "this account is dead" — the refresh path still works |
+| `cursor` | `expired` | transient (`cursor-expired-is-retryable`) | means "this token is old", not "this account is dead" — the refresh path still works |
 | `claude` | `invalid_grant` | transient (`claude-invalid-grant-survives`) | an IdP hiccup answers `invalid_grant` for a token that is still good |
 | `grok-cli` | `invalid_client` | **terminal** (`unrecoverable`, status 401) | a client id the issuer does not recognise cannot become valid by refreshing again; retrying spends the whole attempt budget on a refresh that can never succeed |
 
@@ -210,11 +222,11 @@ carve-out-only row keeps the shared verdict. Both halves are pinned by
 `keeps_a_grok_cli_invalid_client_terminal`, including that `codex` on the same body
 stays transient.
 
-**Known gap:** the `doctor` cell cannot spell a carve-out-only reason.
-`ar-cli`'s `terminal_reason` resolves against `TERMINAL_REFRESH_STATUS` alone, so
-the one reason the generated CHECK admits and the classifier can return is the one
-an operator-facing row cannot name. Filed as finding B1' in
-`docs/audit-notes.md`; not fixed here.
+**Closed (B1'):** the `doctor` cell now spells a carve-out-only reason.
+`ar-cli`'s `terminal_reason` resolves against the **union** of
+`TERMINAL_REFRESH_STATUS` and `CARVE_OUT_TERMINAL_STATUS`, so the one reason the
+generated CHECK admits and the classifier can return is also the one an
+operator-facing row can name. Finding B1' in `docs/audit-notes.md`; fixed.
 **Also now:** the table it sits in. `ar-keys`' `oauth_sessions`
 (`provider` PK, `kind`, `access_key`, `terminal_status`, `terminal_reason`) is
 `credentials`-adjacent and holds placement plus status only — a `keys:` *name*,

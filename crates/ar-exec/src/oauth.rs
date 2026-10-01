@@ -330,12 +330,6 @@ impl OAuthKind {
     #[must_use]
     pub fn carve_out(self, reason: &str) -> Option<RefreshFault> {
         match (self, reason) {
-            // Cursor's `expired` means "this token is old", not "this account is
-            // dead": the refresh path still works, so retiring here would kill a
-            // connection one refresh would have fixed.
-            (Self::Cursor, "expired" | "token_expired") => {
-                Some(RefreshFault::Transient("cursor-expired-is-retryable"))
-            }
             // Claude's refresh tokens survive a *transient* `invalid_grant` — an
             // IdP hiccup answers invalid_grant for a token that is still good.
             // Reading it as terminal retires a working session on a bad
@@ -460,15 +454,29 @@ impl std::fmt::Display for RefreshFault {
 /// Rows are `(status, reason)` because the pair is what a provider actually
 /// sends: a bare 401 does not mean "revoked", it also means "expired" and "wrong
 /// scope".
+///
+/// The absences are load-bearing too — each is an audit verdict, not an
+/// oversight. Every row was checked against the reference executor's terminal
+/// sets file:line before the list was cut, and a row with no terminal verdict
+/// behind it did not survive the cut:
+///
+/// - `permission_denied` — the reference files it under `PROJECT_ROUTE_ERROR`
+///   and counts it *recoverable*, so a 403 saying only "denied" is this
+///   request's access refused, not evidence that the account is gone.
+/// - `invalid_token` and `token_expired` — no terminal verdict anywhere in the
+///   reference. Absent evidence is not evidence of death, so both fail toward
+///   retry and land on the transient fallthrough; a row here would retire a
+///   working account on a verdict no other implementation reached.
+///
+/// `invalid_token` is therefore *not* rescued with invalid-credential phrases:
+/// the unrecognised fallthrough already lands it on retry, which is the
+/// reference's own verdict.
 pub const TERMINAL_REFRESH_STATUS: &[(u16, &str)] = &[
     (400, "invalid_grant"),
     (400, "unauthorized_client"),
     (400, "no_refresh_token"),
-    (401, "invalid_token"),
     (401, "token_revoked"),
-    (401, "token_expired"),
     (403, "account_disabled"),
-    (403, "permission_denied"),
     (410, "token_revoked"),
 ];
 
@@ -481,15 +489,16 @@ pub const TERMINAL_REFRESH_STATUS: &[(u16, &str)] = &[
 /// separately rather than widening the shared table keeps the other five kinds'
 /// verdicts exactly as they were.
 ///
-/// It is read in two places, and both need it: [`reason_in`] scans for these
+/// It is read in three places, and all three need it: [`reason_in`] scans for these
 /// reasons so [`classify_refresh`] can hand one to [`OAuthKind::carve_out`] at all
 /// (a carve-out otherwise never sees a reason the shared scan did not already
-/// find), and [`terminal_check_constraint`] generates its CHECK from the union —
-/// otherwise the classifier could produce a terminal row the store would refuse to
-/// hold. Finding one is the only new behaviour for a kind that has no carve-out
-/// for it: such a reason is not in [`TERMINAL_REFRESH_STATUS`] either, so it still
-/// lands on the transient fallthrough, under the same reason as before.
-const CARVE_OUT_TERMINAL_STATUS: &[(u16, &str)] = &[(401, "invalid_client")];
+/// find); [`terminal_check_constraint`] generates its CHECK from the union, or the
+/// classifier could produce a terminal row the store would refuse to hold; and
+/// `ar doctor` reads the union, or it could not spell a reason the store admits.
+/// Finding one is the only new classification behaviour, for a kind that has no
+/// carve-out for it: such a reason is not in [`TERMINAL_REFRESH_STATUS`] either, so
+/// it still lands on the transient fallthrough, under the same reason as before.
+pub const CARVE_OUT_TERMINAL_STATUS: &[(u16, &str)] = &[(401, "invalid_client")];
 
 /// The `CHECK` clause a credential store's terminal column must carry.
 ///
@@ -577,16 +586,44 @@ fn is_transient_status(status: u16) -> bool {
 ///
 /// The shared list is scanned first and the carve-out-only rows second, so a body
 /// naming both keeps the shared verdict: precedence for a listed row is unchanged.
+/// [`ACCOUNT_DISABLED_ALIASES`] is consulted last, so a phrase body can only ever
+/// *add* the account-dead verdict, never displace a listed row.
 fn reason_in(body: &str) -> &str {
     let lower = body.to_ascii_lowercase();
     let end = lower.len().min(REFRESH_BODY_SCAN);
     let head = &lower[..end];
-    TERMINAL_REFRESH_STATUS
+    if let Some((_, reason)) = TERMINAL_REFRESH_STATUS
         .iter()
         .chain(CARVE_OUT_TERMINAL_STATUS)
         .find(|(_, reason)| head.contains(*reason))
-        .map_or("unauthorized", |(_, reason)| *reason)
+    {
+        return reason;
+    }
+    if ACCOUNT_DISABLED_ALIASES.iter().any(|phrase| head.contains(*phrase)) {
+        "account_disabled"
+    } else {
+        "unauthorized"
+    }
 }
+
+/// Phrase forms of "this account is dead", each resolving to the
+/// `account_disabled` row.
+///
+/// A provider that kills an account often says so in prose rather than in the
+/// `snake_case` error code the rows are keyed by, and a phrase body used to fall
+/// through to retry — so the one verdict that is unambiguously terminal was the
+/// one a human-readable body could not reach. Matched as substrings of the
+/// lowercased prefix, so the trailing clauses providers add
+/// (`…in this account for violation of …`) are covered by the shorter entry
+/// rather than by a second near-duplicate line.
+const ACCOUNT_DISABLED_ALIASES: &[&str] = &[
+    "account_deactivated",
+    "account has been deactivated",
+    "account has been disabled",
+    "your account has been suspended",
+    "this account is deactivated",
+    "this service has been disabled in this account",
+];
 
 /// SHA-256 of an access token, and the rotation cache's key.
 ///
@@ -1024,8 +1061,10 @@ impl<S> Connection<S> {
     /// Retires the session, keeping the first report.
     ///
     /// First report wins because the first verdict is the informative one: a
-    /// later `permission_denied` after an `invalid_grant` is the *consequence* of
-    /// the retirement, and overwriting would report the wrong cause.
+    /// later `account_disabled` after an `invalid_grant` is the *consequence* of
+    /// the retirement, and overwriting would report the wrong cause. (A
+    /// `permission_denied` can no longer arrive as a second report at all — it is
+    /// not a terminal row.)
     pub async fn quarantine(&self, report: TerminalReport) {
         let mut slot = self.terminal.write().await;
         if slot.is_none() {
@@ -2596,14 +2635,90 @@ mod tests {
     }
 
     #[test]
-    fn treats_cursor_expired_as_retryable() {
+    fn treats_cursor_token_expired_as_transient_without_a_carve_out() {
+        // The carve-out arm is gone: `token_expired` lost its terminal row in the
+        // audit (the reference has no terminal verdict for it), so Cursor lands on
+        // the same transient fallthrough as every other kind and no longer needs a
+        // provider-specific rescue.
         let fault = classify_refresh(OAuthKind::Cursor, 401, r#"{"error":"token_expired"}"#);
-        assert_eq!(fault, RefreshFault::Transient("cursor-expired-is-retryable"));
+        assert_eq!(fault, RefreshFault::Transient("unrecognised-auth-failure"));
     }
 
     #[test]
     fn treats_cursor_bare_expired_as_retryable() {
         assert!(!classify_refresh(OAuthKind::Cursor, 401, r#"{"error":"expired"}"#).is_terminal());
+    }
+
+    #[test]
+    fn treats_a_demoted_invalid_token_as_transient() {
+        // No terminal verdict in the reference, so this is retry. The whole reason
+        // the row was cut: a 401 that names only "invalid token" must not retire a
+        // session the reference still considers alive.
+        let fault = classify_refresh(OAuthKind::Cline, 401, r#"{"error":"invalid_token"}"#);
+        assert_eq!(fault, RefreshFault::Transient("unrecognised-auth-failure"));
+    }
+
+    #[test]
+    fn treats_a_demoted_token_expired_as_transient() {
+        let fault = classify_refresh(OAuthKind::Cline, 401, r#"{"error":"token_expired"}"#);
+        assert_eq!(fault, RefreshFault::Transient("unrecognised-auth-failure"));
+    }
+
+    #[test]
+    fn treats_a_demoted_permission_denied_as_transient() {
+        // The reference files `permission_denied` under `PROJECT_ROUTE_ERROR` and
+        // counts it recoverable: a refused request is not a dead account.
+        let fault = classify_refresh(OAuthKind::Cline, 403, r#"{"error":"permission_denied"}"#);
+        assert_eq!(fault, RefreshFault::Transient("unrecognised-auth-failure"));
+    }
+
+    #[test]
+    fn treats_account_deactivated_as_terminal() {
+        assert_account_disabled_phrase(r#"{"error":"account_deactivated"}"#);
+    }
+
+    #[test]
+    fn treats_account_has_been_deactivated_as_terminal() {
+        assert_account_disabled_phrase(r#"{"error":"account has been deactivated"}"#);
+    }
+
+    #[test]
+    fn treats_account_has_been_disabled_as_terminal() {
+        assert_account_disabled_phrase(r#"{"error":"account has been disabled"}"#);
+    }
+
+    #[test]
+    fn treats_your_account_has_been_suspended_as_terminal() {
+        assert_account_disabled_phrase(r#"{"error":"your account has been suspended"}"#);
+    }
+
+    #[test]
+    fn treats_this_account_is_deactivated_as_terminal() {
+        assert_account_disabled_phrase(r#"{"error":"this account is deactivated"}"#);
+    }
+
+    #[test]
+    fn treats_this_service_disabled_in_this_account_as_terminal() {
+        assert_account_disabled_phrase(r#"{"error":"this service has been disabled in this account"}"#);
+    }
+
+    #[test]
+    fn matches_the_longer_disabled_in_account_clause_by_substring() {
+        // The trailing clause providers add is not a second alias: the shorter
+        // entry already contains it, which is why the alias list has six entries
+        // for seven observed wordings.
+        assert_account_disabled_phrase("this service has been disabled in this account for violation of the terms");
+    }
+
+    /// A prose account-dead body must retire the session with the row's reason.
+    fn assert_account_disabled_phrase(body: &str) {
+        // A phrase body used to fall through to retry, so the one verdict that is
+        // unambiguously terminal was the one a human-readable body could not reach.
+        assert_eq!(
+            classify_refresh(OAuthKind::Cline, 403, body),
+            RefreshFault::Unrecoverable { status: 403, reason: "account_disabled" },
+            "{body}",
+        );
     }
 
     #[test]
@@ -2858,7 +2973,56 @@ mod tests {
     async fn reports_a_terminal_session_when_the_rotated_token_is_also_refused() {
         // R2's shape: a token minted seconds ago is already refused, so the
         // session is retired and the failure is the *typed* terminal error
-        // `ar-server` turns into a visible 401 — never a bare 502.
+        // `ar-server` turns into a visible 401 — never a bare 502. The body's
+        // reason has to be a row that survived the audit, so this is
+        // `token_revoked`; a `invalid_token` body now reads as retry.
+        let app = axum::Router::new().fallback(|| async {
+            (StatusCode::UNAUTHORIZED, r#"{"error":"token_revoked"}"#)
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback binds");
+        let addr = listener.local_addr().expect("bound socket has an address");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let refresher = Arc::new(Counting::ok("synthetic-access"));
+        let conn = Connection::pending(
+            Session::new("kimi-coding", OAuthKind::Cline).with_token_url("https://auth.test/token"),
+            Arc::new(RotationPool::new()),
+            refresher.clone() as Arc<dyn Refresher>,
+        )
+        .connect(OAuthToken::new(Secret::new("synthetic-access-0")).with_refresh(Secret::new("r")))
+        .expect("an access token connects");
+        let core = crate::ArExec::new().expect("client");
+
+        let shape = Dispatch {
+            base_url: &format!("http://{addr}"),
+            wire_format: WireFormat::Openai,
+            api_key: "",
+            upstream_model: "m",
+            stream: false,
+            headers: &BTreeMap::new(),
+        };
+        let err = conn
+            .dispatch(&core, &shape, br#"{"model":"m"}"#, &CancellationToken::new())
+            .await
+            .err();
+        server.abort();
+
+        // `token_revoked` is a named terminal row and no carve-out applies, so
+        // the two 401s collapse into one durable retirement.
+        let Some(ExecError::OAuthTerminal(report)) = err else {
+            panic!("expected a typed oauth terminal, got {err:?}");
+        };
+        assert_eq!((report.provider.as_str(), report.reason), ("kimi-coding", "token_revoked"));
+        assert_eq!(refresher.calls(), 1, "one rotation, then stop");
+    }
+
+    #[tokio::test]
+    async fn retries_rather_than_retires_when_the_refreshed_invalid_token_is_also_refused() {
+        // The demoted-row end of the same path: a 401 body naming only
+        // `invalid_token` has no terminal verdict behind it, so the second 401
+        // becomes a transport failure and the session stays usable.
         let app = axum::Router::new().fallback(|| async {
             (StatusCode::UNAUTHORIZED, r#"{"error":"invalid_token"}"#)
         });
@@ -2892,12 +3056,11 @@ mod tests {
             .err();
         server.abort();
 
-        // `invalid_token` is a named terminal row and no carve-out applies, so
-        // the two 401s collapse into one durable retirement.
-        let Some(ExecError::OAuthTerminal(report)) = err else {
-            panic!("expected a typed oauth terminal, got {err:?}");
-        };
-        assert_eq!((report.provider.as_str(), report.reason), ("kimi-coding", "invalid_token"));
+        assert!(
+            matches!(err, Some(ExecError::Transport(_))),
+            "expected a retryable transport failure, got {err:?}",
+        );
+        assert_eq!(conn.terminal().await, None, "a transient verdict must not retire the session");
         assert_eq!(refresher.calls(), 1, "one rotation, then stop");
     }
 
@@ -2961,7 +3124,7 @@ mod tests {
         conn.quarantine(TerminalReport {
             provider: "cline".to_owned(),
             refresh_status: 403,
-            reason: "permission_denied",
+            reason: "account_disabled",
         })
         .await;
         assert_eq!(conn.terminal().await.map(|r| r.reason), Some("invalid_grant"));
