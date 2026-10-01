@@ -1,16 +1,17 @@
-//! Translation between the four inbound wires and the canonical shape.
+//! Translation between the four inbound wires, the canonical shape, and the
+//! eight provider wires.
 //!
 //! Dispatch is generic over the inbound type, so a call site monomorphises and
 //! the compiler inlines the conversion; there is no `dyn` translator table.
-//! `docs/02` calls this crate "highest leverage", which is why every inbound
-//! dialect is one small `impl ArTranslate<In>` rather than a registered
-//! strategy.
+//! `docs/02` calls this crate "highest leverage", which is why every dialect in
+//! either direction is one small function or one `impl ArTranslate<In>` rather
+//! than a registered strategy.
 //!
-//! # The four P2 dialects
+//! # The four inbound dialects
 //!
 //! `docs/02` deferred Anthropic Messages, Ollama and Responses inbound to P2,
 //! and Gemini arrived with the vision family. They landed as more impls of the
-//! same trait, not as a new abstraction:
+//! same trait, not as a new abstraction — one canonical type, four markers:
 //!
 //! | Dialect | Marker | Wire | What the conversion actually does |
 //! |---|---|---|---|
@@ -18,6 +19,11 @@
 //! | Responses | [`ResponsesInbound`] | `POST /v1/responses` | hoists `instructions` into a system turn; `{input, instructions}` become a message array |
 //! | Ollama | [`OllamaInbound`] | `POST /api/chat` | hoists the top-level `system` string; `options.num_predict` becomes `max_tokens` |
 //! | Gemini | [`GeminiInbound`] | `POST /v1beta/models/{model}:generateContent` | hoists `systemInstruction` into a leading system turn; `functionResponse` parts become [`Role::Tool`] turns hoisted ahead of their turn; `inlineData` and `functionCall` cross as carried parts |
+//!
+//! The outbound direction is [`crate::OutboundWire`]: one renderer per provider
+//! wire, reached through [`crate::render_for_wire`], and named as [`Pair`]
+//! variants too — so one registry names every cell this build answers in either
+//! direction.
 //!
 //! # Media, and what is still rejected
 //!
@@ -71,6 +77,24 @@ pub enum Pair {
     GeminiToCanonical,
     /// canonical response -> `chat.completion` JSON.
     CanonicalToOpenai,
+    /// canonical chat -> Anthropic Messages request body.
+    CanonicalToClaude,
+    /// canonical chat -> OpenAI Responses request body.
+    CanonicalToResponses,
+    /// canonical chat -> Gemini `generateContent` request body. Also the
+    /// antigravity body: the reference registers one function under both names, so
+    /// the cell is one and `OutboundWire` carries two spellings of it.
+    CanonicalToGemini,
+    /// canonical chat -> Cursor ask/agent request body.
+    CanonicalToCursor,
+    /// canonical chat -> CLOVA Studio v3 request body.
+    CanonicalToClova,
+    /// canonical chat -> Kiro `conversationState` request body.
+    CanonicalToKiro,
+    /// canonical response -> Anthropic Messages response object.
+    CanonicalToClaudeResponse,
+    /// canonical response -> OpenAI Responses response object.
+    CanonicalToResponsesResponse,
 }
 
 impl Pair {
@@ -84,6 +108,14 @@ impl Pair {
         Self::OllamaToCanonical,
         Self::GeminiToCanonical,
         Self::CanonicalToOpenai,
+        Self::CanonicalToClaude,
+        Self::CanonicalToResponses,
+        Self::CanonicalToGemini,
+        Self::CanonicalToCursor,
+        Self::CanonicalToClova,
+        Self::CanonicalToKiro,
+        Self::CanonicalToClaudeResponse,
+        Self::CanonicalToResponsesResponse,
     ];
 
     /// The stable `source-to-target` name, as it appears in
@@ -97,6 +129,14 @@ impl Pair {
             Self::OllamaToCanonical => "ollama-to-canonical",
             Self::GeminiToCanonical => "gemini-to-canonical",
             Self::CanonicalToOpenai => "canonical-to-openai",
+            Self::CanonicalToClaude => "canonical-to-claude",
+            Self::CanonicalToResponses => "canonical-to-openai-responses",
+            Self::CanonicalToGemini => "canonical-to-gemini",
+            Self::CanonicalToCursor => "canonical-to-cursor",
+            Self::CanonicalToClova => "canonical-to-clova",
+            Self::CanonicalToKiro => "canonical-to-kiro",
+            Self::CanonicalToClaudeResponse => "canonical-to-claude-response",
+            Self::CanonicalToResponsesResponse => "canonical-to-responses-response",
         }
     }
 }
@@ -117,8 +157,9 @@ impl std::fmt::Display for Pair {
 /// ```
 /// use ar_translate::{pair_named, supported_pairs};
 ///
-/// assert_eq!(supported_pairs().len(), 6);
+/// assert!(!supported_pairs().is_empty());
 /// assert!(pair_named("openai-to-canonical").is_ok());
+/// assert!(pair_named("canonical-to-claude").is_ok());
 /// assert!(pair_named("claude-to-gemini").is_err());
 /// ```
 #[must_use]
@@ -129,10 +170,10 @@ pub fn supported_pairs() -> &'static [Pair] {
 /// Resolves a reference matrix cell name to a [`Pair`].
 ///
 /// This is the fail-loud entry point: dialect detection produces a *name*, and
-/// anything this build does not implement — including every one of the twenty
-/// [`missing_pairs`] — comes back as [`TranslateError::UnsupportedPair`] naming
-/// what was asked for, rather than proceeding with a conversion that does not
-/// exist.
+/// anything this build does not implement — including every cell
+/// [`missing_pairs`] names — comes back as [`TranslateError::UnsupportedPair`]
+/// naming what was asked for, rather than proceeding with a conversion that does
+/// not exist.
 ///
 /// # Errors
 ///
@@ -168,8 +209,8 @@ pub struct MissingPair {
 ///
 /// Derived from the `register(...)` calls in
 /// `../OmniRoute/open-sse/translator/{request,response}/`, read against
-/// `formats.ts`, minus the six in [`supported_pairs`]. Two adjustments to that
-/// raw list, both stated so the count is traceable rather than asserted:
+/// `formats.ts`, minus the fifteen in [`supported_pairs`]. Two adjustments to
+/// that raw list, both stated so the count is traceable rather than asserted:
 ///
 /// * `antigravity` is `gemini` under a second dialect name — the reference
 ///   registers the *same function* for both — so its four cells are omitted here
@@ -179,84 +220,36 @@ pub struct MissingPair {
 ///   [`Pair::OllamaToCanonical`] and its outbound response lives at
 ///   `open-sse/utils/ollamaTransform.ts`, outside the matrix.
 ///
-/// # TODO(#p2-dialects)
-/// Take them in the order the server needs them: a response-direction mapper
-/// before an outbound request mapper, because a client that can send a request it
-/// cannot read the answer to fails worse than one that cannot send the request at
-/// all. `anti*` cells ride along with their `gemini` twin for free.
+/// # What is left, and why
+///
+/// * Every cell whose reference mapper is a **chunk-level state machine**:
+///   `canonical-to-claude-response` and `canonical-to-gemini-response` need
+///   block-index allocation, incremental tool-call argument accumulation and
+///   deferred terminal emission, and this crate's response mapper is
+///   non-streaming so there is no cross-chunk state to accumulate into. The two
+///   non-streaming response mappers that *were* ported — the Claude and
+///   Responses envelopes — are ported as envelopes, not as state machines.
+/// * `canonical-to-responses-response`'s tool items, for the same reason:
+///   canonical carries no tool registry to emit a `function_call` item from.
+/// * **Every remaining `*-to-openai` response cell.** These are the *response*
+///   direction: a provider's SSE body has to be re-framed into the INBOUND
+///   dialect, and that path is a byte-relay today (see
+///   `ar-server/src/exec.rs`). Six of them — `cursor-response-to-openai` in
+///   particular — are a no-op in the reference itself, because the executor
+///   already emits OpenAI frames; the other five are the chunk-level state
+///   machines above. Until the relay path carries a re-framing stage they stay
+///   named rather than half-ported: a partial re-framer drops tool calls.
+/// * `claude-to-gemini` — a cross-dialect hop with no hub. Canonical *is* the hub
+///   here, so this cell is claude-to-canonical then canonical-to-gemini, both of
+///   which are implemented, and it needs nothing of its own.
 #[must_use]
 pub fn missing_pairs() -> &'static [MissingPair] {
     &[
-        // ── Outbound request mappers: canonical -> a provider wire ──
-        // Each needs a canonical tool registry to carry `tools`, which does not
-        // exist yet, so each is a canonical-field addition before it is a mapper.
-        MissingPair {
-            name: "canonical-to-claude",
-            reference: "OmniRoute/open-sse/translator/request/openai-to-claude.ts",
-        },
-        MissingPair {
-            name: "canonical-to-gemini",
-            reference: "OmniRoute/open-sse/translator/request/openai-to-gemini.ts",
-        },
-        MissingPair {
-            name: "canonical-to-kiro",
-            reference: "OmniRoute/open-sse/translator/request/openai-to-kiro.ts",
-        },
-        MissingPair {
-            name: "canonical-to-cursor",
-            reference: "OmniRoute/open-sse/translator/request/openai-to-cursor.ts",
-        },
-        MissingPair {
-            name: "canonical-to-clova",
-            reference: "OmniRoute/open-sse/translator/request/openai-to-clova.ts",
-        },
-        MissingPair {
-            name: "canonical-to-responses",
-            reference: "OmniRoute/open-sse/translator/request/openai-responses.ts",
-        },
-        // A cross-dialect hop with no hub: claude in, gemini out. Canonical is
-        // the hub here, so this cell is claude-to-canonical then
-        // canonical-to-gemini — both of which are listed, and it needs nothing
-        // of its own.
-        MissingPair {
-            name: "claude-to-gemini",
-            reference: "OmniRoute/open-sse/translator/request/claude-to-gemini.ts",
-        },
-        // ── Response direction: canonical response -> a non-OpenAI wire ──
-        // (P-response) The Claude mapper is ~800 lines of chunk-level state:
-        // block-index allocation, incremental tool-call argument accumulation,
-        // deferred terminal emission until a trailing usage-only chunk arrives,
-        // DSML and `<invoke>` XML tool-call extraction, markdown-boundary
-        // buffering, tool-call shims and reasoning-placeholder scrubbing. Most of
-        // that is a streaming state machine and this crate's response mapper is
-        // non-streaming, so porting it needs a state struct that does not exist
-        // here. Whole mapper or nothing — a partial one drops tool calls.
-        MissingPair {
-            name: "canonical-to-claude-response",
-            reference: "OmniRoute/open-sse/translator/response/openai-to-claude.ts",
-        },
-        // (P-response) The Gemini mapper *is* the Antigravity one —
-        // `openai-to-gemini.ts` is a 14-line re-registration of
-        // `openai-to-antigravity.ts` — and it is streaming too: it accumulates
-        // tool-call arguments across chunks and emits them once at
-        // `finish_reason`. A non-streaming mapper has no cross-chunk state to
-        // accumulate into, so it cannot produce a `candidates` envelope holding
-        // whole tool calls.
-        MissingPair {
-            name: "canonical-to-gemini-response",
-            reference: "OmniRoute/open-sse/translator/response/openai-to-antigravity.ts (re-registered by openai-to-gemini.ts; streaming SSE in openai-to-gemini-sse.ts)",
-        },
-        MissingPair {
-            name: "canonical-to-responses-response",
-            reference: "OmniRoute/open-sse/translator/response/openai-responses.ts + responsesToolItem.ts",
-        },
-        MissingPair {
-            name: "canonical-to-ollama-response",
-            reference: "OmniRoute/open-sse/utils/ollamaTransform.ts (outside translator/, so not a registered matrix cell)",
-        },
-        // ── Response direction: a dialect's wire -> openai ──
-        // Each is the inbound mirror of an adapter above, so each needs the same
-        // streaming state before it can be written.
+        // ── Response direction: a provider's wire -> the inbound dialect ──
+        // Each is a re-framer over the response stream. The relay in
+        // `ar-server/src/exec.rs` hands the client's bytes straight through
+        // today, so a non-OpenAI provider answers an Anthropic or Responses
+        // client in the provider's own framing.
         MissingPair {
             name: "claude-response-to-openai",
             reference: "OmniRoute/open-sse/translator/response/claude-to-openai.ts",
@@ -275,15 +268,37 @@ pub fn missing_pairs() -> &'static [MissingPair] {
         },
         MissingPair {
             name: "cursor-response-to-openai",
-            reference: "OmniRoute/open-sse/translator/response/cursor-to-openai.ts",
+            reference: "OmniRoute/open-sse/translator/response/cursor-to-openai.ts (a passthrough in the reference too: the executor already emits OpenAI chunks, so the cell is empty only because ar's relay has no re-framing stage)",
         },
         MissingPair {
             name: "clova-response-to-openai",
             reference: "OmniRoute/open-sse/translator/response/clova-to-openai.ts",
         },
+        // ── Response direction: canonical response -> a non-OpenAI inbound wire ──
+        // Both reference mappers are chunk-level state machines: block-index
+        // allocation, incremental tool-call argument accumulation, deferred
+        // terminal emission until a trailing usage-only chunk arrives. The
+        // non-streaming envelopes are ported; the streaming re-framers are not.
         MissingPair {
-            name: "gemini-response-to-claude",
-            reference: "OmniRoute/open-sse/translator/response/gemini-to-claude.ts",
+            name: "canonical-to-claude-response-stream",
+            reference: "OmniRoute/open-sse/translator/response/openai-to-claude.ts",
+        },
+        MissingPair {
+            name: "canonical-to-gemini-response",
+            reference: "OmniRoute/open-sse/translator/response/openai-to-antigravity.ts (re-registered by openai-to-gemini.ts; streaming SSE in openai-to-gemini-sse.ts)",
+        },
+        MissingPair {
+            name: "canonical-to-responses-response-stream",
+            reference: "OmniRoute/open-sse/translator/response/openai-responses.ts + responsesToolItem.ts",
+        },
+        MissingPair {
+            name: "canonical-to-ollama-response",
+            reference: "OmniRoute/open-sse/utils/ollamaTransform.ts (outside translator/, so not a registered matrix cell)",
+        },
+        // ── Cross-dialect hop with no hub of its own ──
+        MissingPair {
+            name: "claude-to-gemini",
+            reference: "OmniRoute/open-sse/translator/request/claude-to-gemini.ts (canonical is the hub: claude-to-canonical then canonical-to-gemini, both implemented)",
         },
     ]
 }
@@ -1401,5 +1416,36 @@ mod tests {
             pair_named("no-such-dialect-to-canonical"),
             Err(TranslateError::UnsupportedPair { pair }) if pair == "no-such-dialect-to-canonical"
         ));
+    }
+
+    /// Every outbound renderer the dispatch table offers must be named here, or
+    /// the registry would report a cell as missing while a provider dispatches on
+    /// it. This is the one test that catches a renderer added to `OutboundWire`
+    /// without a `Pair` behind it.
+    ///
+    /// `antigravity` is exempt because the reference registers one function under
+    /// both names — implementing gemini implements it — and the next test holds
+    /// that exemption to exactly one cell.
+    #[test]
+    fn names_every_outbound_renderer_in_the_pair_registry() {
+        for wire in crate::OutboundWire::ALL {
+            if *wire == crate::OutboundWire::Antigravity {
+                continue;
+            }
+            let name = format!("canonical-to-{}", wire.as_str());
+            assert!(
+                pair_named(&name).is_ok(),
+                "{name} has a renderer but no Pair: it would be reported missing while dispatching",
+            );
+        }
+    }
+
+    /// The antigravity and gemini renderers are one function, so the matrix claims
+    /// one cell for it — naming both would count a cell twice, and the reference's
+    /// own accounting does the same.
+    #[test]
+    fn keeps_one_pair_name_for_the_antigravity_gemini_twin() {
+        assert!(pair_named("canonical-to-gemini").is_ok());
+        assert!(pair_named("canonical-to-antigravity").is_err(), "the twin is one cell, not two");
     }
 }

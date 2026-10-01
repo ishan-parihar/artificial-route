@@ -59,11 +59,11 @@ use std::io::BufRead as _;
 use std::time::Duration;
 
 use ar_config::{Config, OAuthSession};
+use ar_exec::ArExec;
 use ar_exec::oauth::{
     CallbackListener, LoginError, OAuthKind, RefreshFault, Session, authorize_url, exchange_code,
     initiate_device, new_authorize_request, parse_callback_url, poll_device,
 };
-use ar_exec::ArExec;
 use ar_keys::Secret as StoredSecret;
 
 use crate::cli::{AuthArgs, AuthCommand, AuthLoginArgs, AuthProviderArgs};
@@ -81,8 +81,15 @@ use crate::toon;
 /// and `login` is login readiness (can it be re-authorised). A session holding
 /// both tokens but declaring no `authorization_url` is `armed` and `unavailable`
 /// at the same time, and one cell could not say both.
-const STATUS_COLUMNS: [&str; 7] =
-    ["id", "provider", "status", "login", "access_key", "reason", "login_reason"];
+const STATUS_COLUMNS: [&str; 7] = [
+    "id",
+    "provider",
+    "status",
+    "login",
+    "access_key",
+    "reason",
+    "login_reason",
+];
 
 /// Columns of the `ar auth login` result.
 const LOGIN_COLUMNS: [&str; 3] = ["id", "status", "detail"];
@@ -232,7 +239,9 @@ fn access_key(cfg: &Config, provider: &str) -> String {
 /// absent store as the supported `$VAR`-only install — which is right for
 /// `ar serve` and wrong here, because a first-ever login is exactly the case
 /// where the store has to be created.
-fn open_login_store(cli: &crate::cli::Cli) -> anyhow::Result<(std::path::PathBuf, ar_keys::CredentialStore)> {
+fn open_login_store(
+    cli: &crate::cli::Cli,
+) -> anyhow::Result<(std::path::PathBuf, ar_keys::CredentialStore)> {
     let path = commands::store_path(&cli.config);
     let store = commands::open_store(&path).map_err(|e| {
         fail(
@@ -297,7 +306,11 @@ fn report_login(
             "sessions",
             &LOGIN_COLUMNS,
             &toon::every_field(&LOGIN_COLUMNS),
-            &[vec![provider.to_owned(), commands::armed_spelling(&status).to_owned(), reason]],
+            &[vec![
+                provider.to_owned(),
+                commands::armed_spelling(&status).to_owned(),
+                reason
+            ]],
             false,
         )
     );
@@ -309,11 +322,7 @@ fn report_login(
 /// is no account, so there is no code, no redirect and no row. Reads a probe
 /// rather than opening a store, because *opening* one would create a database as
 /// the only trace of a command that was asked to change nothing.
-fn anonymous_login(
-    cfg: &Config,
-    cli: &crate::cli::Cli,
-    provider: &str,
-) -> anyhow::Result<()> {
+fn anonymous_login(cfg: &Config, cli: &crate::cli::Cli, provider: &str) -> anyhow::Result<()> {
     let probe = commands::store_probe(&cli.config);
     let (status, reason) = commands::oauth_row(provider, cfg, &probe);
     print!(
@@ -323,7 +332,11 @@ fn anonymous_login(
             "sessions",
             &LOGIN_COLUMNS,
             &toon::every_field(&LOGIN_COLUMNS),
-            &[vec![provider.to_owned(), commands::armed_spelling(&status).to_owned(), reason]],
+            &[vec![
+                provider.to_owned(),
+                commands::armed_spelling(&status).to_owned(),
+                reason
+            ]],
             false,
         )
     );
@@ -350,7 +363,10 @@ async fn device_login(
 ) -> anyhow::Result<()> {
     if args.port != 0 {
         return Err(fail(
-            format!("--port {} has no meaning for a device login: there is no loopback to bind", args.port),
+            format!(
+                "--port {} has no meaning for a device login: there is no loopback to bind",
+                args.port
+            ),
             "drop --port; a device login is completed in a browser, not on this host",
         ));
     }
@@ -360,10 +376,15 @@ async fn device_login(
     }
     let (path, store) = open_login_store(cli)?;
 
-    let core = ArExec::new()
-        .map_err(|e| fail(e, "the pooled HTTP client could not start; this is a host problem"))?;
-    let (grant, pending) =
-        initiate_device(&core, &session).await.map_err(|e| fail(e, login_help(&args.provider)))?;
+    let core = ArExec::new().map_err(|e| {
+        fail(
+            e,
+            "the pooled HTTP client could not start; this is a host problem",
+        )
+    })?;
+    let (grant, pending) = initiate_device(&core, &session)
+        .await
+        .map_err(|e| fail(e, login_help(&args.provider)))?;
 
     // The two lines the whole flow exists to produce. Both are printable on any
     // device by design, and both are the only thing a caller needs to relay.
@@ -374,7 +395,11 @@ async fn device_login(
         "waiting: polling every {}s for up to {}s",
         grant.interval_secs, args.timeout
     );
-    let opened = if args.no_browser { false } else { try_open_browser(&grant.verification_uri) };
+    let opened = if args.no_browser {
+        false
+    } else {
+        try_open_browser(&grant.verification_uri)
+    };
     if !opened {
         println!("note: open the uri above on any device and enter the code there");
     }
@@ -415,12 +440,19 @@ async fn login(cli: &crate::cli::Cli, args: &AuthLoginArgs) -> anyhow::Result<()
     // A configured redirect is what the provider has registered and what the
     // authorize URL must name byte-for-byte, so a `--port` contradicting it would
     // open a browser that cannot finish. Refusing is cheaper than that.
-    let listener = if args.no_browser { None } else { CallbackListener::bind().await.ok() };
+    let listener = if args.no_browser {
+        None
+    } else {
+        CallbackListener::bind().await.ok()
+    };
     if let (Some(_), Some(configured)) = (&listener, declared.redirect_uri.as_deref())
         && args.port != 0
     {
         return Err(fail(
-            format!("--port {} is ignored: the session pins redirect_uri to {configured}", args.port),
+            format!(
+                "--port {} is ignored: the session pins redirect_uri to {configured}",
+                args.port
+            ),
             "drop --port, or remove `redirect_uri:` from the `oauth:` block to let the listener choose the port",
         ));
     }
@@ -451,15 +483,24 @@ async fn login(cli: &crate::cli::Cli, args: &AuthLoginArgs) -> anyhow::Result<()
     println!("url: {url}");
     println!("provider: {}", args.provider);
     if listener.is_some() {
-        println!("waiting: up to {}s for the redirect on {redirect_uri}", args.timeout);
+        println!(
+            "waiting: up to {}s for the redirect on {redirect_uri}",
+            args.timeout
+        );
     } else {
         println!(
             "paste: open the url above in any browser then paste the redirected url here (or a bare code)"
         );
     }
-    let opened = if args.no_browser { false } else { try_open_browser(&url) };
+    let opened = if args.no_browser {
+        false
+    } else {
+        try_open_browser(&url)
+    };
     if !opened && listener.is_some() {
-        println!("note: no browser was opened; complete the url above and the loopback will catch it");
+        println!(
+            "note: no browser was opened; complete the url above and the loopback will catch it"
+        );
     }
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
@@ -504,8 +545,12 @@ async fn login(cli: &crate::cli::Cli, args: &AuthLoginArgs) -> anyhow::Result<()
         }
     };
 
-    let core = ArExec::new()
-        .map_err(|e| fail(e, "the pooled HTTP client could not start; this is a host problem"))?;
+    let core = ArExec::new().map_err(|e| {
+        fail(
+            e,
+            "the pooled HTTP client could not start; this is a host problem",
+        )
+    })?;
     let token = exchange_code(
         &core,
         &session,
@@ -610,7 +655,8 @@ fn logout(cli: &crate::cli::Cli, args: &AuthProviderArgs) -> anyhow::Result<()> 
     // opening one to find that out would leave a fresh database behind as the
     // only trace of a command that changed nothing. So the probe decides first
     // and the store is only opened when a row is actually going to go.
-    let probe = commands::store_probe(&cli.config);    let mut removed: Vec<String> = Vec::new();
+    let probe = commands::store_probe(&cli.config);
+    let mut removed: Vec<String> = Vec::new();
     if let Some(store) = commands::credential_store(cli) {
         for name in &targets {
             if probe.holds(name) && store.remove(name).map_err(|e| store_write_error(name, e))? {
@@ -628,7 +674,11 @@ fn logout(cli: &crate::cli::Cli, args: &AuthProviderArgs) -> anyhow::Result<()> 
             &toon::every_field(&LOGOUT_COLUMNS),
             &[vec![
                 provider.to_owned(),
-                if removed.is_empty() { "unchanged".to_owned() } else { "logged-out".to_owned() },
+                if removed.is_empty() {
+                    "unchanged".to_owned()
+                } else {
+                    "logged-out".to_owned()
+                },
                 if removed.is_empty() {
                     "no store rows for this session".to_owned()
                 } else {
@@ -691,13 +741,22 @@ fn status(cli: &crate::cli::Cli, args: &AuthProviderArgs) -> anyhow::Result<()> 
     {
         return Err(fail(
             format!("no `oauth:` block declares {id}"),
-            format!("add an `oauth:` block for {id}, or run `ar auth status` to see the sessions that exist"),
+            format!(
+                "add an `oauth:` block for {id}, or run `ar auth status` to see the sessions that exist"
+            ),
         ));
     }
     rows.sort();
     print!(
         "{}",
-        toon::list("sessions", "sessions", &STATUS_COLUMNS, &toon::every_field(&STATUS_COLUMNS), &rows, false)
+        toon::list(
+            "sessions",
+            "sessions",
+            &STATUS_COLUMNS,
+            &toon::every_field(&STATUS_COLUMNS),
+            &rows,
+            false
+        )
     );
     Ok(())
 }
@@ -715,7 +774,9 @@ fn store_write_error(name: &str, e: ar_keys::KeyError) -> anyhow::Error {
 /// An authorization URL is worth little without a place to paste it back into,
 /// so the fix names the mode rather than the mechanism.
 fn login_help(provider: &str) -> String {
-    format!("re-run `ar auth login --provider {provider} --no-browser` and paste the redirected url on one line")
+    format!(
+        "re-run `ar auth login --provider {provider} --no-browser` and paste the redirected url on one line"
+    )
 }
 
 /// The `help:` line a device-login failure carries.
@@ -724,7 +785,9 @@ fn login_help(provider: &str) -> String {
 /// had it, so the useful fact is that the code is still good and the poll is
 /// what to retry, rather than anything about pasting a redirect.
 fn device_help(provider: &str) -> String {
-    format!("re-run `ar auth login --provider {provider}` and enter the new code on any device before it expires")
+    format!(
+        "re-run `ar auth login --provider {provider}` and enter the new code on any device before it expires"
+    )
 }
 
 /// A store row for `secret`, crossing the two `Secret` types.
@@ -768,23 +831,33 @@ mod tests {
         let cfg = cfg_with_session();
         let built = exec_session("codex", session_for(&cfg, "codex").expect("declared"))
             .expect("codex has an executor");
-        assert_eq!(built.authorization_url(), Some("https://auth.example.invalid/authorize"));
+        assert_eq!(
+            built.authorization_url(),
+            Some("https://auth.example.invalid/authorize")
+        );
     }
 
     #[test]
     fn refuses_a_provider_this_build_cannot_authenticate() {
         let cfg = cfg_with_session();
         let declared = cfg.oauth_for("codex").expect("declared");
-        let err = exec_session("kilocode", declared).expect_err("no executor").to_string();
+        let err = exec_session("kilocode", declared)
+            .expect_err("no executor")
+            .to_string();
         assert!(err.contains("no oauth executor for kilocode"), "{err}");
     }
 
     #[test]
     fn names_the_missing_oauth_block_rather_than_inventing_one() {
         let cfg = Config::parse("keys:\n  k: v\n", |_| Ok(Some("v".to_owned()))).expect("parses");
-        let err = session_for(&cfg, "codex").expect_err("no block").to_string();
+        let err = session_for(&cfg, "codex")
+            .expect_err("no block")
+            .to_string();
         assert!(err.contains("no `oauth:` block declares codex"), "{err}");
-        assert!(err.contains("authorization_url"), "the help shows the shape: {err}");
+        assert!(
+            err.contains("authorization_url"),
+            "the help shows the shape: {err}"
+        );
     }
 
     #[test]
@@ -842,7 +915,10 @@ mod tests {
     fn refuses_to_build_a_url_for_a_session_with_no_authorize_endpoint() {
         let bare = Session::new("codex", OAuthKind::Codex).with_client_id("cid");
         let request = new_authorize_request(&bare, "http://127.0.0.1:9/callback");
-        assert!(authorize_url(&request).is_err(), "an endpoint is never inferred");
+        assert!(
+            authorize_url(&request).is_err(),
+            "an endpoint is never inferred"
+        );
     }
 
     #[test]
@@ -913,7 +989,35 @@ mod tests {
         .expect("the device fixture parses");
         let declared = cfg.oauth_for("grok-cli").expect("declared");
         let built = exec_session("grok-cli", declared).expect("grok-cli has an executor");
-        assert_eq!(built.device_auth_url(), Some("https://auth.example.invalid/device"));
+        assert_eq!(
+            built.device_auth_url(),
+            Some("https://auth.example.invalid/device")
+        );
+    }
+
+    #[test]
+    fn carries_a_templated_poll_url_into_the_executor_session_verbatim() {
+        // A provider that addresses the grant by path needs `{code}` to survive the
+        // config → session hop untouched: the executor substitutes it, so anything
+        // that resolved the URL here (or normalised it) would break the poll.
+        let cfg = Config::parse(
+            concat!(
+                "keys:\n  grok: $G\n",
+                "providers:\n  - id: grok-cli\n    key: grok\n",
+                "oauth:\n  - provider: grok-cli\n",
+                "    device_auth_url: https://auth.example.invalid/codes\n",
+                "    device_poll_url: https://auth.example.invalid/poll/{code}\n",
+            ),
+            |name| Ok(Some(format!("synthetic-{name}"))),
+        )
+        .expect("a templated poll URL is a declared endpoint");
+        let declared = cfg.oauth_for("grok-cli").expect("declared");
+        let built = exec_session("grok-cli", declared).expect("grok-cli has an executor");
+        assert_eq!(
+            built.device_poll_url(),
+            Some("https://auth.example.invalid/poll/{code}"),
+            "the placeholder reaches the executor exactly as the operator wrote it"
+        );
     }
 
     #[test]
@@ -923,7 +1027,10 @@ mod tests {
         let rendered = [
             LoginError::NoDeviceAuthUrl.to_string(),
             LoginError::NoDevicePollUrl.to_string(),
-            LoginError::ExchangeFailed(RefreshFault::Transient("device-response-has-no-device-code")).to_string(),
+            LoginError::ExchangeFailed(RefreshFault::Transient(
+                "device-response-has-no-device-code",
+            ))
+            .to_string(),
             LoginError::LoginExpired.to_string(),
         ]
         .join(" | ");
@@ -935,8 +1042,11 @@ mod tests {
         // The editor name is not a secret, but a row that renders config values
         // is a row that will render a credential the first time one is added here.
         let cfg = cfg_anonymous();
-        let (_status, reason) =
-            commands::oauth_row("kilocode", &cfg, &commands::store_probe(std::path::Path::new("no-such-config.yaml")));
+        let (_status, reason) = commands::oauth_row(
+            "kilocode",
+            &cfg,
+            &commands::store_probe(std::path::Path::new("no-such-config.yaml")),
+        );
         assert!(!reason.contains("artificial-route"), "{reason}");
     }
 
@@ -957,13 +1067,19 @@ mod tests {
     fn refuses_a_port_for_a_device_login_rather_than_ignoring_it() {
         // A device login binds nothing, so a `--port` on it is a flag whose
         // absence changes nothing and whose presence promises something.
-        let args = AuthLoginArgs { port: 1455, ..login_args() };
+        let args = AuthLoginArgs {
+            port: 1455,
+            ..login_args()
+        };
         let cfg = cfg_device();
         let declared = cfg.oauth_for("grok-cli").expect("declared");
         let cli = cli_for("no-such-config.yaml");
         let err = commands::block_on_value(device_login(&cfg, &cli, declared, &args))
             .expect_err("no loopback to bind");
-        assert!(err.to_string().contains("no meaning for a device login"), "{err}");
+        assert!(
+            err.to_string().contains("no meaning for a device login"),
+            "{err}"
+        );
     }
 
     fn cfg_device() -> Config {
@@ -982,8 +1098,16 @@ mod tests {
 
     fn cli_for(config: &str) -> crate::cli::Cli {
         use clap::Parser as _;
-        crate::cli::Cli::try_parse_from(["ar", "--config", config, "auth", "login", "--provider", "grok-cli"])
-            .expect("the flag set parses")
+        crate::cli::Cli::try_parse_from([
+            "ar",
+            "--config",
+            config,
+            "auth",
+            "login",
+            "--provider",
+            "grok-cli",
+        ])
+        .expect("the flag set parses")
     }
 
     fn login_args() -> AuthLoginArgs {

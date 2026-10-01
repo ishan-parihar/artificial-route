@@ -2,9 +2,9 @@
 //!
 //! `docs/02` makes this the only place a provider wire format is understood:
 //! inbound dialects land in [`CanonicalChat`], and outbound dialects are
-//! rendered from [`CanonicalResponse`]. Everything downstream (`ar-exec`,
-//! `ar-route`, the cache key in `ar-cache`) speaks these types and never a
-//! wire format.
+//! rendered from it by [`crate::render_for_wire`]. Everything downstream
+//! (`ar-exec`, `ar-route`, the cache key in `ar-cache`) speaks these types and
+//! never a wire format.
 //!
 //! # Why these exist at all
 //!
@@ -211,7 +211,8 @@ pub struct CanonicalChat {
 /// * `tools` / `tool_choice` — no canonical tool registry. An Anthropic
 ///   `tool_use` crosses as a carried [`MediaPart`], which is enough to *observe*
 ///   that a turn used tools and not enough to declare them, so a tool-using
-///   request reaches the upstream without its tool declarations.
+///   request reaches the upstream without its tool declarations. Every outbound
+///   renderer inherits this gap; `TODO(#p1-tools)` is where it closes.
 /// * `top_p` — parsed by two inbound adapters (`OllamaOptions::top_p`,
 ///   `GeminiGenerationConfig::top_p`), no canonical field. Sampling becomes
 ///   temperature-only upstream.
@@ -227,7 +228,8 @@ pub struct CanonicalChat {
 /// Each is a request capability this build does not have, and each is visible
 /// rather than silently substituted. `TODO(#p1-tools)`: give canonical a tool
 /// registry, then the four samplers, `stop`, `n` and `reasoning_effort` follow
-/// from it; re-add them here alongside the canonical fields they read.
+/// from it; re-add them here and in the per-wire renderers alongside the
+/// canonical fields they read.
 #[must_use]
 pub fn render_openai_body(chat: &CanonicalChat) -> Vec<u8> {
     let messages: Vec<serde_json::Value> =

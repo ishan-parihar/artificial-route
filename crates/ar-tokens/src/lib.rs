@@ -4,6 +4,8 @@
 //! token count, [`NormalizedUsage`] turns a provider's `usage` object into
 //! `{prompt, completion, total}`, and [`Ledger`] prices that usage, records it
 //! append-only, and answers whether a key has budget left.
+//! [`ResponseMeta`] closes the loop: the same priced usage, shaped for the
+//! numbers a response reports.
 //!
 //! ```
 //! use ar_tokens::{CostReport, count_text, estimate_request};
@@ -20,6 +22,7 @@
 //! | [`count_text`] | `src/shared/utils/tiktokenCounter.ts::countTextTokens` |
 //! | [`estimate_request`] | `src/lib/quota/tokenEstimator.ts` |
 //! | [`NormalizedUsage`] | `src/lib/usage/tokenAccounting.ts` |
+//! | [`ResponseMeta`] | `src/domain/omnirouteResponseMeta.ts` |
 //! | [`PricingTable`] | `src/lib/usage/{modelPricingRegistry,costCalculator}.ts` |
 //! | [`Ledger`], [`Cap`] | `src/lib/usage/{usageLedger,budgetGuard}.ts` |
 //!
@@ -35,11 +38,13 @@
 pub mod count;
 pub mod error;
 pub mod ledger;
+pub mod meta;
 pub mod pricing;
 pub mod usage;
 
 pub use count::{DEFAULT_OUTPUT_ALLOWANCE, Estimate, MAX_EXACT_TOKEN_COUNT_CHARS, count_text, estimate_request};
 pub use error::TokenError;
 pub use ledger::{Cap, CostReport, DenyReason, Entry, Ledger, LedgerRow, Spend, Verdict};
+pub use meta::{ResponseMeta, usage_from_body};
 pub use pricing::{Cost, Prices, PricingTable, Usd};
 pub use usage::NormalizedUsage;

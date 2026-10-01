@@ -13,7 +13,12 @@
 //!   `config/providers` directory and the reader walks the TypeScript; without
 //!   `--path` there is nothing local to read and the command says so, because
 //!   models.dev carries no executor, format or flat-rate classification and
-//!   importing it under `omniroute` would quietly drop them.
+//!   importing it under `omniroute` would quietly drop them. It also reads three
+//!   files *beside* that tree, each of which exists to correct a field the
+//!   provider entries cannot answer for themselves: `flatRateProviders.ts` +
+//!   `web-cookie.ts` (whose providers are all subscription-backed), and
+//!   `freeModelCatalog.data.ts` (the free-tier allowances, emitted as the third
+//!   generated file).
 //! * [`discovery`] handles the models.dev-shaped provider map, which is what
 //!   `ar-registry`'s live overlay parses.
 //!
@@ -28,6 +33,8 @@ use std::sync::OnceLock;
 use ar_config::{Combo, Strategy};
 use ar_core::Strng;
 use ar_registry::discovery::{self, DiscoveryError, LiveCatalog};
+use ar_registry::free::FreeBudgets;
+use ar_registry::meta::ProviderMeta;
 use ar_registry::{AuthClass, ProviderDef, WireFormat, global};
 use serde::Deserialize;
 
@@ -62,6 +69,21 @@ pub struct Imported {
     pub combos: Vec<Combo>,
     /// The `config.yaml` body, credentials left as `$VAR` references.
     pub config_yaml: String,
+    /// The free-model budget table, empty for a source that carries none.
+    ///
+    /// A third generated file rather than a field on [`Imported::registry`]:
+    /// the table is keyed `(provider, model)` — one row per model, not one per
+    /// provider — so folding it in would either duplicate every provider key or
+    /// make the catalog a document no `BTreeMap<Strng, ProviderDef>` loader can
+    /// parse.
+    pub free_budgets: FreeBudgets,
+    /// What each provider declares about itself: short id, auth header, context
+    /// window, alternate protocols, anonymous key.
+    ///
+    /// A third generated file rather than fields on `ProviderDef`, which is built
+    /// field-by-field in four places outside this crate's write scope. Keyed by
+    /// provider id like the registry, so both documents keep a single shape.
+    pub provider_meta: BTreeMap<Strng, ProviderMeta>,
 }
 
 /// One `provider/model` pair, plus the alias a client would ask for.
@@ -128,7 +150,8 @@ fn from_omniroute(body: &str) -> anyhow::Result<Vec<Row>> {
     Ok(catalog
         .into_iter()
         .flat_map(|(id, d)| {
-            let (provider, base_url, env) = (id.to_string(), d.base_url.clone(), d.env_hint.clone());
+            let (provider, base_url, env) =
+                (id.to_string(), d.base_url.clone(), d.env_hint.clone());
             d.models.into_iter().map(move |m| Row {
                 alias: format!("{provider}/{m}"),
                 provider: provider.clone(),
@@ -154,7 +177,10 @@ fn from_litellm(body: &str) -> anyhow::Result<Vec<Row>> {
         .map(|(i, e)| {
             let raw = e.litellm_params.model.as_deref().ok_or_else(|| {
                 fail(
-                    format!("model_list[{i}] ({:?}) has no litellm_params.model", e.model_name),
+                    format!(
+                        "model_list[{i}] ({:?}) has no litellm_params.model",
+                        e.model_name
+                    ),
                     "give the row a `litellm_params.model: <provider>/<model>`",
                 )
             })?;
@@ -195,28 +221,35 @@ fn assemble(rows: Vec<Row>) -> anyhow::Result<Imported> {
                 "the source config has no api_base and the compiled-in registry has no entry; add one by hand",
             )
         })?;
-        let def = registry.entry(Strng::from(row.provider.as_str())).or_insert_with(|| ProviderDef {
-            base_url,
-            wire_format: known.map_or(WireFormat::Openai, |d| d.wire_format),
-            auth: AuthClass::ApiKey,
-            env_hint: row
-                .env
-                .clone()
-                .or_else(|| known.map(|d| d.env_hint.clone()))
-                .unwrap_or_else(|| default_env(&row.provider)),
-            models: Vec::new(),
-            // A LiteLLM row carries no executor, auth class, price or flat-rate
-            // flag; the compiled-in catalog's values are the only ones there are.
-            prices: known.map(|d| d.prices.clone()).unwrap_or_default(),
-            executor: Strng::from(known.map_or("default", |d| d.executor.as_ref())),
-            auth_kind: Strng::from(known.map_or("apikey", |d| d.auth_kind.as_ref())),
-            flat_rate: known.is_some_and(|d| d.flat_rate),
-            // A LiteLLM row has no header block; the compiled-in entry's is the
-            // only one there is.
-            headers: known.map(|d| d.headers.clone()).unwrap_or_default(),
-        });
+        let def = registry
+            .entry(Strng::from(row.provider.as_str()))
+            .or_insert_with(|| ProviderDef {
+                base_url,
+                wire_format: known.map_or(WireFormat::Openai, |d| d.wire_format),
+                auth: AuthClass::ApiKey,
+                env_hint: row
+                    .env
+                    .clone()
+                    .or_else(|| known.map(|d| d.env_hint.clone()))
+                    .unwrap_or_else(|| default_env(&row.provider)),
+                models: Vec::new(),
+                // A LiteLLM row carries no executor, auth class, price or flat-rate
+                // flag; the compiled-in catalog's values are the only ones there are.
+                prices: known.map(|d| d.prices.clone()).unwrap_or_default(),
+                executor: Strng::from(known.map_or("default", |d| d.executor.as_ref())),
+                auth_kind: Strng::from(known.map_or("apikey", |d| d.auth_kind.as_ref())),
+                flat_rate: known.is_some_and(|d| d.flat_rate),
+                // A LiteLLM row has no header block; the compiled-in entry's is the
+                // only one there is. The provider *metadata* is not copied at
+                // all: it lives in `ar-registry::meta`, keyed by id, so a
+                // LiteLLM row reads it there or not at all.
+                headers: known.map(|d| d.headers.clone()).unwrap_or_default(),
+            });
         def.models.push(Strng::from(row.model.as_str()));
-        targets.entry(row.alias.clone()).or_default().insert(format!("{}/{}", row.provider, row.model));
+        targets
+            .entry(row.alias.clone())
+            .or_default()
+            .insert(format!("{}/{}", row.provider, row.model));
     }
 
     for def in registry.values_mut() {
@@ -228,19 +261,28 @@ fn assemble(rows: Vec<Row>) -> anyhow::Result<Imported> {
 
     let combos = targets
         .into_iter()
-        .map(|(alias, set)| Ok(Combo {
-            id: check_alias(&alias)?,
-            strategy: Strategy::Priority,
-            targets: set.into_iter().collect(),
-            // The LiteLLM export has no candidate-pool concept, so an import never
-            // invents one: a bench that is not in the source is not in the file,
-            // and an operator adds `pool:` by hand.
-            pool: Vec::new(),
-            compression: None,
-        }))
+        .map(|(alias, set)| {
+            Ok(Combo {
+                id: check_alias(&alias)?,
+                strategy: Strategy::Priority,
+                targets: set.into_iter().collect(),
+                weights: BTreeMap::new(),
+                // The LiteLLM export has no candidate-pool concept, so an import never
+                // invents one: a bench that is not in the source is not in the file,
+                // and an operator adds `pool:` by hand.
+                pool: Vec::new(),
+                compression: None,
+            })
+        })
         .collect::<anyhow::Result<Vec<_>>>()?;
     let config_yaml = render_yaml(&registry, &combos);
-    Ok(Imported { registry, combos, config_yaml })
+    Ok(Imported {
+        registry,
+        combos,
+        config_yaml,
+        free_budgets: FreeBudgets::default(),
+        provider_meta: BTreeMap::new(),
+    })
 }
 
 /// The env var an imported provider falls back to when nothing named one.
@@ -249,12 +291,18 @@ fn assemble(rows: Vec<Row>) -> anyhow::Result<Imported> {
 /// wrong guess is a one-line fix at the top of `config.yaml` rather than a
 /// secret this process has to hold.
 fn default_env(provider: &str) -> String {
-    format!("AR_KEY_{}", provider.to_uppercase().replace(['-', '.', '/'], "_"))
+    format!(
+        "AR_KEY_{}",
+        provider.to_uppercase().replace(['-', '.', '/'], "_")
+    )
 }
 
 /// Rejects an alias that would not survive a round trip through the YAML.
 fn check_alias(alias: &str) -> anyhow::Result<String> {
-    if alias.chars().all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c)) {
+    if alias
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c))
+    {
         return Ok(alias.to_owned());
     }
     Err(fail(
@@ -276,15 +324,27 @@ pub(crate) fn render_yaml(registry: &BTreeMap<Strng, ProviderDef>, combos: &[Com
         "# Generated by `ar import`. Credentials stay in the environment.".to_owned(),
         "keys:".to_owned(),
     ];
-    out.extend(registry.iter().map(|(id, d)| format!("  {id}: ${}", d.env_hint)));
+    out.extend(
+        registry
+            .iter()
+            .map(|(id, d)| format!("  {id}: ${}", d.env_hint)),
+    );
     out.push("providers:".to_owned());
     // One key per provider, named after it: sharing one credential across two
     // providers is uncommon and is a two-line edit, whereas guessing a shared
     // name would collide with a key the user already has.
-    out.extend(registry.keys().map(|id| format!("  - id: {id}\n    key: {id}")));
+    out.extend(
+        registry
+            .keys()
+            .map(|id| format!("  - id: {id}\n    key: {id}")),
+    );
     out.push("combos:".to_owned());
     for c in combos {
-        out.push(format!("  - id: {}\n    strategy: {}\n    targets:", c.id, c.strategy.as_str()));
+        out.push(format!(
+            "  - id: {}\n    strategy: {}\n    targets:",
+            c.id,
+            c.strategy.as_str()
+        ));
         out.extend(c.targets.iter().map(|t| format!("      - {t}")));
     }
     let mut yaml = out.join("\n");
@@ -298,9 +358,17 @@ pub fn rows(imported: &Imported, out_dir: &str) -> Vec<Vec<String>> {
         .combos
         .iter()
         .map(|c| {
-            let providers: BTreeSet<&str> =
-                c.targets.iter().map(|t| crate::commands::target_provider(t)).collect();
-            vec![c.id.clone(), providers.into_iter().collect::<Vec<_>>().join("+"), "active".to_owned(), out_dir.to_owned()]
+            let providers: BTreeSet<&str> = c
+                .targets
+                .iter()
+                .map(|t| crate::commands::target_provider(t))
+                .collect();
+            vec![
+                c.id.clone(),
+                providers.into_iter().collect::<Vec<_>>().join("+"),
+                "active".to_owned(),
+                out_dir.to_owned(),
+            ]
         })
         .collect()
 }
@@ -315,11 +383,47 @@ pub fn to_catalog_json(registry: &BTreeMap<Strng, ProviderDef>) -> anyhow::Resul
         .map_err(|e| fail(e, "the converted registry could not be serialised"))
 }
 
+/// The third generated file, beside `registry.json` and `config.yaml`.
+///
+/// Compact for the same reason as [`to_catalog_json`]: `ar-registry`
+/// `include_str!`-s it, so whitespace is `.rodata`.
+///
+/// The free-tier table is keyed `(provider, model)`: one row per model, not one
+/// per provider, so folding it into `registry.json` would make that file a
+/// two-shape document no `ProviderDef` loader can parse. A `ProviderDef` names
+/// a base URL, a wire format and a price; nothing in that shape holds an
+/// allowance.
+///
+/// # Errors
+///
+/// [`serde_json::Error`] when the table cannot be serialised. Unreachable for
+/// a struct of owned strings and integers, and kept so a future field names
+/// itself rather than panicking.
+pub fn to_free_budgets_json(free: &FreeBudgets) -> anyhow::Result<String> {
+    serde_json::to_string(free).map_err(|e| fail(e, "the free-tier table could not be serialised"))
+}
+
+/// Serialises the per-provider metadata table: flat, one document shape, one
+/// parse path, exactly like [`to_catalog_json`].
+///
+/// # Errors
+///
+/// [`serde_json::Error`] when the table cannot be serialised — unreachable for a
+/// struct of owned strings and integers, and kept so a future field names
+/// itself rather than panicking.
+pub fn to_provider_meta_json(meta: &BTreeMap<Strng, ProviderMeta>) -> anyhow::Result<String> {
+    serde_json::to_string(meta)
+        .map_err(|e| fail(e, "the provider metadata could not be serialised"))
+}
+
 /// The upstream document: `path` if given, else the live catalog.
 pub fn upstream(path: Option<&Path>) -> anyhow::Result<String> {
     path.map_or_else(fetch_live, |p| {
         std::fs::read_to_string(p).map_err(|e| {
-            fail(format!("cannot read {}: {e}", p.display()), "pass --path <FILE>, or omit it to fetch models.dev live")
+            fail(
+                format!("cannot read {}: {e}", p.display()),
+                "pass --path <FILE>, or omit it to fetch models.dev live",
+            )
         })
     })
 }
@@ -353,7 +457,10 @@ fn fetch_live() -> anyhow::Result<String> {
             eprintln!("warning: {e}; replaying the cached catalog ({n} providers)");
         }
         Err(e) => {
-            return Err(fail(e, "no catalog has ever been fetched here; pass --path <FILE> to import a saved one"));
+            return Err(fail(
+                e,
+                "no catalog has ever been fetched here; pass --path <FILE> to import a saved one",
+            ));
         }
     }
     c.body().ok_or_else(no_catalog)
@@ -361,7 +468,10 @@ fn fetch_live() -> anyhow::Result<String> {
 
 /// The error for a cache that holds nothing to replay.
 fn no_catalog() -> anyhow::Error {
-    fail("no cached catalog", "pass --path <FILE> to import a saved one")
+    fail(
+        "no cached catalog",
+        "pass --path <FILE> to import a saved one",
+    )
 }
 
 /// One `GET` of the models.dev catalog. The runtime's own start failure folds
@@ -369,7 +479,12 @@ fn no_catalog() -> anyhow::Error {
 /// fetch, and one variant carrying the real message beats a second nobody can
 /// act on.
 async fn fetch_models_dev() -> anyhow::Result<String> {
-    let wrap = |e: reqwest::Error| fail(e, "models.dev is unreachable; pass --path <FILE> to import a saved catalog");
+    let wrap = |e: reqwest::Error| {
+        fail(
+            e,
+            "models.dev is unreachable; pass --path <FILE> to import a saved catalog",
+        )
+    };
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -413,16 +528,30 @@ model_list:
         let out = convert(ImportFrom::Litellm, LITELLM).unwrap();
 
         assert_eq!(out.registry.len(), 3, "openai, groq, anthropic");
-        assert_eq!(out.registry["openai"].models, vec![Strng::from("gpt-4o-mini")], "one row per pair, deduped");
+        assert_eq!(
+            out.registry["openai"].models,
+            vec![Strng::from("gpt-4o-mini")],
+            "one row per pair, deduped"
+        );
         // An alias two providers answer is one combo with a chain, not two rows.
         let shared = out.combos.iter().find(|c| c.id == "fast").unwrap();
-        assert_eq!(shared.targets, vec!["groq/llama-3.3-70b", "openai/gpt-4o-mini"]);
+        assert_eq!(
+            shared.targets,
+            vec!["groq/llama-3.3-70b", "openai/gpt-4o-mini"]
+        );
 
         // `keys:` is sorted by id, so assert the mapping rather than its
         // position: two imports of the same config must produce the same file.
-        assert!(out.config_yaml.contains("\n  openai: $OPENAI_API_KEY\n"), "{}", out.config_yaml);
+        assert!(
+            out.config_yaml.contains("\n  openai: $OPENAI_API_KEY\n"),
+            "{}",
+            out.config_yaml
+        );
         assert!(out.config_yaml.contains("- id: openai\n    key: openai"));
-        assert!(!out.config_yaml.contains("sk-ant-"), "a literal secret is never written");
+        assert!(
+            !out.config_yaml.contains("sk-ant-"),
+            "a literal secret is never written"
+        );
         // Nothing named a variable for groq, so the convention applies.
         assert_eq!(out.registry["groq"].env_hint, "AR_KEY_GROQ");
 
@@ -430,7 +559,8 @@ model_list:
         // `config.yaml` through `ar-config`, `registry.json` through the
         // `include_str!` in `ar-registry`. A file that does not round-trip is
         // not a conversion, it is a broken next boot.
-        let cfg = ar_config::Config::parse(&out.config_yaml, |n| Ok(Some(format!("<{n}>")))).unwrap();
+        let cfg =
+            ar_config::Config::parse(&out.config_yaml, |n| Ok(Some(format!("<{n}>")))).unwrap();
         assert_eq!(cfg.combos, out.combos);
         let json = serde_json::to_string_pretty(&out.registry).unwrap();
         let round: BTreeMap<Strng, ProviderDef> = serde_json::from_str(&json).unwrap();
@@ -449,6 +579,43 @@ model_list:
     }
 
     #[test]
+    fn carries_no_free_tier_rows_when_the_source_carries_none() {
+        // A models.dev-shaped document has no free-tier table, and the field
+        // exists on every `Imported` — so it must read as "none" rather than
+        // leaving a caller to guess whether it was consulted.
+        let out = convert(
+            ImportFrom::Omniroute,
+            r#"{"openai":{"api":"https://api.openai.com/v1","env":["OPENAI_API_KEY"],"models":{"gpt-4o":{}}}}"#,
+        )
+        .unwrap();
+        assert!(out.free_budgets.is_empty());
+    }
+
+    #[test]
+    fn serialises_the_free_tier_table_to_a_reloadable_document() {
+        // The generated file is `include_str!`-ed by `ar-registry`, so a shape
+        // that does not round-trip is a broken next build rather than a cosmetic
+        // diff.
+        let mut free = FreeBudgets {
+            curated_at: Strng::from("2026-09-12"),
+            ..FreeBudgets::default()
+        };
+        free.rows.push(ar_registry::free::FreeBudgetRow {
+            provider: Strng::from("mistral"),
+            model: Strng::from("m1"),
+            monthly_tokens: 1_000_000_000,
+            credit_tokens: 0,
+            regime: ar_registry::free::FreeRegime::RecurringDaily,
+            pool: Some(Strng::from("mistral-free")),
+            tos_avoid: false,
+            gated: false,
+        });
+        let json = to_free_budgets_json(&free).unwrap();
+        let back: FreeBudgets = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, free);
+    }
+
+    #[test]
     fn names_the_failure_rather_than_dropping_the_row() {
         let litellm: Vec<(&str, &str)> = vec![
             ("not yaml at all: [", "expected a LiteLLM config"),
@@ -463,7 +630,9 @@ model_list:
             assert!(e.contains(needle), "wanted {needle:?} in: {e}");
             assert!(e.contains("help:"), "every failure carries a fix: {e}");
         }
-        let e = convert(ImportFrom::Omniroute, "not json").unwrap_err().to_string();
+        let e = convert(ImportFrom::Omniroute, "not json")
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("models.dev-shaped map"), "{e}");
     }
 }

@@ -49,6 +49,25 @@
 //! library call is not a place to refuse text), which is deliberately the
 //! opposite of the reference, where a combo override naming a mode the engine
 //! does not have is accepted and silently ignored.
+//!
+//! # Reference plan modes are approximations
+//!
+//! The reference's per-request vocabulary is `off`/`lite`/`standard`/
+//! `aggressive`/`ultra`/`RTK`/`stacked`; `off`, a bare engine id and a named
+//! combo are already this crate's grammar. Three are not, and each resolves to
+//! the closest ar plan instead:
+//!
+//! * `standard` → `caveman` (`full`) — the reference's `standard` preset is that
+//!   same engine at that same default rung.
+//! * `aggressive` → `rtk@aggressive` — its summarization and turn-aging have no
+//!   ar transform; this is the nearest rung that works harder.
+//! * `ultra` → `caveman@ultra` — its heuristic token pruning is nearest
+//!   `caveman`'s top rung.
+//!
+//! Each is an **approximation, not an equivalent**: it names a rung of the
+//! closest engine, not the reference pipeline, and gives up whatever the missing
+//! transform did. An operator's own combo still wins over the word of the same
+//! name, because an explicit pipeline is more specific than an approximation.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -400,6 +419,7 @@ pub struct Layers<'a> {
 /// | `default` | the panel default, attributed to the header |
 /// | `engine:<id>` | that single engine, when the id is known |
 /// | `<combo>` | the named combo, matched by name then id, both case-insensitively |
+/// | `standard`/`aggressive`/`ultra` | the closest ar plan — an approximation |
 /// | anything else | unrecognized — fall through to `combo` |
 ///
 /// ```
@@ -494,6 +514,31 @@ fn plan_from_header(combos: &[Combo<'_>], layers: &Layers<'_>, header: &str) -> 
             steps: combo.steps.to_vec(),
             source: Source::Header,
         })
+        // Last, so a combo named `ultra` keeps its pipeline: an operator's
+        // explicit choice outranks a built-in approximation of the same word.
+        .or_else(|| reference_mode_plan(header))
+}
+
+/// The reference's own plan modes that have no ar equivalent, as the closest ar
+/// plan to each. Case-insensitive, and consulted after the combo lookup; `None`
+/// for every other value, which leaves the documented fall-through untouched.
+///
+/// The three mappings are one line each in the module docs, and each is an
+/// approximation rather than an equivalent.
+fn reference_mode_plan(mode: &str) -> Option<Plan> {
+    let step = if mode.eq_ignore_ascii_case("standard") {
+        Step::new(Engine::Caveman)
+    } else if mode.eq_ignore_ascii_case("aggressive") {
+        Step::at(Engine::Rtk, Intensity::Aggressive)
+    } else if mode.eq_ignore_ascii_case("ultra") {
+        Step::at(Engine::Caveman, Intensity::Ultra)
+    } else {
+        return None;
+    };
+    Some(Plan {
+        steps: vec![step],
+        source: Source::Header,
+    })
 }
 
 /// Engine dispatch. `lite`/`rtk`/`caveman` are implemented by the sibling
@@ -735,6 +780,55 @@ mod tests {
             &Layers { header: Some("engine:llmlingua"), ..all_layers_set() },
         );
         assert_eq!(plan.source, Source::Combo);
+    }
+
+    /// The reference's three presets, one line each in the module docs: the
+    /// table is the mapping, so a change to a rung has to change this too.
+    #[test]
+    fn maps_each_reference_mode_to_the_closest_ar_plan() {
+        for (mode, step) in [
+            ("standard", Step::new(Engine::Caveman)),
+            ("aggressive", Step::at(Engine::Rtk, Intensity::Aggressive)),
+            ("ultra", Step::at(Engine::Caveman, Intensity::Ultra)),
+        ] {
+            let plan = plan_resolution(
+                &combos(),
+                &Layers { header: Some(mode), ..all_layers_set() },
+            );
+            assert_eq!(plan.steps, [step], "{mode}");
+            assert_eq!(plan.source, Source::Header, "{mode}");
+        }
+    }
+
+    #[test]
+    fn resolves_a_reference_mode_case_insensitively() {
+        let plan = plan_resolution(
+            &combos(),
+            &Layers { header: Some(" ULTRA "), ..all_layers_set() },
+        );
+        assert_eq!(plan.steps, [Step::at(Engine::Caveman, Intensity::Ultra)]);
+    }
+
+    /// The ordering the tail of the header grammar encodes: an operator's own
+    /// pipeline outranks a built-in approximation of the same word.
+    #[test]
+    fn prefers_a_named_combo_over_a_reference_mode_of_the_same_name() {
+        let named = [Combo { id: "ultra", name: None, steps: LITE_ONLY }];
+        let plan = plan_resolution(&named, &Layers { header: Some("ultra"), ..all_layers_set() });
+        assert_eq!(plan.steps, LITE_ONLY);
+    }
+
+    /// The fall-through is unchanged: a value this crate has never heard of is
+    /// still not a decision, so the next layer decides exactly as before.
+    #[test]
+    fn falls_through_for_an_unknown_reference_mode() {
+        for mode in ["extreme", "summarizing", "ultra-ish"] {
+            let plan = plan_resolution(
+                &combos(),
+                &Layers { header: Some(mode), ..all_layers_set() },
+            );
+            assert_eq!(plan.source, Source::Combo, "{mode}");
+        }
     }
 
     #[test]

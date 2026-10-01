@@ -39,6 +39,8 @@ use std::path::{Path, PathBuf};
 
 use ar_config::{Combo, Strategy};
 use ar_core::Strng;
+use ar_registry::free::{FreeBudgetRow, FreeBudgets, FreeRegime};
+use ar_registry::meta::ProviderMeta;
 use ar_registry::{AuthClass, Price, ProviderDef, wire_format};
 
 use crate::commands::fail;
@@ -54,8 +56,10 @@ pub fn scan(providers_dir: &Path) -> anyhow::Result<Imported> {
     let root = read_tree(providers_dir)?;
     let prices = pricing(providers_dir);
     let flat_rate = flat_rate_ids(providers_dir);
+    let free = free_budgets(providers_dir);
 
     let mut defs: BTreeMap<Strng, ProviderDef> = BTreeMap::new();
+    let mut metas: BTreeMap<Strng, ProviderMeta> = BTreeMap::new();
     let mut notes: Vec<String> = Vec::new();
 
     for (_, src) in &root.files {
@@ -67,7 +71,13 @@ pub fn scan(providers_dir: &Path) -> anyhow::Result<Imported> {
                 continue;
             };
             let id = Strng::from(entry.id.as_str());
-            def.flat_rate = flat_rate.contains(entry.id.as_str());
+            // The short id resolves here, so the flat-rate match reads the
+            // metadata rather than the definition: upstream names `cc` in the
+            // same set as `claude`, and the two are one provider.
+            let meta = to_meta(&entry, &consts, &root);
+            def.flat_rate =
+                flat_rate.contains(entry.id.as_str()) || flat_rate.contains(meta.alias.as_ref());
+            metas.entry(id.clone()).or_insert(meta);
             for ((p, m), price) in &prices {
                 if *p == entry.id {
                     def.prices.insert(Strng::from(m.as_str()), *price);
@@ -75,12 +85,17 @@ pub fn scan(providers_dir: &Path) -> anyhow::Result<Imported> {
             }
             match defs.get(&id) {
                 Some(kept) if kept.base_url != def.base_url => {
-                    notes.push(format!("{id} redeclared with a different base URL; kept {}", kept.base_url));
+                    notes.push(format!(
+                        "{id} redeclared with a different base URL; kept {}",
+                        kept.base_url
+                    ));
                 }
                 Some(_) => {}
                 None => {
                     if def.base_url.is_empty() {
-                        notes.push(format!("{id} has no resolvable base URL; listed but unroutable"));
+                        notes.push(format!(
+                            "{id} has no resolvable base URL; listed but unroutable"
+                        ));
                     }
                     defs.insert(id, def);
                 }
@@ -100,7 +115,13 @@ pub fn scan(providers_dir: &Path) -> anyhow::Result<Imported> {
 
     let combos = combos(&defs);
     let config_yaml = render_yaml(&defs, &combos);
-    Ok(Imported { registry: defs, combos, config_yaml })
+    Ok(Imported {
+        registry: defs,
+        combos,
+        config_yaml,
+        free_budgets: free,
+        provider_meta: metas,
+    })
 }
 
 /// The parsed provider tree: every `.ts` file under `providers_dir`, plus a flat
@@ -121,7 +142,10 @@ struct Tree {
 impl Tree {
     #[cfg(test)]
     fn empty() -> Self {
-        Self { files: Vec::new(), consts: Consts::default() }
+        Self {
+            files: Vec::new(),
+            consts: Consts::default(),
+        }
     }
 
     /// The const table to resolve against: this file's own bindings shadow the
@@ -141,11 +165,13 @@ impl Tree {
 fn read_tree(dir: &Path) -> anyhow::Result<Tree> {
     let mut files = Vec::new();
     walk(dir, &mut files, 0)?;
-    let up: Vec<PathBuf> =
-        [dir.parent().map(Path::to_path_buf), dir.parent().and_then(Path::parent).map(Path::to_path_buf)]
-            .into_iter()
-            .flatten()
-            .collect();
+    let up: Vec<PathBuf> = [
+        dir.parent().map(Path::to_path_buf),
+        dir.parent().and_then(Path::parent).map(Path::to_path_buf),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     for dir in up {
         collect_siblings(&dir, &mut files);
     }
@@ -156,12 +182,17 @@ fn read_tree(dir: &Path) -> anyhow::Result<Tree> {
             all.entry(name).or_insert(value);
         }
     }
-    Ok(Tree { files, consts: Consts(all) })
+    Ok(Tree {
+        files,
+        consts: Consts(all),
+    })
 }
 
 /// Reads the `.ts` files directly in `dir`, skipping subdirectories.
 fn collect_siblings(dir: &Path, out: &mut Vec<(PathBuf, String)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in entries.flatten() {
         let path = e.path();
         if path.is_file()
@@ -432,7 +463,9 @@ fn entries(src: &str) -> Vec<Entry> {
         while j < b.len() && b[j] == ' ' {
             j += 1;
         }
-        let Some(end) = balanced_end(&b, j) else { break };
+        let Some(end) = balanced_end(&b, j) else {
+            break;
+        };
         let literal: String = b[j..end].iter().collect();
         let Some((object, defaulted)) = entry_object(&literal) else {
             i = end;
@@ -445,7 +478,11 @@ fn entries(src: &str) -> Vec<Entry> {
         // A file can declare `*_SHARED` (no `id`) and `*Provider` (with one); the
         // `id` check is what separates them, so no name convention is needed.
         if !id.is_empty() && name.ends_with("Provider") {
-            out.push(Entry { id, object, defaulted });
+            out.push(Entry {
+                id,
+                object,
+                defaulted,
+            });
         }
         i = end;
     }
@@ -479,7 +516,10 @@ fn string_field(object: &str, name: &str) -> Option<String> {
 
 /// The raw initialiser text of a top-level field.
 fn value_of(object: &str, name: &str) -> Option<String> {
-    fields(object).into_iter().find(|(k, _)| k == name).map(|(_, v)| v)
+    fields(object)
+        .into_iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v)
 }
 
 /// The top-level fields of an object literal, as `(key, raw value)` pairs.
@@ -540,7 +580,9 @@ fn fields(object: &str) -> Vec<(String, String)> {
             continue;
         }
         i = skip_ws(&b, i + 1);
-        let Some(end) = balanced_end(&b, i) else { break };
+        let Some(end) = balanced_end(&b, i) else {
+            break;
+        };
         out.push((key, b[i..end].iter().collect()));
         i = skip_ws(&b, end);
         if i < b.len() && (b[i] == ',' || b[i] == ';') {
@@ -650,9 +692,12 @@ fn resolve_str(expr: &str, consts: &Consts) -> Option<String> {
     // field out of an object const (`baseUrl: cursorProvider.baseUrl`).
     if t.contains('.') {
         let (owner, field) = t.rsplit_once('.')?;
-            let object = consts.get(owner)?.trim().to_owned();
-        let object =
-            if object.starts_with('{') { object } else { entry_object(&object)?.0 };
+        let object = consts.get(owner)?.trim().to_owned();
+        let object = if object.starts_with('{') {
+            object
+        } else {
+            entry_object(&object)?.0
+        };
         return resolve_str(&value_of(&object, field)?, consts);
     }
     if !t.chars().all(|c| c.is_alphanumeric() || c == '_') {
@@ -666,7 +711,11 @@ fn resolve_name(name: &str, consts: &Consts) -> Option<String> {
     let value = consts.get(name)?;
     let t = value.trim();
     if let Some(lit) = as_literal(t) {
-        return if lit.contains("${") { interpolate(&lit, consts) } else { Some(lit) };
+        return if lit.contains("${") {
+            interpolate(&lit, consts)
+        } else {
+            Some(lit)
+        };
     }
     resolve_name(t, consts)
 }
@@ -697,6 +746,21 @@ fn interpolate(lit: &str, consts: &Consts) -> Option<String> {
     Some(out)
 }
 
+/// A numeric field read from an already-extracted *value*, not a whole object.
+///
+/// [`number_field`] takes the object and looks the field up itself; the callers
+/// here already hold the value (`entry_layers` yielded the `(key, raw)` pair), so
+/// passing the value again would search a number for a named field and find
+/// nothing. `_` separators are stripped because TypeScript writes `1_048_576`.
+fn number_value(raw: &str, consts: &Consts) -> Option<f64> {
+    let t = raw.trim().replace('_', "");
+    t.parse::<f64>().ok().or_else(|| {
+        // `128_000` strips to a literal, but a value may still name a const.
+        consts
+            .get(&t)
+            .and_then(|v| v.trim().replace('_', "").parse::<f64>().ok())
+    })
+}
 
 /// Builds a [`ProviderDef`] from one entry, or `None` when the id is unreadable.
 fn to_def(entry: &Entry, consts: &Consts, root: &Tree) -> Option<ProviderDef> {
@@ -709,8 +773,7 @@ fn to_def(entry: &Entry, consts: &Consts, root: &Tree) -> Option<ProviderDef> {
     // The builder's defaults, then the object's own fields, then any spread.
     // `resolve_field` walks the const chain, so `...KIMI_CODING_SHARED` in one
     // file and an imported `...SHARED` in another behave the same way.
-    let layers = entry_layers(entry, consts, root);
-    for (key, raw) in &layers {
+    for (key, raw) in &entry_layers(entry, consts, root) {
         match key.as_str() {
             "format" => format = resolve_str(raw, consts),
             "executor" => executor = resolve_str(raw, consts),
@@ -739,11 +802,199 @@ fn to_def(entry: &Entry, consts: &Consts, root: &Tree) -> Option<ProviderDef> {
     })
 }
 
+/// Reads an entry's metadata: its short id, its auth header, its window, the
+/// other protocols it speaks, and the anonymous key it publishes.
+///
+/// Separate from [`to_def`] because a `ProviderDef` is built field-by-field in
+/// four places outside this file, so a field it does not need today is a
+/// workspace-wide struct change. Both read the same resolved layers, so a
+/// spread-carried value (`kimi-coding`'s `x-api-key`, which arrives through
+/// `KIMI_CODING_SHARED`) lands here exactly as it would have landed there.
+///
+/// Recorded rather than interpreted: this module describes what a provider
+/// declares, and `ar-exec`/`ar-route` keep every verdict.
+fn to_meta(entry: &Entry, consts: &Consts, root: &Tree) -> ProviderMeta {
+    let mut meta = ProviderMeta::default();
+    let mut context_length = 0f64;
+    let mut max_input_tokens = 0f64;
+    for (key, raw) in &entry_layers(entry, consts, root) {
+        match key.as_str() {
+            // A spread can carry `authHeader` for a whole provider family, so
+            // this reads the resolved layers rather than the entry's own object.
+            "alias" => meta.alias = Strng::from(resolve_str(raw, consts).unwrap_or_default()),
+            "authHeader" => {
+                // Only what the entry declared. The default belongs to the
+                // reader (`MetaCatalog::auth_header`), not to the file: writing
+                // `bearer` on the ~200 entries that never mention it would make
+                // the generated table restate a default 200 times and hide the
+                // ~30 that declare something else.
+                meta.auth_header = Strng::from(resolve_str(raw, consts).unwrap_or_default());
+            }
+            "responsesBaseUrl" => {
+                meta.responses_base_url = Strng::from(resolve_str(raw, consts).unwrap_or_default());
+            }
+            "anonymousApiKey" => {
+                meta.anonymous_api_key = Strng::from(resolve_str(raw, consts).unwrap_or_default());
+            }
+            "defaultContextLength" => {
+                context_length = context_length.max(number_value(raw, consts).unwrap_or(0.0));
+            }
+            "alternateFormats" => {
+                meta.alternate_formats = alternate_formats_in(raw, consts, root);
+            }
+            "models" => {
+                // A per-model `contextLength` / `maxInputTokens` is a property of
+                // the model, not the provider, so the provider-wide figure is the
+                // largest one any model declares: the ceiling a candidate context
+                // window is filtered against, never a per-model claim.
+                context_length =
+                    context_length.max(model_number(raw, consts, root, "contextLength"));
+                max_input_tokens =
+                    max_input_tokens.max(model_number(raw, consts, root, "maxInputTokens"));
+            }
+            _ => {}
+        }
+    }
+    meta.context_length = context_length as u32;
+    meta.max_input_tokens = max_input_tokens as u32;
+    meta
+}
+
+/// The largest value any of a provider's models declares for `field`.
+///
+/// The models arrive in three shapes (see [`model_ids`]), so this walks the same
+/// expression and reads one numeric field per model object. A number the reader
+/// cannot resolve contributes `0.0`, which is the "catalog names none" state.
+fn model_number(raw: &str, consts: &Consts, root: &Tree, field: &str) -> f64 {
+    let mut out = 0.0f64;
+    for (id, value) in model_fields(raw, consts, root, field) {
+        if id.is_some() {
+            out = out.max(value);
+        }
+    }
+    out
+}
+
+/// Every `(model id, field value)` pair in a `models` expression.
+///
+/// The id is `None` for a shape that declares no `id` (a bare string id has one,
+/// but a `const` holding a plain id array does not reach here), and the caller
+/// only trusts a pair whose id resolved — a `contextLength` on a provider-wide
+/// object is not a model's window.
+fn model_fields(
+    raw: &str,
+    consts: &Consts,
+    root: &Tree,
+    field: &str,
+) -> Vec<(Option<String>, f64)> {
+    let mut out: Vec<(Option<String>, f64)> = Vec::new();
+    collect_model_fields(raw, consts, root, field, &mut out, 0);
+    out
+}
+
+fn collect_model_fields(
+    raw: &str,
+    consts: &Consts,
+    root: &Tree,
+    field: &str,
+    out: &mut Vec<(Option<String>, f64)>,
+    depth: usize,
+) {
+    if depth > 4 {
+        return;
+    }
+    let t = raw.trim();
+    let body: Vec<String> = if t.starts_with('[') {
+        let Some(inner) = t.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else {
+            return;
+        };
+        array_elements(inner)
+    } else if t.starts_with("buildModels(") {
+        match call_fields(t) {
+            v if !v.is_empty() => v.into_iter().map(|(_, raw)| raw).collect(),
+            _ => {
+                let inner = t.trim_start_matches("buildModels(").trim_end_matches(')');
+                array_elements(inner.trim_start_matches('[').trim_end_matches(']'))
+            }
+        }
+    } else if let Some(name) = t.strip_prefix("...") {
+        let name = name.trim();
+        if let Some(v) = consts.get(name).or_else(|| root.consts.get(name)) {
+            collect_model_fields(v, consts, root, field, out, depth + 1);
+        }
+        return;
+    } else if let Some(v) = consts.get(t).or_else(|| root.consts.get(t)) {
+        collect_model_fields(v, consts, root, field, out, depth + 1);
+        return;
+    } else {
+        return;
+    };
+    for value in body {
+        if value.starts_with("..") {
+            continue;
+        }
+        if value.trim_start().starts_with('{') {
+            let f = fields(&value);
+            let id = f
+                .iter()
+                .find(|(k, _)| k == "id")
+                .and_then(|(_, v)| resolve_str(v, consts));
+            let n = f
+                .iter()
+                .find(|(k, _)| k == field)
+                .and_then(|(_, v)| number_value(v, consts));
+            if let Some(n) = n {
+                out.push((id, n));
+            }
+        }
+    }
+}
+
+/// The `format` label of every entry in an `alternateFormats` array.
+///
+/// Each alternate carries its own base URL, auth header and extra headers, so
+/// only the protocol names are recorded here: the catalog describes which
+/// protocols a provider accepts, and the connection still chooses one and
+/// supplies the rest. The primary [`ar_registry::WireFormat`] is deliberately not
+/// repeated — it is already [`ProviderDef::wire_format`].
+fn alternate_formats_in(raw: &str, consts: &Consts, root: &Tree) -> Vec<Strng> {
+    let t = raw.trim();
+    let body = if t.starts_with('[') {
+        t.strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .map(str::to_owned)
+    } else {
+        // A `const` holding the array may be wrapped (`Object.freeze([…])`).
+        consts
+            .get(t)
+            .or_else(|| root.consts.get(t))
+            .map(unwrap_array)
+    };
+    let Some(body) = body else { return Vec::new() };
+    let mut out: Vec<Strng> = Vec::new();
+    for element in array_elements(&body) {
+        if !element.trim_start().starts_with('{') {
+            continue;
+        }
+        if let Some(format) = string_field(&element, "format")
+            && !out.contains(&Strng::from(format.as_str()))
+        {
+            out.push(Strng::from(format.as_str()));
+        }
+    }
+    out.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+    out
+}
+
 /// The field layers an entry resolves to, builder defaults first.
 fn entry_layers(entry: &Entry, consts: &Consts, root: &Tree) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     if entry.defaulted {
-        for (k, v) in [("format", "openai"), ("executor", "default"), ("authType", "apikey")] {
+        for (k, v) in [
+            ("format", "openai"),
+            ("executor", "default"),
+            ("authType", "apikey"),
+        ] {
             out.push((k.to_owned(), format!("\"{v}\"")));
         }
     }
@@ -772,9 +1023,13 @@ fn entry_layers(entry: &Entry, consts: &Consts, root: &Tree) -> Vec<(String, Str
 /// The object literal inside a call expression, e.g. `buildModels(["a"])`.
 fn call_fields(call: &str) -> Vec<(String, String)> {
     let t = call.trim();
-    let Some(open) = t.find('(') else { return Vec::new() };
+    let Some(open) = t.find('(') else {
+        return Vec::new();
+    };
     let chars: Vec<char> = t.chars().collect();
-    let Some(end) = balanced_end(&chars, open) else { return Vec::new() };
+    let Some(end) = balanced_end(&chars, open) else {
+        return Vec::new();
+    };
     let inner: String = chars[open + 1..end.saturating_sub(1)].iter().collect();
     if inner.trim_start().starts_with('{') {
         fields(&inner)
@@ -817,14 +1072,14 @@ fn first_of_array(raw: &str, consts: &Consts) -> Option<String> {
         Some(inner) => inner.to_owned(),
         None => {
             // An identifier naming an array (`baseUrls: [...ANTIGRAVITY_RUNTIME_BASE_URLS]`
-                // resolves to a `NAME` whose value is `Object.freeze([…])`, which is
-                // neither a string literal nor a bracket, so the const is read
-                // directly rather than through `resolve_str`.
-                let resolved = match resolve_str(t, consts).or_else(|| resolve_name(t, consts)) {
-                    Some(v) => v,
-                    None => consts.get(t)?.to_owned(),
-                };
-                return first_of_array(&unwrap_array(&resolved), consts);
+            // resolves to a `NAME` whose value is `Object.freeze([…])`, which is
+            // neither a string literal nor a bracket, so the const is read
+            // directly rather than through `resolve_str`.
+            let resolved = match resolve_str(t, consts).or_else(|| resolve_name(t, consts)) {
+                Some(v) => v,
+                None => consts.get(t)?.to_owned(),
+            };
+            return first_of_array(&unwrap_array(&resolved), consts);
         }
     };
     // An element may itself resolve to an array (`[...NAME]`), in which case the
@@ -875,7 +1130,9 @@ fn array_elements(body: &str) -> Vec<String> {
             // A spread element: `[...NAME]`.
             i = skip_ws(&b, i + 3);
         }
-        let Some(end) = balanced_end(&b, i) else { break };
+        let Some(end) = balanced_end(&b, i) else {
+            break;
+        };
         let element = b[i..end].iter().collect::<String>();
         if element != "..." && !element.is_empty() {
             out.push(element);
@@ -909,7 +1166,9 @@ fn collect_models(
     }
     let t = raw.trim();
     let body: Vec<String> = if t.starts_with('[') {
-        let Some(inner) = t.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else { return };
+        let Some(inner) = t.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else {
+            return;
+        };
         array_elements(inner)
     } else if t.starts_with("buildModels(") {
         match call_fields(t) {
@@ -974,12 +1233,22 @@ fn env_hint(id: &str) -> String {
 /// otherwise would corrupt every budget decision downstream.
 fn pricing(providers_dir: &Path) -> BTreeMap<(String, String), Price> {
     let mut out = BTreeMap::new();
-    let Some(dir) = pricing_dir(providers_dir) else { return out };
-    let Ok(entries) = std::fs::read_dir(&dir) else { return out };
-    let mut files: Vec<PathBuf> = entries.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "ts")).collect();
+    let Some(dir) = pricing_dir(providers_dir) else {
+        return out;
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return out;
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "ts"))
+        .collect();
     files.sort();
     for path in files {
-        let Ok(raw) = std::fs::read_to_string(&path) else { continue };
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
         let src = strip_comments(&raw);
         let consts = Consts::of(&src);
         for (name, value) in bindings(&src) {
@@ -988,10 +1257,13 @@ fn pricing(providers_dir: &Path) -> BTreeMap<(String, String), Price> {
             }
             for (provider, models) in price_layers(&value, &consts) {
                 for (model, (input, output)) in models {
-                    out.insert((provider.clone(), model), Price {
-                        input_usd_per_mtok: input,
-                        output_usd_per_mtok: output,
-                    });
+                    out.insert(
+                        (provider.clone(), model),
+                        Price {
+                            input_usd_per_mtok: input,
+                            output_usd_per_mtok: output,
+                        },
+                    );
                 }
             }
         }
@@ -1055,7 +1327,9 @@ fn price_rows(value: &str, consts: &Consts) -> Vec<(String, (f64, f64))> {
             }
             continue;
         }
-        let Some(input) = number_field(&raw, "input", consts) else { continue };
+        let Some(input) = number_field(&raw, "input", consts) else {
+            continue;
+        };
         // `output` is optional upstream (`?? 0` in transform.ts); a row with only
         // an input price is a real row, priced at zero output.
         let output = number_field(&raw, "output", consts).unwrap_or(0.0);
@@ -1072,7 +1346,9 @@ fn number_field(object: &str, name: &str, consts: &Consts) -> Option<f64> {
     // the alias resolves first: `fields()` on `"TIER"` would skip its first
     // character looking for an opening brace and find nothing. The name is
     // carried through, or an aliased row would price `output` at `input`.
-    if consts.get(t).is_some_and(|v| v.trim_start().starts_with('{'))
+    if consts
+        .get(t)
+        .is_some_and(|v| v.trim_start().starts_with('{'))
         && let Some(v) = number_of(t, name, consts)
     {
         return Some(v);
@@ -1093,32 +1369,52 @@ fn number_of(raw: &str, name: &str, consts: &Consts) -> Option<f64> {
     v.trim().parse::<f64>().ok()
 }
 
-/// Provider ids billed at a flat rate, from `flatRateProviders.ts`.
+/// Provider names billed at a flat rate, from `flatRateProviders.ts` **and**
+/// `web-cookie.ts`.
 ///
-/// The explicit plan set only. `isFlatRateProvider` also covers every
-/// cookie/web session via `WEB_COOKIE_PROVIDERS`, which is a different file in a
-/// different directory; a provider from that set is left unpriced rather than
-/// marked flat on a guess.
+/// Two sets, one flag, because upstream's `isFlatRateProvider` unions them and
+/// splitting them would import a lie: the explicit plan list is the
+/// *subscription and coding-plan* providers, while `WEB_COOKIE_PROVIDERS` is
+/// the cookie/web sessions, every one of which is backed by a consumer
+/// subscription too. The deliberate import rule is that a web-session provider
+/// is flat-rate on the strength of being one — not because a hand-maintained
+/// list happens to name it — which is exactly what
+/// `hasOwnProperty(WEB_COOKIE_PROVIDERS, id)` says upstream.
+///
+/// The set mixes ids and aliases: `cc` is in the upstream list and is `claude`'s
+/// short id, not a provider of its own. [`scan`] therefore matches an entry on
+/// its id *or* its alias, and the alias lands in [`ProviderDef::alias`] — one
+/// entry per real provider, never a duplicate invented for the alias.
 fn flat_rate_ids(providers_dir: &Path) -> BTreeSet<String> {
+    let mut out = subscription_ids(providers_dir);
+    out.extend(web_cookie_ids(providers_dir));
+    out
+}
+
+/// The explicit subscription / coding-plan set in `flatRateProviders.ts`.
+fn subscription_ids(providers_dir: &Path) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
-    let mut dir = providers_dir.to_path_buf();
-    let target = loop {
-        let Some(parent) = dir.parent().map(Path::to_path_buf) else { return out };
-        dir = parent;
-        let candidate = dir.join("src/lib/usage/flatRateProviders.ts");
-        if candidate.is_file() {
-            break candidate;
-        }
+    let Some(target) = find_up(providers_dir, "src/lib/usage/flatRateProviders.ts") else {
+        return out;
     };
-    let Ok(raw) = std::fs::read_to_string(&target) else { return out };
+    let Ok(raw) = std::fs::read_to_string(&target) else {
+        return out;
+    };
     let src = strip_comments(&raw);
     let chars: Vec<char> = src.chars().collect();
     // `new Set([...])` — the values are the array the set is built from.
-    let Some(start) = src.find("new Set([").or_else(|| src.find("FLAT_RATE_SUBSCRIPTION_PROVIDER_IDS")) else {
+    let Some(start) = src
+        .find("new Set([")
+        .or_else(|| src.find("FLAT_RATE_SUBSCRIPTION_PROVIDER_IDS"))
+    else {
         return out;
     };
-    let Some(open) = src[start..].find('[') else { return out };
-    let Some(end) = balanced_end(&chars, start + open) else { return out };
+    let Some(open) = src[start..].find('[') else {
+        return out;
+    };
+    let Some(end) = balanced_end(&chars, start + open) else {
+        return out;
+    };
     let body: String = chars[start + open..end].iter().collect();
     // The array holds bare strings, not `key: value` pairs, so it needs the
     // array walk rather than the object one.
@@ -1127,6 +1423,225 @@ fn flat_rate_ids(providers_dir: &Path) -> BTreeSet<String> {
         if let Some(id) = as_literal(element.trim()) {
             out.insert(id);
         }
+    }
+    out
+}
+
+/// Ids of `WEB_COOKIE_PROVIDERS`, read as the top-level keys of that object
+/// literal.
+///
+/// A provider from this set is flat-rate whether or not the explicit plan list
+/// names it: every entry in it is a browser-cookie session backed by a
+/// consumer subscription, which is the same economics as a coding plan.
+fn web_cookie_ids(providers_dir: &Path) -> BTreeSet<String> {
+    let Some(path) = find_up(
+        providers_dir,
+        "src/shared/constants/providers/web-cookie.ts",
+    ) else {
+        return BTreeSet::new();
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return BTreeSet::new();
+    };
+    let src = strip_comments(&raw);
+    let consts = Consts::of(&src);
+    let Some((_, value)) = bindings(&src)
+        .into_iter()
+        .find(|(n, _)| n == "WEB_COOKIE_PROVIDERS")
+    else {
+        return BTreeSet::new();
+    };
+    // The value is a bare object literal keyed by provider id, so `fields()`
+    // reads it directly. A `const` alias to another object resolves one level.
+    let object = if value.trim_start().starts_with('{') {
+        value
+    } else {
+        let Some(inner) = consts.get(value.trim()) else {
+            return BTreeSet::new();
+        };
+        inner.to_owned()
+    };
+    fields(&object)
+        .into_iter()
+        .map(|(k, _)| k)
+        .filter(|k| !k.starts_with(".."))
+        .collect()
+}
+
+/// Walks up from `dir` until `rel` exists, bounded so a `/` root cannot spin.
+///
+/// Six levels covers the OmniRoute layout: `providers` → `config` → `open-sse`
+/// → the repo root, which is where `src/…` lives.
+fn find_up(dir: &Path, rel: &str) -> Option<PathBuf> {
+    let mut cur = dir.to_path_buf();
+    for _ in 0..6 {
+        let candidate = cur.join(rel);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        cur = cur.parent()?.to_path_buf();
+    }
+    None
+}
+
+/// The free-model budget table, read from `config/freeModelCatalog.data.ts`.
+///
+/// An empty table when the file is absent: a registry with no free-tier rows is
+/// still a registry, and failing the whole import over an optional table would
+/// make the catalog unregenerable from a partial checkout. The importer reports
+/// the shortfall on stderr rather than shipping a silently empty table.
+///
+/// The rows are sorted by `(provider, model, regime)` so two imports of the same
+/// tree produce byte-identical JSON — the property that makes a regenerated
+/// `freeBudgets.json` reviewable in a diff.
+fn free_budgets(providers_dir: &Path) -> FreeBudgets {
+    let Some(config_dir) = providers_dir.parent() else {
+        return FreeBudgets::default();
+    };
+    // The data file is a sibling of the `config` directory the provider tree
+    // lives under, so it is reached by name from the tree's parent. No upward
+    // search here, unlike the flat-rate files: this one is fixed to that layout,
+    // and a search would silently read a *different* checkout's table.
+    let data = config_dir.join("freeModelCatalog.data.ts");
+    let traits_file = config_dir.join("freeModelCatalog.ts");
+    let Ok(raw) = std::fs::read_to_string(&data) else {
+        eprintln!(
+            "note: no freeModelCatalog.data.ts under {}; the free-tier table will be empty",
+            config_dir.display()
+        );
+        return FreeBudgets::default();
+    };
+    let src = strip_comments(&raw);
+    let chars: Vec<char> = src.chars().collect();
+    let curated_at = bindings(&src)
+        .into_iter()
+        .find(|(n, _)| n == "FREE_CATALOG_CURATED_AT")
+        .and_then(|(_, v)| as_literal(v.trim()))
+        .unwrap_or_default();
+    let empty = FreeBudgets {
+        curated_at: Strng::from(curated_at.clone()),
+        rows: Vec::new(),
+    };
+    let Some(open) = src
+        .find("FREE_MODEL_BUDGETS: FreeModelBudget[] = [")
+        .map(|i| i + "FREE_MODEL_BUDGETS: FreeModelBudget[] = ".len())
+    else {
+        eprintln!(
+            "note: {} declares no FREE_MODEL_BUDGETS array; the free-tier table will be empty",
+            data.display()
+        );
+        return empty;
+    };
+    let Some(end) = balanced_end(&chars, open) else {
+        eprintln!(
+            "note: the FREE_MODEL_BUDGETS array in {} never closes; the free-tier table will be empty",
+            data.display()
+        );
+        return empty;
+    };
+    let body: String = chars[open..end].iter().collect();
+    // The array's own brackets are stripped so the walk below sees every row at
+    // depth 0; left in, they push each `{` to depth 1 and the walk finds none.
+    let inner = body.trim_start_matches('[').trim_end_matches(']');
+
+    let mut rows: Vec<FreeBudgetRow> = Vec::new();
+    // One row per top-level `{…}` in the array body. A naive `{` split also
+    // matches nested model objects, so the walk tracks depth and the row is read
+    // from the balanced literal rather than from the text up to the next brace.
+    for object in top_level_objects(inner) {
+        let (Some(provider), Some(model)) = (
+            string_field(&object, "provider"),
+            string_field(&object, "modelId"),
+        ) else {
+            continue;
+        };
+        let Some(free_type) = string_field(&object, "freeType") else {
+            continue;
+        };
+        let Some(regime) = FreeRegime::from_label(&free_type) else {
+            eprintln!(
+                "note: freeModelCatalog.data.ts regime {free_type:?} is unclassified; the row is skipped"
+            );
+            continue;
+        };
+        rows.push(FreeBudgetRow {
+            provider: Strng::from(provider.as_str()),
+            model: Strng::from(model.as_str()),
+            monthly_tokens: literal_number(&object, "monthlyTokens") as u64,
+            credit_tokens: literal_number(&object, "creditTokens") as u64,
+            regime,
+            pool: string_field(&object, "poolKey")
+                .filter(|p| !p.is_empty())
+                .map(Strng::from),
+            tos_avoid: string_field(&object, "tos").as_deref() == Some("avoid"),
+            gated: value_of(&object, "eligibilityGate").is_some(),
+        });
+    }
+    rows.sort_by(|a, b| {
+        (&*a.provider, &*a.model, a.regime.as_str()).cmp(&(
+            &*b.provider,
+            &*b.model,
+            b.regime.as_str(),
+        ))
+    });
+    // The 7-regime taxonomy lives in a *different* file (`freeModelCatalog.ts`),
+    // and a `freeType` it does not classify above is named on stderr rather than
+    // defaulted. This check is what makes that visible when the data file gains
+    // a regime before the taxonomy does.
+    if !traits_file.is_file() {
+        eprintln!(
+            "note: no freeModelCatalog.ts beside {}; regime classification came from the importer alone",
+            data.display()
+        );
+    }
+    FreeBudgets {
+        curated_at: Strng::from(curated_at),
+        rows,
+    }
+}
+/// A number in a bare object literal, `0.0` when the field is absent.
+///
+/// The `_` separator is stripped because TypeScript writes these as digit
+/// groups — upstream has `500_000_000`, which `parse::<f64>` rejects. Without it
+/// the table parses and every figure reads zero, which is worse than a parse
+/// failure because the row count still matches.
+///
+/// The free-tier data file is flat data with no `const` indirection, so unlike
+/// [`number_field`] there is nothing to resolve.
+fn literal_number(object: &str, name: &str) -> f64 {
+    value_of(object, name)
+        .and_then(|raw| raw.trim().replace('_', "").parse::<f64>().ok())
+        .unwrap_or(0.0)
+}
+
+/// Every depth-0 object literal in an array body, each as its own string.
+///
+/// Depth is tracked across brackets so a nested `{ … }` inside a row — a
+/// per-model `evidence` block, say — cannot split the row in two.
+fn top_level_objects(body: &str) -> Vec<String> {
+    let b: Vec<char> = body.chars().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    let mut depth = 0usize;
+    while i < b.len() {
+        match b[i] {
+            '"' | '\'' | '`' => {
+                i = skip_string(&b, i);
+                continue;
+            }
+            '[' | '(' => depth += 1,
+            ']' | ')' => depth = depth.saturating_sub(1),
+            '{' if depth == 0 => {
+                let Some(end) = balanced_end(&b, i) else {
+                    break;
+                };
+                out.push(b[i..end].iter().collect());
+                i = end;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
     }
     out
 }
@@ -1140,6 +1655,7 @@ fn combos(defs: &BTreeMap<Strng, ProviderDef>) -> Vec<Combo> {
                 id: format!("{id}/{model}"),
                 strategy: Strategy::Priority,
                 targets: vec![format!("{id}/{model}")],
+                weights: BTreeMap::new(),
                 // One target per combo is what this importer makes: it folds a
                 // provider catalog, not OmniRoute's combo files, so it has no
                 // candidate pool to read and must not fabricate one.
@@ -1155,6 +1671,59 @@ fn combos(defs: &BTreeMap<Strng, ProviderDef>) -> Vec<Combo> {
 mod tests {
     use super::*;
 
+    /// A throwaway directory tree for a reader that takes a path.
+    ///
+    /// `scan` is the only importer entry point that reads the filesystem, so its
+    /// tests need one. `TempTree` rather than a fixture directory in the repo:
+    /// these tests are about *reading* a tree, and a checked-in tree would be a
+    /// second copy of OmniRoute's shape to keep in sync with the first.
+    mod tempdir {
+        use std::path::PathBuf;
+
+        /// An owned directory removed when the value drops.
+        pub struct TempTree {
+            root: PathBuf,
+        }
+
+        impl TempTree {
+            /// Creates a uniquely-named tree under the system temp dir.
+            pub fn new() -> Self {
+                // ponytail: the process id plus a counter is enough
+                // uniqueness for a test fixture, and avoids a `tempfile`
+                // dependency for one helper.
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static N: AtomicU32 = AtomicU32::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed);
+                let root =
+                    std::env::temp_dir().join(format!("ar-import-test-{}-{n}", std::process::id()));
+                std::fs::create_dir_all(&root).expect("temp dir");
+                Self { root }
+            }
+
+            /// Writes `body` at `rel`, creating parent directories.
+            pub fn write(&self, rel: &str, body: &str) {
+                let path = self.root.join(rel);
+                std::fs::create_dir_all(path.parent().expect("rel has a parent"))
+                    .expect("parent dir");
+                std::fs::write(&path, body).expect("fixture write");
+            }
+
+            /// The `config/providers` directory [`crate::scan`] expects.
+            pub fn providers_dir(&self) -> PathBuf {
+                self.root.join("open-sse/config/providers")
+            }
+        }
+
+        impl Drop for TempTree {
+            fn drop(&mut self) {
+                // Best-effort: a leftover temp tree is noise, not a test failure,
+                // and a `remove_dir_all` that races another test's temp dir would
+                // be worse than the noise.
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
+        }
+    }
+
     #[test]
     fn strips_block_comment_holding_a_url() {
         let out = strip_comments("// see https://x/y\nconst A = \"u\"; /* https://z/w */");
@@ -1165,7 +1734,10 @@ mod tests {
 
     #[test]
     fn keeps_url_inside_a_string() {
-        assert_eq!(strip_comments("const A = \"https://x/y\";"), "const A = \"https://x/y\";");
+        assert_eq!(
+            strip_comments("const A = \"https://x/y\";"),
+            "const A = \"https://x/y\";"
+        );
     }
 
     #[test]
@@ -1273,13 +1845,475 @@ mod tests {
         "#;
         let clean = strip_comments(src);
         let layers = price_layers(
-            &bindings(&clean).into_iter().find(|(n, _)| n == "DEFAULT_PRICING_FRONTIER").unwrap().1,
+            &bindings(&clean)
+                .into_iter()
+                .find(|(n, _)| n == "DEFAULT_PRICING_FRONTIER")
+                .unwrap()
+                .1,
             &Consts::of(&clean),
         );
-        let openai = layers.iter().find(|(p, _)| p == "openai").expect("openai priced");
-        let anthropic = layers.iter().find(|(p, _)| p == "anthropic").expect("anthropic priced");
+        let openai = layers
+            .iter()
+            .find(|(p, _)| p == "openai")
+            .expect("openai priced");
+        let anthropic = layers
+            .iter()
+            .find(|(p, _)| p == "anthropic")
+            .expect("anthropic priced");
         assert_eq!(openai.1["gpt-x"], (2.5, 10.0));
         assert_eq!(anthropic.1["claude-y"], (3.0, 15.0));
+    }
+
+    // ── flat rate: the two upstream sets, and the alias case ──────────────
+
+    /// A tree with both flat-rate sources plus a provider entry.
+    fn flat_rate_tree(files: &[(&str, &str)]) -> tempdir::TempTree {
+        let t = tempdir::TempTree::new();
+        for (rel, body) in files {
+            t.write(rel, body);
+        }
+        t
+    }
+    const FLAT_RATE_TS: &str = r#"
+        const IDS: ReadonlySet<string> = new Set([
+          "claude", // Claude Code plan
+          "cc",     // alias id
+          // `byteplus` is deliberately EXCLUDED upstream (a metered inference
+          // host, billed per token), so the fixture names it only in a comment.
+        ]);
+    "#;
+
+    const WEB_COOKIE_TS: &str = r#"
+        export const WEB_COOKIE_PROVIDERS = {
+          "grok-web": { id: "grok-web", name: "Grok Web" },
+          "gemini-web": { id: "gemini-web", name: "Gemini Web" },
+        };
+    "#;
+
+    #[test]
+    fn marks_the_web_cookie_set_flat_rate_beyond_the_explicit_plan_list() {
+        // The deliberate import rule: every WEB_COOKIE_PROVIDERS entry is
+        // subscription-backed, so it is flat-rate whether or not the plan list
+        // names it. `grok-web` is in neither explicit list and must still land.
+        let t = flat_rate_tree(&[
+            ("src/lib/usage/flatRateProviders.ts", FLAT_RATE_TS),
+            (
+                "src/shared/constants/providers/web-cookie.ts",
+                WEB_COOKIE_TS,
+            ),
+            (
+                "open-sse/config/providers/registry/grok-web/index.ts",
+                "export const grok_webProvider: RegistryEntry = { id: \"grok-web\", baseUrl: \"https://grok.com\" };",
+            ),
+            (
+                "open-sse/config/providers/registry/gemini-web/index.ts",
+                "export const gemini_webProvider: RegistryEntry = { id: \"gemini-web\", baseUrl: \"https://gemini.google.com\" };",
+            ),
+            (
+                "open-sse/config/providers/registry/byteplus/index.ts",
+                "export const byteplusProvider: RegistryEntry = { id: \"byteplus\", baseUrl: \"https://byteplus\" };",
+            ),
+        ]);
+        let flat = flat_rate_ids(&t.providers_dir());
+        assert!(
+            flat.contains("grok-web"),
+            "a web-cookie session is subscription-backed: {flat:?}"
+        );
+        assert!(flat.contains("gemini-web"), "{flat:?}");
+        // The excluded metered provider stays out: the import does not re-decide
+        // the upstream exclusions, it unions the two sets.
+        assert!(!flat.contains("byteplus"), "{flat:?}");
+    }
+
+    #[test]
+    fn carries_a_flat_rate_alias_through_the_entry_alias_field() {
+        // `cc` names no provider; it is `claude`'s short id. The entry stays one
+        // entry, and the alias is what makes the flat-rate name resolvable.
+        let t = flat_rate_tree(&[
+            ("src/lib/usage/flatRateProviders.ts", FLAT_RATE_TS),
+            (
+                "open-sse/config/providers/registry/claude/index.ts",
+                "export const claudeProvider: RegistryEntry = { id: \"claude\", alias: \"cc\", baseUrl: \"https://api.anthropic.com\" };",
+            ),
+        ]);
+        let out = scan(&t.providers_dir()).expect("the tree holds one entry");
+        // The alias is metadata, read from the metadata table; the flat-rate flag
+        // it resolved is on the definition. Neither half is the answer alone,
+        // which is the point of keeping them in two files.
+        let claude = out
+            .registry
+            .get("claude")
+            .expect("claude is in the catalog");
+        assert_eq!(
+            out.provider_meta["claude"].alias.as_ref(),
+            "cc",
+            "the alias is what resolved the flat-rate name"
+        );
+        assert!(
+            claude.flat_rate,
+            "`cc` in the plan set marks the provider it aliases"
+        );
+        assert!(
+            !out.registry.contains_key("cc"),
+            "the alias must not become a second entry"
+        );
+    }
+
+    #[test]
+    fn reads_the_web_cookie_set_when_the_plan_list_is_absent() {
+        // A checkout without `flatRateProviders.ts` still has the web set, and a
+        // missing file must not silently drop the web-session economics.
+        let t = flat_rate_tree(&[(
+            "src/shared/constants/providers/web-cookie.ts",
+            WEB_COOKIE_TS,
+        )]);
+        assert_eq!(
+            flat_rate_ids(&t.providers_dir()),
+            BTreeSet::from(["gemini-web".to_owned(), "grok-web".to_owned()])
+        );
+    }
+
+    // ── free-model budget table ────────────────────────────────────────────
+
+    /// The shape of `freeModelCatalog.data.ts`, reduced to what the reader needs:
+    /// a curation date, a row literal, and one nested object per row.
+    const FREE_DATA_TS: &str = r#"
+        export const FREE_CATALOG_CURATED_AT = "2026-09-12";
+        export const FREE_MODEL_BUDGETS: FreeModelBudget[] = [
+          { provider: "mistral", modelId: "m1", monthlyTokens: 500_000_000, creditTokens: 0, freeType: "recurring-daily", poolKey: "mistral-free", tos: "caution" },
+          { provider: "mistral", modelId: "m2", monthlyTokens: 1_000_000_000, creditTokens: 0, freeType: "recurring-daily", poolKey: "mistral-free", tos: "caution" },
+          { provider: "kiro", modelId: "claude", monthlyTokens: 25_000, creditTokens: 0, freeType: "keyless", poolKey: null, tos: "avoid" },
+          { provider: "bytez", modelId: "m", monthlyTokens: 0, creditTokens: 1_000_000, freeType: "recurring-credit", poolKey: "bytez", tos: "ok" },
+          { provider: "signup", modelId: "m", monthlyTokens: 0, creditTokens: 400_000_000, freeType: "one-time-initial", poolKey: "signup", tos: "caution" },
+          { provider: "modelscope", modelId: "q", monthlyTokens: 6_000_000, creditTokens: 0, freeType: "recurring-daily", poolKey: "modelscope-free", tos: "caution", eligibilityGate: "regional-identity" },
+          { provider: "siliconflow", modelId: "deepseek", monthlyTokens: 0, creditTokens: 0, freeType: "recurring-uncapped", poolKey: "siliconflow", tos: "caution" },
+          { provider: "old", modelId: "m", monthlyTokens: 9_000_000, creditTokens: 0, freeType: "discontinued", poolKey: "old", tos: "ok" },
+          { provider: "brandnew", modelId: "m", monthlyTokens: 1, creditTokens: 0, freeType: "pay-as-you-go", poolKey: "x", tos: "ok" },
+        ];
+    "#;
+
+    /// A tree holding the fixture files, laid out the way OmniRoute is.
+    fn free_tree() -> tempdir::TempTree {
+        let t = tempdir::TempTree::new();
+        // `config/providers` is the tree `scan` is pointed at, and the free-tier
+        // files are its parent's siblings — the real OmniRoute layout.
+        t.write(
+            "open-sse/config/providers/registry/openai/index.ts",
+            "export const openaiProvider: RegistryEntry = { id: \"openai\", baseUrl: \"https://api.openai.com/v1\" };",
+        );
+        t.write("open-sse/config/freeModelCatalog.data.ts", FREE_DATA_TS);
+        t.write("open-sse/config/freeModelCatalog.ts", "export const X = 1;");
+        t
+    }
+
+    #[test]
+    fn reads_every_free_tier_row_upstream_declares() {
+        // Nine literals, one of which names a regime this build has not
+        // classified — that row is skipped by name, so the count is 8 not 9.
+        let t = free_tree();
+        let free = free_budgets(&t.providers_dir());
+        let models: Vec<&str> = free.iter().map(|r| r.model.as_ref()).collect();
+        assert_eq!(free.rows.len(), 8, "{models:?}");
+        assert_eq!(free.curated_at.as_ref(), "2026-09-12");
+    }
+
+    #[test]
+    fn reads_a_pool_key_and_a_null_one() {
+        // `poolKey: null` is the "this model is independent" spelling and has to
+        // stay distinguishable from a missing field, or the row would be pooled
+        // against nothing.
+        let free = free_budgets(&free_tree().providers_dir());
+        let m1 = free.row("mistral", "m1").expect("m1 is a row");
+        assert_eq!(m1.pool.as_deref(), Some("mistral-free"));
+        assert_eq!(
+            free.row("kiro", "claude").expect("kiro is a row").pool,
+            None
+        );
+    }
+
+    #[test]
+    fn carries_the_to_avoid_flag_onto_the_row() {
+        let free = free_budgets(&free_tree().providers_dir());
+        assert!(free.row("kiro", "claude").expect("kiro is a row").tos_avoid);
+        assert!(!free.row("mistral", "m1").expect("m1 is a row").tos_avoid);
+    }
+
+    #[test]
+    fn carries_a_regional_identity_gate_onto_the_row() {
+        let free = free_budgets(&free_tree().providers_dir());
+        assert!(free.row("modelscope", "q").expect("gated row").gated);
+        assert!(!free.row("mistral", "m1").expect("m1 is a row").gated);
+    }
+
+    #[test]
+    fn keeps_credit_and_uncapped_regimes_distinct_from_a_monthly_quota() {
+        let free = free_budgets(&free_tree().providers_dir());
+        let totals = free.totals(Default::default());
+        // Four regimes, four different figures: a totals() that summed every
+        // numeric field into the headline would report a different number here.
+        assert_eq!(totals.recurring_credit_tokens, 1_000_000, "bytez refills");
+        assert_eq!(
+            totals.one_time_credit_tokens, 400_000_000,
+            "the signup credit is first-month only"
+        );
+        assert_eq!(
+            totals.steady_monthly_tokens, 1_000_025_000,
+            "the mistral pool at its max, plus kiro's 25K"
+        );
+        assert_eq!(totals.uncapped_providers, vec![Strng::from("siliconflow")]);
+    }
+
+    #[test]
+    fn drops_a_discontinued_row_from_every_figure() {
+        // A retired tier is catalogued, so its row must exist, and it grants
+        // nothing, so it must reach no total.
+        let free = free_budgets(&free_tree().providers_dir());
+        let row = free.row("old", "m").expect("the retired row is catalogued");
+        assert_eq!(row.monthly_tokens, 9_000_000);
+        assert!(!row.regime.grants_free_access());
+        let totals = free.totals(Default::default());
+        assert_eq!(
+            totals.steady_monthly_tokens, 1_000_025_000,
+            "the 9M retired row is in no figure"
+        );
+        assert!(!free.usable("old", "m"));
+    }
+
+    #[test]
+    fn excludes_a_to_avoid_row_from_usable_headroom() {
+        // The routing-facing figure: the mistral pool survives, kiro's 25K does
+        // not, because its terms forbid proxy use.
+        let free = free_budgets(&free_tree().providers_dir());
+        assert_eq!(free.usable_monthly_tokens(), 1_000_000_000);
+        assert!(!free.usable("kiro", "claude"));
+        assert!(free.usable("mistral", "m1"));
+    }
+
+    #[test]
+    fn marks_a_regional_identity_gate_apart_from_the_headline() {
+        // The gated row is real and recurring, so it is reported beside the
+        // headline rather than inside it: a reader who cannot pass a
+        // region-bound identity check has no access to it.
+        let free = free_budgets(&free_tree().providers_dir());
+        let totals = free.totals(Default::default());
+        assert_eq!(totals.gated_recurring_tokens, 6_000_000);
+        assert_eq!(
+            totals.steady_monthly_tokens, 1_000_025_000,
+            "the 6M gated row is excluded"
+        );
+    }
+
+    #[test]
+    fn sorts_free_rows_so_a_regenerated_table_is_byte_stable() {
+        let rows = free_budgets(&free_tree().providers_dir()).rows;
+        let mut sorted = rows.clone();
+        sorted.sort_by(|a, b| {
+            (&*a.provider, &*a.model, a.regime.as_str()).cmp(&(
+                &*b.provider,
+                &*b.model,
+                b.regime.as_str(),
+            ))
+        });
+        assert_eq!(rows, sorted, "the importer emits sorted rows");
+    }
+
+    #[test]
+    fn reports_an_empty_free_table_when_the_source_is_absent() {
+        // A partial checkout still imports a catalog; the missing table is named
+        // on stderr rather than failing the whole conversion.
+        let t = tempdir::TempTree::new();
+        assert!(free_budgets(&t.providers_dir()).is_empty());
+    }
+
+    #[test]
+    fn carries_the_free_table_alongside_a_scanned_registry() {
+        // The end-to-end shape: one `scan` produces both generated files, so a
+        // caller never has to know which upstream file fed which.
+        let out = scan(&free_tree().providers_dir()).expect("the fixture tree has one entry");
+        assert!(out.registry.contains_key("openai"));
+        assert_eq!(out.free_budgets.rows.len(), 8);
+        assert!(!out.config_yaml.is_empty());
+    }
+
+    #[test]
+    fn counts_a_shared_pool_once_across_the_parsed_rows() {
+        // The pool-dedup assertion, on rows this importer actually parsed rather
+        // than on a hand-built fixture: mistral publishes 500M and 1B for one
+        // allowance, so the table's figure is 1B, not 1.5B.
+        let free = free_budgets(&free_tree().providers_dir());
+        let row_sum: u64 = free
+            .iter()
+            .filter(|r| r.regime == FreeRegime::RecurringDaily)
+            .map(|r| r.monthly_tokens)
+            .sum();
+        assert!(
+            row_sum > free.pool_monthly_tokens("mistral-free"),
+            "row sum {row_sum} vs pool"
+        );
+        assert_eq!(free.pool_monthly_tokens("mistral-free"), 1_000_000_000);
+    }
+
+    // ── provider metadata ─────────────────────────────────────────────────
+
+    #[test]
+    fn reads_the_auth_header_out_of_a_shared_spread() {
+        // The case that matters: `kimi-coding` declares no `authHeader` of its
+        // own, it arrives through `KIMI_CODING_SHARED`, and it is the provider
+        // that needs `x-api-key` rather than a bearer token.
+        let src = r#"
+            const SHARED = { format: "claude", authHeader: "x-api-key", baseUrl: "https://k/v1" };
+            export const kimi_codingProvider: RegistryEntry = { id: "kimi-coding", ...SHARED };
+        "#;
+        let clean = strip_comments(src);
+        let meta = to_meta(&entries(&clean)[0], &Consts::of(&clean), &Tree::empty());
+        assert_eq!(meta.auth_header.as_ref(), "x-api-key");
+    }
+
+    #[test]
+    fn records_no_auth_header_when_none_is_declared() {
+        // The file records declarations, not the reader's default: an empty
+        // field is "the entry never mentioned one", which is a different fact
+        // from "the entry said bearer". `MetaCatalog::auth_header` supplies the
+        // default and has its own assertion for it.
+        let src = r#"
+            export const pProvider: RegistryEntry = { id: "p", baseUrl: "https://x", models: [] };
+        "#;
+        let clean = strip_comments(src);
+        let meta = to_meta(&entries(&clean)[0], &Consts::of(&clean), &Tree::empty());
+        assert!(
+            meta.auth_header.is_empty(),
+            "the reader supplies the default"
+        );
+    }
+
+    #[test]
+    fn reads_the_responses_base_url_override() {
+        let src = r#"
+            export const xaiProvider: RegistryEntry = {
+              id: "xai", baseUrl: "https://api.x.ai/v1/chat/completions",
+              responsesBaseUrl: "https://api.x.ai/v1/responses", models: [],
+            };
+        "#;
+        let clean = strip_comments(src);
+        let meta = to_meta(&entries(&clean)[0], &Consts::of(&clean), &Tree::empty());
+        assert_eq!(
+            meta.responses_base_url.as_ref(),
+            "https://api.x.ai/v1/responses"
+        );
+    }
+
+    #[test]
+    fn records_every_declared_alternate_protocol() {
+        // Three alternates, sorted so the generated JSON is byte-stable, and the
+        // primary `format` is not repeated among them.
+        let src = r#"
+            export const hcnsecProvider: RegistryEntry = {
+              id: "hcnsec", format: "openai", baseUrl: "https://x",
+              alternateFormats: [
+                { format: "gemini", baseUrl: "https://g" },
+                { format: "claude", baseUrl: "https://c" },
+                { format: "openai-responses", baseUrl: "https://r" },
+              ],
+              models: [],
+            };
+        "#;
+        let clean = strip_comments(src);
+        let meta = to_meta(&entries(&clean)[0], &Consts::of(&clean), &Tree::empty());
+        let got: Vec<&str> = meta.alternate_formats.iter().map(|f| f.as_ref()).collect();
+        assert_eq!(got, vec!["claude", "gemini", "openai-responses"]);
+        let again = strip_comments(src);
+        let def = to_def(&entries(&again)[0], &Consts::of(&again), &Tree::empty()).unwrap();
+        assert_eq!(
+            def.wire_format,
+            ar_registry::WireFormat::Openai,
+            "the primary format stays on the definition, not among the alternates"
+        );
+    }
+
+    #[test]
+    fn reads_the_anonymous_api_key_literal() {
+        let src = r#"
+            export const aihordeProvider: RegistryEntry = buildOpenAiCompatibleRegistryEntry({
+              id: "aihorde", baseUrl: "https://oai.aihorde.net", anonymousApiKey: "0000000000",
+              models: [{ id: "m", name: "M" }],
+            });
+        "#;
+        let clean = strip_comments(src);
+        let meta = to_meta(&entries(&clean)[0], &Consts::of(&clean), &Tree::empty());
+        assert_eq!(meta.anonymous_api_key.as_ref(), "0000000000");
+    }
+
+    #[test]
+    fn takes_the_largest_context_window_any_model_declares() {
+        // A provider-wide ceiling, not a per-model claim: `openai` spans 128K to
+        // 1M, and the candidate filter needs the largest, never the first.
+        let src = r#"
+            export const pProvider: RegistryEntry = { id: "p", baseUrl: "https://x", models: [
+              { id: "small", name: "S", contextLength: 128000 },
+              { id: "big", name: "B", contextLength: 1000000 },
+            ] };
+        "#;
+        let clean = strip_comments(src);
+        let meta = to_meta(&entries(&clean)[0], &Consts::of(&clean), &Tree::empty());
+        assert_eq!(meta.context_length, 1_000_000);
+        assert_eq!(
+            meta.max_input_tokens, 0,
+            "no model declares an input ceiling"
+        );
+    }
+
+    #[test]
+    fn reads_an_explicit_max_input_budget() {
+        // Distinct from the window: the input ceiling can be smaller because the
+        // backend reserves part of the window for output.
+        let src = r#"
+            export const pProvider: RegistryEntry = { id: "p", baseUrl: "https://x", models: [
+              { id: "m", name: "M", contextLength: 1048576, maxInputTokens: 272000 },
+            ] };
+        "#;
+        let clean = strip_comments(src);
+        let meta = to_meta(&entries(&clean)[0], &Consts::of(&clean), &Tree::empty());
+        assert_eq!(meta.max_input_tokens, 272_000);
+    }
+
+    #[test]
+    fn reads_a_provider_wide_default_context_length() {
+        let src = r#"
+            export const pProvider: RegistryEntry = { id: "p", baseUrl: "https://x", defaultContextLength: 200000, models: [] };
+        "#;
+        let clean = strip_comments(src);
+        let meta = to_meta(&entries(&clean)[0], &Consts::of(&clean), &Tree::empty());
+        assert_eq!(meta.context_length, 200_000);
+    }
+
+    #[test]
+    fn leaves_metadata_empty_for_an_entry_that_declares_none() {
+        let src = r#"
+            export const pProvider: RegistryEntry = { id: "p", baseUrl: "https://x", models: [] };
+        "#;
+        let clean = strip_comments(src);
+        let meta = to_meta(&entries(&clean)[0], &Consts::of(&clean), &Tree::empty());
+        assert_eq!(meta.context_length, 0);
+        assert_eq!(meta.max_input_tokens, 0);
+        assert!(meta.responses_base_url.as_ref().is_empty());
+        assert!(meta.alternate_formats.is_empty());
+        assert!(meta.anonymous_api_key.as_ref().is_empty());
+        assert!(meta.alias.as_ref().is_empty());
+    }
+
+    #[test]
+    fn keeps_nested_objects_out_of_a_free_row_split() {
+        // A row with a nested literal must stay one row: the depth walk is what
+        // stops the split.
+        // String values and quoted keys, as TypeScript writes them: `fields()` steps
+        // over a key it cannot parse and `string_field` reads literals only, so a
+        // numeric fixture would test neither.
+        let objects = top_level_objects(r#"{ "a": "1", "nested": { "b": "2" } }, { "c": "3" }"#);
+        assert_eq!(objects.len(), 2, "{objects:?}");
+        assert_eq!(string_field(&objects[0], "a").as_deref(), Some("1"));
+        // The nested object is part of row 1, never its own entry.
+        assert_eq!(string_field(&objects[0], "nested"), None);
+        assert_eq!(string_field(&objects[1], "c").as_deref(), Some("3"));
     }
 
     #[test]

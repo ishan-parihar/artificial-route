@@ -5,6 +5,15 @@
 //! rules and drops the machinery around them: no hedging, no per-model timeout
 //! tasks, no set-retry rounds, no quota accounting. What survives decides
 //! *retry, fail over, or stop* — see [`classify_status`].
+//!
+//! What it adds on top of the P0 port is the answer to a second question:
+//! *which resilience scope does this failure belong to?* [`classify_status`]
+//! says retry / fail over / stop; [`classify_fault`] says key, model, provider
+//! breaker, or retirement. Upstream keeps the same split
+//! (`checkFallbackError` picks the reason, the pre-dispatch gates in
+//! `combo/executeTargetGates.ts` apply it), and it is the split that keeps one
+//! exhausted model from cooling a provider or one dead model from being
+//! re-selected forever.
 
 use std::time::Duration;
 
@@ -12,7 +21,9 @@ use http::StatusCode;
 
 use crate::contract::{CanonicalRequest, ExecError, Executor, ProviderId, Upstream};
 use crate::error::RouteError;
-use crate::resilience::Resilience;
+use crate::resilience::{
+    BreakerClass, LockReason, LOCKOUT_BASE_COOLDOWN, Resilience, quota_cooldown,
+};
 
 /// Upper bound on providers tried for one request.
 ///
@@ -153,6 +164,87 @@ const ADVANCE_400_ROWS: &[&str] = &[
     "does not support",
 ];
 
+/// 402 is a payment-required status: a spent allowance, never a rate limit.
+/// Upstream reads the same way (`combo/quotaExhaustion.ts`'s status arm), and
+/// getting it wrong is expensive — a payment failure re-selected on a 3s
+/// backoff is a hot loop against a provider that cannot serve anyone until
+/// someone is paid.
+const PAYMENT_REQUIRED: u16 = 402;
+
+/// Rate limit. Also the status that *carries* the quota-vs-throttle split, so
+/// it gets a dedicated constant rather than a bare literal at four sites.
+const RATE_LIMITED: u16 = 429;
+
+/// 429 bodies that mean the *allowance* is gone, not that the window is full.
+///
+/// A compact slice of upstream's `CREDITS_EXHAUSTED_SIGNALS`. The one that
+/// cannot be dropped is the anchored `"tier has been exhausted"`: a bare
+/// `"has been exhausted"` also appears in Gemini's transient 429 body
+/// ("Resource has been exhausted (e.g. check quota)."), and matching that turns
+/// an RPM blip into a day-long lockout.
+const QUOTA_EXHAUSTED_SIGNALS: &[&str] = &[
+    "insufficient_quota",
+    "billing_hard_limit_reached",
+    "credit balance is too low",
+    "credits exhausted",
+    "insufficient credit",
+    "insufficient balance",
+    "insufficient account balance",
+    "payment required",
+    "exceeded your current quota",
+    "tier has been exhausted",
+    "exhausted all your credits",
+];
+
+/// 4xx bodies meaning the *account* is permanently gone. A compact slice of
+/// upstream's `ACCOUNT_DEACTIVATED_SIGNALS`. Retires the provider: the
+/// credential behind the key is dead, so the provider's other models have
+/// nothing left to fall back to.
+const ACCOUNT_DEACTIVATED_SIGNALS: &[&str] = &[
+    "account_deactivated",
+    "account has been deactivated",
+    "account has been disabled",
+    "account has been suspended",
+    "this service has been disabled",
+];
+
+/// 404/410 bodies meaning the *model* is retired. A compact slice of upstream's
+/// `MODEL_PERMANENTLY_UNAVAILABLE_PATTERNS`, as substrings. Such a model fails
+/// on every future request, so a cooldown is just one wasted upstream call per
+/// window — and at volume that reads as abuse to the provider.
+const MODEL_RETIRED_SIGNALS: &[&str] = &[
+    "no longer available",
+    "no longer supported",
+    "end of life",
+    "deprecated",
+    "discontinued",
+];
+
+/// What one failed attempt means for the resilience layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fault {
+    /// 5xx, transport, or an auth refusal: the key's cooldown, plus a tick on
+    /// the provider breaker.
+    Transient,
+    /// 429 with no quota language: seconds, not days. Both the key and the
+    /// model take a lockout, at their own widths.
+    Throttled,
+    /// 402, or a 429 whose body says the allowance is gone: a day-boundary
+    /// lockout, and the client is told to come back then.
+    QuotaExhausted,
+    /// Nothing recovers on a timer.
+    Terminal(Terminal),
+}
+
+/// Which scope a terminal body retires.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Terminal {
+    /// The account is gone.
+    Provider,
+    /// The model is gone.
+    Model,
+}
+
 /// Classifies one upstream status into the loop's next move.
 ///
 /// Pure: no clock, no state, no I/O. Everything the decision needs is in the
@@ -178,6 +270,111 @@ fn classify_status(status: u16, body: &str) -> Step {
     Step::Failover { status }
 }
 
+/// Splits a failover into the scope it has to be charged to, and says whether
+/// the *client* should come back.
+///
+/// Order is load-bearing. Terminal is tested first, because a 401 carrying
+/// `"account has been deactivated"` would otherwise be charged to the key as an
+/// auth refusal and re-probed for the next thirty minutes on a credential that
+/// is gone forever. Then 402, which is unconditionally a spent allowance. Then
+/// the 429 body split, which is the only place the two throttles diverge.
+#[must_use]
+fn classify_fault(status: u16, body: &str) -> Fault {
+    let lower = body.to_ascii_lowercase();
+    if let Some(scope) = classify_terminal(&lower) {
+        return Fault::Terminal(scope);
+    }
+    if status == PAYMENT_REQUIRED
+        || (status == RATE_LIMITED && QUOTA_EXHAUSTED_SIGNALS.iter().any(|s| lower.contains(s)))
+    {
+        return Fault::QuotaExhausted;
+    }
+    if status == RATE_LIMITED {
+        return Fault::Throttled;
+    }
+    Fault::Transient
+}
+
+/// Which scope a terminal body retires, if it is terminal at all.
+///
+/// The account check runs first and wins: an account that has been deactivated
+/// takes its models with it, so retiring one model would leave the rest
+/// dispatching into the same wall.
+fn classify_terminal(lower: &str) -> Option<Terminal> {
+    if ACCOUNT_DEACTIVATED_SIGNALS.iter().any(|s| lower.contains(s)) {
+        return Some(Terminal::Provider);
+    }
+    MODEL_RETIRED_SIGNALS
+        .iter()
+        .any(|s| lower.contains(s))
+        .then_some(Terminal::Model)
+}
+
+/// Charges the failed attempt to the scope that owns it.
+///
+/// Returns `(cooldown_to_report, client_should_retry)`. The arms differ in
+/// *which* layer learns about the failure, not in how the verdict is reported,
+/// which is why they live in one function instead of four in the loop body.
+fn charge_failure(
+    resilience: &Resilience,
+    provider: &ProviderId,
+    model: &str,
+    status: u16,
+    body: &str,
+    retry_after: Option<Duration>,
+) -> (Duration, bool) {
+    let provider = provider.as_str();
+    match classify_fault(status, body) {
+        // Retirement is the whole answer here. A cooldown would just buy one
+        // wasted upstream call per window, forever.
+        Fault::Terminal(scope) => {
+            match scope {
+                Terminal::Provider => resilience.retire_provider(provider),
+                Terminal::Model => resilience.retire_model(provider, model),
+            }
+            (Duration::ZERO, false)
+        }
+        // The allowance is spent: a day-boundary lockout on the model, and the
+        // client told to come back then. Note the provider breaker is *not*
+        // charged — an empty account says nothing about the endpoint's health.
+        Fault::QuotaExhausted => (
+            resilience.lock_model(provider, model, LockReason::QuotaExhausted, quota_cooldown()),
+            true,
+        ),
+        // A throttle answers to both scopes at their own widths: the key takes
+        // the backoff and honours `Retry-After`, the model takes a long lockout
+        // so one model riding a shared limit stops being re-selected.
+        Fault::Throttled => {
+            let cooldown = resilience.record_failure(provider, retry_after);
+            resilience.lock_model(
+                provider,
+                model,
+                LockReason::Throttled,
+                LOCKOUT_BASE_COOLDOWN,
+            );
+            (cooldown, true)
+        }
+        // Everything else — 5xx, transport, an auth refusal — is the key's
+        // problem and the provider breaker's to count. Here the layering
+        // collapses on purpose: with one key per provider there is nothing for
+        // a dead credential to fall back to, so an auth refusal *is* the
+        // provider's failure.
+        Fault::Transient => {
+            let cooldown = resilience.record_failure(provider, retry_after);
+            // A 400 the request itself provoked is the key's cooldown and
+            // nothing more: after a dozen oversized prompts, a breaker that
+            // counted them would be blaming the endpoint for our request.
+            // Upstream carves out the same class (`isModelCapacityOverloadError`
+            // in `circuitBreaker.ts`). Only the advance rows reach here — a
+            // stop-row 400 already aborted.
+            if status != 400 {
+                resilience.record_provider_failure(provider, BreakerClass::default());
+            }
+            (cooldown, false)
+        }
+    }
+}
+
 /// Whether a 400 body is a client-shape failure rather than a model refusal.
 fn is_stop_400(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
@@ -190,8 +387,9 @@ fn is_stop_400(body: &str) -> bool {
 /// Runs `canonical` against `fallback_chain` until one provider answers.
 ///
 /// `fallback_chain[0]` is where [`crate::pick`] put the winner; the rest are
-/// fallbacks. A provider whose key is already cooling is skipped without
-/// spending an attempt, and no provider is tried twice.
+/// fallbacks. A provider whose key or model is already cooling is skipped
+/// without spending an attempt, as is one behind an open breaker, and no
+/// provider is tried twice.
 ///
 /// # Errors
 /// Never in P0: the loop has no fallible setup. It returns `Result` because
@@ -228,11 +426,25 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
         if tried as usize >= MAX_ATTEMPTS {
             break;
         }
-        // A key already cooling is a known-dead key: skipping it costs one loop
-        // iteration, spending an attempt on it costs a round trip and a second
-        // 429. `is_cooling` also sweeps, so this is the self-cleaning path.
-        if resilience.is_cooling(provider.as_str()) {
+        // A key or model already cooling is a known-dead target: skipping it
+        // costs one loop iteration, spending an attempt on it costs a round
+        // trip and a second 429. `is_cooling_for` also sweeps, so this is the
+        // self-cleaning path. It runs *before* `is_usable` deliberately:
+        // `is_usable` spends a half-open probe, and a provider already known to
+        // be cooling must not burn one.
+        if resilience.is_cooling_for(provider.as_str(), &canonical.model) {
             tracing::debug!(provider = %provider, "skipping cooling provider");
+            continue;
+        }
+        // The breaker is the whole-provider layer: many targets on one provider
+        // fail together, and one dead endpoint should not cost a round trip per
+        // target while it is down.
+        if !resilience.is_usable(provider.as_str()) {
+            tracing::debug!(
+                provider = %provider,
+                state = ?resilience.breaker_state(provider.as_str()),
+                "skipping provider behind an open breaker"
+            );
             continue;
         }
 
@@ -242,8 +454,11 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
                 Step::Success => {
                     // Success clears all error state for this key
                     // (`connectionCooldown.ts`), so the next failure of an
-                    // otherwise-healthy provider starts from `base` again.
+                    // otherwise-healthy provider starts from `base` again — and
+                    // closes the breaker, since a working call is proof the
+                    // provider is back.
                     resilience.record_success(provider.as_str());
+                    resilience.record_provider_success(provider.as_str());
                     return Ok(AttemptOutcome::Succeeded {
                         provider: provider.clone(),
                         attempts: tried,
@@ -258,21 +473,35 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
                     }));
                 }
                 Step::Failover { status } => {
-                    let cooldown =
-                        resilience.record_failure(provider.as_str(), upstream.retry_after);
+                    let (cooldown, throttled) = charge_failure(
+                        resilience,
+                        provider,
+                        &canonical.model,
+                        status,
+                        &body_text(&upstream),
+                        upstream.retry_after,
+                    );
                     tracing::warn!(
                         provider = %provider,
                         status,
                         cooldown_ms = cooldown.as_millis() as u64,
                         "attempt failed over"
                     );
-                    (status, provider.clone(), cooldown, status == 429)
+                    (status, provider.clone(), cooldown, throttled)
                 }
             },
             Err(ExecError(msg)) => {
                 // No verdict from the provider at all: charge a cooldown so the
-                // next request does not walk into the same dead socket.
-                let cooldown = resilience.record_failure(provider.as_str(), None);
+                // next request does not walk into the same dead socket, and a
+                // breaker tick so enough dead sockets take the provider out.
+                let (cooldown, _) = charge_failure(
+                    resilience,
+                    provider,
+                    &canonical.model,
+                    502,
+                    "",
+                    None,
+                );
                 tracing::warn!(provider = %provider, error = %msg, "transport failure, failing over");
                 (502, provider.clone(), cooldown, false)
             }
@@ -352,9 +581,10 @@ mod tests {
     use bytes::Bytes;
     use http::StatusCode;
 
-    use super::{MAX_ATTEMPTS, attempt_loop, classify_status, Step};
+    use super::{Fault, MAX_ATTEMPTS, Terminal, attempt_loop, classify_fault, classify_status, Step};
     use crate::contract::{CanonicalRequest, ExecError, Executor, ProviderId, Upstream};
-    use crate::resilience::Resilience;
+    use crate::resilience::BreakerClass;
+use crate::resilience::Resilience;
     use crate::AttemptOutcome;
 
     /// A cloneable verdict description; `Upstream` is not `Clone` because it
@@ -426,6 +656,13 @@ mod tests {
     const MALFORMED: Verdict = Verdict::Status(400, r#"{"error":"invalid message format"}"#);
     const OVERFLOW: Verdict = Verdict::Status(400, "maximum context length is 8192 tokens");
     const PROMPT_SHAPE: Verdict = Verdict::Status(400, "prompt is malformed");
+    const QUOTA_429: Verdict = Verdict::Status(429, r#"{"error":{"code":"insufficient_quota"}}"#);
+    const PLAIN_429: Verdict = Verdict::Status(429, "slow down");
+    const PAYMENT_402: Verdict = Verdict::Status(402, "payment required");
+    const ACCOUNT_DEAD: Verdict = Verdict::Status(401, "your account has been deactivated");
+    const MODEL_GONE: Verdict = Verdict::Status(404, "this model is no longer available");
+    const GEMINI_RPM: Verdict =
+        Verdict::Status(429, "Resource has been exhausted (e.g. check quota).");
 
     fn req() -> CanonicalRequest {
         CanonicalRequest::new("m", Bytes::from_static(b"{}"))
@@ -613,5 +850,141 @@ mod tests {
             classify_status(400, "prompt is malformed"),
             Step::Abort { status: StatusCode::BAD_REQUEST }
         );
+    }
+
+    #[test]
+    fn a_quota_429_is_not_a_transient_429() {
+        // Same status, different meaning: one waits for a day, the other for
+        // a backoff step. Reading both as the same is what makes an exhausted
+        // account get re-selected every few seconds until it is topped up.
+        assert_eq!(classify_fault(429, "insufficient_quota"), Fault::QuotaExhausted);
+        assert_eq!(classify_fault(429, "slow down"), Fault::Throttled);
+        // The anchored "tier has been exhausted" signal exists so Gemini's
+        // transient RPM phrasing below stays a throttle: a bare "has been
+        // exhausted" would match it and turn an RPM blip into a day-long lock.
+        let Verdict::Status(_, gemini) = GEMINI_RPM else {
+            panic!("expected a status verdict");
+        };
+        assert_eq!(classify_fault(429, gemini), Fault::Throttled);
+        assert_eq!(
+            classify_fault(429, "the free tier has been exhausted"),
+            Fault::QuotaExhausted
+        );
+    }
+
+    #[test]
+    fn a_402_is_always_a_spent_allowance() {
+        assert_eq!(classify_fault(402, ""), Fault::QuotaExhausted);
+    }
+
+    #[test]
+    fn terminal_bodies_split_between_account_and_model() {
+        assert_eq!(classify_fault(401, "your account has been deactivated"), Fault::Terminal(Terminal::Provider));
+        assert_eq!(classify_fault(404, "this model is no longer available"), Fault::Terminal(Terminal::Model));
+        // The account wins when a body could read as either: a dead account
+        // takes its models with it.
+        assert_eq!(
+            classify_fault(404, "account has been disabled: model no longer supported"),
+            Fault::Terminal(Terminal::Provider)
+        );
+    }
+
+    #[test]
+    fn anything_else_is_a_transient_failure() {
+        assert_eq!(classify_fault(500, "boom"), Fault::Transient);
+        assert_eq!(classify_fault(401, "invalid api key"), Fault::Transient);
+    }
+
+    #[test]
+    fn quota_429_and_transient_429_diverge_end_to_end() {
+        let quota_r = Resilience::new();
+        let quota_exec = Scripted::new(vec![QUOTA_429, QUOTA_429]);
+        let Ok(AttemptOutcome::Retry { after: quota_after, .. }) =
+            block(attempt_loop(&req(), &chain(&["p1", "p2"]), &quota_exec, &quota_r))
+        else {
+            panic!("expected retry");
+        };
+        assert!(quota_after > Duration::from_secs(3600), "a spent allowance waits for the day");
+
+        let plain_r = Resilience::new();
+        let plain_exec = Scripted::new(vec![PLAIN_429, PLAIN_429]);
+        let Ok(AttemptOutcome::Retry { after: plain_after, .. }) =
+            block(attempt_loop(&req(), &chain(&["p1", "p2"]), &plain_exec, &plain_r))
+        else {
+            panic!("expected retry");
+        };
+        assert!(plain_after <= Duration::from_secs(300), "a plain 429 takes the backoff");
+    }
+
+    #[test]
+    fn a_quota_402_takes_the_same_day_lockout_as_a_quota_429() {
+        let r = Resilience::new();
+        let exec = Scripted::new(vec![PAYMENT_402, PAYMENT_402]);
+        let Ok(AttemptOutcome::Retry { after, .. }) =
+            block(attempt_loop(&req(), &chain(&["p1", "p2"]), &exec, &r))
+        else {
+            panic!("expected retry");
+        };
+        assert!(after > Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn a_retired_model_does_not_retire_its_provider() {
+        // A 404 on one model is the case the whole lockout layer exists for:
+        // retiring the provider would take its healthy siblings with it.
+        let r = Resilience::new();
+        let exec = Scripted::new(vec![MODEL_GONE]);
+        let _ = block(attempt_loop(&req(), &chain(&["p1"]), &exec, &r));
+        assert!(r.is_cooling_for("p1", "m"), "the dead model is unusable");
+        assert!(r.is_usable("p1"), "the provider still serves other models");
+    }
+
+    #[test]
+    fn a_dead_account_is_retired_whole() {
+        let r = Resilience::new();
+        let exec = Scripted::new(vec![ACCOUNT_DEAD, Verdict::Ok]);
+        let got = block(attempt_loop(&req(), &chain(&["p1", "p2"]), &exec, &r));
+        assert!(!r.is_usable("p1"), "the credential is gone, not merely slow");
+        // The chain still fails over to p2 rather than aborting on the spot:
+        // another provider can serve the request.
+        assert!(matches!(got, Ok(AttemptOutcome::Succeeded { .. })));
+    }
+
+    #[test]
+    fn a_retired_model_is_skipped_without_spending_an_attempt() {
+        let r = Resilience::new();
+        r.retire_model("p1", "m");
+        let exec = Scripted::new(vec![Verdict::Ok]);
+        let _ = block(attempt_loop(&req(), &chain(&["p1"]), &exec, &r));
+        assert!(exec.seen().is_empty());
+    }
+
+    #[test]
+    fn skips_a_provider_behind_an_open_breaker_without_spending_an_attempt() {
+        let r = Resilience::new();
+        for _ in 0..BreakerClass::Key.threshold() {
+            r.record_provider_failure("p1", BreakerClass::Key);
+        }
+        let exec = Scripted::new(vec![Verdict::Ok]);
+        let _ = block(attempt_loop(&req(), &chain(&["p1"]), &exec, &r));
+        assert!(exec.seen().is_empty());
+    }
+
+    #[test]
+    fn a_repeated_context_overflow_does_not_trip_the_provider_breaker() {
+        // The provider is fine; our prompt is too big for the model. Charging
+        // the breaker here would let one client take a provider down for
+        // everyone after twelve requests.
+        let rounds = BreakerClass::Key.threshold() + 4;
+        let r = Resilience::new();
+        let exec = Scripted::new(vec![OVERFLOW; rounds as usize]);
+        for _ in 0..rounds {
+            let _ = block(attempt_loop(&req(), &chain(&["p1"]), &exec, &r));
+            // Clear the key cooldown between rounds so each one really
+            // dispatches; the breaker is what is under test here.
+            r.record_success("p1");
+        }
+        assert_eq!(exec.seen().len() as u32, rounds, "every round dispatched");
+        assert!(r.is_usable("p1"), "an oversized prompt is not an outage");
     }
 }

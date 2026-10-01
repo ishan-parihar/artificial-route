@@ -58,7 +58,11 @@ fn exits_fast_when_version() {
     // machine the suite happens to run on.
     let empty = empty_dir("version-fast-path");
 
-    let out = Command::new(BIN).arg("--version").current_dir(&empty).output().expect("the ar binary runs");
+    let out = Command::new(BIN)
+        .arg("--version")
+        .current_dir(&empty)
+        .output()
+        .expect("the ar binary runs");
 
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
     assert_eq!(stdout(&out), "ar 0.1.1\n");
@@ -71,7 +75,10 @@ fn fails_loud_when_unknown_flag() {
 
     assert_eq!(code(&out), 2);
     let text = stdout(&out);
-    assert!(text.contains("--nope"), "must name the offending flag: {text}");
+    assert!(
+        text.contains("--nope"),
+        "must name the offending flag: {text}"
+    );
     assert!(text.contains("--fields"), "{text}");
     assert!(text.contains("--full"), "{text}");
     // The subcommand's own flag set, not the root's: `--prompt` belongs to `run`.
@@ -107,11 +114,28 @@ fn renders_models_list_shape() {
     // The `[N]` is the row count, so the header is matched in two parts; the
     // whole output is never interpolated into a failure message, because at 1559
     // rows that would bury the assertion.
-    assert!(text.contains("total\nmodels["), "{}", &text[..text.len().min(200)]);
-    assert!(text.contains("{id,provider,status}:"), "{}", &text[..text.len().min(200)]);
-    assert!(text.contains("openai/gpt-5.4-nano,openai,routable"), "the catalog model is listed");
-    assert!(text.contains("anthropic/claude-sonnet-5,anthropic,routable"), "the combo target is listed");
-    assert!(!text.contains("gpt-5.4-nope"), "a model outside the catalog is not listed");
+    assert!(
+        text.contains("total\nmodels["),
+        "{}",
+        &text[..text.len().min(200)]
+    );
+    assert!(
+        text.contains("{id,provider,status}:"),
+        "{}",
+        &text[..text.len().min(200)]
+    );
+    assert!(
+        text.contains("openai/gpt-5.4-nano,openai,routable"),
+        "the catalog model is listed"
+    );
+    assert!(
+        text.contains("anthropic/claude-sonnet-5,anthropic,routable"),
+        "the combo target is listed"
+    );
+    assert!(
+        !text.contains("gpt-5.4-nope"),
+        "a model outside the catalog is not listed"
+    );
 }
 
 #[test]
@@ -124,7 +148,11 @@ fn narrows_columns_when_fields_given() {
     let out = ar(&["providers", "--fields", "id,key"]);
 
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
-    assert!(stdout(&out).contains("providers[2]{id,key}:"), "{}", stdout(&out));
+    assert!(
+        stdout(&out).contains("providers[2]{id,key}:"),
+        "{}",
+        stdout(&out)
+    );
 }
 
 #[test]
@@ -132,7 +160,11 @@ fn fails_run_when_model_not_a_combo() {
     let out = ar(&["run", "--model", "nope", "-p", "hi"]);
 
     assert_eq!(code(&out), 1);
-    assert!(stdout(&out).contains("no combo named \"nope\" is configured"), "{}", stdout(&out));
+    assert!(
+        stdout(&out).contains("no combo named \"nope\" is configured"),
+        "{}",
+        stdout(&out)
+    );
 }
 
 #[test]
@@ -140,7 +172,11 @@ fn rejects_unknown_field_with_usage_error() {
     let out = ar(&["providers", "--fields", "nope"]);
 
     assert_eq!(code(&out), 2);
-    assert!(stdout(&out).contains("unknown field \"nope\""), "{}", stdout(&out));
+    assert!(
+        stdout(&out).contains("unknown field \"nope\""),
+        "{}",
+        stdout(&out)
+    );
 }
 
 #[test]
@@ -185,7 +221,11 @@ fn fails_check_when_target_provider_absent() {
         .expect("the ar binary runs");
 
     assert_eq!(code(&out), 1);
-    assert!(stdout(&out).contains("1 check(s) failed"), "{}", stdout(&out));
+    assert!(
+        stdout(&out).contains("1 check(s) failed"),
+        "{}",
+        stdout(&out)
+    );
 }
 
 #[test]
@@ -193,7 +233,11 @@ fn states_zero_definitively_when_no_combos() {
     let dir = empty_dir("no-combos");
     std::fs::write(dir.join("config.yaml"), "keys:\n  k: v\n").expect("the fixture writes");
 
-    let out = Command::new(BIN).args(["combo"]).current_dir(&dir).output().expect("the ar binary runs");
+    let out = Command::new(BIN)
+        .args(["combo"])
+        .current_dir(&dir)
+        .output()
+        .expect("the ar binary runs");
 
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
     assert_eq!(stdout(&out), "combo: 0 combos found\n");
@@ -224,7 +268,11 @@ fn with_custom_config(name: &str, yaml: &str) -> PathBuf {
 }
 
 fn ar_in(dir: &Path, args: &[&str]) -> Output {
-    Command::new(BIN).args(args).current_dir(dir).output().expect("the ar binary runs")
+    Command::new(BIN)
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("the ar binary runs")
 }
 
 #[test]
@@ -236,7 +284,10 @@ fn passes_doctor_when_a_custom_provider_is_declared() {
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
     let text = stdout(&out);
     assert!(text.contains("custom/local-gateway,ok"), "{text}");
-    assert!(text.contains("target/local-gateway/some-model,ok,routable"), "{text}");
+    assert!(
+        text.contains("target/local-gateway/some-model,ok,routable"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -259,7 +310,11 @@ fn lists_a_custom_provider_when_it_is_declared() {
     let out = ar_in(&dir, &["providers"]);
 
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
-    assert!(stdout(&out).contains("local-gateway,openai,custom"), "{}", stdout(&out));
+    assert!(
+        stdout(&out).contains("local-gateway,openai,custom"),
+        "{}",
+        stdout(&out)
+    );
 }
 
 #[test]
@@ -276,8 +331,14 @@ fn fails_check_when_a_custom_provider_id_collides_with_the_catalog() {
     assert_eq!(code(&out), 1, "stdout: {}", stdout(&out));
     let text = stdout(&out);
     assert!(text.contains("1 check(s) failed"), "{text}");
-    assert!(text.contains("custom,fail"), "the collision is the named row: {text}");
-    assert!(text.contains("\"openai\" is already in the registry"), "{text}");
+    assert!(
+        text.contains("custom,fail"),
+        "the collision is the named row: {text}"
+    );
+    assert!(
+        text.contains("\"openai\" is already in the registry"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -290,7 +351,11 @@ fn fails_check_when_a_custom_providers_base_url_has_no_scheme() {
     let out = ar_in(&dir, &["doctor"]);
 
     assert_eq!(code(&out), 1);
-    assert!(stdout(&out).contains("not an http(s) URL"), "{}", stdout(&out));
+    assert!(
+        stdout(&out).contains("not an http(s) URL"),
+        "{}",
+        stdout(&out)
+    );
 }
 
 #[test]
@@ -314,13 +379,21 @@ fn fails_check_when_the_credential_store_cannot_be_read() {
         "keys:\n  k: v\nproviders:\n  - id: openai\n    key: k\ncombos:\n  - id: c\n    strategy: priority\n    targets:\n      - openai/gpt-5.4\n",
     )
     .expect("the fixture writes");
-    std::fs::write(dir.join("credentials.db"), b"not a sqlite file at all").expect("the fixture writes");
+    std::fs::write(dir.join("credentials.db"), b"not a sqlite file at all")
+        .expect("the fixture writes");
 
-    let out = Command::new(BIN).args(["doctor"]).current_dir(&dir).output().expect("the ar binary runs");
+    let out = Command::new(BIN)
+        .args(["doctor"])
+        .current_dir(&dir)
+        .output()
+        .expect("the ar binary runs");
 
     let text = stdout(&out);
     assert!(text.contains("store,fail,"), "{text}");
-    assert!(text.contains("AR_MASTER_KEY"), "the reason names the fix: {text}");
+    assert!(
+        text.contains("AR_MASTER_KEY"),
+        "the reason names the fix: {text}"
+    );
     assert_eq!(code(&out), 1);
 }
 
@@ -422,12 +495,18 @@ fn renders_a_session_row_when_status_is_asked_for() {
 
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
     let text = stdout(&out);
-    assert!(text.contains("sessions[1]{id,provider,status,login,access_key,reason,login_reason}:"), "{text}");
+    assert!(
+        text.contains("sessions[1]{id,provider,status,login,access_key,reason,login_reason}:"),
+        "{text}"
+    );
     assert!(text.contains("codex,codex,armed,"), "{text}");
     // The two verdicts are separate columns: the `keys:` literals resolve, so the
     // session dispatches (`armed`), and the declared endpoint makes it loggable
     // (`armed` again — a different question, answered on its own terms).
-    assert!(text.contains(",armed,armed,codex,"), "both verdicts have their own cell: {text}");
+    assert!(
+        text.contains(",armed,armed,codex,"),
+        "both verdicts have their own cell: {text}"
+    );
 }
 
 #[test]
@@ -450,13 +529,19 @@ fn never_renders_a_credential_value_in_auth_output() {
     ] {
         let text = stdout(&ar_auth(&dir, args));
         assert!(!text.contains("sk-test"), "{args:?} leaked a key: {text}");
-        assert!(!text.contains("code_verifier"), "{args:?} leaked a verifier: {text}");
+        assert!(
+            !text.contains("code_verifier"),
+            "{args:?} leaked a verifier: {text}"
+        );
     }
 }
 
 #[test]
 fn reports_logout_as_a_no_op_when_the_store_holds_nothing_for_the_session() {
-    let out = ar_auth(&auth_dir("auth-logout-empty"), &["auth", "logout", "--provider", "codex"]);
+    let out = ar_auth(
+        &auth_dir("auth-logout-empty"),
+        &["auth", "logout", "--provider", "codex"],
+    );
 
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
     let text = stdout(&out);
@@ -474,11 +559,17 @@ fn refuses_logout_without_a_provider() {
 
 #[test]
 fn refuses_a_login_for_a_provider_no_session_declares() {
-    let out = ar_auth(&auth_dir("auth-login-undeclared"), &["auth", "login", "--provider", "kilocode"]);
+    let out = ar_auth(
+        &auth_dir("auth-login-undeclared"),
+        &["auth", "login", "--provider", "kilocode"],
+    );
 
     assert_eq!(code(&out), 1);
     let text = stdout(&out);
-    assert!(text.contains("no `oauth:` block declares kilocode"), "{text}");
+    assert!(
+        text.contains("no `oauth:` block declares kilocode"),
+        "{text}"
+    );
     // The refusal hands over the exact block that fixes it, because "add one" is
     // not an instruction an agent can act on.
     assert!(text.contains("authorization_url"), "{text}");
@@ -508,7 +599,10 @@ fn prints_the_authorize_url_before_reading_stdin() {
     );
 
     let text = stdout(&out);
-    assert!(text.contains("url: https://auth.example.invalid/authorize?"), "{text}");
+    assert!(
+        text.contains("url: https://auth.example.invalid/authorize?"),
+        "{text}"
+    );
     // The PKCE halves are public by construction and belong on the URL; the
     // verifier never does.
     assert!(text.contains("code_challenge_method=S256"), "{text}");
@@ -535,7 +629,10 @@ fn lists_the_login_flags_when_one_of_them_is_misspelled() {
 
     assert_eq!(code(&out), 2);
     let text = stdout(&out);
-    assert!(text.contains("--prov"), "must name the offending flag: {text}");
+    assert!(
+        text.contains("--prov"),
+        "must name the offending flag: {text}"
+    );
     assert!(text.contains("--provider"), "and the valid set: {text}");
     assert!(text.contains("--no-browser"), "{text}");
 }
@@ -548,7 +645,10 @@ fn names_login_readiness_in_the_doctor_rows() {
 
     let text = stdout(&out);
     assert!(text.contains("auth/codex,armed,"), "{text}");
-    assert!(text.contains("ar auth login --provider codex"), "the row names the fix: {text}");
+    assert!(
+        text.contains("ar auth login --provider codex"),
+        "the row names the fix: {text}"
+    );
 }
 
 /// A directory under the crate's own target tree holding nothing but whatever the
@@ -582,19 +682,33 @@ fn seed_rows(dir: &Path) {
     // parallel threads in one process, and a process-global `AR_MASTER_KEY` would
     // be one test's key becoming another's. The material is passed explicitly
     // here and per-command for the `ar` runs, so both sides read one constant.
-    let material = ar_keys::Secret::new(hex_to_bytes(TEST_MASTER_KEY).expect("the test key is hex"));
-    let store = ar_keys::CredentialStore::open_with_material(&dir.join("credentials.db"), &material)
-        .expect("the store opens under the test master key");
+    let material =
+        ar_keys::Secret::new(hex_to_bytes(TEST_MASTER_KEY).expect("the test key is hex"));
+    let store =
+        ar_keys::CredentialStore::open_with_material(&dir.join("credentials.db"), &material)
+            .expect("the store opens under the test master key");
     // A row for an unrelated provider, so "logout removed the session's rows" can
     // be told apart from "logout removed every row".
     store
-        .insert("openai", "openai", &ar_keys::Secret::new(b"sk-unrelated".to_vec()))
+        .insert(
+            "openai",
+            "openai",
+            &ar_keys::Secret::new(b"sk-unrelated".to_vec()),
+        )
         .expect("the unrelated row writes");
     store
-        .insert("codex", "codex", &ar_keys::Secret::new(b"access-token-value".to_vec()))
+        .insert(
+            "codex",
+            "codex",
+            &ar_keys::Secret::new(b"access-token-value".to_vec()),
+        )
         .expect("the access row writes");
     store
-        .insert("codex", "codex_refresh", &ar_keys::Secret::new(b"refresh-token-value".to_vec()))
+        .insert(
+            "codex",
+            "codex_refresh",
+            &ar_keys::Secret::new(b"refresh-token-value".to_vec()),
+        )
         .expect("the refresh row writes");
 }
 
@@ -619,10 +733,16 @@ fn removes_exactly_the_session_rows_on_logout() {
 
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
     let text = stdout(&out);
-    assert!(text.contains("codex,logged-out,codex+codex_refresh"), "{text}");
+    assert!(
+        text.contains("codex,logged-out,codex+codex_refresh"),
+        "{text}"
+    );
     // The unrelated provider's row is the whole point of the assertion: a logout
     // that deleted every row would pass the check above.
-    assert!(!text.contains("openai"), "another provider's row was removed: {text}");
+    assert!(
+        !text.contains("openai"),
+        "another provider's row was removed: {text}"
+    );
 }
 
 #[test]

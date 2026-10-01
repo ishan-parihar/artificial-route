@@ -40,6 +40,21 @@ impl Usd {
     pub fn as_f64(self) -> f64 {
         self.micros as f64 / 1e6
     }
+
+    /// Six-decimal USD rendering, the one shape cost is printed in.
+    ///
+    /// Shared by `ar cost-report`'s TOON column and the `x-ar-response-cost`
+    /// header so the two cannot disagree on rounding: micro-dollars are exact
+    /// integers, and a header that printed a different number of digits would
+    /// read as a different amount.
+    ///
+    /// ```
+    /// assert_eq!(ar_tokens::Usd::per_mtok(1.5).as_decimal_string(), "1.500000");
+    /// ```
+    #[must_use]
+    pub fn as_decimal_string(self) -> String {
+        format!("{:.6}", self.as_f64())
+    }
 }
 
 /// Per-token prices for one model, expressed per million tokens in

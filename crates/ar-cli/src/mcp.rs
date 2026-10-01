@@ -75,9 +75,12 @@ pub async fn run(cli: &Cli, args: &McpArgs) -> anyhow::Result<()> {
             "run `ar doctor`; a target whose provider is not in the compiled-in registry cannot be served",
         )
     })?;
-    ar_mcp::serve_stdio(built)
-        .await
-        .map_err(|e| commands::fail(e, "the MCP host closed the connection; nothing to retry from here"))
+    ar_mcp::serve_stdio(built).await.map_err(|e| {
+        commands::fail(
+            e,
+            "the MCP host closed the connection; nothing to retry from here",
+        )
+    })
 }
 
 /// Prints the catalog as TOON, then the two things a caller does next.
@@ -91,7 +94,13 @@ fn list() -> anyhow::Result<()> {
     let cell = |s: &str| s.replace(',', ";");
     let rows: Vec<Vec<String>> = Tool::ALL
         .iter()
-        .map(|t| vec![t.name().to_owned(), t.scope_doc().to_owned(), cell(t.one_liner())])
+        .map(|t| {
+            vec![
+                t.name().to_owned(),
+                t.scope_doc().to_owned(),
+                cell(t.one_liner()),
+            ]
+        })
         .chain(std::iter::once(vec![
             ar_mcp::TOOL_SEARCH_NAME.to_owned(),
             "none".to_owned(),
@@ -100,7 +109,14 @@ fn list() -> anyhow::Result<()> {
         .collect();
     print!(
         "{}",
-        toon::list("tools", "tools", &TOOL_COLUMNS, &toon::every_field(&TOOL_COLUMNS), &rows, false)
+        toon::list(
+            "tools",
+            "tools",
+            &TOOL_COLUMNS,
+            &toon::every_field(&TOOL_COLUMNS),
+            &rows,
+            false
+        )
     );
     println!("next:");
     println!("  ar mcp             serve the catalog over stdio");
@@ -156,11 +172,23 @@ fn build(cli: &Cli, cfg: &Config, scope: Scope) -> Result<Host, anyhow::Error> {
         )
     })?;
 
-    let admission = Admission::new([LaneSpec::INTERACTIVE, LaneSpec::BATCH, LaneSpec::HEAVY], CONTROL_PLANE_RPM)
-        .map_err(|e| commands::fail(e, "the admission controller could not be built; this is a host problem"))?;
+    let admission = Admission::new(
+        [LaneSpec::INTERACTIVE, LaneSpec::BATCH, LaneSpec::HEAVY],
+        CONTROL_PLANE_RPM,
+    )
+    .map_err(|e| {
+        commands::fail(
+            e,
+            "the admission controller could not be built; this is a host problem",
+        )
+    })?;
 
-    let exec = ArExec::new()
-        .map_err(|e| commands::fail(e, "the pooled HTTP client could not be built; this is a host problem"))?;
+    let exec = ArExec::new().map_err(|e| {
+        commands::fail(
+            e,
+            "the pooled HTTP client could not be built; this is a host problem",
+        )
+    })?;
 
     Ok(Host {
         combos,
@@ -238,14 +266,19 @@ fn auth_targets(cfg: &Config) -> Vec<AuthTarget> {
 /// A set-but-unreadable value is a startup failure, not a default — a host that
 /// meant to lock the control plane down must not get a wide-open server.
 fn scope() -> Result<Scope, anyhow::Error> {
-    let Ok(raw) = std::env::var(SCOPE_VAR) else { return Ok(Scope::ALL) };
+    let Ok(raw) = std::env::var(SCOPE_VAR) else {
+        return Ok(Scope::ALL);
+    };
     if raw.trim().is_empty() {
         return Ok(Scope::ALL);
     }
     Scope::parse(&raw).map_err(|e| {
         commands::fail(
             format!("{SCOPE_VAR} is not a scope grant: {e}"),
-            format!("set {SCOPE_VAR} to a comma-separated subset of: {}", Scope::NAMES.join(", ")),
+            format!(
+                "set {SCOPE_VAR} to a comma-separated subset of: {}",
+                Scope::NAMES.join(", ")
+            ),
         )
     })
 }
@@ -256,7 +289,11 @@ fn scope() -> Result<Scope, anyhow::Error> {
 /// is a trail nobody reads. The control plane dispatches no traffic of its own, so
 /// the first configured key is the honest attribution.
 fn key_id(cfg: &Config) -> String {
-    cfg.keys.keys().next().cloned().unwrap_or_else(|| "mcp".to_owned())
+    cfg.keys
+        .keys()
+        .next()
+        .cloned()
+        .unwrap_or_else(|| "mcp".to_owned())
 }
 
 /// The directory the control plane's own state lives in, beside the config.
@@ -314,7 +351,10 @@ mod tests {
     #[test]
     fn marks_the_first_combo_active_so_a_routed_call_needs_no_argument() {
         let host = build(&cli("active"), &config(YAML), Scope::ALL).expect("built");
-        assert_eq!(host.active.into_inner().expect("lock").active.as_deref(), Some("cheap"));
+        assert_eq!(
+            host.active.into_inner().expect("lock").active.as_deref(),
+            Some("cheap")
+        );
     }
 
     #[test]
@@ -322,21 +362,34 @@ mod tests {
         // Same table `ar serve` uses: an unpriced target would sort last under
         // `cost-optimized` here and there alike.
         let host = build(&cli("prices"), &config(YAML), Scope::ALL).expect("built");
-        assert!(host.combos[0].candidates.iter().any(|c| c.input_usd_per_mtok.is_some()));
+        assert!(
+            host.combos[0]
+                .candidates
+                .iter()
+                .any(|c| c.input_usd_per_mtok.is_some())
+        );
     }
 
     #[test]
     fn refuses_a_config_with_nothing_routable() {
         let empty = config("keys:\n  k: v\nproviders:\n  - id: openai\n    key: k\ncombos: []\n");
-        let e = build(&cli("empty"), &empty, Scope::ALL).err().expect("no combo is a refusal").to_string();
+        let e = build(&cli("empty"), &empty, Scope::ALL)
+            .err()
+            .expect("no combo is a refusal")
+            .to_string();
         assert!(e.contains("nothing to serve"), "{e}");
         assert!(e.contains("help:"), "{e}");
     }
 
     #[test]
     fn names_a_target_whose_provider_is_not_in_the_registry() {
-        let bad = config("keys:\n  k: v\nproviders:\n  - id: openai\n    key: k\ncombos:\n  - id: c\n    strategy: priority\n    targets:\n      - nosuchprov/m\n");
-        let e = build(&cli("unknown"), &bad, Scope::ALL).err().expect("unknown provider is a refusal").to_string();
+        let bad = config(
+            "keys:\n  k: v\nproviders:\n  - id: openai\n    key: k\ncombos:\n  - id: c\n    strategy: priority\n    targets:\n      - nosuchprov/m\n",
+        );
+        let e = build(&cli("unknown"), &bad, Scope::ALL)
+            .err()
+            .expect("unknown provider is a refusal")
+            .to_string();
         assert!(e.contains("nosuchprov"), "{e}");
     }
 
@@ -361,7 +414,11 @@ mod tests {
 
     #[test]
     fn a_narrow_grant_leaves_the_write_tools_refused() {
-        assert!(!Scope::parse("read:*").expect("known").permits(Tool::SwitchCombo.scope()));
+        assert!(
+            !Scope::parse("read:*")
+                .expect("known")
+                .permits(Tool::SwitchCombo.scope())
+        );
     }
 
     #[test]
@@ -375,7 +432,11 @@ mod tests {
     fn a_narrow_grant_leaves_the_login_writes_refused() {
         let read_only = Scope::parse("read:*").expect("known");
         for tool in [Tool::AuthComplete, Tool::AuthLogout] {
-            assert!(!read_only.permits(tool.scope()), "{} is reachable under read:*", tool.name());
+            assert!(
+                !read_only.permits(tool.scope()),
+                "{} is reachable under read:*",
+                tool.name()
+            );
         }
     }
 
@@ -383,7 +444,11 @@ mod tests {
     fn a_read_grant_reaches_both_login_reads() {
         let read_only = Scope::parse("read:*").expect("known");
         for tool in [Tool::AuthLoginUrl, Tool::AuthStatus] {
-            assert!(read_only.permits(tool.scope()), "{} is refused under read:*", tool.name());
+            assert!(
+                read_only.permits(tool.scope()),
+                "{} is refused under read:*",
+                tool.name()
+            );
         }
     }
 
@@ -392,9 +457,15 @@ mod tests {
         // `config()` resolves every `$VAR` to the literal `v`, so if a value
         // reached a login row this would see it.
         let target = &auth_targets(&config(LOGIN_YAML))[0];
-        assert_eq!(target.access_key, "codex", "the access token lands in the provider's own key row");
+        assert_eq!(
+            target.access_key, "codex",
+            "the access token lands in the provider's own key row"
+        );
         assert_eq!(target.refresh_key.as_deref(), Some("codex_refresh"));
-        assert_eq!(target.client_secret_key, None, "a public PKCE client declares no secret row");
+        assert_eq!(
+            target.client_secret_key, None,
+            "a public PKCE client declares no secret row"
+        );
     }
 
     #[test]
@@ -402,7 +473,10 @@ mod tests {
         // One builder, shared with `ar auth login`: the executor's `authorize_url`
         // reads `Session`, so a login row must not re-spell them.
         let target = &auth_targets(&config(LOGIN_YAML))[0];
-        assert_eq!(target.session.authorization_url(), Some("https://auth.test/authorize"));
+        assert_eq!(
+            target.session.authorization_url(),
+            Some("https://auth.test/authorize")
+        );
         assert_eq!(target.session.token_url(), Some("https://auth.test/token"));
     }
 
@@ -414,8 +488,13 @@ mod tests {
 
     #[test]
     fn an_oauth_block_without_endpoints_is_not_offered_as_loggable() {
-        let half = config("keys:\n  k: v\nproviders:\n  - id: openai\n    key: k\ncombos: []\noauth:\n  - provider: openai\n    refresh_key: k\n");
-        assert!(auth_targets(&half).is_empty(), "no authorization_url means no login to start");
+        let half = config(
+            "keys:\n  k: v\nproviders:\n  - id: openai\n    key: k\ncombos: []\noauth:\n  - provider: openai\n    refresh_key: k\n",
+        );
+        assert!(
+            auth_targets(&half).is_empty(),
+            "no authorization_url means no login to start"
+        );
     }
 
     #[test]
@@ -427,7 +506,10 @@ mod tests {
     #[test]
     fn the_login_tools_write_where_serve_reads() {
         let host = build(&cli("login-store"), &config(LOGIN_YAML), Scope::ALL).expect("built");
-        assert_eq!(host.store_path, commands::store_path(&cli("login-store").config));
+        assert_eq!(
+            host.store_path,
+            commands::store_path(&cli("login-store").config)
+        );
     }
 
     #[test]
@@ -441,7 +523,11 @@ mod tests {
         // The one-liners are written for an MCP host, where a comma is
         // punctuation. In TOON it would widen the row past its header.
         for tool in Tool::ALL {
-            assert!(!tool.one_liner().replace(',', ";").contains(','), "{}", tool.name());
+            assert!(
+                !tool.one_liner().replace(',', ";").contains(','),
+                "{}",
+                tool.name()
+            );
         }
     }
 }

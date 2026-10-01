@@ -17,7 +17,8 @@ use std::path::Path;
 use rusqlite::{Connection, params};
 
 use crate::error::TokenError;
-use crate::pricing::{Cost, Usd};
+use crate::meta::ResponseMeta;
+use crate::pricing::{Cost, PricingTable, Usd};
 use crate::usage::NormalizedUsage;
 
 const SCHEMA: &str = "
@@ -253,7 +254,7 @@ impl CostReport {
 }
 
 fn format_usd(usd: Usd) -> String {
-    format!("{:.6}", usd.as_f64())
+    usd.as_decimal_string()
 }
 
 /// SQLite-backed usage ledger.
@@ -303,6 +304,39 @@ impl Ledger {
     /// Returns [`TokenError::Sqlite`] on a write failure.
     pub fn record(&self, entry: &Entry<'_>) -> Result<(), TokenError> {
         self.record_batch(std::slice::from_ref(entry))
+    }
+
+    /// Records one completed dispatch and answers what it cost.
+    ///
+    /// The response path's entry point. [`Entry`] is unchanged — a caller that
+    /// already knows its usage still builds the row by hand — so this is the same
+    /// append with the two derivations the response path would otherwise repeat
+    /// per request: [`NormalizedUsage::from_usage`] over the provider's own
+    /// `usage` object, and [`PricingTable::cost`] over the resolved price row.
+    ///
+    /// Both halves come out of one [`ResponseMeta`], and that is the point: the
+    /// cost a caller stamps on the response and the row written here cannot
+    /// disagree, because they are the same numbers read twice.
+    ///
+    /// A provider that reports no usage is recorded as a zero-token row, not
+    /// skipped: the request *was* served, and a gap would read downstream as "no
+    /// request happened" rather than "no measurement".
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TokenError::Sqlite`] on a write failure.
+    pub fn record_response(
+        &self,
+        key_id: &str,
+        provider: &str,
+        model: &str,
+        upstream_usage: &serde_json::Value,
+        created_at: i64,
+        prices: &PricingTable,
+    ) -> Result<ResponseMeta, TokenError> {
+        let meta = ResponseMeta::from_upstream(prices, provider, model, upstream_usage);
+        self.record(&Entry { key_id, provider, model, usage: meta.usage(), cost: meta.cost(), created_at })?;
+        Ok(meta)
     }
 
     /// Records many completions in one transaction against one prepared
@@ -494,9 +528,10 @@ fn has_column(conn: &Connection, column: &str) -> Result<bool, TokenError> {
 #[cfg(test)]
 mod tests {
     use super::{Cap, CostReport, DenyReason, Entry, Ledger, Verdict};
-    use crate::pricing::{Cost, PricingTable, Usd};
+    use crate::pricing::{Cost, Prices, PricingTable, Usd};
     use crate::usage::NormalizedUsage;
     use rusqlite::Connection;
+    use serde_json::json;
 
     fn entry<'a>(key_id: &'a str, provider: &'a str, model: &'a str, tokens: u32) -> Entry<'a> {
         Entry {
@@ -513,6 +548,16 @@ mod tests {
         let mut t = PricingTable::default();
         t.set_flat_rate("claude");
         t
+    }
+
+    fn priced_table() -> PricingTable {
+        let mut t = PricingTable::default();
+        t.set("openai", "gpt-4o", Prices { input_micros_per_mtok: 2_500_000, output_micros_per_mtok: 10_000_000 });
+        t
+    }
+
+    fn upstream_usage() -> serde_json::Value {
+        json!({ "prompt_tokens": 1_000_000, "completion_tokens": 1_000_000 })
     }
 
     #[test]
@@ -640,6 +685,67 @@ mod tests {
         let cap = ledger.cap("k1").expect("cap").expect("a row");
         assert_eq!((cap.usd_micros, cap.tokens, cap.refuse_unpriced), (Some(5_000), Some(900), false));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn records_the_usage_a_response_reported() {
+        let ledger = Ledger::open_in_memory().expect("open");
+        ledger.record_response("k1", "openai", "gpt-4o", &upstream_usage(), 1_700_000_000, &priced_table()).expect("record");
+        assert_eq!(ledger.spend("k1").expect("spend").tokens, 2_000_000);
+    }
+
+    #[test]
+    fn normalizes_the_prompt_count_when_the_provider_splits_its_cache_counters() {
+        // The Anthropic shape: `input_tokens` is the *non-cached* portion, so the
+        // row has to carry the sum or a flat-rate provider's token cap is fed a
+        // number half the real one.
+        let ledger = Ledger::open_in_memory().expect("open");
+        let usage = json!({ "input_tokens": 10, "cache_read_input_tokens": 4, "cache_creation_input_tokens": 1, "output_tokens": 2 });
+        let meta = ledger.record_response("k1", "anthropic", "claude-sonnet-4", &usage, 1_700_000_000, &priced_table()).expect("record");
+        assert_eq!(meta.tokens_in(), 15);
+        assert_eq!(ledger.spend("k1").expect("spend").tokens, 17);
+    }
+
+    #[test]
+    fn answers_with_the_same_cost_it_stored() {
+        // The contract the response headers lean on: the returned meta and the
+        // persisted row are one computation read twice, never two that can drift.
+        let ledger = Ledger::open_in_memory().expect("open");
+        let meta = ledger.record_response("k1", "openai", "gpt-4o", &upstream_usage(), 1_700_000_000, &priced_table()).expect("record");
+        assert_eq!(meta.cost().usd.micros, ledger.report(1).expect("report").rows[0].cost_usd.micros);
+    }
+
+    #[test]
+    fn records_a_zero_row_when_the_provider_reported_no_usage() {
+        // A served request with no measurement is still a served request; a gap
+        // would read downstream as "no request happened".
+        let ledger = Ledger::open_in_memory().expect("open");
+        let meta = ledger.record_response("k1", "openai", "gpt-4o", &json!({}), 1_700_000_000, &priced_table()).expect("record");
+        assert_eq!(meta.usage(), NormalizedUsage::new(0, 0));
+        assert_eq!(ledger.report(1).expect("report").rows.len(), 1);
+    }
+
+    #[test]
+    fn records_a_flat_rate_response_as_priced_zero() {
+        let ledger = Ledger::open_in_memory().expect("open");
+        let meta = ledger.record_response("k1", "claude", "claude-sonnet-4", &upstream_usage(), 1_700_000_000, &flat_rate_table()).expect("record");
+        assert_eq!(meta.cost(), Cost { usd: Usd::ZERO, priced: true });
+    }
+
+    #[test]
+    fn records_an_unpriced_model_as_unpriced_rather_than_free() {
+        let ledger = Ledger::open_in_memory().expect("open");
+        let meta = ledger.record_response("k1", "openai", "no-such-model", &upstream_usage(), 1_700_000_000, &priced_table()).expect("record");
+        assert_eq!(meta.cost(), Cost::UNPRICED);
+    }
+
+    #[test]
+    fn records_every_response_of_a_session_separately() {
+        let ledger = Ledger::open_in_memory().expect("open");
+        for _ in 0..3 {
+            ledger.record_response("k1", "openai", "gpt-4o", &upstream_usage(), 1_700_000_000, &priced_table()).expect("record");
+        }
+        assert_eq!(ledger.report(10).expect("report").rows.len(), 3);
     }
 
     #[test]

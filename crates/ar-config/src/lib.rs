@@ -18,7 +18,7 @@
 
 #![deny(missing_docs)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -212,6 +212,8 @@ pub enum Strategy {
     ResetWindow,
     /// Most free fraction, discounted as a pool nears exhaustion.
     ResetAware,
+    /// Reset-aware score, load-weighted by live in-flight.
+    QuotaWeighted,
     /// Deficit-round-robin order by normalised weight.
     QuotaShareFair,
 
@@ -265,6 +267,7 @@ impl Strategy {
             "headroom" => Self::Headroom,
             "reset-window" => Self::ResetWindow,
             "reset-aware" => Self::ResetAware,
+            "quota-weighted" => Self::QuotaWeighted,
             "quota-share-fair" => Self::QuotaShareFair,
             "context-relay" => Self::ContextRelay,
             "context-optimized" => Self::ContextOptimized,
@@ -300,6 +303,7 @@ impl Strategy {
             Self::Headroom => "headroom",
             Self::ResetWindow => "reset-window",
             Self::ResetAware => "reset-aware",
+            Self::QuotaWeighted => "quota-weighted",
             Self::QuotaShareFair => "quota-share-fair",
             Self::ContextRelay => "context-relay",
             Self::ContextOptimized => "context-optimized",
@@ -364,8 +368,35 @@ pub struct ProviderCfg {
     pub key: String,
 }
 
-/// A named chain of `provider/model` targets plus the strategy that walks it.
+/// One `targets:` entry as written: a bare `provider/model` string, or the
+/// same string with a `weight:`.
+///
+/// The string form is every config written before this field existed, so it has
+/// to keep parsing byte for byte. The map form is the only way an operator can
+/// say "this one gets more than its share" — the reference carries a `weight`
+/// on every combo step (`src/lib/combos/steps.ts:13-56`) and this schema had no
+/// way to spell it.
+///
+/// `untagged` rather than a two-variant enum the caller matches on: there is
+/// nothing to match *on*, the two forms collapse into the same `TargetLoad`
+/// either way, and an untagged enum is the only spelling serde_yaml accepts for
+/// "either a string or this map".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum TargetEntry {
+    /// `openai/gpt-5.4` — no opinion about share.
+    Bare(String),
+    /// `{ target: openai/gpt-5.4, weight: 3 }`.
+    Weighted {
+        /// The `provider/model` target string.
+        target: String,
+        /// `Strategy::Weighted` share for this target.
+        weight: u32,
+    },
+}
+
+/// A named chain of `provider/model` targets plus the strategy that walks it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Combo {
     /// Combo id; the `model` a client asks for resolves to this.
     pub id: String,
@@ -373,6 +404,17 @@ pub struct Combo {
     pub strategy: Strategy,
     /// `provider/model` targets, in strategy order.
     pub targets: Vec<String>,
+    /// Explicit `weight:` per target string, from the map form of a
+    /// `targets:` entry.
+    ///
+    /// Keyed by the target string rather than held in a parallel vector: a combo
+    /// that names one `provider/model` twice is already a no-op duplicate, so
+    /// the two entries could not meaningfully carry different shares, and a map
+    /// cannot drift out of step with [`Self::targets`] the way a second vector
+    /// would. Absent entry = the target said nothing, which is every config
+    /// written before this field existed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub weights: BTreeMap<String, u32>,
     /// `provider/model` candidates that feed failover but never win the pick.
     ///
     /// The bench, not a second routing table: entries are appended *after* the
@@ -392,6 +434,63 @@ pub struct Combo {
     /// `x-ar-compression` header still wins over it.
     #[serde(default)]
     pub compression: Option<Compression>,
+}
+
+impl<'de> Deserialize<'de> for Combo {
+    /// Reads the string-or-map `targets:` form, then folds the map entries'
+    /// weights into [`Combo::weights`].
+    ///
+    /// Hand-written because the weight lives in a *sibling* field, and serde has
+    /// no way to let a field deserializer populate another one. The wire struct
+    /// carries both spellings of the weight so a config round-trips: a bare
+    /// target on the way out, a `weights:` map beside it, and a target written
+    /// either way on the way back in.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            id: String,
+            strategy: Strategy,
+            targets: Vec<TargetEntry>,
+            #[serde(default)]
+            weights: BTreeMap<String, u32>,
+            #[serde(default)]
+            pool: Vec<String>,
+            #[serde(default)]
+            compression: Option<Compression>,
+        }
+
+        let wire = Wire::deserialize(d)?;
+        let mut weights = wire.weights;
+        let targets = wire
+            .targets
+            .into_iter()
+            .map(|entry| match entry {
+                TargetEntry::Bare(target) => target,
+                TargetEntry::Weighted { target, weight } => {
+                    weights.entry(target.clone()).or_insert(weight);
+                    target
+                }
+            })
+            .collect();
+        Ok(Self { id: wire.id, strategy: wire.strategy, targets, weights, pool: wire.pool, compression: wire.compression })
+    }
+}
+
+impl Combo {
+    /// The `Strategy::Weighted` share declared for `target`, or `1` when the
+    /// config named none.
+    ///
+    /// `1` is what every target used to get, so an unweighted config draws
+    /// exactly as it did before: a uniform share is uniform whatever constant it
+    /// is, and `ar-server` used to synthesise a per-combo index for exactly this
+    /// field, which cancelled in the roulette wheel and did nothing else.
+    /// Clamped to `1` because `Candidate::with_weight` treats `0` as `1` anyway;
+    /// doing it here means the number a caller reads back is the number that
+    /// routes.
+    #[must_use]
+    pub fn weight_of(&self, target: &str) -> u32 {
+        self.weights.get(target).copied().unwrap_or(1).max(1)
+    }
 }
 
 /// A combo's `compression:` block: which engine, and how hard.
@@ -748,16 +847,21 @@ impl Config {
                     url: url.clone(),
                 });
             }
-            for (field, url) in
-                [("device_auth_url", &s.device_auth_url), ("device_poll_url", &s.device_poll_url)]
-            {
+            for (field, url, may_placeholder) in [
+                ("device_auth_url", &s.device_auth_url, false),
+                ("device_poll_url", &s.device_poll_url, true),
+            ] {
                 if let Some(url) = url
-                    && !http_url_ok(url)
+                    && (!http_url_ok(url) || !device_code_placeholder_ok(url, may_placeholder))
                 {
                     return Err(ConfigError::BadOAuthUrl {
                         provider: s.provider.clone(),
                         field,
-                        expectation: "an http(s) URL with no whitespace",
+                        expectation: if may_placeholder {
+                            "an http(s) URL with no whitespace, whose only brace group is {code}"
+                        } else {
+                            "an http(s) URL with no whitespace"
+                        },
                         url: url.clone(),
                     });
                 }
@@ -834,6 +938,38 @@ impl Config {
     pub fn declares(&self, id: &str) -> bool {
         self.providers.iter().any(|p| p.id == id) || self.custom_providers.iter().any(|c| c.id == id)
     }
+}
+
+/// The device-code placeholder a `device_poll_url` may carry: `{code}`.
+const DEVICE_POLL_CODE_PLACEHOLDER: &str = "{code}";
+
+/// Whether `url`'s only brace group is [`DEVICE_POLL_CODE_PLACEHOLDER`], or it has none.
+///
+/// Some providers address a device grant by path (`/poll/{code}`) rather than by
+/// body parameter, and which of the two a given provider does is not derivable
+/// from its provider id without inventing a wire format — so the substitution is
+/// declared here, in the file an operator already edits, and performed by the
+/// executor. That makes the typo worth catching at load: a misspelled group would
+/// otherwise be polled verbatim for the whole timeout, and the login would report
+/// "expired" rather than naming what was wrong with the config.
+///
+/// `may_placeholder` is false for `device_auth_url`, which is asked *before* any
+/// device code exists — there is nothing there to substitute, so a `{code}` there
+/// is a configuration mistake rather than a template.
+fn device_code_placeholder_ok(url: &str, may_placeholder: bool) -> bool {
+    let mut rest = url;
+    let mut seen = false;
+    while let Some(open) = rest.find('{') {
+        let Some(close) = rest[open..].find('}') else {
+            return false;
+        };
+        if &rest[open..open + close + 1] != DEVICE_POLL_CODE_PLACEHOLDER {
+            return false;
+        }
+        seen = true;
+        rest = &rest[open + close + 1..];
+    }
+    !rest.contains('}') && (may_placeholder || !seen)
 }
 
 /// Whether `url` is an `http`/`https` URL with a non-empty authority and no
@@ -1093,11 +1229,11 @@ combos:
 
     /// Every name `ar-route::Strategy::parse` claims, so a rename there fails
     /// here instead of silently routing under [`Strategy::Deferred`].
-    const ROUTE_STRATEGIES: [&str; 19] = [
+    const ROUTE_STRATEGIES: [&str; 20] = [
         "priority", "round-robin", "cost-optimized", "lkgp", "weighted", "fill-first", "p2c",
         "least-used", "random", "strict-random", "headroom", "reset-window", "reset-aware",
-        "quota-share-fair", "context-relay", "context-optimized", "cache-optimized", "fusion",
-        "pipeline",
+        "quota-weighted", "quota-share-fair", "context-relay", "context-optimized",
+        "cache-optimized", "fusion", "pipeline",
     ];
 
     #[test]
@@ -1105,7 +1241,7 @@ combos:
         for name in ROUTE_STRATEGIES {
             assert!(Strategy::parse(name).is_routable(), "{name}");
         }
-        assert_eq!(ROUTE_STRATEGIES.len(), 19);
+        assert_eq!(ROUTE_STRATEGIES.len(), 20);
     }
 
     #[test]
@@ -1149,6 +1285,72 @@ combos:
         let yaml = "keys:\n  k: v\ncombos:\n  - id: c\n    strategy: quota-share-fair\n    targets: [openai/gpt-5.4]\n";
         let cfg = Config::parse(yaml, |_| Ok(Some("v".to_owned()))).unwrap();
         assert_eq!(cfg.combos[0].strategy, Strategy::QuotaShareFair);
+    }
+
+    #[test]
+    fn loads_quota_weighted_as_its_own_strategy_rather_than_degrading() {
+        // The regression this pins: `ar-route` has carried `quota-weighted` since
+        // it landed and this table did not, so a config naming it parsed fine and
+        // then answered every request with a 501 that said "deferred" — the
+        // operator's own spelling treated as a typo.
+        let yaml = "keys:\n  k: v\ncombos:\n  - id: c\n    strategy: quota-weighted\n    targets: [openai/gpt-5.4]\n";
+        let cfg = Config::parse(yaml, stub_lookup).expect("quota-weighted is a strategy this build has");
+        assert_eq!(cfg.combos[0].strategy, Strategy::QuotaWeighted);
+        assert!(cfg.combos[0].strategy.is_routable());
+        assert_eq!(cfg.combos[0].strategy.as_str(), "quota-weighted");
+    }
+
+    #[test]
+    fn keeps_a_bare_string_target_list_exactly_as_written() {
+        // Every config written before the map form existed. No weight is
+        // invented for any of them, and the strings come back byte for byte.
+        let yaml = "keys:\n  k: v\ncombos:\n  - id: c\n    strategy: weighted\n    targets: [openai/gpt-5.4, groq/llama-3.3-70b]\n";
+        let cfg = Config::parse(yaml, stub_lookup).unwrap();
+        let combo = &cfg.combos[0];
+        assert_eq!(combo.targets, ["openai/gpt-5.4", "groq/llama-3.3-70b"]);
+        assert!(combo.weights.is_empty(), "a bare list declares no weights");
+        for target in &combo.targets {
+            assert_eq!(combo.weight_of(target), 1, "{target} keeps the default share");
+        }
+    }
+
+    #[test]
+    fn reads_a_weight_off_the_map_form_of_a_target() {
+        let yaml = concat!(
+            "keys:\n  k: v\ncombos:\n  - id: c\n    strategy: weighted\n    targets:\n",
+            "      - openai/gpt-5.4\n      - { target: groq/llama-3.3-70b, weight: 7 }\n",
+        );
+        let cfg = Config::parse(yaml, stub_lookup).unwrap();
+        let combo = &cfg.combos[0];
+        assert_eq!(combo.targets, ["openai/gpt-5.4", "groq/llama-3.3-70b"]);
+        assert_eq!(combo.weight_of("groq/llama-3.3-70b"), 7);
+        assert_eq!(combo.weight_of("openai/gpt-5.4"), 1, "the bare one declared nothing");
+    }
+
+    #[test]
+    fn round_trips_a_declared_target_weight_through_serialisation() {
+        // The map form is a schema, not a one-way import: serialising a combo
+        // that named a weight and reading it back must not lose it.
+        let yaml = concat!(
+            "keys:\n  k: v\ncombos:\n  - id: c\n    strategy: weighted\n    targets:\n",
+            "      - { target: groq/llama-3.3-70b, weight: 4 }\n",
+        );
+        let cfg = Config::parse(yaml, stub_lookup).unwrap();
+        let out = serde_yaml::to_string(&cfg).expect("serialises");
+        let back = Config::parse(&out, stub_lookup).expect("and reads back");
+        assert_eq!(back.combos[0].weight_of("groq/llama-3.3-70b"), 4);
+    }
+
+    #[test]
+    fn clamps_a_zero_weight_to_the_share_the_router_would_see() {
+        // `Candidate::with_weight` already treats 0 as 1; doing it here means the
+        // number an operator reads back is the number that routes.
+        let yaml = concat!(
+            "keys:\n  k: v\ncombos:\n  - id: c\n    strategy: weighted\n    targets:\n",
+            "      - { target: groq/llama-3.3-70b, weight: 0 }\n",
+        );
+        let cfg = Config::parse(yaml, stub_lookup).unwrap();
+        assert_eq!(cfg.combos[0].weight_of("groq/llama-3.3-70b"), 1);
     }
 
     const OAUTH_YAML: &str = concat!(
@@ -1551,6 +1753,69 @@ combos:
             "    device_poll_url: https://auth.example.invalid/poll\n",
         );
         let err = Config::parse(yaml, stub_lookup).expect_err("an endpoint is never inferred");
+        assert!(err.to_string().contains("device_auth_url"), "{err}");
+    }
+
+    /// A device block with `poll` as the poll URL, so a templating test varies one
+    /// field rather than four.
+    fn device_yaml(poll_url: &str) -> String {
+        format!(
+            concat!(
+                "keys:\n  grok: $G\n",
+                "providers:\n  - id: grok-cli\n    key: grok\n",
+                "oauth:\n  - provider: grok-cli\n",
+                "    device_auth_url: https://auth.example.invalid/codes\n",
+                "    device_poll_url: {poll_url}\n",
+            ),
+            poll_url = poll_url
+        )
+    }
+
+    #[test]
+    fn loads_a_device_poll_url_carrying_the_code_placeholder() {
+        // A provider that addresses the grant by path cannot be expressed by a flat
+        // poll URL, so the placeholder has to be accepted rather than read as a
+        // malformed URL — the request it builds is the operator's declaration.
+        let cfg = Config::parse(&device_yaml("https://auth.example.invalid/poll/{code}"), stub_lookup)
+            .expect("a templated poll URL is a declared endpoint");
+        assert_eq!(
+            cfg.oauth_for("grok-cli").expect("declared").device_poll_url.as_deref(),
+            Some("https://auth.example.invalid/poll/{code}"),
+            "the placeholder is carried through verbatim for the executor to substitute"
+        );
+    }
+
+    #[test]
+    fn refuses_a_poll_url_whose_brace_group_is_not_the_code_placeholder() {
+        // A typo would otherwise be polled verbatim for the grant's whole lifetime,
+        // and the login would report an expiry instead of naming the bad config.
+        for bad in [
+            "https://auth.example.invalid/poll/{}",
+            "https://auth.example.invalid/poll/{codes}",
+            "https://auth.example.invalid/poll/{code",
+            "https://auth.example.invalid/{code}/poll}",
+        ] {
+            let err = Config::parse(&device_yaml(bad), stub_lookup)
+                .expect_err("a placeholder the executor cannot substitute is refused at load");
+            assert!(
+                err.to_string().contains("device_poll_url"),
+                "{bad} should name the offending field, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_a_code_placeholder_in_the_device_auth_url() {
+        // The initiate request is made before any device code exists, so there is
+        // nothing to substitute there.
+        let yaml = concat!(
+            "keys:\n  grok: $G\n",
+            "providers:\n  - id: grok-cli\n    key: grok\n",
+            "oauth:\n  - provider: grok-cli\n",
+            "    device_auth_url: https://auth.example.invalid/codes/{code}\n",
+            "    device_poll_url: https://auth.example.invalid/poll\n",
+        );
+        let err = Config::parse(yaml, stub_lookup).expect_err("there is no device code yet to place there");
         assert!(err.to_string().contains("device_auth_url"), "{err}");
     }
 }

@@ -48,7 +48,8 @@ pub enum DiscoveryError {
 /// unpriced last by design (README) and reads no capability field, so storing
 /// them here would be RAM spent on nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-pub struct Discovered {    /// Upstream API root, when the provider published one.
+pub struct Discovered {
+    /// Upstream API root, when the provider published one.
     #[serde(default)]
     pub base_url: Option<String>,
     /// First documented environment variable holding the credential.
@@ -142,7 +143,9 @@ impl LiveCatalog {
     /// An empty cache is always stale: there is nothing to serve, so there is
     /// nothing to gain by waiting.
     pub fn is_stale(&self, now: u64, ttl_secs: u64) -> bool {
-        self.lock().fetched_at.is_none_or(|at| now.saturating_sub(at) >= ttl_secs)
+        self.lock()
+            .fetched_at
+            .is_none_or(|at| now.saturating_sub(at) >= ttl_secs)
     }
 
     /// Fetches and installs a new catalog, returning the provider count.
@@ -207,9 +210,15 @@ mod tests {
             vec![Strng::from("gpt-4o"), Strng::from("gpt-4o-mini")],
             "BTreeMap keys come out sorted, so the model list is deterministic"
         );
-        assert_eq!(c.catalog()["openai"].base_url.as_deref(), Some("https://api.openai.com/v1"));
+        assert_eq!(
+            c.catalog()["openai"].base_url.as_deref(),
+            Some("https://api.openai.com/v1")
+        );
         assert!(!c.is_stale(100, 3600));
-        assert!(c.is_stale(100 + 3600, 3600), "the ttl is a boundary, not a suggestion");
+        assert!(
+            c.is_stale(100 + 3600, 3600),
+            "the ttl is a boundary, not a suggestion"
+        );
     }
 
     #[test]
@@ -222,13 +231,28 @@ mod tests {
         c.refresh(100, || Ok(UPSTREAM.to_owned())).unwrap();
         let before = c.catalog();
 
-        let err = c.refresh(200, || Err(DiscoveryError::Fetch("dns".into()))).unwrap_err();
+        let err = c
+            .refresh(200, || Err(DiscoveryError::Fetch("dns".into())))
+            .unwrap_err();
         assert!(err.to_string().contains("dns"), "{err}");
-        assert_eq!(c.catalog(), before, "a failed refresh must not empty the catalog");
-        assert!(c.body().is_some(), "the body that backs the catalog is kept too");
+        assert_eq!(
+            c.catalog(),
+            before,
+            "a failed refresh must not empty the catalog"
+        );
+        assert!(
+            c.body().is_some(),
+            "the body that backs the catalog is kept too"
+        );
         assert_eq!(c.lock().refreshes, 2);
-        assert!(!c.is_stale(200, 3600), "100s old is inside a 1h ttl, so it is still served as current");
-        assert!(c.is_stale(100 + 3600, 3600), "and past the ttl it is served only as stale");
+        assert!(
+            !c.is_stale(200, 3600),
+            "100s old is inside a 1h ttl, so it is still served as current"
+        );
+        assert!(
+            c.is_stale(100 + 3600, 3600),
+            "and past the ttl it is served only as stale"
+        );
         assert!(c.last_error().unwrap().contains("dns"));
     }
 }

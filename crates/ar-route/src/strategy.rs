@@ -16,7 +16,7 @@
 //! [`crate::auto_variant_for_model`] is the pure helper a server stream calls to
 //! learn whether a requested model is an `auto` alias.
 //!
-//! # Four port decisions that are not the obvious ones
+//! # Five port decisions that are not the obvious ones
 //!
 //! **No clock.** The reference ranks quota strategies on `resetAt - now` and
 //! takes one `now` snapshot per ranking (`quotaScoring.ts`, the `#9330` fix).
@@ -34,6 +34,17 @@
 //! dependency, and a sequence that is a pure function of its seed across
 //! versions — which is what makes these testable without a flaky seed.
 //!
+//! **The load-shaped pair reads a per-target ledger.** `p2c` scored on
+//! in-flight alone and `least-used` ranked on in-flight alone, so both were
+//! really the same strategy with a random draw in front, and neither could see
+//! anything the sixteen-factor scorer already knew. [`TargetLoads`] holds the
+//! cumulative served count and the [`Factors::load_signals`] pair per
+//! `provider:model` execution key — the `#7015` keying shape, minus the account
+//! half this crate's [`Candidate`] has no field for. It is process-wide rather
+//! than a parameter because [`pick`]'s signature belongs to callers outside this
+//! crate; that is also the shape upstream gets from its module-level
+//! `getComboMetrics`.
+//!
 //! **The panel-shaped pair is not a comparator.** `fusion` fans out and
 //! `pipeline` chains stages, so neither is "rank the list, return the head".
 //! [`pick`] still returns a provider for both — the panel leader and the
@@ -50,14 +61,17 @@
 //! deferred table names for it — the prefix pin — and that is
 //! [`Strategy::ContextRelay`].
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use ar_cache::affinity::{AffinityKey, AffinityTarget};
 use bytes::Bytes;
 use futures::StreamExt;
 use http::StatusCode;
 
-use crate::contract::{CanonicalRequest, Candidate, ExecError, Executor, ProviderId, Upstream};
+use crate::auto::Factors;
+use crate::contract::{CanonicalRequest, Candidate, ExecError, Executor, ProviderId, Strng, Upstream};
 use crate::error::RouteError;
 
 /// Model slot for the prefix-pin key when the caller supplied no model.
@@ -82,6 +96,171 @@ const EXHAUSTION_GUARD: f64 = 0.10;
 /// knowing the pool is empty would route every unmonitored provider away from.
 const NEUTRAL_SCORE: f64 = 0.5;
 
+/// `p2c`'s in-flight penalty ceiling — the reference's `breakerPenalty` value.
+///
+/// The reference subtracts a flat `0.25` when the breaker is `HALF_OPEN`. This
+/// crate has no breaker state on a [`Candidate`], so the term it subtracts is
+/// live load instead, and it is applied *saturating*
+/// (`ceiling * n / (1 + n)`, so it approaches `ceiling` and never crosses it)
+/// rather than linearly. A linear term would let one busy target's own penalty
+/// run away and decide the comparison on its own, which is the failure mode the
+/// bounded reference term exists to prevent.
+const P2C_LOAD_PENALTY: f64 = 0.25;
+
+/// `getP2CTargetScore`'s score for a target nothing has been observed about.
+///
+/// The reference reads `0.5` and `0.25` here and this crate keeps both numbers,
+/// so an unobserved target sits *between* a target observed failing everything
+/// and a target observed perfect — the honest "we have not watched this one"
+/// position. Zeroing them instead would make "never seen" indistinguishable
+/// from "seen and always broken", and an unmeasured provider would be routed
+/// away from on the strength of a silence.
+const P2C_NEUTRAL_RELIABILITY: f64 = 0.5;
+const P2C_NEUTRAL_LATENCY: f64 = 0.25;
+
+/// One target's observed load and health, as `p2c` and `least-used` rank it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TargetLoad {
+    /// Requests this router has handed to the target, cumulatively.
+    ///
+    /// The `least-used` primary key, and the counter that makes the strategy
+    /// *least-used* rather than *least-busy*.
+    pub served: u64,
+    /// Observed success share in `0.0..=1.0`, or `None` when never observed.
+    pub reliability: Option<f64>,
+    /// Observed inverse latency in `0.0..=1.0`, or `None` when never observed.
+    pub latency_inv: Option<f64>,
+}
+
+impl TargetLoad {
+    /// What a target nothing is known about scores.
+    fn unknown() -> Self {
+        Self { served: 0, reliability: None, latency_inv: None }
+    }
+
+    /// `p2c`'s score for this target under `in_flight` units of live load:
+    /// success and inverse latency add, load subtracts. Higher wins.
+    ///
+    /// Mirrors `getP2CTargetScore`'s additive-success-plus-latency-minus-a-
+    /// penalty shape, with the bounded penalty documented on
+    /// [`P2C_LOAD_PENALTY`]. No clock is read: `in_flight` is a count the
+    /// caller supplies and the two factors are already-computed `f64`s, so the
+    /// same pool and the same counts always score the same way.
+    fn p2c_score(&self, in_flight: u32) -> f64 {
+        let success = self.reliability.unwrap_or(P2C_NEUTRAL_RELIABILITY);
+        let latency = self.latency_inv.unwrap_or(P2C_NEUTRAL_LATENCY);
+        let load = f64::from(in_flight);
+        success + latency - P2C_LOAD_PENALTY * load / (1.0 + load)
+    }
+}
+
+/// What one target has been observed to do, keyed `provider:model`.
+///
+/// The reference keys per-target usage on `executionKey` — provider, model
+/// *and* account — precisely so a combo that repeats one model across distinct
+/// accounts spreads its load per account instead of collapsing into the shared
+/// model bucket and exhausting whichever account sorts first (#7015). This
+/// crate routes by provider rather than by connection, so the account half of
+/// that key does not exist and `provider:model` is the finest identity a
+/// [`Candidate`] carries. It is the same execution key
+/// [`affinity_target`] builds, so one string serves both.
+fn execution_key(c: &Candidate) -> String {
+    format!("{}/{}", c.provider.as_str(), c.model)
+}
+
+/// Per-target load and health, shared by `p2c` and `least-used`.
+///
+/// Two signals this crate had nowhere to put, on one key, in one table: the
+/// cumulative served count `least-used` was missing, and the reliability and
+/// latency factors `p2c` was missing. `pick`'s signature is fixed by the
+/// callers this crate cannot edit (`ar-server`'s `order`, `ar-mcp`, `ar-cli`), so
+/// the table is reached through a process-wide default rather than a parameter —
+/// the same shape the reference gets from its module-level
+/// `getComboMetrics(comboName)`, and the reason those metrics are per-combo
+/// there and per-target here.
+///
+/// `observe` is the write side. It is deliberately not called from `score_pool`:
+/// `simulate_route` and `explain_route` are *dry runs*, and a dry run that
+/// published live routing state would make a simulation change the routing it
+/// was describing. A caller that holds real telemetry calls it.
+///
+/// `ponytail:` one process-wide `Mutex<HashMap>`, one key per
+/// `provider:model` ever routed — bounded by the config's target list, not by
+/// traffic, so it cannot grow without limit. A per-combo table (as upstream
+/// keys it) would multiply that by the combo count for no behavioural gain.
+/// Take it when a caller needs per-combo isolation. One `String` is built per
+/// key and handed to `Arc<str>` in place, so a served pick costs one allocation
+/// rather than two.
+#[derive(Debug, Default)]
+pub struct TargetLoads {
+    rows: Mutex<HashMap<Strng, TargetLoad>>,
+}
+
+impl TargetLoads {
+    /// An empty table.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records what is known about `target` from an already-scored factor set.
+    ///
+    /// Takes [`Factors`] rather than two loose `f64`s so the two numbers cannot
+    /// be transposed at the call site; [`Factors::load_signals`] is where the
+    /// pair is named.
+    ///
+    /// `allow(dead_code)`: the producer is the server's telemetry path, which
+    /// reads outcome and latency data this crate never sees and lives in files
+    /// outside the change this landed in. Until it calls in, `p2c` reads the
+    /// documented neutral pair and degrades to the load term it always had —
+    /// the same contract every unpopulated optional signal in [`Candidate`]
+    /// carries.
+    #[allow(dead_code, reason = "write path for the caller's telemetry; no producer in-crate yet")]
+    pub fn observe(&self, target: &Candidate, factors: &Factors) {
+        let (reliability, latency_inv) = factors.load_signals();
+        if let Ok(mut rows) = self.rows.lock() {
+            let row = rows.entry(Strng::from(execution_key(target))).or_insert(TargetLoad::unknown());
+            row.reliability = Some(reliability);
+            row.latency_inv = Some(latency_inv);
+        }
+    }
+
+    /// Records that this router has served one request on `target`.
+    pub fn serve(&self, target: &Candidate) {
+        if let Ok(mut rows) = self.rows.lock() {
+            let row = rows.entry(Strng::from(execution_key(target))).or_insert(TargetLoad::unknown());
+            row.served = row.served.saturating_add(1);
+        }
+    }
+
+    /// What is known about `target`; [`TargetLoad::unknown`] when nothing is.
+    ///
+    /// The `is_empty` guard is what keeps the common case allocation-free:
+    /// naming a target costs a `String` for the key, and a proxy nobody has
+    /// published observations for must not pay that once per candidate per
+    /// request.
+    #[must_use]
+    pub fn load(&self, target: &Candidate) -> TargetLoad {
+        let Ok(rows) = self.rows.lock() else {
+            // A poisoned table costs two strategies their second signal, not
+            // correctness: every candidate reads as unobserved, which is the
+            // documented fallback. Skip rather than panic a live request.
+            return TargetLoad::unknown();
+        };
+        if rows.is_empty() {
+            return TargetLoad::unknown();
+        }
+        rows.get(execution_key(target).as_str()).copied().unwrap_or_else(TargetLoad::unknown)
+    }
+
+    /// The table [`by_p2c`] and [`by_least_used`] read.
+    #[must_use]
+    pub fn global() -> &'static Self {
+        static LOADS: OnceLock<TargetLoads> = OnceLock::new();
+        LOADS.get_or_init(TargetLoads::new)
+    }
+}
+
 /// The full strategy set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Strategy {
@@ -102,10 +281,16 @@ pub enum Strategy {
     /// Keep the incoming order and let the attempt loop drain the head. An
     /// identity comparator in the reference too, and for the same reason.
     FillFirst,
-    /// Power of two choices: draw two distinct, take the quieter. Beats uniform
-    /// random on tail latency for the same cost, which is why both exist.
+    /// Power of two choices: draw two distinct, take the healthier one. Beats
+    /// uniform random on tail latency for the same cost, which is why both
+    /// exist. "Healthier" is [`TargetLoad::p2c_score`]: success rate and inverse
+    /// latency add, live load subtracts, and an unobserved target sits at the
+    /// reference's neutral so the draw degrades to a load comparison.
     P2c,
-    /// Fewest requests served wins, stable on ties.
+    /// Fewest requests served wins, then fewest in flight, then `rank`. The
+    /// first key is cumulative and keyed per target, so a combo listing one
+    /// model across several providers spreads across providers instead of
+    /// draining whichever it started on (#7015).
     LeastUsed,
     /// Uniform draw.
     Random,
@@ -399,6 +584,14 @@ fn route(
         Strategy::Deferred(_) => return Err(RouteError::DeferredStrategy(strategy)),
     };
 
+    // The served counter is `least-used`'s own accounting, so only `least-used`
+    // writes it. Counting every strategy's picks here instead would make one
+    // strategy's ranking depend on how much traffic an unrelated one had drawn,
+    // and would let a combo flip between two schedulers and lose its history.
+    if strategy == Strategy::LeastUsed {
+        TargetLoads::global().serve(winner);
+    }
+
     Ok(winner.provider.clone())
 }
 
@@ -488,15 +681,25 @@ fn by_weight<'a>(candidates: &'a [Candidate], rr: &AtomicU64) -> &'a Candidate {
     &candidates[0]
 }
 
-/// `p2c`: draw two distinct, take the quieter.
+/// `p2c`: draw two distinct, take the healthier one.
 ///
 /// The two indices are built the reference's way — `r1 % n` and `r2 % (n-1)`
 /// shifted past the first — so the pair is not uniform over unordered pairs.
 /// Reproducing that is the point: a "cleaner" `(r1 % n, r2 % n)` would be a
 /// different distribution, and this table exists to be comparable against the
-/// thing it ports. The reference scores on success-rate and latency; this crate
-/// carries no per-model metrics, so the score is live in-flight load, which is
-/// the signal those two proxy for.
+/// thing it ports.
+///
+/// The *score* is the reference's too (`getP2CTargetScore`): success rate and
+/// inverse latency add, a penalty subtracts, and the higher score wins. What
+/// the two signals read is [`TargetLoad`] — the same two factors
+/// [`Factors::load_signals`] names out of the sixteen, so the draw ranks on
+/// health rather than on queue depth alone. The tiebreak stays the reference's:
+/// `score(second) > score(first)`, so an exact tie keeps the *first* draw.
+///
+/// With nothing observed, both draws score the neutral pair and the comparison
+/// collapses to the load term, which is what this function did before the
+/// ledger existed — a strategy that has never been told about a provider
+/// degrades to the signal it always had rather than to an error.
 fn by_p2c<'a>(candidates: &'a [Candidate], rr: &AtomicU64) -> &'a Candidate {
     let n = candidates.len() as u64;
     if n < 2 {
@@ -509,17 +712,32 @@ fn by_p2c<'a>(candidates: &'a [Candidate], rr: &AtomicU64) -> &'a Candidate {
         second += 1;
     }
     let (a, b) = (&candidates[first], &candidates[second]);
-    // The reference's score is "higher is better"; in-flight load is the
-    // opposite polarity, so the comparison is `<`, and strict so a tie keeps
-    // the *first* draw exactly as `score(second) > score(first)` does upstream.
-    if b.in_flight < a.in_flight { b } else { a }
+    let loads = TargetLoads::global();
+    let score = |c: &'a Candidate| loads.load(c).p2c_score(c.in_flight);
+    // Strict `>`, so a tie keeps `a` — the reference's `score(second) >
+    // score(first) ? secondIndex : firstIndex` spelled the same way round.
+    if score(b) > score(a) { b } else { a }
 }
 
-/// `least-used`: fewest requests served, stable on ties.
+/// `least-used`: fewest requests served, then fewest in flight, then `rank`.
+///
+/// The first key is cumulative, which is the whole point of the variant and was
+/// this function's gap: it ranked on `in_flight` alone, so a target that had
+/// just drained looked identical to one that had never been used, and the combo
+/// kept handing work back to whichever account it had already spent. Keyed on
+/// the execution identity ([`execution_key`]) so a combo that lists one model
+/// across several providers still spreads per target rather than per model
+/// (#7015).
+///
+/// In-flight survives as the second key for the case the cumulative count cannot
+/// see: two targets that have served equally and one is mid-burst right now.
+/// `rank` is last, unchanged, so a config with no telemetry at all ranks exactly
+/// as it did before.
 fn by_least_used<'a>(candidates: &'a [Candidate], first: &'a Candidate) -> &'a Candidate {
+    let loads = TargetLoads::global();
     candidates
         .iter()
-        .min_by_key(|c| (c.in_flight, c.rank))
+        .min_by_key(|c| (loads.load(c).served, c.in_flight, c.rank))
         .unwrap_or(first)
 }
 
@@ -1330,8 +1548,8 @@ mod tests {
     use http::StatusCode;
 
     use super::{
-        MODEL_SCOPE, Strategy, affinity_key, dispatch_fusion, dispatch_pipeline, pick,
-        pick_filtered, pick_for_model, reset_aware_score, splitmix,
+        Factors, MODEL_SCOPE, Strategy, TargetLoad, TargetLoads, affinity_key, dispatch_fusion,
+        dispatch_pipeline, pick, pick_filtered, pick_for_model, reset_aware_score, splitmix,
     };
     use crate::contract::{
         CanonicalRequest, Candidate, ExecError, Executor, ProviderId, QuotaWindow, Upstream,
@@ -1640,7 +1858,9 @@ mod tests {
     #[test]
     fn takes_the_quieter_of_two_draws_when_p2c() {
         // The idle provider wins the comparison in every seeded pair, so this
-        // pins the rule rather than the draw.
+        // pins the rule rather than the draw. With nothing observed both draws
+        // score the neutral pair, so the load term decides — the behaviour this
+        // function had before the ledger existed.
         let c = vec![
             Candidate::new("busy".into(), "m").with_in_flight(9).with_rank(0),
             Candidate::new("idle".into(), "m").with_in_flight(0).with_rank(1),
@@ -1649,6 +1869,80 @@ mod tests {
             .filter(|seed| routed_seeded(Strategy::P2c, &c, *seed) == "idle")
             .count();
         assert_eq!(idle, 200);
+    }
+
+    /// A factor set with every field healthy, so a test can override only the
+    /// two `p2c` reads. A local copy of `scoring`'s own test helper because
+    /// `Factors` deliberately has no `Default`: an all-zero factor set is not a
+    /// neutral one, and a `Default` would invite exactly that reading.
+    fn healthy(reliability: f64, latency_inv: f64) -> Factors {
+        Factors {
+            quota: 1.0,
+            health: 1.0,
+            cost_inv: 1.0,
+            latency_inv,
+            task_fit: 1.0,
+            stability: 1.0,
+            tier_priority: 1.0,
+            tier_affinity: 0.5,
+            specificity_match: 0.5,
+            context_affinity: 0.5,
+            cache_affinity: 0.0,
+            session_availability: 1.0,
+            reset_window_affinity: 0.5,
+            connection_density: 0.0,
+            quality: 0.5,
+            reliability,
+        }
+    }
+
+    #[test]
+    fn prefers_the_healthy_fast_draw_when_p2c() {
+        // The reference's own claim for `getP2CTargetScore`: a target that
+        // answers reliably and quickly beats a quieter one that does not, in
+        // every seeded pair, so the assertion is about the score and not the
+        // draw. The healthy one is the *busier* of the two — the case a
+        // load-only comparison gets backwards.
+        let c = vec![
+            Candidate::new("p2c-healthy".into(), "m").with_in_flight(4).with_rank(0),
+            Candidate::new("p2c-unknown".into(), "m").with_in_flight(0).with_rank(1),
+        ];
+        TargetLoads::global().observe(&c[0], &healthy(1.0, 1.0));
+        let wins = (0..200)
+            .filter(|seed| routed_seeded(Strategy::P2c, &c, *seed) == "p2c-healthy")
+            .count();
+        assert_eq!(wins, 200, "health must outrank the load term");
+    }
+
+    #[test]
+    fn reads_an_unobserved_target_above_one_observed_failing_when_p2c() {
+        // "Not measured" is not "measured and broken". The reference's own
+        // fallbacks are 0.5 and 0.25 for exactly this reason, and a scorer that
+        // zeroed them would route away from every provider it had not watched.
+        let c = vec![
+            Candidate::new("p2c-broken".into(), "m").with_in_flight(0).with_rank(0),
+            Candidate::new("p2c-silent".into(), "m").with_in_flight(0).with_rank(1),
+        ];
+        TargetLoads::global().observe(&c[0], &healthy(0.0, 0.0));
+        let wins = (0..200)
+            .filter(|seed| routed_seeded(Strategy::P2c, &c, *seed) == "p2c-silent")
+            .count();
+        assert_eq!(wins, 200);
+    }
+
+    #[test]
+    fn p2c_scoring_is_deterministic_for_a_fixed_draw() {
+        // No clock, no RNG beyond the draw itself: the same target and the same
+        // in-flight count always score the same, which is what lets the two
+        // tests above assert over 200 seeds instead of one.
+        let load = TargetLoad { served: 0, reliability: Some(0.8), latency_inv: Some(0.6) };
+        assert_eq!(load.p2c_score(3), load.p2c_score(3));
+        assert!(load.p2c_score(0) > load.p2c_score(9), "more load, lower score");
+        let failing = TargetLoad { served: 0, reliability: Some(0.0), latency_inv: Some(0.0) };
+        assert!(
+            TargetLoad::unknown().p2c_score(0) > failing.p2c_score(0),
+            "an unobserved target scores its neutral, not zero"
+        );
     }
 
     #[test]
@@ -1664,6 +1958,39 @@ mod tests {
             Candidate::new("idle".into(), "m").with_in_flight(0).with_rank(1),
         ];
         assert_eq!(routed(Strategy::LeastUsed, &c), "idle");
+    }
+
+    #[test]
+    fn ranks_by_cumulative_served_before_in_flight_when_least_used() {
+        // The #7015 shape. A long-busy account that has *drained* looks exactly
+        // like a fresh one on in-flight alone, so the combo kept handing work
+        // back to the account it had already spent; the cumulative count is
+        // what finally moves it.
+        let spent = Candidate::new("lu-spent".into(), "m").with_rank(0);
+        let fresh = Candidate::new("lu-fresh".into(), "m").with_rank(1);
+        let loads = TargetLoads::global();
+        for _ in 0..5 {
+            loads.serve(&spent);
+        }
+        assert_eq!(loads.load(&spent).served, 5);
+        assert_eq!(loads.load(&fresh).served, 0);
+        // Both are idle, so in-flight is a tie and only the served count can
+        // separate them.
+        assert_eq!(routed(Strategy::LeastUsed, &[spent, fresh]), "lu-fresh");
+    }
+
+    #[test]
+    fn spreads_picks_across_targets_when_least_used() {
+        // The counter has to actually accumulate, or the ordering above is a
+        // one-shot coincidence: two idle targets, four picks, both used.
+        let a = Candidate::new("lu-spread-a".into(), "m").with_rank(0);
+        let b = Candidate::new("lu-spread-b".into(), "m").with_rank(1);
+        let c = vec![a, b];
+        let mut winners = std::collections::BTreeSet::new();
+        for _ in 0..4 {
+            winners.insert(routed(Strategy::LeastUsed, &c));
+        }
+        assert_eq!(winners.len(), 2, "both targets were served: {winners:?}");
     }
 
     #[test]

@@ -15,12 +15,12 @@ use ar_config::{Combo, Config};
 use ar_keys::{CredentialStore, KeyError};
 use ar_registry::{Registry, global as registry};
 use ar_server::config::split_target_known;
-use clap::error::ErrorKind;
 use clap::CommandFactory;
+use clap::error::ErrorKind;
 
 use crate::cli::{Cli, Command, ConfigureArgs, ImportArgs, ListArgs};
-use crate::import::ImportFrom;
 use crate::import;
+use crate::import::ImportFrom;
 use crate::serve;
 use crate::toon;
 
@@ -96,7 +96,10 @@ pub const STORE_PATH_VAR: &str = "AR_CRED_STORE";
 /// the CWD is how two checkouts in different directories end up sharing
 /// credentials without either saying so.
 pub fn store_path(config_path: &Path) -> PathBuf {
-    if let Some(p) = std::env::var(STORE_PATH_VAR).ok().filter(|v| !v.trim().is_empty()) {
+    if let Some(p) = std::env::var(STORE_PATH_VAR)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    {
         return PathBuf::from(p);
     }
     match config_path.parent() {
@@ -127,7 +130,10 @@ pub fn credential_store(cli: &Cli) -> Option<CredentialStore> {
     match open_store(&path) {
         Ok(store) => Some(store),
         Err(e) if path.exists() => {
-            eprintln!("ar: credential store {} is unusable ({e}); falling back to $VAR", path.display());
+            eprintln!(
+                "ar: credential store {} is unusable ({e}); falling back to $VAR",
+                path.display()
+            );
             None
         }
         Err(_) => None,
@@ -190,7 +196,10 @@ impl StoreProbe<'_> {
         }
         match open_store(&path).and_then(|store| store.list_names()) {
             Ok(names) => Self::Open { path, names },
-            Err(e) => Self::Unreadable { path, reason: e.to_string() },
+            Err(e) => Self::Unreadable {
+                path,
+                reason: e.to_string(),
+            },
         }
     }
 
@@ -207,14 +216,25 @@ impl StoreProbe<'_> {
             ),
             Self::Open { path, names } => (
                 "ok".to_owned(),
-                format!("{} readable with {} credential(s)", path.display(), names.len()),
+                format!(
+                    "{} readable with {} credential(s)",
+                    path.display(),
+                    names.len()
+                ),
             ),
             Self::Live { path, store } => match store.list_names() {
                 Ok(names) => (
                     "ok".to_owned(),
-                    format!("{} readable with {} credential(s)", path.display(), names.len()),
+                    format!(
+                        "{} readable with {} credential(s)",
+                        path.display(),
+                        names.len()
+                    ),
                 ),
-                Err(e) => ("fail".to_owned(), format!("{} unreadable: {e}", path.display())),
+                Err(e) => (
+                    "fail".to_owned(),
+                    format!("{} unreadable: {e}", path.display()),
+                ),
             },
             Self::Unreadable { path, reason } => (
                 "fail".to_owned(),
@@ -227,7 +247,9 @@ impl StoreProbe<'_> {
     pub fn holds(&self, name: &str) -> bool {
         match self {
             Self::Open { names, .. } => names.iter().any(|n| n == name),
-            Self::Live { store, .. } => store.list_names().is_ok_and(|names| names.iter().any(|n| n == name)),
+            Self::Live { store, .. } => store
+                .list_names()
+                .is_ok_and(|names| names.iter().any(|n| n == name)),
             _ => false,
         }
     }
@@ -239,16 +261,21 @@ impl StoreProbe<'_> {
 /// A collision is fatal rather than skipped — shadowing a compiled-in id would
 /// make the catalog stop describing the world, and `ar doctor` says which one.
 fn catalog(cfg: &Config) -> anyhow::Result<Registry> {
-    registry()
-        .merge(&cfg.custom_providers)
-        .map_err(|e| fail(e, "rename the `custom_providers` entry so its `id:` is not a compiled-in provider"))
+    registry().merge(&cfg.custom_providers).map_err(|e| {
+        fail(
+            e,
+            "rename the `custom_providers` entry so its `id:` is not a compiled-in provider",
+        )
+    })
 }
 
 /// Runs `future` on a tokio runtime built on demand.
 ///
 /// Built here rather than by `#[tokio::main]` so the five local verbs never pay
 /// for a runtime: `--version`, the home view and the lists answer without one.
-pub fn block_on<F: std::future::Future<Output = anyhow::Result<()>>>(future: F) -> anyhow::Result<()> {
+pub fn block_on<F: std::future::Future<Output = anyhow::Result<()>>>(
+    future: F,
+) -> anyhow::Result<()> {
     block_on_value(future)
 }
 
@@ -260,7 +287,12 @@ where
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .map_err(|e| fail(e, "the async runtime could not start; this is a host problem, not a config one"))?;
+        .map_err(|e| {
+            fail(
+                e,
+                "the async runtime could not start; this is a host problem, not a config one",
+            )
+        })?;
     rt.block_on(future)
 }
 
@@ -279,7 +311,10 @@ pub fn store_probe(config_path: &Path) -> StoreProbe<'static> {
 /// and writes the token rows through the same handle, and a second connection to
 /// a file this process is mid-write on would report on the wrong half.
 pub fn live_store_probe<'a>(path: &Path, store: &'a CredentialStore) -> StoreProbe<'a> {
-    StoreProbe::Live { path: path.to_path_buf(), store }
+    StoreProbe::Live {
+        path: path.to_path_buf(),
+        store,
+    }
 }
 
 /// The `ar auth status` spelling of a doctor row's status, as a borrowed
@@ -329,7 +364,14 @@ fn home(cli: &Cli) -> anyhow::Result<()> {
     println!("registry: {} providers", registry().len());
     print!(
         "{}",
-        toon::list("combos", "combos", &COMBO_COLUMNS, &toon::fields_or_default(None), &combo_rows(&cfg.combos, &catalog), true)
+        toon::list(
+            "combos",
+            "combos",
+            &COMBO_COLUMNS,
+            &toon::fields_or_default(None),
+            &combo_rows(&cfg.combos, &catalog),
+            true
+        )
     );
     println!("next:");
     println!("  ar serve      start the proxy");
@@ -343,16 +385,30 @@ fn home(cli: &Cli) -> anyhow::Result<()> {
 /// `current_exe` fails on a deleted or unlinked binary, which is not worth an
 /// error: the caller still wants the rest of the view.
 fn self_path() -> String {
-    std::env::current_exe().map_or_else(|_| "ar (path unavailable)".to_owned(), |p| p.display().to_string())
+    std::env::current_exe().map_or_else(
+        |_| "ar (path unavailable)".to_owned(),
+        |p| p.display().to_string(),
+    )
 }
 
 fn models(cli: &Cli, args: &ListArgs) -> anyhow::Result<()> {
     let cfg = load(cli)?;
     let catalog = catalog(&cfg)?;
-    let fields = columns(&toon::fields_or_default(args.fields.as_deref()), &MODEL_COLUMNS, "models")?;
+    let fields = columns(
+        &toon::fields_or_default(args.fields.as_deref()),
+        &MODEL_COLUMNS,
+        "models",
+    )?;
     print!(
         "{}",
-        toon::list("models", "models", &MODEL_COLUMNS, &fields, &model_rows(&cfg, &catalog), args.full)
+        toon::list(
+            "models",
+            "models",
+            &MODEL_COLUMNS,
+            &fields,
+            &model_rows(&cfg, &catalog),
+            args.full
+        )
     );
     Ok(())
 }
@@ -382,7 +438,12 @@ fn model_rows(cfg: &Config, catalog: &Registry) -> Vec<Row> {
                         *owned = format!("{owned}+{}", c.id);
                     }
                 }
-                None => rows.push(vec![t.clone(), provider.to_owned(), status.to_owned(), c.id.clone()]),
+                None => rows.push(vec![
+                    t.clone(),
+                    provider.to_owned(),
+                    status.to_owned(),
+                    c.id.clone(),
+                ]),
             }
         }
     }
@@ -390,7 +451,12 @@ fn model_rows(cfg: &Config, catalog: &Registry) -> Vec<Row> {
         for model in &def.models {
             let id = format!("{provider_id}/{model}");
             if !rows.iter().any(|r| r[0] == id) {
-                rows.push(vec![id, provider_id.to_string(), "known".to_owned(), "-".to_owned()]);
+                rows.push(vec![
+                    id,
+                    provider_id.to_string(),
+                    "known".to_owned(),
+                    "-".to_owned(),
+                ]);
             }
         }
     }
@@ -417,10 +483,21 @@ fn target_provider_in<'a>(target: &'a str, catalog: &Registry) -> &'a str {
 fn providers(cli: &Cli, args: &ListArgs) -> anyhow::Result<()> {
     let cfg = load(cli)?;
     let catalog = catalog(&cfg)?;
-    let fields = columns(&toon::fields_or_default(args.fields.as_deref()), &PROVIDER_COLUMNS, "providers")?;
+    let fields = columns(
+        &toon::fields_or_default(args.fields.as_deref()),
+        &PROVIDER_COLUMNS,
+        "providers",
+    )?;
     print!(
         "{}",
-        toon::list("providers", "providers", &PROVIDER_COLUMNS, &fields, &provider_rows(&cfg, &catalog), args.full)
+        toon::list(
+            "providers",
+            "providers",
+            &PROVIDER_COLUMNS,
+            &fields,
+            &provider_rows(&cfg, &catalog),
+            args.full
+        )
     );
     Ok(())
 }
@@ -439,8 +516,18 @@ fn provider_rows(cfg: &Config, catalog: &Registry) -> Vec<Row> {
             let def = catalog.get(&p.id);
             let dialect = def.map_or("unknown", |d| d.wire_format.as_str());
             let base_url = def.map_or("-", |d| d.base_url.as_str());
-            let status = if def.is_some() { "ok" } else { "not-in-registry" };
-            vec![p.id.clone(), dialect.to_owned(), status.to_owned(), base_url.to_owned(), p.key.clone()]
+            let status = if def.is_some() {
+                "ok"
+            } else {
+                "not-in-registry"
+            };
+            vec![
+                p.id.clone(),
+                dialect.to_owned(),
+                status.to_owned(),
+                base_url.to_owned(),
+                p.key.clone(),
+            ]
         })
         .chain(cfg.custom_providers.iter().map(|c| {
             vec![
@@ -459,10 +546,21 @@ fn provider_rows(cfg: &Config, catalog: &Registry) -> Vec<Row> {
 fn combo(cli: &Cli, args: &ListArgs) -> anyhow::Result<()> {
     let cfg = load(cli)?;
     let catalog = catalog(&cfg)?;
-    let fields = columns(&toon::fields_or_default(args.fields.as_deref()), &COMBO_COLUMNS, "combo")?;
+    let fields = columns(
+        &toon::fields_or_default(args.fields.as_deref()),
+        &COMBO_COLUMNS,
+        "combo",
+    )?;
     print!(
         "{}",
-        toon::list("combo", "combos", &COMBO_COLUMNS, &fields, &combo_rows(&cfg.combos, &catalog), args.full)
+        toon::list(
+            "combo",
+            "combos",
+            &COMBO_COLUMNS,
+            &fields,
+            &combo_rows(&cfg.combos, &catalog),
+            args.full
+        )
     );
     Ok(())
 }
@@ -475,8 +573,16 @@ fn combo_rows(combos: &[Combo], catalog: &Registry) -> Vec<Row> {
     let mut rows: Vec<Row> = combos
         .iter()
         .map(|c| {
-            let providers: BTreeSet<&str> = c.targets.iter().map(|t| target_provider_in(t, catalog)).collect();
-            let status = if c.targets.is_empty() { "no-targets" } else { "active" };
+            let providers: BTreeSet<&str> = c
+                .targets
+                .iter()
+                .map(|t| target_provider_in(t, catalog))
+                .collect();
+            let status = if c.targets.is_empty() {
+                "no-targets"
+            } else {
+                "active"
+            };
             vec![
                 c.id.clone(),
                 providers.into_iter().collect::<Vec<_>>().join("+"),
@@ -502,7 +608,14 @@ fn doctor(cli: &Cli) -> anyhow::Result<()> {
     let checks = findings(&cfg, &cli.config.display().to_string(), &store);
     print!(
         "{}",
-        toon::list("checks", "checks", &CHECK_COLUMNS, &toon::every_field(&CHECK_COLUMNS), &checks, false)
+        toon::list(
+            "checks",
+            "checks",
+            &CHECK_COLUMNS,
+            &toon::every_field(&CHECK_COLUMNS),
+            &checks,
+            false
+        )
     );
     let failed = checks.iter().filter(|r| r[1] == "fail").count();
     if failed > 0 {
@@ -538,21 +651,35 @@ fn findings(cfg: &Config, path: &str, store: &StoreProbe<'_>) -> Vec<Row> {
         .flat_map(|c| c.targets.iter().chain(c.pool.iter()))
         .filter(|t| {
             let (provider, model) = split_target_known(t, |id| catalog.get(id).is_some());
-            catalog.get(provider).is_some() && !model.is_empty() && !model_known_in(&catalog, provider, model)
+            catalog.get(provider).is_some()
+                && !model.is_empty()
+                && !model_known_in(&catalog, provider, model)
         })
         .count();
 
     let mut rows: Vec<Row> = vec![
-        vec!["config".to_owned(), "ok".to_owned(), format!("{path} ({} providers + {} custom + {} combos)", cfg.providers.len(), cfg.custom_providers.len(), cfg.combos.len())],
+        vec![
+            "config".to_owned(),
+            "ok".to_owned(),
+            format!(
+                "{path} ({} providers + {} custom + {} combos)",
+                cfg.providers.len(),
+                cfg.custom_providers.len(),
+                cfg.combos.len()
+            ),
+        ],
         registry_row(unroutable),
     ];
     let (status, detail) = store.row();
     rows.push(vec!["store".to_owned(), status, detail]);
 
-        // F-MED-2: the terminal-status list, reported from the executor's own copy
-        // so an operator sees the same rows the classifier uses and the store's
-        // CHECK is generated from. A literal here would be a fourth copy to drift.
-        let executors: Vec<&str> = ar_server::OAuthKind::ALL.iter().map(|k| k.as_str()).collect();
+    // F-MED-2: the terminal-status list, reported from the executor's own copy
+    // so an operator sees the same rows the classifier uses and the store's
+    // CHECK is generated from. A literal here would be a fourth copy to drift.
+    let executors: Vec<&str> = ar_server::OAuthKind::ALL
+        .iter()
+        .map(|k| k.as_str())
+        .collect();
     rows.push(vec![
         "terminal-status".to_owned(),
         "ok".to_owned(),
@@ -584,7 +711,11 @@ fn findings(cfg: &Config, path: &str, store: &StoreProbe<'_>) -> Vec<Row> {
             ]);
             continue;
         };
-        rows.push(vec![format!("provider/{}", p.id), "ok".to_owned(), "in registry".to_owned()]);
+        rows.push(vec![
+            format!("provider/{}", p.id),
+            "ok".to_owned(),
+            "in registry".to_owned(),
+        ]);
 
         // F-CRIT-1: a provider the catalog labels `oauth` is not "known" to this
         // build just because it is in the registry. Without this row `doctor`
@@ -611,19 +742,43 @@ fn findings(cfg: &Config, path: &str, store: &StoreProbe<'_>) -> Vec<Row> {
             let refused = if c.protocol.wire_format() == ar_registry::WireFormat::Openai {
                 String::new()
             } else {
-                format!("; {:?} is not dispatchable in this build", c.protocol.wire_format())
+                format!(
+                    "; {:?} is not dispatchable in this build",
+                    c.protocol.wire_format()
+                )
             };
-            ("ok", format!("{} at {}{refused}", c.protocol.wire_format().as_str(), c.base_url))
+            (
+                "ok",
+                format!(
+                    "{} at {}{refused}",
+                    c.protocol.wire_format().as_str(),
+                    c.base_url
+                ),
+            )
         } else {
-            ("fail", format!("base_url {:?} is not an http(s) URL with an authority", c.base_url))
+            (
+                "fail",
+                format!(
+                    "base_url {:?} is not an http(s) URL with an authority",
+                    c.base_url
+                ),
+            )
         };
-        rows.push(vec![format!("custom/{}", c.id), status.to_owned(), detail.to_owned()]);
+        rows.push(vec![
+            format!("custom/{}", c.id),
+            status.to_owned(),
+            detail.to_owned(),
+        ]);
     }
 
     let mut names: Vec<&str> = cfg.keys.keys().map(String::as_str).collect();
     names.sort_unstable();
     for name in names {
-        rows.push(vec![format!("key/{name}"), key_status(name, cfg, store), key_detail(name, cfg, store)]);
+        rows.push(vec![
+            format!("key/{name}"),
+            key_status(name, cfg, store),
+            key_detail(name, cfg, store),
+        ]);
     }
 
     // A bench entry gets its own `pool/<id>` prefix rather than being folded into
@@ -635,7 +790,11 @@ fn findings(cfg: &Config, path: &str, store: &StoreProbe<'_>) -> Vec<Row> {
     for (prefix, entries) in [("target", target_rows(cfg)), ("pool", pool_rows(cfg))] {
         for t in entries {
             let (status, detail) = target_verdict(t, cfg, &catalog);
-            rows.push(vec![format!("{prefix}/{t}"), status.to_owned(), detail.to_owned()]);
+            rows.push(vec![
+                format!("{prefix}/{t}"),
+                status.to_owned(),
+                detail.to_owned(),
+            ]);
         }
     }
 
@@ -644,12 +803,18 @@ fn findings(cfg: &Config, path: &str, store: &StoreProbe<'_>) -> Vec<Row> {
 
 /// Every `targets:` entry, deduplicated across combos.
 fn target_rows(cfg: &Config) -> BTreeSet<&str> {
-    cfg.combos.iter().flat_map(|c| c.targets.iter().map(String::as_str)).collect()
+    cfg.combos
+        .iter()
+        .flat_map(|c| c.targets.iter().map(String::as_str))
+        .collect()
 }
 
 /// Every `pool:` entry, deduplicated across combos.
 fn pool_rows(cfg: &Config) -> BTreeSet<&str> {
-    cfg.combos.iter().flat_map(|c| c.pool.iter().map(String::as_str)).collect()
+    cfg.combos
+        .iter()
+        .flat_map(|c| c.pool.iter().map(String::as_str))
+        .collect()
 }
 
 /// Whether one `provider/model` string routes, and what to say when it does not.
@@ -668,7 +833,10 @@ fn target_verdict(target: &str, cfg: &Config, catalog: &Registry) -> (&'static s
         // The provider half passing is not enough: a typo in the model half
         // survives every provider check and only surfaces as a 404 from the
         // upstream, which reads as "the proxy is broken".
-        ("fail", "model not in registry; run `ar import --from omniroute --path <OmniRoute/open-sse/config/providers>` or `ar models`")
+        (
+            "fail",
+            "model not in registry; run `ar import --from omniroute --path <OmniRoute/open-sse/config/providers>` or `ar models`",
+        )
     } else {
         ("ok", "routable")
     }
@@ -700,7 +868,11 @@ fn registry_row(unroutable: usize) -> Row {
 /// [`registry_row`] at an explicit `now`, so the ttl boundary is testable without
 /// a seven-day-old build.
 fn registry_row_at(unroutable: usize, now: u64) -> Row {
-    let compiled = format!("{} providers compiled in + snapshot {}d old", registry().len(), ar_registry::age_days(now));
+    let compiled = format!(
+        "{} providers compiled in + snapshot {}d old",
+        registry().len(),
+        ar_registry::age_days(now)
+    );
     if ar_registry::is_stale(now) {
         return vec![
             "registry".to_owned(),
@@ -761,7 +933,10 @@ pub fn oauth_row(provider: &str, cfg: &Config, store: &StoreProbe<'_>) -> (Strin
     let Some(declared) = cfg.oauth_for(provider) else {
         return (
             "fail".to_owned(),
-            format!("catalog authType is oauth; add an `oauth:` block naming a refresh_key and token_url{}", relogin(provider)),
+            format!(
+                "catalog authType is oauth; add an `oauth:` block naming a refresh_key and token_url{}",
+                relogin(provider)
+            ),
         );
     };
 
@@ -769,21 +944,31 @@ pub fn oauth_row(provider: &str, cfg: &Config, store: &StoreProbe<'_>) -> (Strin
     if !resolves(access_name, cfg, store) {
         return (
             "fail".to_owned(),
-            format!("access token {access_name:?} is in neither the credential store nor keys:{}", relogin(provider)),
+            format!(
+                "access token {access_name:?} is in neither the credential store nor keys:{}",
+                relogin(provider)
+            ),
         );
     }
 
     // Spelled from the executor's own list, so this reason cannot drift from the
     // one a real refresh failure would record.
     let terminal = terminal_reason(400, "no_refresh_token").unwrap_or("no_refresh_token");
-    match (declared.refresh_key.as_deref(), declared.token_url.as_deref()) {
+    match (
+        declared.refresh_key.as_deref(),
+        declared.token_url.as_deref(),
+    ) {
         (None, _) => (
             "fail".to_owned(),
-            format!("access token resolves; no refresh_key, so the first 401 is terminal ({terminal})"),
+            format!(
+                "access token resolves; no refresh_key, so the first 401 is terminal ({terminal})"
+            ),
         ),
         (Some(_), None) => (
             "fail".to_owned(),
-            format!("access token resolves; refresh row declared but no token_url, so the first 401 is terminal ({terminal})"),
+            format!(
+                "access token resolves; refresh row declared but no token_url, so the first 401 is terminal ({terminal})"
+            ),
         ),
         (Some(name), Some(_)) if !resolves(name, cfg, store) => (
             "fail".to_owned(),
@@ -811,7 +996,11 @@ pub fn oauth_row(provider: &str, cfg: &Config, store: &StoreProbe<'_>) -> (Strin
 /// values is a row that will render a credential the moment someone copies the
 /// pattern.
 fn anonymous_row(declared: &ar_config::OAuthSession) -> (String, String) {
-    let editor = if declared.anonymous_editor.as_deref().is_some_and(|e| !e.is_empty()) {
+    let editor = if declared
+        .anonymous_editor
+        .as_deref()
+        .is_some_and(|e| !e.is_empty())
+    {
         "anonymous_editor set"
     } else {
         "anonymous_editor is empty"
@@ -855,11 +1044,7 @@ fn no_executor_fix(cfg: &Config, provider: &str) -> String {
 ///
 /// The fix therefore names two commands: `ar auth login` for the endpoint the
 /// operator has to add, and the login itself for the tokens a re-auth mints.
-pub fn login_readiness(
-    provider: &str,
-    cfg: &Config,
-    store: &StoreProbe<'_>,
-) -> (String, String) {
+pub fn login_readiness(provider: &str, cfg: &Config, store: &StoreProbe<'_>) -> (String, String) {
     let Some(declared) = cfg.oauth_for(provider) else {
         return (
             "unavailable".to_owned(),
@@ -909,10 +1094,18 @@ pub fn login_readiness(
     let access_name = cfg.key_name(provider).unwrap_or(provider);
     let armed = resolves(access_name, cfg, store);
     (
-        if armed { "armed".to_owned() } else { "needs-login".to_owned() },
+        if armed {
+            "armed".to_owned()
+        } else {
+            "needs-login".to_owned()
+        },
         format!(
             "authorize at {endpoint}; access {access_name:?} {}{}",
-            if armed { "resolves" } else { "does not resolve yet" },
+            if armed {
+                "resolves"
+            } else {
+                "does not resolve yet"
+            },
             relogin(provider)
         ),
     )
@@ -962,7 +1155,9 @@ fn resolves(name: &str, cfg: &Config, store: &StoreProbe<'_>) -> bool {
 /// provider as a typo. A custom node is always in that case — its model spelling
 /// lives in the combo target, not in a catalog row.
 fn model_known_in(catalog: &Registry, provider: &str, model: &str) -> bool {
-    let Some(def) = catalog.get(provider) else { return false };
+    let Some(def) = catalog.get(provider) else {
+        return false;
+    };
     def.models.is_empty() || def.models.iter().any(|m| m.as_ref() == model)
 }
 
@@ -975,7 +1170,9 @@ fn model_known_in(catalog: &Registry, provider: &str, model: &str) -> bool {
 /// `keys: {ollama: ""}` is the documented way to write them and an empty
 /// credential is correct rather than a hole.
 fn needs_credential(provider: &str) -> bool {
-    registry().get(provider).is_none_or(|d| d.auth_kind.as_ref() == "apikey")
+    registry()
+        .get(provider)
+        .is_none_or(|d| d.auth_kind.as_ref() == "apikey")
 }
 
 /// The `status` cell of a `key/<name>` row.
@@ -992,7 +1189,10 @@ fn key_status(name: &str, cfg: &Config, store: &StoreProbe<'_>) -> String {
     // `auth_kind` to say it is keyless, and dispatching one unauthenticated is
     // the hole this reports.
     if cfg.custom_providers.iter().any(|c| c.key_ref == name)
-        || cfg.providers.iter().any(|p| p.key == name && needs_credential(&p.id))
+        || cfg
+            .providers
+            .iter()
+            .any(|p| p.key == name && needs_credential(&p.id))
     {
         return "fail".to_owned();
     }
@@ -1007,9 +1207,18 @@ fn key_detail(name: &str, cfg: &Config, store: &StoreProbe<'_>) -> String {
         .iter()
         .filter(|p| p.key == name)
         .map(|p| p.id.as_str())
-        .chain(cfg.custom_providers.iter().filter(|c| c.key_ref == name).map(|c| c.id.as_str()))
+        .chain(
+            cfg.custom_providers
+                .iter()
+                .filter(|c| c.key_ref == name)
+                .map(|c| c.id.as_str()),
+        )
         .collect();
-    let bound = if users.is_empty() { "unused".to_owned() } else { format!("for {}", users.join("+")) };
+    let bound = if users.is_empty() {
+        "unused".to_owned()
+    } else {
+        format!("for {}", users.join("+"))
+    };
     if store.holds(name) {
         return format!("resolved from store ({bound})");
     }
@@ -1041,7 +1250,11 @@ fn configure(cli: &Cli, args: &ConfigureArgs) -> anyhow::Result<()> {
         )
     );
 
-    let checks = findings(&cfg, &cli.config.display().to_string(), &StoreProbe::resolve(&cli.config));
+    let checks = findings(
+        &cfg,
+        &cli.config.display().to_string(),
+        &StoreProbe::resolve(&cli.config),
+    );
     let failed = checks.iter().filter(|r| r[1] == "fail").count();
     if args.check && failed > 0 {
         return Err(fail(
@@ -1061,36 +1274,58 @@ fn setting_rows(cfg: &Config, path: &str) -> Vec<Row> {
         vec!["config.path".to_owned(), path.to_owned()],
         vec!["server.host".to_owned(), cfg.server.host.clone()],
         vec!["server.port".to_owned(), cfg.server.port.to_string()],
-        vec!["registry.providers".to_owned(), registry().len().to_string()],
+        vec![
+            "registry.providers".to_owned(),
+            registry().len().to_string(),
+        ],
         vec!["providers".to_owned(), cfg.providers.len().to_string()],
-        vec!["custom_providers".to_owned(), cfg.custom_providers.len().to_string()],
+        vec![
+            "custom_providers".to_owned(),
+            cfg.custom_providers.len().to_string(),
+        ],
         vec!["combos".to_owned(), cfg.combos.len().to_string()],
     ];
     for p in &cfg.providers {
-        let base_url = registry().get(&p.id).map_or_else(|| "-".to_owned(), |d| d.base_url.clone());
+        let base_url = registry()
+            .get(&p.id)
+            .map_or_else(|| "-".to_owned(), |d| d.base_url.clone());
         rows.push(vec![format!("provider.{}.key", p.id), p.key.clone()]);
         rows.push(vec![format!("provider.{}.base_url", p.id), base_url]);
     }
     for c in &cfg.custom_providers {
         rows.push(vec![format!("provider.{}.key", c.id), c.key_ref.clone()]);
-        rows.push(vec![format!("provider.{}.base_url", c.id), c.base_url.clone()]);
-        rows.push(vec![format!("provider.{}.protocol", c.id), c.protocol.wire_format().as_str().to_owned()]);
+        rows.push(vec![
+            format!("provider.{}.base_url", c.id),
+            c.base_url.clone(),
+        ]);
+        rows.push(vec![
+            format!("provider.{}.protocol", c.id),
+            c.protocol.wire_format().as_str().to_owned(),
+        ]);
     }
     for c in &cfg.combos {
-        rows.push(vec![format!("combo.{}.strategy", c.id), c.strategy.as_str().to_owned()]);
+        rows.push(vec![
+            format!("combo.{}.strategy", c.id),
+            c.strategy.as_str().to_owned(),
+        ]);
         rows.push(vec![format!("combo.{}.targets", c.id), c.targets.join("+")]);
     }
     rows
 }
 
-/// Converts another tool's config into `config.yaml` + `registry.json`.
+/// Converts another tool's config into `config.yaml`, `registry.json`,
+/// `freeBudgets.json` and `providerMeta.json`.
 ///
-/// Both files are written before anything is printed, so a partial failure
+/// Every file is written before anything is printed, so a partial failure
 /// never leaves a table claiming a conversion that did not land.
 fn import_config(args: &ImportArgs) -> anyhow::Result<()> {
     let result = match args.from {
-        ImportFrom::Omniroute => import::omniroute::scan(import::upstream_tree(args.path.as_deref())?)?,
-        ImportFrom::Litellm => import::convert(args.from, &import::upstream(args.path.as_deref())?)?,
+        ImportFrom::Omniroute => {
+            import::omniroute::scan(import::upstream_tree(args.path.as_deref())?)?
+        }
+        ImportFrom::Litellm => {
+            import::convert(args.from, &import::upstream(args.path.as_deref())?)?
+        }
     };
 
     let out = Path::new(&args.out_dir);
@@ -1102,7 +1337,29 @@ fn import_config(args: &ImportArgs) -> anyhow::Result<()> {
     })?;
     let written = out.display().to_string();
     write_file(&out.join("config.yaml"), &result.config_yaml)?;
-    write_file(&out.join("registry.json"), &import::to_catalog_json(&result.registry)?)?;
+    write_file(
+        &out.join("registry.json"),
+        &import::to_catalog_json(&result.registry)?,
+    )?;
+    // A third file, keyed `(provider, model)`: one row per model rather than
+    // one per provider, so folding it in would make `registry.json` a two-shape
+    // document no `ProviderDef` loader can parse. Written unconditionally, and
+    // empty for a source with no such table, so the output set is
+    // `--from`-independent.
+    write_file(
+        &out.join("freeBudgets.json"),
+        &import::to_free_budgets_json(&result.free_budgets)?,
+    )?;
+    // A fourth file, keyed by provider id: what each provider declares about
+    // itself. Not folded into `registry.json` because a `ProviderDef` is built
+    // field-by-field in four places outside this crate's write scope, and because
+    // one document with two top-level shapes needs a branch in every loader.
+    // Written unconditionally, and empty for a source that declares nothing, so
+    // the output set is `--from`-independent.
+    write_file(
+        &out.join("providerMeta.json"),
+        &import::to_provider_meta_json(&result.provider_meta)?,
+    )?;
 
     print!(
         "{}",
@@ -1132,7 +1389,9 @@ fn write_file(path: &Path, body: &str) -> anyhow::Result<()> {
 /// usage errors, `0` for `--help` and `--version`.
 pub fn usage_exit_code(kind: ErrorKind) -> u8 {
     match kind {
-        ErrorKind::DisplayHelp | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand | ErrorKind::DisplayVersion => 0,
+        ErrorKind::DisplayHelp
+        | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        | ErrorKind::DisplayVersion => 0,
         _ => 2,
     }
 }
@@ -1196,7 +1455,10 @@ pub fn unknown_flag_hint(args: &[OsString], invalid: &str) -> String {
     flags.sort_unstable();
     flags.dedup();
 
-    format!("unknown flag {invalid:?}\nhelp: valid flags: {}", flags.join(" "))
+    format!(
+        "unknown flag {invalid:?}\nhelp: valid flags: {}",
+        flags.join(" ")
+    )
 }
 
 #[cfg(test)]
@@ -1205,7 +1467,11 @@ mod tests {
 
     #[test]
     fn default_columns_lead_with_toon_defaults() {
-        for cols in [PROVIDER_COLUMNS.as_slice(), MODEL_COLUMNS.as_slice(), COMBO_COLUMNS.as_slice()] {
+        for cols in [
+            PROVIDER_COLUMNS.as_slice(),
+            MODEL_COLUMNS.as_slice(),
+            COMBO_COLUMNS.as_slice(),
+        ] {
             assert_eq!(&cols[..3], &toon::DEFAULT_FIELDS[..], "{cols:?}");
         }
     }
@@ -1234,7 +1500,9 @@ mod tests {
 
     #[test]
     fn flags_unknown_field_with_valid_list() {
-        let e = columns(&["nope".to_owned()], &PROVIDER_COLUMNS, "providers").unwrap_err().to_string();
+        let e = columns(&["nope".to_owned()], &PROVIDER_COLUMNS, "providers")
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("unknown field \"nope\""), "{e}");
         assert!(e.contains("id, provider, status"), "{e}");
     }
@@ -1246,6 +1514,7 @@ mod tests {
                 id: "empty".to_owned(),
                 strategy: ar_config::Strategy::Priority,
                 targets: vec![],
+                weights: std::collections::BTreeMap::new(),
                 pool: vec![],
                 compression: None,
             }],
@@ -1263,7 +1532,11 @@ mod tests {
             |_| Ok(Some("v".to_owned())),
         )
         .unwrap();
-        let checks = findings(&cfg, "config.yaml", &StoreProbe::Absent(PathBuf::from("credentials.db")));
+        let checks = findings(
+            &cfg,
+            "config.yaml",
+            &StoreProbe::Absent(PathBuf::from("credentials.db")),
+        );
         let failed: Vec<&Row> = checks.iter().filter(|r| r[1] == "fail").collect();
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0][0], "pool/openai/gpt-9.9-typo");
@@ -1278,7 +1551,11 @@ mod tests {
             |_| Ok(Some("v".to_owned())),
         )
         .unwrap();
-        let checks = findings(&cfg, "config.yaml", &StoreProbe::Absent(PathBuf::from("credentials.db")));
+        let checks = findings(
+            &cfg,
+            "config.yaml",
+            &StoreProbe::Absent(PathBuf::from("credentials.db")),
+        );
         assert!(checks.iter().any(|r| r[0] == "target/openai/gpt-5.4"));
         assert!(checks.iter().any(|r| r[0] == "pool/groq/llama-3.3-70b"));
     }
@@ -1290,7 +1567,11 @@ mod tests {
             |_| Ok(Some("v".to_owned())),
         )
         .unwrap();
-        let checks = findings(&cfg, "config.yaml", &StoreProbe::Absent(PathBuf::from("credentials.db")));
+        let checks = findings(
+            &cfg,
+            "config.yaml",
+            &StoreProbe::Absent(PathBuf::from("credentials.db")),
+        );
         let failed: Vec<&Row> = checks.iter().filter(|r| r[1] == "fail").collect();
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0][0], "target/groq/llama");
@@ -1305,11 +1586,21 @@ mod tests {
             |_| Ok(Some("v".to_owned())),
         )
         .unwrap();
-        let checks = findings(&cfg, "config.yaml", &StoreProbe::Absent(PathBuf::from("credentials.db")));
-        let row = checks.iter().find(|r| r[0] == "target/openai/gpt-5.4-nope").expect("the target row");
+        let checks = findings(
+            &cfg,
+            "config.yaml",
+            &StoreProbe::Absent(PathBuf::from("credentials.db")),
+        );
+        let row = checks
+            .iter()
+            .find(|r| r[0] == "target/openai/gpt-5.4-nope")
+            .expect("the target row");
         assert_eq!(row[1], "fail");
         assert!(row[2].contains("model not in registry"), "{row:?}");
-        assert!(row[2].contains("ar import"), "the help names the fix: {row:?}");
+        assert!(
+            row[2].contains("ar import"),
+            "the help names the fix: {row:?}"
+        );
     }
 
     #[test]
@@ -1319,16 +1610,24 @@ mod tests {
             |_| Ok(Some("v".to_owned())),
         )
         .unwrap();
-        let checks = findings(&cfg, "config.yaml", &StoreProbe::Absent(PathBuf::from("credentials.db")));
-        assert!(
-            !checks.iter().any(|r| r[1] == "fail"),
-            "{checks:?}"
+        let checks = findings(
+            &cfg,
+            "config.yaml",
+            &StoreProbe::Absent(PathBuf::from("credentials.db")),
         );
+        assert!(!checks.iter().any(|r| r[1] == "fail"), "{checks:?}");
     }
 
     #[test]
     fn lists_valid_flags_for_named_subcommand() {
-        let hint = unknown_flag_hint(&[OsString::from("--config"), OsString::from("c.yaml"), OsString::from("models")], "--nope");
+        let hint = unknown_flag_hint(
+            &[
+                OsString::from("--config"),
+                OsString::from("c.yaml"),
+                OsString::from("models"),
+            ],
+            "--nope",
+        );
         assert!(hint.contains("--fields"), "{hint}");
         assert!(!hint.contains("--prompt"), "{hint}");
     }
@@ -1341,7 +1640,10 @@ mod tests {
         )
         .unwrap();
         let rows = model_rows(&cfg, &registry().clone());
-        let first = rows.iter().find(|r| r[0] == "openai/gpt-5.4").expect("the shared target");
+        let first = rows
+            .iter()
+            .find(|r| r[0] == "openai/gpt-5.4")
+            .expect("the shared target");
         assert_eq!(first[3], "a+b", "one row, both owning combos in one cell");
     }
 
@@ -1371,7 +1673,10 @@ mod tests {
     fn routes_a_custom_provider_target_when_it_is_declared() {
         let cfg = custom_config("https://api.example.invalid/v1", "local-gateway");
         let checks = findings(&cfg, "config.yaml", &no_store());
-        let row = checks.iter().find(|r| r[0] == "target/local-gateway/some-model").expect("the target row");
+        let row = checks
+            .iter()
+            .find(|r| r[0] == "target/local-gateway/some-model")
+            .expect("the target row");
         assert_eq!(row[1], "ok", "{row:?}");
     }
 
@@ -1379,7 +1684,10 @@ mod tests {
     fn fails_check_when_a_custom_providers_base_url_has_no_scheme() {
         let cfg = custom_config("api.example.invalid/v1", "local-gateway");
         let checks = findings(&cfg, "config.yaml", &no_store());
-        let row = checks.iter().find(|r| r[0] == "custom/local-gateway").expect("the custom row");
+        let row = checks
+            .iter()
+            .find(|r| r[0] == "custom/local-gateway")
+            .expect("the custom row");
         assert_eq!(row[1], "fail", "{row:?}");
         assert!(row[2].contains("not an http(s) URL"), "{row:?}");
     }
@@ -1388,9 +1696,15 @@ mod tests {
     fn fails_check_when_a_custom_provider_id_collides_with_the_catalog() {
         let cfg = custom_config("https://api.example.invalid/v1", "openai");
         let checks = findings(&cfg, "config.yaml", &no_store());
-        let row = checks.iter().find(|r| r[0] == "custom").expect("the collision row");
+        let row = checks
+            .iter()
+            .find(|r| r[0] == "custom")
+            .expect("the collision row");
         assert_eq!(row[1], "fail", "{row:?}");
-        assert!(row[2].contains("openai"), "the row names the colliding id: {row:?}");
+        assert!(
+            row[2].contains("openai"),
+            "the row names the colliding id: {row:?}"
+        );
     }
 
     #[test]
@@ -1461,9 +1775,16 @@ mod tests {
         // `fail` would be a lie that costs an operator the most: the session
         // works, and only re-auth is impossible.
         let rows = checks(OAUTH_ARMED, &probe(&["codex", "codex_refresh"]));
-        assert_eq!(row(&rows, "oauth/codex")[1], "ok", "it still dispatches: {rows:?}");
+        assert_eq!(
+            row(&rows, "oauth/codex")[1],
+            "ok",
+            "it still dispatches: {rows:?}"
+        );
         let detail = &row(&rows, "auth/codex")[2];
-        assert!(detail.contains("ar auth login --provider codex"), "the row names the fix: {detail}");
+        assert!(
+            detail.contains("ar auth login --provider codex"),
+            "the row names the fix: {detail}"
+        );
     }
 
     #[test]
@@ -1485,7 +1806,8 @@ mod tests {
         // so without claiming anything is broken. The empty expansion is the whole
         // point — a `$VAR` that expands to a value would resolve, which is a
         // different and also correct answer.
-        let cfg = Config::parse(OAUTH_LOGINABLE, |_| Ok(Some(String::new()))).expect("the fixture parses");
+        let cfg = Config::parse(OAUTH_LOGINABLE, |_| Ok(Some(String::new())))
+            .expect("the fixture parses");
         let rows = findings(&cfg, "config.yaml", &probe(&[]));
         assert_eq!(row(&rows, "auth/codex")[1], "needs-login", "{rows:?}");
     }
@@ -1503,7 +1825,10 @@ mod tests {
     fn names_the_missing_session_block_as_the_fix() {
         let rows = checks(OAUTH_NO_SESSION, &no_store());
         let detail = &row(&rows, "oauth/codex")[2];
-        assert!(detail.contains("oauth:"), "the detail names the fix: {detail}");
+        assert!(
+            detail.contains("oauth:"),
+            "the detail names the fix: {detail}"
+        );
     }
 
     #[test]
@@ -1543,7 +1868,10 @@ mod tests {
             .find(|(_, reason)| *reason == "no_refresh_token")
             .expect("the list carries it")
             .1;
-        assert!(detail.contains(listed), "the detail quotes the list: {detail}");
+        assert!(
+            detail.contains(listed),
+            "the detail quotes the list: {detail}"
+        );
     }
 
     #[test]
@@ -1559,7 +1887,10 @@ mod tests {
     fn reports_the_terminal_status_list_the_executor_classifies_against() {
         let rows = checks(ONE_PROVIDER, &no_store());
         let detail = &row(&rows, "terminal-status")[2];
-        assert!(detail.contains(&ar_server::TERMINAL_REFRESH_STATUS.len().to_string()), "{detail}");
+        assert!(
+            detail.contains(&ar_server::TERMINAL_REFRESH_STATUS.len().to_string()),
+            "{detail}"
+        );
     }
 
     #[test]
@@ -1569,7 +1900,10 @@ mod tests {
         // table could not name a reason the store would accept — and would fall
         // back to the literal at the call site, reintroducing the copy this exists
         // to delete.
-        assert_eq!(terminal_reason(401, "invalid_client"), Some("invalid_client"));
+        assert_eq!(
+            terminal_reason(401, "invalid_client"),
+            Some("invalid_client")
+        );
     }
 
     #[test]
@@ -1580,25 +1914,34 @@ mod tests {
     }
 
     fn probe(names: &[&str]) -> StoreProbe<'static> {
-        StoreProbe::Open { path: PathBuf::from("credentials.db"), names: names.iter().map(|n| (*n).to_owned()).collect() }
+        StoreProbe::Open {
+            path: PathBuf::from("credentials.db"),
+            names: names.iter().map(|n| (*n).to_owned()).collect(),
+        }
     }
 
     fn checks(yaml: &str, store: &StoreProbe<'_>) -> Vec<Row> {
-        let cfg = Config::parse(yaml, |name| Ok(Some(format!("secret-{name}")))).expect("the fixture parses");
+        let cfg = Config::parse(yaml, |name| Ok(Some(format!("secret-{name}"))))
+            .expect("the fixture parses");
         findings(&cfg, "config.yaml", store)
     }
 
     const ONE_PROVIDER: &str = "keys:\n  k: $AR_KEY\nproviders:\n  - id: openai\n    key: k\ncombos:\n  - id: c\n    strategy: priority\n    targets:\n      - openai/gpt-5.4\n";
 
     fn row<'a>(rows: &'a [Row], check: &str) -> &'a Row {
-        rows.iter().find(|r| r[0] == check).unwrap_or_else(|| panic!("no {check} row in {rows:?}"))
+        rows.iter()
+            .find(|r| r[0] == check)
+            .unwrap_or_else(|| panic!("no {check} row in {rows:?}"))
     }
 
     #[test]
     fn reports_no_store_when_the_file_is_absent() {
         let absent = StoreProbe::Absent(PathBuf::from("credentials.db"));
         let (status, detail) = absent.row();
-        assert_eq!(status, "skip", "an env-only install is supported, not broken");
+        assert_eq!(
+            status, "skip",
+            "an env-only install is supported, not broken"
+        );
         assert!(detail.contains("credentials.db"), "{detail}");
     }
 
@@ -1610,7 +1953,10 @@ mod tests {
         }
         .row();
         assert_eq!(status, "fail");
-        assert!(detail.contains("AR_MASTER_KEY"), "the reason is the fix: {detail}");
+        assert!(
+            detail.contains("AR_MASTER_KEY"),
+            "the reason is the fix: {detail}"
+        );
     }
 
     #[test]
@@ -1624,13 +1970,21 @@ mod tests {
     fn names_the_store_as_the_source_when_it_holds_the_key() {
         let rows = checks(ONE_PROVIDER, &probe(&["k"]));
         assert_eq!(row(&rows, "key/k")[1], "ok");
-        assert!(row(&rows, "key/k")[2].contains("from store"), "{:?}", row(&rows, "key/k"));
+        assert!(
+            row(&rows, "key/k")[2].contains("from store"),
+            "{:?}",
+            row(&rows, "key/k")
+        );
     }
 
     #[test]
     fn names_the_config_as_the_source_when_the_store_has_no_row() {
         let rows = checks(ONE_PROVIDER, &probe(&["other"]));
-        assert!(row(&rows, "key/k")[2].contains("from keys:"), "{:?}", row(&rows, "key/k"));
+        assert!(
+            row(&rows, "key/k")[2].contains("from keys:"),
+            "{:?}",
+            row(&rows, "key/k")
+        );
     }
 
     #[test]
@@ -1638,10 +1992,15 @@ mod tests {
         // The `store` first, `keys:` second order means an empty entry is a real
         // state: the store is shadowed by an empty variable, or neither exists.
         // `checks` expands to a non-empty value, so this one parses its own.
-        let cfg = Config::parse(ONE_PROVIDER, |_| Ok(Some(String::new()))).expect("the fixture parses");
+        let cfg =
+            Config::parse(ONE_PROVIDER, |_| Ok(Some(String::new()))).expect("the fixture parses");
         let rows = findings(&cfg, "config.yaml", &probe(&[]));
         assert_eq!(row(&rows, "key/k")[1], "fail", "{rows:?}");
-        assert!(row(&rows, "key/k")[2].contains("resolved to nothing"), "{:?}", row(&rows, "key/k"));
+        assert!(
+            row(&rows, "key/k")[2].contains("resolved to nothing"),
+            "{:?}",
+            row(&rows, "key/k")
+        );
     }
 
     #[test]
@@ -1657,7 +2016,10 @@ mod tests {
     fn never_renders_a_credential_value_in_a_check_row() {
         let rows = checks(ONE_PROVIDER, &probe(&["k"]));
         for r in &rows {
-            assert!(!r[2].contains("secret-AR_KEY"), "a check row leaked a value: {r:?}");
+            assert!(
+                !r[2].contains("secret-AR_KEY"),
+                "a check row leaked a value: {r:?}"
+            );
         }
     }
 
@@ -1677,7 +2039,10 @@ mod tests {
         // stale catalog is invisible until a request 404s.
         let rows = checks(ONE_PROVIDER, &probe(&["k"]));
         let detail = &row(&rows, "registry")[2];
-        assert!(detail.contains("snapshot") && detail.contains("d old"), "{detail}");
+        assert!(
+            detail.contains("snapshot") && detail.contains("d old"),
+            "{detail}"
+        );
     }
 
     #[test]
@@ -1700,15 +2065,27 @@ mod tests {
     fn a_stale_registry_row_warns_and_names_the_import_fix() {
         // Age is the build's, so the test drives `registry_row` at a `now` far
         // enough past the stamp rather than waiting seven days.
-        let row = registry_row_at(3, ar_registry::discovery::unix_now() + (ar_registry::SNAPSHOT_TTL_DAYS + 1) * 86_400);
+        let row = registry_row_at(
+            3,
+            ar_registry::discovery::unix_now() + (ar_registry::SNAPSHOT_TTL_DAYS + 1) * 86_400,
+        );
         assert_eq!(row[1], "warn", "{row:?}");
         assert!(row[2].contains("ar import --from omniroute"), "{row:?}");
-        assert!(row[2].contains('3'), "it counts the models it cannot route: {row:?}");
+        assert!(
+            row[2].contains('3'),
+            "it counts the models it cannot route: {row:?}"
+        );
     }
 
     #[test]
     fn puts_the_store_beside_the_config_file_by_default() {
-        assert_eq!(store_path(Path::new("config.yaml")), PathBuf::from("credentials.db"));
-        assert_eq!(store_path(Path::new("/etc/ar/config.yaml")), PathBuf::from("/etc/ar/credentials.db"));
+        assert_eq!(
+            store_path(Path::new("config.yaml")),
+            PathBuf::from("credentials.db")
+        );
+        assert_eq!(
+            store_path(Path::new("/etc/ar/config.yaml")),
+            PathBuf::from("/etc/ar/credentials.db")
+        );
     }
 }

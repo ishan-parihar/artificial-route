@@ -351,6 +351,20 @@ pub struct Factors {
 }
 
 impl Factors {
+    /// The two factors `p2c` ranks on, in the order it reads them.
+    ///
+    /// Upstream's `getP2CTargetScore` scores a drawn pair on
+    /// `successRate / 100` plus `1 / log10(avgLatency + 10)`
+    /// (`combo/targetSorters.ts:126-140`). Those are the same two quantities as
+    /// [`Self::reliability`] and [`Self::latency_inv`] after this crate's
+    /// `[0, 1]` normalisation, so naming the pair here is what stops `p2c` from
+    /// carrying a private copy of two of the sixteen and drifting from the set
+    /// the rest of the scorer writes.
+    #[must_use]
+    pub const fn load_signals(&self) -> (f64, f64) {
+        (self.reliability, self.latency_inv)
+    }
+
     /// Field name and value pairs, in declaration order.
     ///
     /// This is the whole serialisation contract for `ar_explain_route` (P4

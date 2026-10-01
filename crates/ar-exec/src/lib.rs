@@ -1,10 +1,29 @@
 //! Upstream dispatch for Artificial Route.
 //!
 //! One executor, one job: take a canonical chat, POST it to a provider, and hand
-//! back a decoded SSE stream. Ports OmniRoute's `executors/default.ts` +
+//! back a live response stream. `post_chat` and `post` are the two entry points,
+//! and [`render_request`] is the wire gate both of them share.
+//!
+//! Ports OmniRoute's `executors/default.ts` +
 //! `base/{headers,mergeAbortSignals}` + `default/urlNormalizers` and drops the
 //! other 158 executors (bedrock SigV4, vertex, claude-web, codex OAuth) as
 //! `docs/02` directs.
+//!
+//! The OpenAI wire is the default and stays byte-identical; the other seven
+//! wires are rendered from the same canonical chat by `ar-translate`'s outbound
+//! mappers. [`render_request`] is the single place that gate lives, and
+//! [`outbound_wire`] is the single mapping from a registry label to a renderer.
+//!
+//! # Response direction
+//!
+//! The response path is a byte-relay: `ar-server` hands the client's bytes
+//! straight through whatever the provider framed them in, so a Claude-dialect
+//! client sees Gemini SSE when the router picked a Gemini provider. What exists
+//! for that job: `ar-translate`'s two non-streaming *inbound*-facing envelopes
+//! ([`ar_translate::to_anthropic_response`],
+//! [`ar_translate::to_responses_response`]), and
+//! `ar_translate::missing_pairs` naming every remaining re-framing cell with the
+//! reason it is still missing.
 //!
 //! # Why `reqwest` and not `ar-pool`
 //!
@@ -72,7 +91,7 @@ use std::time::{Duration, SystemTime};
 
 use ar_config::Secret;
 use ar_registry::{AuthClass, ProviderDef, WireFormat};
-use ar_translate::CanonicalChat;
+use ar_translate::{CanonicalChat, OutboundWire, render_for_wire};
 use async_stream::stream;
 use bytes::Bytes;
 use futures::Stream;
@@ -187,9 +206,9 @@ const _: () = {
 /// Why an upstream call failed.
 #[derive(Debug, thiserror::Error)]
 pub enum ExecError {
-    /// The provider speaks a dialect this build cannot post a canonical
-    /// OpenAI body to.
-    #[error("provider wire format {0:?} is not implemented in P0")]
+    /// The provider speaks a dialect this build cannot render a canonical body
+    /// into.
+    #[error("provider wire format {0:?} has no renderer in this build")]
     UnsupportedWire(WireFormat),
     /// The caller aborted before the response headers arrived.
     #[error("upstream call aborted by caller")]
@@ -286,9 +305,10 @@ impl ArExec {
     ///
     /// # Errors
     ///
-    /// [`ExecError::UnsupportedWire`] for a non-OpenAI provider, plus transport,
-    /// abort, timeout and non-2xx failures. A non-2xx reply is an error rather
-    /// than a stream, because its body is a JSON error object, not SSE.
+    /// [`ExecError::UnsupportedWire`] for a provider on a wire this build cannot
+    /// render, plus transport, abort, timeout and non-2xx failures. A non-2xx
+    /// reply is an error rather than a stream, because its body is a JSON error
+    /// object, not SSE.
     pub async fn post_chat(
         &self,
         chat: &CanonicalChat,
@@ -313,8 +333,8 @@ impl ArExec {
         Ok(start)
     }
 
-    /// The one execution core: gate the wire format, merge headers, POST, and
-    /// hand back the live response whatever its status.
+    /// The one execution core: render the wire, merge headers, POST, and hand
+    /// back the live response whatever its status.
     ///
     /// Both consumers go through here — [`ArExec::post_chat`], which folds a
     /// non-2xx into [`ExecError::Upstream`], and `ar-server`'s `HttpExec`, which
@@ -327,23 +347,59 @@ impl ArExec {
     /// is what lets it use this core without a lossy parse through
     /// [`CanonicalChat`] first.
     ///
+    /// # The wire gate, and where rendering happens
+    ///
+    /// The gate is per-provider rather than OpenAI-only: a provider whose registry
+    /// entry names a wire this build can render is rendered into *that* wire by
+    /// [`ArExec::render_request`]. Only [`WireFormat::Custom`] — and a dialect
+    /// with no renderer — stays [`ExecError::UnsupportedWire`], because a
+    /// wrong-wire POST is worse than a refusal.
+    ///
+    /// `upstream_model` is applied by the renderer for every wire *except* the
+    /// OpenAI one, where the historical [`rewrite_model`] path is kept so the
+    /// default wire stays byte-identical. Two paths, stated rather than hidden:
+    /// on a `Custom`-wire body there is no `"model"` key to rewrite, and a
+    /// dialect that carries the id on the URL has no key at all.
+    ///
     /// # Errors
     ///
     /// [`ExecError::UnsupportedWire`] for a provider this build cannot speak,
-    /// plus transport, abort and start-timeout failures. **Not** for a non-2xx:
-    /// an HTTP status is a verdict the caller has to see, not an executor
-    /// failure.
+    /// plus transport, abort, start-timeout, encode and not-an-object failures.
+    /// **Not** for a non-2xx: an HTTP status is a verdict the caller has to see,
+    /// not an executor failure.
     pub async fn post(
         &self,
         d: &Dispatch<'_>,
         canonical: &[u8],
         abort: &CancellationToken,
     ) -> Result<ChatStream, ExecError> {
-        if d.wire_format != WireFormat::Openai {
-            return Err(ExecError::UnsupportedWire(d.wire_format));
-        }
+        self.post_rendered(d, self.render_request(d, canonical)?, abort).await
+    }
 
-        let body = rewrite_model(canonical, d.upstream_model)?;
+    /// POSTs a body that has already been rendered into `d`'s wire.
+    ///
+    /// The tail of [`Self::post`], with the render step hoisted out so a caller
+    /// that has to *see* the rendered bytes — to log them, count them, or fail
+    /// before spending a connection — can render once and post those. Reusing
+    /// `post` on an already-rendered body would render it a second time, which
+    /// for every non-OpenAI wire means parsing a provider body as canonical.
+    ///
+    /// The bearer is still `d.api_key`, so this is not a way to skip the OAuth
+    /// path: it takes a [`Dispatch`] and reads its credential like any other.
+    ///
+    /// # Errors
+    ///
+    /// Transport, abort and start-timeout failures. **Not** [`ExecError::UnsupportedWire`]:
+    /// the gate already ran, in [`Self::render_request`].
+    /// Rendered once per dispatch by `render_request` and written straight to the
+    /// request body, so `&[u8]` in `Bytes` out rather than a typed struct: there
+    /// is no second consumer for a struct to stay in sync with.
+    pub async fn post_rendered(
+        &self,
+        d: &Dispatch<'_>,
+        body: Bytes,
+        abort: &CancellationToken,
+    ) -> Result<ChatStream, ExecError> {
         let start = await_start(
             self.client
                 .post(chat_url(d.base_url))
@@ -360,6 +416,83 @@ impl ArExec {
             abort: abort.clone(),
         })
     }
+
+    /// Renders a canonical body into `d`'s wire.
+    ///
+    /// The single place the wire gate lives. Split from [`Self::post`] so
+    /// `ar-server` can render a request for a dispatch it is about to hand to the
+    /// OAuth path, and so a caller can assert the rendered bytes without a
+    /// network round-trip.
+    ///
+    /// # Errors
+    ///
+    /// [`ExecError::UnsupportedWire`] for a wire with no renderer, or one of the
+    /// encode errors when the canonical body is not a JSON object.
+    pub fn render_request(
+        &self,
+        d: &Dispatch<'_>,
+        canonical: &[u8],
+    ) -> Result<Bytes, ExecError> {
+        let Some(wire) = outbound_wire(d.wire_format) else {
+            return Err(ExecError::UnsupportedWire(d.wire_format));
+        };
+        // The OpenAI arm is the historical path, kept whole: same bytes, same
+        // `rewrite_model` behaviour, no parse through `CanonicalChat`.
+        if wire == OutboundWire::Openai {
+            return rewrite_model(canonical, d.upstream_model);
+        }
+        // Every other wire is rendered from the typed canonical chat, so the
+        // upstream receives a body in its own dialect rather than a renamed
+        // OpenAI one. `upstream_model` is the model the provider is configured
+        // with, so it replaces the caller's combo id before rendering.
+        //
+        // The body is read as a `Value` first, for two reasons: a malformed body
+        // reports [`ExecError::Encode`] rather than the `NotAnObject` a
+        // leading-brace sniff would give it, and a valid-JSON-non-object reports
+        // the same `NotAnObject` the OpenAI arm's `rewrite_model` already does —
+        // so a caller reading `ExecError` need not know which renderer ran.
+        // `canonical` is the router's own bytes, so a double parse is not on any
+        // hot path a request can fail.
+        let value: serde_json::Value = serde_json::from_slice(canonical)?;
+        if !value.is_object() {
+            return Err(ExecError::NotAnObject);
+        }
+        let mut chat: CanonicalChat = serde_json::from_value(value)?;
+        if !d.upstream_model.is_empty() {
+            chat.model = d.upstream_model.to_owned();
+        }
+        Ok(Bytes::from(render_for_wire(&chat, wire)))
+    }
+}
+
+/// Maps a registry wire onto the renderer this build has for it.
+///
+/// `None` means "no renderer", which is [`ExecError::UnsupportedWire`]. Exactly
+/// one wire lands on `None`: [`WireFormat::Custom`], a provider-specific dialect
+/// with no shared label and therefore no shape this build can transcribe.
+/// Inventing one is exactly the failure the gate exists to prevent.
+///
+/// The other seven all render, including [`WireFormat::Antigravity`] — which
+/// shares the Gemini body, because the reference registers one function under both
+/// names.
+///
+/// The mapping is by [`WireFormat`] rather than by provider id on purpose: a
+/// file-declared custom provider picks up its dialect from the same field a
+/// catalogued one does, so a new endpoint needs no code change and no id
+/// allowlist.
+#[must_use]
+pub const fn outbound_wire(format: WireFormat) -> Option<OutboundWire> {
+    match format {
+        WireFormat::Openai => Some(OutboundWire::Openai),
+        WireFormat::Anthropic => Some(OutboundWire::Claude),
+        WireFormat::OpenaiResponses => Some(OutboundWire::Responses),
+        WireFormat::Gemini => Some(OutboundWire::Gemini),
+        WireFormat::Antigravity => Some(OutboundWire::Antigravity),
+        WireFormat::Cursor => Some(OutboundWire::Cursor),
+        WireFormat::Clova => Some(OutboundWire::Clova),
+        WireFormat::Kiro => Some(OutboundWire::Kiro),
+        WireFormat::Custom => None,
+    }
 }
 
 /// Everything one dispatch needs, borrowed from the caller's provider config.
@@ -372,7 +505,7 @@ impl ArExec {
 pub struct Dispatch<'a> {
     /// Upstream API root, trailing slashes allowed ([`chat_url`] trims them).
     pub base_url: &'a str,
-    /// Dialect this provider speaks. Anything but OpenAI is
+    /// The provider's wire dialect. Anything this build has no renderer for is
     /// [`ExecError::UnsupportedWire`] rather than a wrong-wire POST.
     pub wire_format: WireFormat,
     /// Bearer credential. Empty means no `Authorization` header.
@@ -883,28 +1016,253 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn gates_non_openai_wire_before_any_dispatch() {
-        // The point of the gate: no request reaches the socket, so there is no
-        // way for an OpenAI body to be POSTed to an Anthropic endpoint.
-        let exec = ArExec::new().unwrap();
-        let d = Dispatch {
-            base_url: "https://api.anthropic.com/v1",
-            wire_format: WireFormat::Anthropic,
+            /// A canonical body in the shape `ar-route` hands the executor, carrying a
+    /// system turn and a user turn so every renderer's hoisting is exercised.
+    const CANONICAL: &[u8] =
+        br#"{"model":"auto","messages":[{"role":"system","content":"be terse"},{"role":"user","content":"hi"}],"max_tokens":64,"stream":true}"#;
+
+    /// The header map every dispatch below carries. A `static` rather than a
+    /// `&BTreeMap::new()` temporary, which would not outlive the returned bundle.
+    static NO_HEADERS: BTreeMap<String, String> = BTreeMap::new();
+
+    /// A dispatch bundle naming one wire, as a provider's config would. Generic
+    /// over the model borrow rather than pinned to `'static`, since the header map
+    /// outlives it but the `&str` need not.
+    fn dispatch_shape<'a>(dialect: WireFormat, model: &'a str) -> Dispatch<'a> {
+        Dispatch {
+            base_url: "https://api.test/v1",
+            wire_format: dialect,
             api_key: "sk-x",
-            upstream_model: "claude-sonnet-4-5",
+            upstream_model: model,
             stream: true,
-            headers: &BTreeMap::new(),
-        };
-        let err = futures::executor::block_on(exec.post(
-            &d,
-            br#"{"model":"m"}"#,
-            &CancellationToken::new()
-        ));
+            headers: &NO_HEADERS,
+        }
+    }
+
+    /// Renders `CANONICAL` through `d` and returns the body as text, asserting
+    /// along the way that it is JSON — a renderer that emitted prose would fail
+    /// here rather than pass a substring test below. The parsed value comes back
+    /// too, because `serde_json::Map` is a `BTreeMap` here and so the serialised
+    /// key order is alphabetical: an assertion on a rendered body has to read the
+    /// value, not a substring of the text.
+    fn rendered(exec: &ArExec, d: &Dispatch<'_>) -> (String, serde_json::Value) {
+        let bytes = exec.render_request(d, CANONICAL).expect("a renderable wire");
+        let text = String::from_utf8(bytes.to_vec()).expect("utf-8 body");
+        let value = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("{} body is not json: {text}\n{e}", d.wire_format.as_str()));
+        (text, value)
+    }
+
+    /// The gate that remains: a provider-specific dialect has no shared
+    /// shape, so no request reaches the socket and no body is sent in its
+    /// place. Paired with `a_custom_wire_is_not_dispatchable` on the ar-server
+    /// side.
+    #[test]
+    fn gates_a_custom_wire_before_any_dispatch() {
+        // The gate that remains: a provider-specific dialect has no shared shape,
+        // so no request reaches the socket and no OpenAI body is sent in its place.
+        let exec = ArExec::new().unwrap();
+        let d = dispatch_shape(WireFormat::Custom, "m");
         assert!(matches!(
-            err,
-            Err(ExecError::UnsupportedWire(WireFormat::Anthropic))
+            exec.render_request(&d, CANONICAL),
+            Err(ExecError::UnsupportedWire(WireFormat::Custom))
         ));
+    }
+
+    #[test]
+    fn maps_every_named_registry_wire_to_a_renderer() {
+    // The unblock, asserted on the mapping rather than on a count: every
+    // dialect the registry names except `custom` has one.
+        for format in [
+            WireFormat::Openai,
+            WireFormat::Anthropic,
+            WireFormat::OpenaiResponses,
+            WireFormat::Gemini,
+            WireFormat::Antigravity,
+            WireFormat::Cursor,
+            WireFormat::Clova,
+            WireFormat::Kiro,
+        ] {
+            assert!(outbound_wire(format).is_some(), "{format:?} has no renderer");
+        }
+        assert_eq!(outbound_wire(WireFormat::Custom), None, "custom has no renderer");
+    }
+
+    #[test]
+    fn maps_each_registry_wire_to_the_renderer_named_for_that_wire() {
+    // The two enums can drift — `ar-registry` is a catalog label set and
+    // `OutboundWire` is a "can this build send it" set — so the pairing is
+    // asserted per variant rather than assumed. A new `ar-registry` label with
+    // no renderer fails the first test; a wrong pairing fails this one.
+    // `Custom` is included and asserted `None`, so an added variant cannot
+    // silently become dispatchable.
+        let pairs = [
+            (WireFormat::Openai, OutboundWire::Openai),
+            (WireFormat::Anthropic, OutboundWire::Claude),
+            (WireFormat::OpenaiResponses, OutboundWire::Responses),
+            (WireFormat::Gemini, OutboundWire::Gemini),
+            (WireFormat::Antigravity, OutboundWire::Antigravity),
+            (WireFormat::Cursor, OutboundWire::Cursor),
+            (WireFormat::Clova, OutboundWire::Clova),
+            (WireFormat::Kiro, OutboundWire::Kiro),
+        ];
+        for (format, wire) in pairs {
+            assert_eq!(outbound_wire(format), Some(wire), "{format:?} is wired wrong");
+        }
+        assert_eq!(outbound_wire(WireFormat::Custom), None, "custom has no renderer");
+    }
+
+    /// The default path must not move: same bytes, same model rewrite. Asserted
+    /// against `rewrite_model` rather than against a golden string, so the
+    /// delegation is what is under test.
+    #[test]
+    fn leaves_the_openai_wire_byte_identical() {
+        let exec = ArExec::new().unwrap();
+        let d = dispatch_shape(WireFormat::Openai, "llama-3.3-70b");
+        assert_eq!(
+            exec.render_request(&d, CANONICAL).expect("rendered"),
+            rewrite_model(CANONICAL, "llama-3.3-70b").expect("rewrite"),
+        );
+    }
+
+    /// One dispatch test per newly-unblocked provider family, asserting the
+    /// rendered body carries that wire's own dialect rather than a renamed
+    /// OpenAI one — the defect the old OpenAI-only gate prevented, with the gate
+    /// moved to "has a renderer". Each reads the parsed value rather than a
+    /// substring of the text, because `serde_json::Map` is a `BTreeMap` here and
+    /// the serialised key order is alphabetical.
+    ///
+    /// The dispatch bundle every test below builds carries the provider's own
+    /// model, so a body reaching the wire with the caller's combo id is a defect
+    /// the first assertion in each test is there to catch.
+    #[test]
+    fn dispatch_shape_borrows_its_model_and_its_header_map_is_static() {
+        // Both halves of the test helper's signature: the bundle is `Dispatch<'a>`
+        // over `model`, while the empty header map outlives every call. A
+        // `&BTreeMap::new()` temporary here would not.
+        let d = dispatch_shape(WireFormat::Anthropic, "m");
+        assert_eq!(d.upstream_model, "m");
+        assert!(d.headers.is_empty());
+    }
+
+    #[test]
+    fn dispatches_a_claude_wire_provider_in_the_anthropic_dialect() {
+        let (body, value) =
+            rendered(&ArExec::new().unwrap(), &dispatch_shape(WireFormat::Anthropic, "claude-sonnet-4-5"));
+        assert_eq!(value["model"], "claude-sonnet-4-5", "the provider's spelling wins: {body}");
+        // The system turn left the message array for the top-level block, and
+        // `max_tokens` is Anthropic's *required* field rather than an option.
+        assert_eq!(value["system"][0]["text"], "be terse", "{body}");
+        assert_eq!(value["max_tokens"], 64, "{body}");
+    }
+
+    #[test]
+    fn dispatches_a_responses_wire_provider_in_the_responses_dialect() {
+        let (body, value) = rendered(
+            &ArExec::new().unwrap(),
+            &dispatch_shape(WireFormat::OpenaiResponses, "gpt-5.4"),
+        );
+        assert_eq!(value["instructions"], "be terse", "{body}");
+        assert_eq!(value["max_output_tokens"], 64, "{body}");
+        assert!(value.get("messages").is_none(), "not a chat-completions body: {body}");
+    }
+
+    #[test]
+    fn dispatches_a_gemini_wire_provider_in_the_gemini_dialect() {
+        let (body, value) =
+            rendered(&ArExec::new().unwrap(), &dispatch_shape(WireFormat::Gemini, "gemini-3-pro"));
+        assert_eq!(value["systemInstruction"]["parts"][0]["text"], "be terse", "{body}");
+        assert_eq!(value["generationConfig"]["maxOutputTokens"], 64, "{body}");
+        assert!(value.get("messages").is_none(), "not a chat-completions body: {body}");
+    }
+
+    #[test]
+    fn dispatches_an_antigravity_wire_provider_with_the_gemini_body() {
+        let exec = ArExec::new().unwrap();
+        assert_eq!(
+            rendered(&exec, &dispatch_shape(WireFormat::Antigravity, "gemini-3-pro")),
+            rendered(&exec, &dispatch_shape(WireFormat::Gemini, "gemini-3-pro")),
+        );
+    }
+
+    #[test]
+    fn dispatches_a_cursor_wire_provider_in_the_cursor_dialect() {
+        let (body, value) =
+            rendered(&ArExec::new().unwrap(), &dispatch_shape(WireFormat::Cursor, "cursor-small"));
+        assert_eq!(value["messages"][0]["content"], "[System Instructions]\nbe terse", "{body}");
+        assert!(value.get("system").is_none(), "cursor has no system field: {body}");
+    }
+
+    #[test]
+    fn dispatches_a_clova_wire_provider_in_the_clova_dialect() {
+        let (body, value) =
+            rendered(&ArExec::new().unwrap(), &dispatch_shape(WireFormat::Clova, "HCX-005"));
+        assert_eq!(value["maxTokens"], 64, "{body}");
+        assert!(value.get("max_tokens").is_none(), "the openai spelling is not a clova key: {body}");
+    }
+
+    #[test]
+    fn dispatches_a_kiro_wire_provider_in_the_kiro_dialect() {
+        let (body, value) =
+            rendered(&ArExec::new().unwrap(), &dispatch_shape(WireFormat::Kiro, "claude-sonnet-4-5"));
+        let current = &value["conversationState"]["currentMessage"]["userInputMessage"];
+        assert_eq!(current["modelId"], "claude-sonnet-4-5", "{body}");
+        assert!(value.get("messages").is_none(), "kiro has no messages array: {body}");
+    }
+
+    #[test]
+    fn leaves_the_caller_model_alone_when_the_provider_declares_none() {
+        // A misconfigured mapping must stay visible rather than be papered over
+        // with an invented model name.
+        let (body, value) =
+            rendered(&ArExec::new().unwrap(), &dispatch_shape(WireFormat::Anthropic, ""));
+        assert_eq!(value["model"], "auto", "{body}");
+    }
+
+    /// The OpenAI arm reports this from `rewrite_model`; the others only get it
+    /// from the check `render_request` does before deserializing, so both arms
+    /// have to agree or a caller reading `ExecError` has to know which renderer
+    /// ran. The model is non-empty on every row, because `rewrite_model` returns
+    /// a body with no `upstream_model` unchanged and never parses it — that
+    /// short-circuit is the pre-existing OpenAI behaviour, kept byte-identical.
+    #[test]
+    fn reports_a_canonical_body_that_is_not_an_object() {
+        let exec = ArExec::new().unwrap();
+        for dialect in [WireFormat::Openai, WireFormat::Anthropic, WireFormat::Gemini] {
+            let d = dispatch_shape(dialect, "m-1");
+            let err = exec.render_request(&d, b"[1,2]").expect_err("not an object is refused");
+            assert!(
+                matches!(err, ExecError::NotAnObject),
+                "{dialect:?} named {err:?} for a json array"
+            );
+            let err = exec
+                .render_request(&d, b"\"a string\"")
+                .expect_err("not an object is refused");
+            assert!(
+                matches!(err, ExecError::NotAnObject),
+                "{dialect:?} named {err:?} for a json string"
+            );
+        }
+    }
+
+    /// Every arm refuses a body it cannot parse, and every arm names the refusal
+    /// the same way: the OpenAI arm delegates to `rewrite_model` while the others
+    /// read the body here, so this is two implementations of one rule.
+    #[test]
+    fn reports_a_canonical_body_that_is_not_json() {
+        let exec = ArExec::new().unwrap();
+        // The model is non-empty throughout, because `rewrite_model` hands a body
+        // with no `upstream_model` straight back without parsing it — that
+        // short-circuit is the pre-existing OpenAI behaviour, kept byte-identical.
+        for dialect in [WireFormat::Openai, WireFormat::Anthropic, WireFormat::Gemini] {
+            let d = dispatch_shape(dialect, "m-1");
+            for body in [&b"{"[..], &b"not json"[..]] {
+                let err = exec
+                    .render_request(&d, body)
+                    .expect_err("a body this build cannot read is refused, not forwarded");
+                assert!(matches!(err, ExecError::Encode(_)), "{dialect:?} on {body:?}: {err:?}");
+            }
+        }
     }
 
     #[test]
@@ -990,12 +1348,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_post_when_wire_format_not_openai() {
+    async fn refuses_post_chat_on_a_wire_with_no_renderer() {
         let exec = ArExec::new().unwrap();
         let mut def = provider("ANTHROPIC_API_KEY");
-        def.wire_format = WireFormat::Anthropic;
+        def.wire_format = WireFormat::Custom;
         let chat = CanonicalChat {
-            model: "claude-sonnet-4-5".into(),
+            model: "m".into(),
             messages: vec![],
             temperature: None,
             max_tokens: None,
@@ -1006,6 +1364,6 @@ mod tests {
             .post_chat(&chat, &def, &Secret::new("sk-x"), &CancellationToken::new())
             .await
             .err();
-        assert!(matches!(err, Some(ExecError::UnsupportedWire(WireFormat::Anthropic))));
+        assert!(matches!(err, Some(ExecError::UnsupportedWire(WireFormat::Custom))));
     }
 }

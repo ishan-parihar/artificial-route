@@ -181,7 +181,14 @@ mod tests {
         ]];
         let fields = fields_or_default(Some("id,status"));
         assert_eq!(
-            list("providers", "providers", &DEFAULT_FIELDS, &fields, &rows, false),
+            list(
+                "providers",
+                "providers",
+                &DEFAULT_FIELDS,
+                &fields,
+                &rows,
+                false
+            ),
             "count: 1 of 1 total\nproviders[1]{id,status}:\n  openai,configured\n"
         );
     }

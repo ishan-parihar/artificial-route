@@ -111,6 +111,32 @@
 //! is never printed: it lives in a `DevicePending` behind a [`Secret`], so it
 //! cannot reach a log through `Debug` even by accident.
 //!
+//! # Surviving a restart
+//!
+//! A refresh that renews a token has to write it down, or the next process loads
+//! the refresh token this one just spent. Four mechanisms, each mirroring a
+//! shape the reference carries:
+//!
+//! * [`HttpRefresher`] retries with jittered exponential backoff
+//!   ([`REFRESH_MAX_ATTEMPTS`] attempts) and short-circuits on an
+//!   unrecoverable verdict, because a second attempt spends a second
+//!   refresh-token use to learn the same thing.
+//! * [`RefreshBreaker`] stops a provider that has failed
+//!   [`REFRESH_BREAKER_THRESHOLD`] refreshes in a row from being asked again
+//!   for [`REFRESH_BREAKER_COOLDOWN_SECS`]. It reports a *transient* fault and
+//!   never retires an account — that is [`classify_refresh`]'s list alone.
+//! * [`Connection::rotate`] bounds how long it waits for its own refresh lock
+//!   ([`REFRESH_LOCK_BOUND_SECS`]), so a hung upstream faults instead of parking
+//!   every waiter on that connection until restart.
+//! * [`Connection::rotate`] persists the renewal through a [`RotationSink`]
+//!   inside the lock, guarded so a concurrent writer's fresher rotation is not
+//!   reverted.
+//!
+//! Proactive *when* is per-provider: [`OAuthKind::refresh_lead_secs`] plus a
+//! per-session [`Session::with_refresh_lead_secs`] override, both defaulting to
+//! five minutes. The reason it is a table rather than one constant is the
+//! refresh-token *family*, not the access token — see that method.
+//!
 //! The socket is unauthenticated for its entire life, so it is bound to the
 //! loopback address and never to `0.0.0.0`, it serves exactly one request, and it
 //! is dropped the moment that request is answered or the deadline passes. A
@@ -138,13 +164,76 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{ArExec, ChatStream, Dispatch, ExecError};
 
-/// Seconds of headroom before expiry at which a token counts as already stale.
+/// Proactive-refresh lead time when neither a session override nor a
+/// per-kind row says otherwise: five minutes.
 ///
-/// A token that expires *during* the upstream round trip would 401 a request
-/// this proxy could have avoided. Thirty seconds is about one busy upstream's
-/// `Retry-After`, and it is a constant rather than a knob because a refresh
-/// costs a round trip whether it is needed or not.
-const EXPIRY_SKEW_SECS: u64 = 30;
+/// Five minutes is generous enough that a token cannot expire during the
+/// upstream round trip it was sent on, and small enough that a provider which
+/// revokes a whole refresh-token *family* on sibling use is not asked to
+/// rotate more often than it has to. The reference's `TOKEN_EXPIRY_BUFFER_MS`
+/// is the same number for the same reason.
+const REFRESH_LEAD_SECS: u64 = 300;
+
+/// Lead time for a provider whose refresh tokens are permanent, so refreshing
+/// costs nothing but a round trip.
+///
+/// Google's OAuth refresh tokens do not rotate, so a longer lead is free there
+/// and saves upstream chatter. Mirrors the `antigravity`/`agy` rows of the
+/// reference's `REFRESH_LEAD_MS`; [`OAuthKind::refresh_lead_secs`] is where the
+/// choice is made.
+const NON_ROTATING_REFRESH_LEAD_SECS: u64 = 900;
+
+/// Attempts one refresh makes before it reports a transient fault.
+///
+/// Three because the reference's `refreshWithRetry` and the grok-cli executor
+/// both use three, and because two failures in a row on the same endpoint is
+/// already an outage rather than a blip.
+const REFRESH_MAX_ATTEMPTS: usize = 3;
+
+/// Floor of the jittered exponential backoff between refresh attempts.
+///
+/// 200ms is the reference grok-cli executor's `GROK_BUILD_REFRESH_MIN_DELAY_MS`.
+const REFRESH_MIN_DELAY_MS: u64 = 200;
+
+/// Ceiling of the jittered exponential backoff between refresh attempts.
+///
+/// 2s is the reference's cap: long enough that a struggling provider is not
+/// hammered, short enough that three attempts still finish inside a client's
+/// patience.
+const REFRESH_MAX_DELAY_MS: u64 = 2_000;
+
+/// Consecutive refresh failures for one provider before refreshes stop
+/// entirely.
+///
+/// The reference's `CIRCUIT_BREAKER_THRESHOLD`. Five, because a provider that
+/// has failed five refreshes in a row is not going to succeed on the sixth, and
+/// every attempt spends a refresh-token use.
+const REFRESH_BREAKER_THRESHOLD: u32 = 5;
+
+/// How long a tripped breaker stays open, in seconds.
+///
+/// Thirty minutes, the reference's `CIRCUIT_BREAKER_COOLDOWN`: long enough for
+/// an outage window to close on its own, short enough that an operator who
+/// fixed the problem does not have to restart the process.
+const REFRESH_BREAKER_COOLDOWN_SECS: u64 = 30 * 60;
+
+/// Upper bound on how long a caller waits for the per-connection refresh lock.
+///
+/// The lock is held across the refresh `await`, so a hung upstream — a
+/// blackholed proxy mid-outage, an endpoint that accepts the socket and never
+/// answers — would park every waiting request on this connection until process
+/// restart. 90s ≈ 3× the 30s per-attempt budget of
+/// [`REFRESH_MAX_ATTEMPTS`] attempts, which is generous for a slow but healthy
+/// refresh and short enough to unwedge a wedged one. Mirrors the reference's
+/// `REFRESH_MUTEX_MAX_MS_DEFAULT`.
+const REFRESH_LOCK_BOUND_SECS: u64 = 90;
+
+/// `expires_in` assumed when a refresh response omits one.
+///
+/// The reference grok-cli executor's fallback: six hours, which is the
+/// lifetime Grok Build actually issues. Without it the token would be born
+/// already stale and every request would refresh on its way out.
+const EXPIRES_IN_FALLBACK_SECS: u64 = 21_600;
 
 /// Ceiling on how much of a refresh-failure body is scanned for a reason.
 ///
@@ -171,6 +260,31 @@ const TOKEN_ENDPOINT_TIMEOUT: Duration = Duration::from_secs(30);
     /// cadence than 5s should have said so, and one that says nothing cannot make
     /// this build into a hot loop.
     const DEVICE_DEFAULT_INTERVAL_SECS: u64 = 5;
+
+    /// The cadence a kilo-shaped grant is polled at when it names no `interval`.
+    ///
+    /// §3.2's own default stays the answer for every grant that reads like the
+    /// RFC; this is the one provider whose endpoint wants a poll faster than that,
+    /// and it wants it *silently* — it publishes no `interval` field at all, so
+    /// the only evidence it is not an RFC grant is that its other fields are not
+    /// RFC either. Hence the trigger: applied only when the expiry itself arrived
+    /// camelCase (see [`initiate_device`]), so an RFC-shaped grant that omits
+    /// `interval` still gets [`DEVICE_DEFAULT_INTERVAL_SECS`].
+    ///
+    /// Faster than the RFC floor by design, and not a hot loop: 3s is a poll
+    /// rate, not a spin, and it is the provider's own number rather than a guess
+    /// at one.
+    const DEVICE_CAMEL_INTERVAL_SECS: u64 = 3;
+
+    /// The device-code placeholder a `device_poll_url` may carry: `{code}`.
+    ///
+    /// Some providers address the grant by path (`/poll/{code}`) rather than by
+    /// body parameter, and which one a given provider does cannot be inferred from
+    /// its id without inventing a wire format (AGENTS.md) — so the substitution is
+    /// the operator's to declare in `config.yaml` and [`poll_device`]'s to
+    /// perform. A URL without the placeholder is polled byte-identically, which is
+    /// what keeps every existing provider on exactly the request it had.
+    const DEVICE_POLL_CODE_PLACEHOLDER: &str = "{code}";
 
 /// How much §3.5's `slow_down` adds to the wait, per its own wording.
 ///
@@ -351,6 +465,31 @@ impl OAuthKind {
                 Some(RefreshFault::Unrecoverable { status: 401, reason: "invalid_client" })
             }
             _ => None,
+        }
+    }
+
+    /// How far ahead of expiry this provider should be refreshed, in seconds.
+    ///
+    /// Most rows take [`REFRESH_LEAD_SECS`], and the reason is the provider's
+    /// refresh-token *family*, not its access token. Codex and Claude enforce
+    /// "one active session per client", so refreshing one account can invalidate
+    /// the refresh_token of every sibling under the same client id. Those kinds
+    /// therefore wait until the access token is genuinely about to expire, and a
+    /// session that still has more than the lead left keeps the token it has —
+    /// which is the whole point of the row being 5min rather than an hour.
+    ///
+    /// [`Self::GeminiCli`] is the exception and gets
+    /// [`NON_ROTATING_REFRESH_LEAD_SECS`]: Google's refresh tokens are permanent,
+    /// so an early refresh buys no safety and only adds upstream chatter.
+    ///
+    /// A session may override this per connection with
+    /// [`Session::with_refresh_lead_secs`], which is how an operator tunes one
+    /// account without changing what every other codex session does.
+    #[must_use]
+    pub fn refresh_lead_secs(self) -> u64 {
+        match self {
+            Self::GeminiCli => NON_ROTATING_REFRESH_LEAD_SECS,
+            _ => REFRESH_LEAD_SECS,
         }
     }
 }
@@ -728,12 +867,25 @@ impl OAuthToken {
         self.refresh.is_some()
     }
 
-    /// Whether the token is at or past its expiry, with [`EXPIRY_SKEW_SECS`] of
+    /// Whether the token is at or past its expiry, with [`lead_secs`] of
     /// headroom.
+    ///
+    /// `lead_secs` is a parameter rather than a constant because the headroom is
+    /// a property of the *provider* — see [`OAuthKind::refresh_lead_secs`] — and
+    /// a token cannot know which provider it is about to be sent to.
+    #[must_use]
+    pub fn is_expiring_within(&self, now: u64, lead_secs: u64) -> bool {
+        self.expires_at.is_some_and(|at| at <= now.saturating_add(lead_secs))
+    }
+
+    /// Whether the token is at or past its expiry, with the default
+    /// [`REFRESH_LEAD_SECS`] of headroom.
+    ///
+    /// The no-argument form, for a caller that has a lead time in hand already
+    /// and only wants the comparison. Kept so the common question stays one call.
     #[must_use]
     pub fn is_expiring(&self, now: u64) -> bool {
-        self.expires_at
-            .is_some_and(|at| at <= now.saturating_add(EXPIRY_SKEW_SECS))
+        self.is_expiring_within(now, REFRESH_LEAD_SECS)
     }
 }
 
@@ -802,6 +954,8 @@ pub struct Session {
     device_poll_url: Option<String>,
     client_id: Option<String>,
     scope: Option<String>,
+    /// Per-session override of [`OAuthKind::refresh_lead_secs`], in seconds.
+    refresh_lead_secs: Option<u64>,
 }
 
 impl Session {
@@ -817,6 +971,7 @@ impl Session {
             device_poll_url: None,
             client_id: None,
             scope: None,
+            refresh_lead_secs: None,
         }
     }
 
@@ -869,6 +1024,31 @@ impl Session {
     pub fn with_scope(mut self, scope: impl Into<String>) -> Self {
         self.scope = Some(scope.into());
         self
+    }
+
+    /// Overrides how far ahead of expiry this one session refreshes.
+    ///
+    /// Precedence over [`OAuthKind::refresh_lead_secs`], so an operator can tune
+    /// a single account — the one behind a provider whose family invalidation is
+    /// misbehaving, say — without changing what every other session of the same
+    /// provider does. `None` restores the per-kind default.
+    ///
+    /// Zero is a legal value and means "refresh only once expired", which is a
+    /// real thing to want from a provider with a long-lived access token.
+    #[must_use]
+    pub fn with_refresh_lead_secs(mut self, lead_secs: u64) -> Self {
+        self.refresh_lead_secs = Some(lead_secs);
+        self
+    }
+
+    /// This session's proactive-refresh lead time, in seconds.
+    ///
+    /// The override when one was set, otherwise the per-kind default. Read once
+    /// at the grant decision rather than threaded through, because it cannot
+    /// change while the session is in flight.
+    #[must_use]
+    pub fn refresh_lead_secs(&self) -> u64 {
+        self.refresh_lead_secs.unwrap_or_else(|| self.kind.refresh_lead_secs())
     }
 
     /// The registry provider id.
@@ -1017,6 +1197,41 @@ pub struct Unconnected;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Connected;
 
+/// Where a rotation's renewed tokens get written, and the identity the write is
+/// guarded by.
+///
+/// Splitting this out as a trait is what keeps rotation persistence out of this
+/// crate's dependency graph: `ar-keys` depends on `ar-exec` (its
+/// `oauth_sessions` CHECK is generated from [`terminal_check_constraint`]), so
+/// `ar-exec` cannot name `CredentialStore`. The trait points the other way — the
+/// store implements it, this crate only calls it.
+///
+/// Implemented by `ar_keys::CredentialStore`. A caller with no store wires none,
+/// and the connection's rotations stay in memory exactly as they were.
+///
+/// # Why the bound is `Send` and not `Sync`
+///
+/// A store that owns a sqlite connection cannot be `Sync` — `rusqlite` holds an
+/// internal `RefCell` — so requiring `Sync` here would make the only real sink
+/// unimplementable. The connection holds its sink behind an async mutex instead,
+/// which is where the exclusion belongs anyway: the write is a blocking sqlite
+/// transaction, so it must not run concurrently with another one.
+pub trait RotationSink: Send {
+    /// Writes `renewed` as the current tokens for `provider`, and reports whether
+    /// the write happened.
+    ///
+    /// `presented` is the refresh token the refresh exchanged. A sink that finds
+    /// its stored refresh token already differs must return `false` and write
+    /// nothing: a concurrent writer rotated past us, and overwriting would revert
+    /// its rotation. The caller hands the renewed token to the request either
+    /// way, because upstream already authenticated it; only the stored state is
+    /// in question.
+    ///
+    /// `false` is never an error the caller must handle. It means "somebody
+    /// fresher got there first", which is the good outcome.
+    fn persist_rotation(&self, provider: &str, presented: Option<&str>, renewed: &OAuthToken) -> bool;
+}
+
 /// One authenticated provider connection, in state `S`.
 ///
 /// TypeState rather than a `connected: bool`, for the reason [`Unconnected`]
@@ -1028,13 +1243,45 @@ pub struct Connection<S> {
     /// because it is held across the refresh `await`; a `std` mutex there would
     /// block the runtime thread.
     refresh_lock: AsyncMutex<()>,
+    /// How long [`Self::rotate`] will wait for [`Self::refresh_lock`], so a
+    /// wedged refresh faults rather than parking the request forever.
+    refresh_lock_bound: Duration,
     terminal: RwLock<Option<TerminalReport>>,
     pool: Arc<RotationPool>,
     refresher: Arc<dyn Refresher>,
+    /// Where a rotation's renewed tokens are written, when a store is wired.
+    ///
+    /// Behind a `std` mutex because a sink may own a blocking sqlite connection,
+    /// which is `Send` but not `Sync` — see [`RotationSink`]'s bound. The write is
+    /// a short synchronous transaction that never awaits, so a std lock cannot
+    /// stall the runtime the way an async one would be entitled to.
+    sink: Option<Arc<Mutex<Box<dyn RotationSink>>>>,
     _state: PhantomData<fn() -> S>,
 }
 
 impl<S> Connection<S> {
+    /// Wires a store for renewed tokens, on a not-yet-connected connection.
+    ///
+    /// A builder rather than a `pending` argument so the existing three-argument
+    /// construction keeps compiling: a deployment with no credential store wires
+    /// nothing, and its rotations are in-memory exactly as they were.
+    #[must_use]
+    pub fn with_sink(mut self, sink: Box<dyn RotationSink>) -> Self {
+        self.sink = Some(Arc::new(Mutex::new(sink)));
+        self
+    }
+
+    /// Narrows how long [`Connection::rotate`] waits for the refresh lock.
+    ///
+    /// Only for a test that would otherwise wait [`REFRESH_LOCK_BOUND_SECS`]. The
+    /// production path takes the default, which is a real bound rather than a
+    /// test-only affordance: the whole point is that a wedged refresh unwedges.
+    #[must_use]
+    pub fn with_refresh_lock_bound(mut self, bound: Duration) -> Self {
+        self.refresh_lock_bound = bound;
+        self
+    }
+
     /// The registry provider id.
     #[must_use]
     pub fn provider(&self) -> &str {
@@ -1112,9 +1359,11 @@ impl Connection<Unconnected> {
             session,
             token: RwLock::new(OAuthToken::new(Secret::new(""))),
             refresh_lock: AsyncMutex::new(()),
+            refresh_lock_bound: Duration::from_secs(REFRESH_LOCK_BOUND_SECS),
             terminal: RwLock::new(None),
             pool,
             refresher,
+            sink: None,
             _state: PhantomData,
         }
     }
@@ -1139,9 +1388,11 @@ impl Connection<Unconnected> {
             session: self.session,
             token: RwLock::new(token),
             refresh_lock: self.refresh_lock,
+            refresh_lock_bound: self.refresh_lock_bound,
             terminal: self.terminal,
             pool: self.pool,
             refresher: self.refresher,
+            sink: self.sink,
             _state: PhantomData,
         })
     }
@@ -1205,7 +1456,7 @@ impl Connection<Connected> {
             return Err(report.into_fault());
         }
         let current = self.token.read().await.clone();
-        if origin == Origin::Probe || !current.is_expiring(now) {
+        if origin == Origin::Probe || !current.is_expiring_within(now, self.session.refresh_lead_secs()) {
             return Ok(Grant::of(current));
         }
         self.rotate(token_hash(current.access.expose())).await
@@ -1236,6 +1487,17 @@ impl Connection<Connected> {
     /// Whatever [`Refresher::refresh`] produced. A terminal fault is written to
     /// the session's terminal slot, so the *next* call fails without a network
     /// round trip at all.
+    ///
+    /// # The wedge bound
+    ///
+    /// Waiting for [`Self::refresh_lock`] is itself bounded by
+    /// [`REFRESH_LOCK_BOUND_SECS`]. Without it, one hung upstream parks every
+    /// request on this connection indefinitely: the lock is held across the
+    /// refresh `await`, and a socket that is accepted and never answered never
+    /// releases it. Exceeding the bound is reported as
+    /// `RefreshFault::Transient("refresh-lock-wedged")` — transient, because the
+    /// account is not what is wrong, and a caller can fall through to another
+    /// combo or retry in a moment.
     pub async fn rotate(&self, stale: TokenHash) -> Result<Grant, RefreshFault> {
         if let Some(fresh) = self.pool.take(stale) {
             *self.token.write().await = fresh.clone();
@@ -1245,7 +1507,22 @@ impl Connection<Connected> {
         // The lock is the connection's, not the pool's: two *connections* sharing
         // a refresh token is the reuse case the pool prevents, and serialising
         // across connections would serialise unrelated providers.
-        let _single_flight = self.refresh_lock.lock().await;
+        let _single_flight = match tokio::time::timeout(
+            self.refresh_lock_bound,
+            self.refresh_lock.lock(),
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(_) => {
+                tracing::error!(
+                    provider = %self.session.provider(),
+                    bound_secs = self.refresh_lock_bound.as_secs(),
+                    "refresh lock held past its bound; a concurrent refresh is wedged"
+                );
+                return Err(RefreshFault::Transient("refresh-lock-wedged"));
+            }
+        };
         if let Some(fresh) = self.pool.take(stale) {
             *self.token.write().await = fresh.clone();
             return Ok(Grant::of(fresh));
@@ -1255,10 +1532,36 @@ impl Connection<Connected> {
         // lock buys and why this clone is free of contention concerns: refresh is
         // already serialised per connection by `refresh_lock` above.
         let current = self.token.read().await.clone();
+        let presented = current.refresh.clone();
         let outcome = self.refresher.refresh(&self.session, &current).await;
         match outcome {
             Ok(renewed) => {
                 self.pool.record(stale, renewed.clone());
+                // Persisted inside the lock, deliberately: the network call and
+                // the stored state then advance as one step, so a waiter that
+                // joins this lock reads the *new* token rather than the one the
+                // refresh just retired. Outside the lock there is a window where
+                // the store still holds a spent refresh token.
+                //
+                // A skip is logged, not propagated: it means a concurrent writer
+                // already rotated past us, and the request still gets the token
+                // upstream just accepted.
+                if let Some(sink) = self.sink.as_ref() {
+                    let persisted = sink
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .persist_rotation(
+                            self.session.provider(),
+                            presented.as_ref().map(|token| token.expose()),
+                            &renewed,
+                        );
+                    if !persisted {
+                        tracing::warn!(
+                            provider = %self.session.provider(),
+                            "rotation not persisted: a concurrent writer already rotated this session"
+                        );
+                    }
+                }
                 *self.token.write().await = renewed.clone();
                 Ok(Grant::of(renewed))
             }
@@ -1359,6 +1662,7 @@ impl ExecError {
 pub struct HttpRefresher {
     client: reqwest::Client,
     timeout: Duration,
+    breaker: Arc<RefreshBreaker>,
 }
 
 impl HttpRefresher {
@@ -1367,7 +1671,7 @@ impl HttpRefresher {
     /// ([`RefreshFault::Unrecoverable`]), not a construction failure.
     #[must_use]
     pub fn new(client: reqwest::Client) -> Self {
-        Self { client, timeout: TOKEN_ENDPOINT_TIMEOUT }
+        Self { client, timeout: TOKEN_ENDPOINT_TIMEOUT, breaker: Arc::new(RefreshBreaker::new()) }
     }
 
     /// Overrides the refresh timeout.
@@ -1377,10 +1681,134 @@ impl HttpRefresher {
         self
     }
 
+    /// Shares one breaker across refreshers, so a blackout one refresher trips
+    /// is observed by every other refresh on the same provider.
+    ///
+    /// Without this each refresher would carry its own and a multi-connection
+    /// deployment would keep hammering a provider that has already failed five
+    /// times. [`Self::new`] still builds a working one — a single refresher needs
+    /// no coordination.
+    #[must_use]
+    pub fn with_breaker(mut self, breaker: Arc<RefreshBreaker>) -> Self {
+        self.breaker = breaker;
+        self
+    }
+
+    /// The breaker this refresher consults and reports to.
+    #[must_use]
+    pub fn breaker(&self) -> &Arc<RefreshBreaker> {
+        &self.breaker
+    }
+
     /// The `reqwest` client this refresher shares with dispatch.
     #[must_use]
     pub fn client(&self) -> &reqwest::Client {
         &self.client
+    }
+}
+
+/// Per-provider refresh circuit breaker: consecutive failures in, a blackout out.
+///
+/// # What it is for
+///
+/// A refresh endpoint that is down answers the same way every time, and each
+/// attempt spends a refresh-token use against a provider that may count them. So
+/// after [`REFRESH_BREAKER_THRESHOLD`] consecutive failures for one provider,
+/// refreshes for that provider stop being attempted for
+/// [`REFRESH_BREAKER_COOLDOWN_SECS`] and report a transient fault instead — which
+/// leaves the caller free to try again in a minute, a dispatch to fall through
+/// to another combo, and the *session* alive.
+///
+/// # Why a transient and not a terminal verdict
+///
+/// The breaker records that refreshes are not working, never that the account is
+/// dead. Deciding an account is finished is [`classify_refresh`]'s job and its
+/// list alone; a breaker that retired sessions would be a second, invisible
+/// taxonomy — exactly what F-MED-2 exists to prevent.
+///
+/// # Success clears it
+///
+/// One success resets the counter, so a provider that recovers mid-cooldown is
+/// picked up immediately rather than waiting out the window. The reference's
+/// `recordSuccess` deletes the entry outright and so does this.
+///
+/// In-memory and per-process, exactly like the reference: a restart is a fresh
+/// start, which is the correct behaviour for an outage window.
+#[derive(Debug, Default)]
+pub struct RefreshBreaker {
+    state: Mutex<HashMap<String, BreakerEntry>>,
+}
+
+/// One provider's breaker state. `failures` counts since the last success;
+/// `blocked_until` is a unix second, and `0` means never blocked.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BreakerEntry {
+    failures: u32,
+    blocked_until: u64,
+}
+
+impl RefreshBreaker {
+    /// A breaker with nothing tripped.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether `provider`'s refreshes are currently blacked out at `now`.
+    ///
+    /// A blackout that has expired clears itself here, so the next call proceeds
+    /// with the counter it had — the reference's `isProviderBlocked` deletes the
+    /// entry on cooldown expiry, which for our purposes is the same observable
+    /// behaviour.
+    #[must_use]
+    pub fn is_blocked(&self, provider: &str, now: u64) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            // A poisoned lock means another thread panicked holding it. A breaker
+            // is an optimisation over a real refresh attempt, so letting the
+            // attempt through is the safe direction.
+            return false;
+        };
+        let Some(entry) = state.get_mut(provider) else {
+            return false;
+        };
+        if entry.blocked_until > now {
+            return true;
+        }
+        entry.blocked_until = 0;
+        false
+    }
+
+    /// Clears `provider`'s counter and blackout.
+    pub fn record_success(&self, provider: &str) {
+        if let Ok(mut state) = self.state.lock() {
+            state.remove(provider);
+        }
+    }
+
+    /// Counts one failed refresh for `provider`, tripping a blackout at the
+    /// threshold.
+    pub fn record_failure(&self, provider: &str, now: u64) {
+        let Ok(mut state) = self.state.lock() else {
+            tracing::warn!(provider, "refresh breaker lock poisoned; blackout unavailable");
+            return;
+        };
+        let entry = state.entry(provider.to_owned()).or_default();
+        entry.failures = entry.failures.saturating_add(1);
+        if entry.failures >= REFRESH_BREAKER_THRESHOLD && entry.blocked_until <= now {
+            entry.blocked_until = now.saturating_add(REFRESH_BREAKER_COOLDOWN_SECS);
+            tracing::error!(
+                provider,
+                failures = entry.failures,
+                cooldown_secs = REFRESH_BREAKER_COOLDOWN_SECS,
+                "refresh circuit breaker tripped; refreshes paused for this provider"
+            );
+        }
+    }
+
+    /// Consecutive failures recorded for `provider` since its last success.
+    #[must_use]
+    pub fn failures(&self, provider: &str) -> u32 {
+        self.state.lock().map_or(0, |state| state.get(provider).map_or(0, |entry| entry.failures))
     }
 }
 
@@ -1400,6 +1828,16 @@ impl Refresher for HttpRefresher {
                 return Err(RefreshFault::Unrecoverable { status: 400, reason: "no_refresh_token" });
             };
 
+            // The breaker gates the whole refresh, before a single token use is
+            // spent. A tripped provider is reported as transient so the caller
+            // falls through to another combo rather than treating the session as
+            // finished — the breaker never speaks for the account's validity.
+            let provider = session.provider();
+            if self.breaker.is_blocked(provider, unix_now()) {
+                tracing::warn!(provider, "refresh circuit breaker open; not attempting a refresh");
+                return Err(RefreshFault::Transient("refresh-breaker-open"));
+            }
+
             let mut form: Vec<(&str, &str)> = vec![
                 ("grant_type", "refresh_token"),
                 ("refresh_token", refresh.expose()),
@@ -1411,59 +1849,144 @@ impl Refresher for HttpRefresher {
                 form.push(("scope", scope));
             }
 
-            let response = match self.client.post(url).form(&form).timeout(self.timeout).send().await {
-                Ok(r) => r,
-                // A transport failure is the definition of transient: no verdict
-                // was produced, so nothing about the account was learned.
-                Err(e) => return Err(RefreshFault::Transient(transport_reason(&e))),
-            };
-
-            let status = response.status().as_u16();
-            let success = response.status().is_success();
-            let raw = response.bytes().await.unwrap_or_default();
-            let body = String::from_utf8_lossy(&raw[..raw.len().min(REFRESH_BODY_SCAN)]).into_owned();
-            if !success {
-                return Err(classify_refresh(session.kind(), status, &body));
+            let mut last: Option<RefreshFault> = None;
+            for attempt in 1..=REFRESH_MAX_ATTEMPTS {
+                match self.attempt(session.kind(), url, &form, current).await {
+                    Ok(token) => {
+                        self.breaker.record_success(provider);
+                        return Ok(token);
+                    }
+                    // An unrecoverable verdict is not retried: the reference
+                    // short-circuits on it for the same reason we do — a second
+                    // attempt spends a second refresh-token use to learn the same
+                    // thing, and the session needs a human either way. It *does*
+                    // still reach the caller as its own verdict rather than being
+                    // flattened into the loop's last transient.
+                    Err(fault) if fault.is_terminal() => return Err(fault),
+                    Err(fault) => {
+                        tracing::warn!(
+                            provider,
+                            attempt,
+                            max_attempts = REFRESH_MAX_ATTEMPTS,
+                            reason = %fault,
+                            "refresh attempt failed; retrying with backoff"
+                        );
+                        last = Some(fault);
+                        if attempt < REFRESH_MAX_ATTEMPTS {
+                            tokio::time::sleep(retry_delay(attempt)).await;
+                        }
+                    }
+                }
             }
 
-            let parsed: serde_json::Value = serde_json::from_str(&body)
-                .map_err(|_| RefreshFault::Transient("unreadable-refresh-response"))?;
-            let Some(access) = parsed
-                .get("access_token")
-                .and_then(serde_json::Value::as_str)
-                .map(Secret::new)
-            else {
-                return Err(RefreshFault::Transient("refresh-response-has-no-access-token"));
-            };
-
-            // §5.1: `refresh_token` is optional on a refresh response, and its
-            // absence means "keep using the one you have". Providers that rotate
-            // send it; a provider that does not must not lose its session here.
-            let refreshed = parsed
-                .get("refresh_token")
-                .and_then(serde_json::Value::as_str)
-                .map(Secret::new)
-                .or_else(|| current.refresh.clone());
-
-            let mut token = OAuthToken::new(access).with_expiry(expiry_at(&parsed, unix_now()));
-            if let Some(refresh) = refreshed {
-                token = token.with_refresh(refresh);
-            }
-            Ok(token)
+            // Every attempt spent. One failure is counted, not three: the breaker
+            // exists to stop a *failing provider*, and three attempts against a
+            // dead endpoint is one failure with a longer latency.
+            self.breaker.record_failure(provider, unix_now());
+            Err(last.unwrap_or(RefreshFault::Transient("refresh-failed")))
         })
     }
 }
 
+impl HttpRefresher {
+    /// One POST against the token endpoint, and the §5.1 parse of its answer.
+    ///
+    /// Split out of the loop so each attempt is one bounded unit of work with the
+    /// per-attempt timeout applied to it, and so the loop above reads as retry
+    /// policy rather than as wire format. `current` supplies the §5.1 fallback
+    /// refresh token and nothing else.
+    async fn attempt(
+        &self,
+        kind: OAuthKind,
+        url: &str,
+        form: &[(&str, &str)],
+        current: &OAuthToken,
+    ) -> Result<OAuthToken, RefreshFault> {
+        let response = match self.client.post(url).form(form).timeout(self.timeout).send().await {
+            Ok(r) => r,
+            // A transport failure is the definition of transient: no verdict
+            // was produced, so nothing about the account was learned.
+            Err(e) => return Err(RefreshFault::Transient(transport_reason(&e))),
+        };
+
+        let status = response.status().as_u16();
+        let success = response.status().is_success();
+        let raw = response.bytes().await.unwrap_or_default();
+        let body = String::from_utf8_lossy(&raw[..raw.len().min(REFRESH_BODY_SCAN)]).into_owned();
+        if !success {
+            return Err(classify_refresh(kind, status, &body));
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|_| RefreshFault::Transient("unreadable-refresh-response"))?;
+        let Some(access) = parsed
+            .get("access_token")
+            .and_then(serde_json::Value::as_str)
+            .map(Secret::new)
+        else {
+            return Err(RefreshFault::Transient("refresh-response-has-no-access-token"));
+        };
+
+        // §5.1: `refresh_token` is optional on a refresh response, and its
+        // absence means "keep using the one you have". Providers that rotate
+        // send it; a provider that does not must not lose its session here.
+        let refreshed = parsed
+            .get("refresh_token")
+            .and_then(serde_json::Value::as_str)
+            .map(Secret::new)
+            .or_else(|| current.refresh.clone());
+
+        let mut token = OAuthToken::new(access).with_expiry(expiry_at(&parsed, unix_now()));
+        if let Some(refresh) = refreshed {
+            token = token.with_refresh(refresh);
+        }
+        Ok(token)
+    }
+}
+
+/// Jittered exponential backoff before attempt `attempt + 1`, doubling from
+/// [`REFRESH_MIN_DELAY_MS`] and capped at [`REFRESH_MAX_DELAY_MS`].
+///
+/// Full jitter over the exponential — a uniform draw from half the base delay to
+/// one and a half times it — rather than the full range, so the cap is honoured
+/// and two refreshers that failed together do not retry in lockstep. The
+/// reference grok-cli executor's `getRefreshRetryDelayMs`, shape for shape.
+fn retry_delay(attempt: usize) -> Duration {
+    let base = REFRESH_MIN_DELAY_MS
+        .saturating_mul(1u64 << (attempt - 1).min(8))
+        .min(REFRESH_MAX_DELAY_MS);
+    // `attempt >= 1` always here, and the shift is capped, so no overflow.
+    let jitter_millis = u64::from(jitter_byte()) * base / 255;
+    Duration::from_millis((base.saturating_sub(base / 2)).saturating_add(jitter_millis).max(1))
+}
+
+/// One draw from the OS entropy pool, as a `0..=255` scale factor.
+///
+/// One byte of a fresh v4 UUID, which is a getrandom draw the crate already
+/// makes elsewhere. A whole RNG for one jitter multiplier is not a dependency
+/// worth having, and a seeded `u64` from the clock would be the wrong tool: two
+/// refreshers failing in the same millisecond would then retry in lockstep, which
+/// is the thing jitter exists to prevent.
+fn jitter_byte() -> u8 {
+    // The slice is fixed at 16 bytes by `uuid`, so the index cannot be out of
+    // range and there is nothing to guard against.
+    Uuid::new_v4().as_bytes()[0]
+}
+
 /// Unix expiry from a §5.1 `expires_in`, relative to `now`.
 ///
-/// Absent means no expiry, which reads as "never proactively refresh" — the 401
-/// path still renews, so a provider that omits `expires_in` costs one round trip
-/// rather than a session.
+/// A response that omits `expires_in` gets [`EXPIRES_IN_FALLBACK_SECS`] rather
+/// than `now`. Handing back `now` would mint a token that is *already* stale, so
+/// every single dispatch would decide it had to refresh — one wasted refresh-token
+/// use per request forever, on a provider that answered perfectly well. Six
+/// hours is the reference grok-cli executor's fallback and the lifetime Grok
+/// Build actually issues; a provider whose real lifetime is shorter still gets
+/// its 401 path, which is what expiry is for.
 fn expiry_at(parsed: &serde_json::Value, now: u64) -> u64 {
     parsed
         .get("expires_in")
         .and_then(serde_json::Value::as_u64)
-        .map_or(now, |secs| now.saturating_add(secs))
+        .map_or_else(|| now.saturating_add(EXPIRES_IN_FALLBACK_SECS), |secs| now.saturating_add(secs))
 }
 
 /// `reqwest`'s own reason, narrowed to the two the taxonomy distinguishes.
@@ -1472,6 +1995,14 @@ fn expiry_at(parsed: &serde_json::Value, now: u64) -> u64 {
 /// error strings, so a static reason is what the taxonomy gets.
 fn transport_reason(e: &reqwest::Error) -> &'static str {    if e.is_timeout() { "refresh-transport-timeout" } else { "refresh-transport-failure" }
 }
+
+/// The provider-secret an [`OAuthToken`] carries.
+///
+/// Re-exported because a [`RotationSink`] implementation has to *construct* an
+/// [`OAuthToken`] to say what it writes, and `ar-exec` cannot make every sink take
+/// its own dependency on `ar-config` just to name this type. It is the same type,
+/// so a sink that already depends on `ar-config` may keep using it.
+pub use ar_config::Secret as ProviderSecret;
 
 /// Unix seconds, as [`Connection::grant_at`] judges them.
 ///
@@ -2201,7 +2732,7 @@ pub async fn initiate_device(
         form.push(("scope", scope));
     }
 
-    let response = match core
+let response = match core
         .client()
         .post(url)
         .form(&form)
@@ -2232,12 +2763,24 @@ pub async fn initiate_device(
     // the user code cannot be displayed, and one without the URI leaves the human
     // nothing to open. A half-grant would be a login that looks started and then
     // fails minutes later, with the user code already typed into the void.
+    //
+    // Each lookup is a *fallback*, RFC name first. A provider need not be an RFC
+    // provider to be a real one: kilocode publishes camelCase, and folds §3.2's
+    // `device_code` and `user_code` into a single opaque `code` — which is exactly
+    // what such a provider means, since the string the human types and the code
+    // the polls carry are then one value. Renaming these instead of falling back
+    // would reject every RFC-shaped grant, and that is the one shape that has to
+    // keep working.
     let missing = |field: &'static str| LoginError::ExchangeFailed(RefreshFault::Transient(field));
+    let shared_code = || string_field(&parsed, "code");
     let device_code = string_field(&parsed, "device_code")
+        .or_else(shared_code)
         .ok_or_else(|| missing("device-response-has-no-device-code"))?;
-    let user_code =
-        string_field(&parsed, "user_code").ok_or_else(|| missing("device-response-has-no-user-code"))?;
+    let user_code = string_field(&parsed, "user_code")
+        .or_else(shared_code)
+        .ok_or_else(|| missing("device-response-has-no-user-code"))?;
     let verification_uri = string_field(&parsed, "verification_uri")
+        .or_else(|| string_field(&parsed, "verificationUrl"))
         .ok_or_else(|| missing("device-response-has-no-verification-uri"))?;
 
     // §3.2 makes `expires_in` required and `interval` optional; the default is
@@ -2245,15 +2788,17 @@ pub async fn initiate_device(
     // possible". `expires_in` is required rather than defaulted for the same
     // reason the code is: it is the grant's budget, and a login that invented
     // one would poll a code the provider had already discarded.
-    // §3.2 makes `expires_in` required and `interval` optional; the default is
-    // the RFC's own floor, so an absent interval is 5s rather than "as fast as
-    // possible". `expires_in` is required rather than defaulted for the same
-    // reason the code is: it is the grant's budget, and a login that invented
-    // one would poll a code the provider had already discarded.
-    let Some(expires_in_secs) = parsed.get("expires_in").and_then(serde_json::Value::as_u64)
-    else {
-        return Err(missing("device-response-has-no-expiry"));
-    };
+    //
+    // `expiresIn` is the same fact camelCased. Its presence is also the marker for
+    // the one signal a kilo-shaped grant cannot state for itself: it names no
+    // cadence, so the cadence comes from the shape of the grant rather than from
+    // a field. RFC name still wins whenever the provider sends both.
+    let camel_expiry = parsed.get("expiresIn").and_then(serde_json::Value::as_u64);
+    let expires_in_secs = parsed
+        .get("expires_in")
+        .and_then(serde_json::Value::as_u64)
+        .or(camel_expiry)
+        .ok_or_else(|| missing("device-response-has-no-expiry"))?;
     let interval_secs = parsed
         .get("interval")
         .and_then(serde_json::Value::as_u64)
@@ -2261,6 +2806,7 @@ pub async fn initiate_device(
         // the only safe reading, because the alternative is a hot loop against an
         // endpoint that named no cadence at all.
         .filter(|secs| *secs > 0)
+        .or_else(|| camel_expiry.is_some().then_some(DEVICE_CAMEL_INTERVAL_SECS))
         .unwrap_or(DEVICE_DEFAULT_INTERVAL_SECS);
 
     Ok((
@@ -2335,9 +2881,21 @@ pub async fn poll_device(
     pending: &DevicePending,
     timeout: Duration,
 ) -> Result<OAuthToken, LoginError> {
-    let Some(url) = session.device_poll_url() else {
+    let Some(template) = session.device_poll_url() else {
         return Err(LoginError::NoDevicePollUrl);
     };
+    // A provider that addresses the grant by path needs the device code in the
+    // URL; one that takes it as a body parameter does not, and which of the two a
+    // given provider does is not inferable from its id without inventing a wire
+    // format (AGENTS.md) — so the operator declares it with
+    // `DEVICE_POLL_CODE_PLACEHOLDER` and this is the substitution. `replace` on a
+    // URL with no placeholder returns it unchanged, so every flat poll URL is
+    // polled byte-identically. Built once, outside the loop, because the device
+    // code it embeds is fixed for the whole grant; borrowed (`as_str`) at the
+    // `.post` below, which would otherwise move it on the first poll. Built once here, outside the loop, because the
+    // device code it embeds is fixed for the whole grant; borrowed (`as_str`) at
+    // the `.post` below, which would otherwise move it on the first poll.
+    let url = template.replace(DEVICE_POLL_CODE_PLACEHOLDER, pending.device_code.expose());
 
     let mut wait = Duration::from_secs(pending.interval_secs);
     // One deadline for both budgets: the caller's `timeout` is the outer bound,
@@ -2374,7 +2932,7 @@ pub async fn poll_device(
 
         let response = match core
             .client()
-            .post(url)
+            .post(url.as_str())
             .form(&form)
             .timeout(TOKEN_ENDPOINT_TIMEOUT)
             .send()
@@ -2395,23 +2953,44 @@ pub async fn poll_device(
 
         // Read the §3.5 codes from the parsed body rather than from the status:
         // `authorization_pending` and `slow_down` arrive as 400, so a status-only
-        // read would report a successful request as a refusal.
+        // read would report a successful request as a refusal. The three statuses
+        // the arms below match on are read the other way round, because those are
+        // exactly the cases where the body carries nothing.
         let code = serde_json::from_str::<serde_json::Value>(&body)
             .ok()
             .and_then(|v| string_field(&v, "error"));
 
-        match (success, code.as_deref()) {
+        match (status, success, code.as_deref()) {
+            // The two terminal verdicts, read off the status and never off a body.
+            //
+            // 403 is the human refusing and 410 is the grant being over, and a
+            // provider signals either with an empty body as clearly as one that
+            // sends §3.5's error code. Reading them from the body instead does not
+            // merely lose the answer — it inverts it: the terminal list's own rows
+            // for these statuses are `account_disabled` and `token_revoked`, both
+            // *account* verdicts, so a body read falls through to the classifier's
+            // transient default and the loop keeps asking someone who has already
+            // answered, until the deadline reports a timeout instead of their choice.
+            (403, _, _) => return Err(LoginError::LoginDenied("access_denied".to_owned())),
+            (410, _, _) => return Err(LoginError::LoginExpired),
+            // 202 Accepted *is* §3.5's `authorization_pending`, carried on the
+            // status, with no body at all — which is why it has to be matched
+            // before the success arm: `is_success()` is true for 202, so without
+            // this arm an empty 202 reaches the token parser and reports an
+            // unreadable response rather than waiting for a human who is still
+            // typing the code.
+            (202, _, _) => {}
             // Approval: the token response, parsed by the same rules as
             // `exchange_code`, so a provider cannot answer the two flows with
             // two different shapes without the difference showing here.
-            (true, _) => return token_from_body(&body),
-            (_, Some("access_denied")) => {
+            (_, true, _) => return token_from_body(&body),
+            (_, _, Some("access_denied")) => {
                 return Err(LoginError::LoginDenied("access_denied".to_owned()));
             }
-            (_, Some("expired_token")) => return Err(LoginError::LoginExpired),
+            (_, _, Some("expired_token")) => return Err(LoginError::LoginExpired),
             // §3.5's two loop states: neither is a verdict about the human.
-            (_, Some("authorization_pending")) => {}
-            (_, Some("slow_down")) => {
+            (_, _, Some("authorization_pending")) => {}
+            (_, _, Some("slow_down")) => {
                 // §3.5's own step, capped so the next poll still lands inside the
                 // grant's lifetime rather than being overtaken by the expiry.
                 wait = (wait + Duration::from_secs(SLOW_DOWN_STEP_SECS)).min(Duration::from_secs(
@@ -2444,7 +3023,11 @@ pub async fn poll_device(
 fn token_from_body(body: &str) -> Result<OAuthToken, LoginError> {
     let parsed: serde_json::Value = serde_json::from_str(body)
         .map_err(|_| LoginError::ExchangeFailed(RefreshFault::Transient("unreadable-refresh-response")))?;
-    let Some(access) = string_field(&parsed, "access_token") else {
+    // `token` is the same fact under a name some providers publish, so it is a
+    // fallback rather than a replacement: §5.1's own spelling is tried first and an
+    // RFC-shaped response is read exactly as before.
+    let Some(access) = string_field(&parsed, "access_token").or_else(|| string_field(&parsed, "token"))
+    else {
         return Err(LoginError::ExchangeFailed(RefreshFault::Transient(
             "refresh-response-has-no-access-token",
         )));
@@ -2464,12 +3047,17 @@ fn token_from_body(body: &str) -> Result<OAuthToken, LoginError> {
 // pool is shared across connections. Prove it at compile time rather than
 // discovering it from a spawn error on the first concurrent request (ch.9).
 const _: () = {
-    const fn assert_send<T: Send>() {}
+    const fn assert_send<T: Send + ?Sized>() {}
     const fn assert_send_sync<T: Send + Sync + ?Sized>() {}
     assert_send::<Connection<Connected>>();
     assert_send::<Connection<Unconnected>>();
     assert_send_sync::<RotationPool>();
     assert_send_sync::<dyn Refresher>();
+    // The sink sits behind an async mutex in a `Send` connection, and the breaker
+    // is shared across refreshers by `Arc`, so both bounds are load-bearing rather
+    // than incidental.
+    assert_send::<dyn RotationSink>();
+    assert_send_sync::<RefreshBreaker>();
 };
 
 #[cfg(test)]
@@ -2485,12 +3073,13 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        CallbackListener, Connected, DEVICE_DEFAULT_INTERVAL_SECS, Dispatch, EXPIRY_SKEW_SECS,
-        ExecError, HttpRefresher, LoginError, OAuthKind, OAuthToken, Origin, PKCE_VERIFIER_MIN_LEN,
-        RefreshFault, Refresher, RotationPool, Session, TERMINAL_REFRESH_STATUS, TerminalReport,
-        Unconnected, authorize_url, classify_refresh, code_challenge_for, exchange_code,
-        initiate_device, new_authorize_request, parse_callback_url, poll_device,
-        terminal_check_constraint, token_hash, unix_now,
+        CallbackListener, Connected, DEVICE_DEFAULT_INTERVAL_SECS, Dispatch, EXPIRES_IN_FALLBACK_SECS,
+        ExecError, HttpRefresher, LoginError, NON_ROTATING_REFRESH_LEAD_SECS, OAuthKind, OAuthToken,
+        Origin, PKCE_VERIFIER_MIN_LEN, REFRESH_BREAKER_THRESHOLD, REFRESH_LEAD_SECS, REFRESH_MAX_ATTEMPTS,
+        RefreshBreaker, RefreshFault, Refresher, RotationPool, RotationSink, Session,
+        TERMINAL_REFRESH_STATUS, TerminalReport, Unconnected, authorize_url, classify_refresh,
+        code_challenge_for, exchange_code, expiry_at, initiate_device, new_authorize_request,
+        parse_callback_url, poll_device, terminal_check_constraint, token_hash, unix_now,
     };
     use crate::oauth::Connection;
 
@@ -3144,14 +3733,14 @@ mod tests {
     }
 
     #[test]
-    fn reports_an_expiry_inside_the_skew_as_stale() {
-        let soon = OAuthToken::new(Secret::new("a")).with_expiry(1_000 + EXPIRY_SKEW_SECS - 1);
+    fn reports_an_expiry_inside_the_lead_as_stale() {
+        let soon = OAuthToken::new(Secret::new("a")).with_expiry(1_000 + REFRESH_LEAD_SECS - 1);
         assert!(soon.is_expiring(1_000));
     }
 
     #[test]
-    fn reports_an_expiry_beyond_the_skew_as_fresh() {
-        let later = OAuthToken::new(Secret::new("a")).with_expiry(1_000 + EXPIRY_SKEW_SECS + 1);
+    fn reports_an_expiry_beyond_the_lead_as_fresh() {
+        let later = OAuthToken::new(Secret::new("a")).with_expiry(1_000 + REFRESH_LEAD_SECS + 1);
         assert!(!later.is_expiring(1_000));
     }
 
@@ -3192,8 +3781,8 @@ mod tests {
                 .with_expiry(1_000_000),
         );
         // One second *inside* the window, then the boundary itself:
-        // `is_expiring` is `<=`, so `expires_at == now + skew` is already stale.
-        let inside = 1_000_000 - EXPIRY_SKEW_SECS - 1;
+        // `is_expiring` is `<=`, so `expires_at == now + lead` is already stale.
+        let inside = 1_000_000 - REFRESH_LEAD_SECS - 1;
         assert!(conn.grant_at(Origin::Client, inside).await.is_ok());
         assert_eq!(refresher.calls(), 0, "still inside the window");
         assert!(conn.grant_at(Origin::Client, 1_000_000).await.is_ok());
@@ -3864,6 +4453,261 @@ mod tests {
     /// A grant whose lifetime has already elapsed, for the deadline assertion.
     const DEVICE_GRANT_EXPIRED: &str = r#"{"device_code":"dc-secret","user_code":"WXYZ-1234","verification_uri":"https://auth.test/device","expires_in":0,"interval":1}"#;
 
+    /// A kilo-shaped initiate body: one `code` serving as *both* the device code
+    /// and the user code, camelCase URI and expiry, and no `interval` at all.
+    ///
+    /// Not RFC 8628: §3.2 names four required fields and this sends none of them
+    /// under those names. A single opaque `code` is the whole grant, so the two
+    /// halves of the poll credential and the string a human types are one value.
+    const DEVICE_GRANT_CAMEL: &str =
+        r#"{"code":"kilo-opaque-code","verificationUrl":"https://kilo.test/device","expiresIn":600}"#;
+
+    /// The same provider's approval: the token under `token`, gated on `status`,
+    /// with no RFC §5.1 field name anywhere in it.
+    const DEVICE_APPROVAL_CAMEL: &str =
+        r#"{"status":"approved","token":"kilo-at","userEmail":"dev@kilo.test"}"#;
+
+    /// The poll queue's answer to remember the exact path it arrived on.
+    #[derive(Clone)]
+    struct PollSpy {
+        paths: Arc<Mutex<Vec<String>>>,
+        queue: Arc<Mutex<std::vec::IntoIter<(StatusCode, &'static str)>>>,
+    }
+
+    /// One handler for every poll path, recording the raw path it was called at.
+    async fn poll_spy(
+        axum::extract::State(spy): axum::extract::State<PollSpy>,
+        uri: axum::http::Uri,
+    ) -> (StatusCode, &'static str) {
+        spy.paths.lock().unwrap_or_else(|p| p.into_inner()).push(uri.path().to_owned());
+        spy.queue
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .next()
+            .unwrap_or((StatusCode::BAD_REQUEST, r#"{"error":"authorization_pending"}"#))
+    }
+
+    /// A device endpoint that records the exact path each poll arrived on.
+    ///
+    /// A provider that addresses the grant by path (`/poll/{code}`) rather than
+    /// by body parameter needs the substitution *provable from the request the
+    /// server saw* — and a flat poll URL has to stay byte-identical, which is the
+    /// same assertion from the other side. One handler behind two routes reads
+    /// the raw path rather than a route parameter, so an unsubstituted `{code}`
+    /// shows up as itself instead of being invisible to the assertion.
+    async fn device_endpoint_recording_paths(
+        grant: (StatusCode, &'static str),
+        polls: Vec<(StatusCode, &'static str)>,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        let paths: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let issued = Arc::new((grant.0, grant.1.to_owned()));
+        let spy = PollSpy { paths: Arc::clone(&paths), queue: Arc::new(Mutex::new(polls.into_iter())) };
+
+        let issues = Arc::clone(&issued);
+        let app = axum::Router::new()
+            .route(
+                "/codes",
+                axum::routing::post(move || {
+                    let issued = Arc::clone(&issues);
+                    async move {
+                        let (status, body) = issued.as_ref();
+                        (*status, body.clone())
+                    }
+                }),
+            )
+            .route("/poll", axum::routing::post(poll_spy))
+            .route("/poll/{code}", axum::routing::post(poll_spy))
+            .with_state(spy);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback binds");
+        let addr = listener.local_addr().expect("bound socket has an address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), paths)
+    }
+
+    #[tokio::test]
+    async fn accepts_a_camel_case_grant_whose_single_code_is_both_halves() {
+        // REPLAY: a provider that answers one `code` for the device code and the
+        // user code, camelCase URI and expiry. §3.2's own field names are absent.
+        let (base, _) = device_endpoint((StatusCode::OK, DEVICE_GRANT_CAMEL), vec![]).await;
+        let core = crate::ArExec::new().expect("client");
+
+        let (grant, pending) = initiate_device(&core, &device_session(&base))
+            .await
+            .expect("a grant carrying one code for both halves is still a device grant");
+
+        assert_eq!(
+            pending.device_code().expose(),
+            "kilo-opaque-code",
+            "`code` is the device code, the half the polls carry"
+        );
+        assert_eq!(grant.user_code, "kilo-opaque-code", "`code` is also the code a human types");
+        assert_eq!(grant.verification_uri, "https://kilo.test/device", "`verificationUrl` is where it is typed");
+        assert_eq!(grant.expires_in_secs, 600, "`expiresIn` is the grant's own budget");
+        assert_eq!(
+            grant.interval_secs, 3,
+            "this provider's own cadence is 3s, and naming none means it, not the RFC's 5s floor"
+        );
+    }
+
+    #[tokio::test]
+    async fn keeps_polling_when_the_provider_answers_202_with_an_empty_body() {
+        // REPLAY: 202 Accepted with nothing in the body. `is_success()` is true for
+        // it, so an arm ordered on success hands "" to the token parser and reports
+        // a JSON failure instead of waiting for a human.
+        let (base, asked) = device_endpoint(
+            (StatusCode::OK, DEVICE_GRANT_BODY),
+            vec![
+                (StatusCode::ACCEPTED, ""),
+                (StatusCode::ACCEPTED, ""),
+                (StatusCode::OK, r#"{"access_token":"at-1","expires_in":3600}"#),
+            ],
+        )
+        .await;
+        let core = crate::ArExec::new().expect("client");
+        let session = device_session(&base);
+        let (_, pending) = initiate_device(&core, &session).await.expect("grant");
+
+        let token = poll_device(&core, &session, &pending, Duration::from_secs(60))
+            .await
+            .expect("202 is a loop state, not a verdict");
+
+        assert_eq!(token.access().expose(), "at-1", "the approval after the 202s still lands");
+        assert_eq!(
+            *asked.lock().unwrap_or_else(|p| p.into_inner()),
+            3,
+            "both empty 202s were polled again rather than parsed as a token response"
+        );
+    }
+
+    #[tokio::test]
+    async fn treats_a_403_as_a_denial_off_the_status_with_no_body() {
+        // REPLAY: 403 with an empty body. The status is the whole signal, and the
+        // terminal list's own 403 row is `account_disabled`, so a body read lands
+        // on the transient fallthrough and the loop keeps asking a human who
+        // already said no.
+        let (base, asked) = device_endpoint(
+            (StatusCode::OK, DEVICE_GRANT_BODY),
+            vec![(StatusCode::FORBIDDEN, "")],
+        )
+        .await;
+        let core = crate::ArExec::new().expect("client");
+        let session = device_session(&base);
+        let (_, pending) = initiate_device(&core, &session).await.expect("grant");
+
+        let err = poll_device(&core, &session, &pending, Duration::from_secs(30)).await.err();
+
+        assert_eq!(
+            err,
+            Some(LoginError::LoginDenied("access_denied".to_owned())),
+            "403 is the human refusing, and polling cannot change it"
+        );
+        assert_eq!(
+            *asked.lock().unwrap_or_else(|p| p.into_inner()),
+            1,
+            "a denial ends the loop on the first answer rather than re-asking"
+        );
+    }
+
+    #[tokio::test]
+    async fn treats_a_410_as_an_expiry_off_the_status_with_no_body() {
+        // REPLAY: 410 with an empty body. The terminal list's own 410 row is
+        // `token_revoked`, which is an account verdict and not this one — the
+        // status means the *grant* is over.
+        let (base, asked) = device_endpoint(
+            (StatusCode::OK, DEVICE_GRANT_BODY),
+            vec![(StatusCode::GONE, "")],
+        )
+        .await;
+        let core = crate::ArExec::new().expect("client");
+        let session = device_session(&base);
+        let (_, pending) = initiate_device(&core, &session).await.expect("grant");
+
+        let err = poll_device(&core, &session, &pending, Duration::from_secs(30)).await.err();
+
+        assert_eq!(
+            err,
+            Some(LoginError::LoginExpired),
+            "410 is the grant being over, which is the login's own expiry"
+        );
+        assert_eq!(
+            *asked.lock().unwrap_or_else(|p| p.into_inner()),
+            1,
+            "an expiry ends the loop on the first answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn returns_the_token_from_a_camel_case_approval() {
+        // REPLAY: 200 `{status, token, userEmail}`. No `access_token` anywhere, so
+        // the §5.1 parser names a missing field on a grant that was approved.
+        let (base, _) = device_endpoint(
+            (StatusCode::OK, DEVICE_GRANT_CAMEL),
+            vec![(StatusCode::OK, DEVICE_APPROVAL_CAMEL)],
+        )
+        .await;
+        let core = crate::ArExec::new().expect("client");
+        let session = device_session(&base);
+        let (_, pending) = initiate_device(&core, &session).await.expect("grant");
+
+        let token = poll_device(&core, &session, &pending, Duration::from_secs(30))
+            .await
+            .expect("the provider approved the device");
+
+        assert_eq!(token.access().expose(), "kilo-at", "`token` is the approved access token");
+        assert!(!token.can_refresh(), "this grant carries no refresh half, so none is invented");
+    }
+
+    #[tokio::test]
+    async fn substitutes_the_device_code_into_a_templated_poll_url() {
+        // REPLAY: a provider that addresses the grant by path. With no `{code}`
+        // placeholder in the config the poll has nowhere to put the code, so this
+        // is unreachable — the endpoint would be asked with no code in it.
+        let (base, paths) = device_endpoint_recording_paths(
+            (StatusCode::OK, DEVICE_GRANT_CAMEL),
+            vec![(StatusCode::OK, DEVICE_APPROVAL_CAMEL)],
+        )
+        .await;
+        let core = crate::ArExec::new().expect("client");
+        let session = device_session(&base).with_device_poll_url(format!("{base}/poll/{{code}}"));
+        let (_, pending) = initiate_device(&core, &session).await.expect("grant");
+
+        poll_device(&core, &session, &pending, Duration::from_secs(30))
+            .await
+            .expect("the approval lands at the path-suffixed poll endpoint");
+
+        assert_eq!(
+            *paths.lock().unwrap_or_else(|p| p.into_inner()),
+            vec!["/poll/kilo-opaque-code".to_owned()],
+            "the device code is substituted into the poll URL's path"
+        );
+    }
+
+    #[tokio::test]
+    async fn keeps_a_flat_poll_url_byte_identical() {
+        // The other side of the same assertion: no placeholder, no rewrite. A poll
+        // URL with nothing to substitute must reach the provider exactly as typed.
+        let (base, paths) = device_endpoint_recording_paths(
+            (StatusCode::OK, DEVICE_GRANT_BODY),
+            vec![(StatusCode::OK, r#"{"access_token":"at-1","expires_in":3600}"#)],
+        )
+        .await;
+        let core = crate::ArExec::new().expect("client");
+        let session = device_session(&base).with_device_poll_url(format!("{base}/poll"));
+        let (_, pending) = initiate_device(&core, &session).await.expect("grant");
+
+        poll_device(&core, &session, &pending, Duration::from_secs(30))
+            .await
+            .expect("the flat poll endpoint approves");
+
+        assert_eq!(
+            *paths.lock().unwrap_or_else(|p| p.into_inner()),
+            vec!["/poll".to_owned()],
+            "a flat poll URL is polled byte-identically, with nothing appended"
+        );
+    }
+
     #[tokio::test]
     async fn parses_the_device_grant_when_the_provider_answers_rfc8628_fields() {
         let (base, _) = device_endpoint(
@@ -4234,5 +5078,360 @@ mod tests {
             LoginError::NoDevicePollUrl.to_string(),
             "no device poll endpoint is configured; set device_poll_url"
         );
+    }
+
+    /// A token endpoint that answers each request from a scripted queue and
+    /// records how many it was asked.
+    ///
+    /// Distinct from [`token_endpoint`], which answers every request the same way:
+    /// retry and breaker tests need the *sequence* of verdicts, and a count that
+    /// proves how many attempts were actually spent.
+    async fn scripted_endpoint(
+        script: Vec<(StatusCode, &'static str)>,
+    ) -> (String, Arc<Mutex<usize>>) {
+        let asked: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let counter = Arc::clone(&asked);
+        let queue = Arc::new(Mutex::new(script.into_iter()));
+        let slot = Arc::clone(&queue);
+        let app = axum::Router::new().fallback(move || {
+            let counter = Arc::clone(&counter);
+            let queue = Arc::clone(&slot);
+            async move {
+                *counter.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+                queue
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .next()
+                    .unwrap_or((StatusCode::BAD_REQUEST, r#"{"error":"server_error"}"#))
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback binds");
+        let addr = listener.local_addr().expect("bound socket has an address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), asked)
+    }
+
+    fn asked_how_often(asked: &Arc<Mutex<usize>>) -> usize {
+        *asked.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[tokio::test]
+    async fn grants_the_token_when_a_transient_503_is_followed_by_success() {
+        // The retry loop's whole claim: two 503s are one problem, not three, and
+        // the caller sees a granted token rather than a fault. A 503 is the
+        // canonical transient — no verdict, nothing learned about the account.
+        let (base, asked) = scripted_endpoint(vec![
+            (StatusCode::SERVICE_UNAVAILABLE, r#"{"error":"upstream"}"#),
+            (StatusCode::SERVICE_UNAVAILABLE, r#"{"error":"upstream"}"#),
+            (StatusCode::OK, r#"{"access_token":"at-granted","expires_in":3600}"#),
+        ])
+        .await;
+        let session = Session::new("codex", OAuthKind::Codex)
+            .with_token_url(format!("{base}/token"));
+        let refresher = HttpRefresher::new(reqwest::Client::new());
+
+        let token = refresher
+            .refresh(&session, &expired_token().with_refresh(Secret::new("rt-1")))
+            .await
+            .expect("the third attempt grants");
+
+        assert_eq!(token.access().expose(), "at-granted");
+        assert_eq!(asked_how_often(&asked), REFRESH_MAX_ATTEMPTS, "every attempt was spent");
+    }
+
+    #[tokio::test]
+    async fn spends_one_attempt_when_the_refresh_grant_is_invalid() {
+        // The short-circuit. `invalid_grant` is terminal: the refresh token is
+        // spent or revoked, and a second attempt would spend a second one to learn
+        // the same thing. Three attempts here would be three refresh-token uses
+        // against a provider that has already said no.
+        let (base, asked) = scripted_endpoint(vec![(StatusCode::BAD_REQUEST, r#"{"error":"invalid_grant"}"#)])
+            .await;
+        let session = Session::new("codex", OAuthKind::Codex)
+            .with_token_url(format!("{base}/token"));
+        let refresher = HttpRefresher::new(reqwest::Client::new());
+
+        let fault = refresher
+            .refresh(&session, &expired_token().with_refresh(Secret::new("rt-1")))
+            .await
+            .expect_err("invalid_grant is terminal");
+
+        assert_eq!(fault, RefreshFault::Unrecoverable { status: 400, reason: "invalid_grant" });
+        assert_eq!(asked_how_often(&asked), 1, "a terminal verdict is not retried");
+    }
+
+    #[tokio::test]
+    async fn opens_the_breaker_after_five_consecutive_refresh_failures() {
+        // The threshold, proven from the outside: five failing refreshes in, and
+        // the sixth never reaches the endpoint at all.
+        let (base, asked) = scripted_endpoint(Vec::new()).await;
+        let session = Session::new("codex", OAuthKind::Codex)
+            .with_token_url(format!("{base}/token"));
+        let refresher = HttpRefresher::new(reqwest::Client::new());
+        let token = expired_token().with_refresh(Secret::new("rt-1"));
+
+        for _ in 0..REFRESH_BREAKER_THRESHOLD {
+            assert!(
+                refresher.refresh(&session, &token).await.is_err(),
+                "a queued 503 fails every attempt"
+            );
+        }
+        let spent = asked_how_often(&asked);
+
+        let fault = refresher.refresh(&session, &token).await.expect_err("the breaker is open");
+
+        assert_eq!(fault, RefreshFault::Transient("refresh-breaker-open"));
+        assert_eq!(asked_how_often(&asked), spent, "the endpoint was not asked again");
+    }
+
+    #[tokio::test]
+    async fn clears_the_breaker_when_a_refresh_succeeds() {
+        // One success resets the counter, so a provider that recovers mid-window
+        // is picked up rather than left blacked out. Asserted on the counter
+        // rather than only on `is_blocked`, because the reset is what makes the
+        // next five failures start from zero.
+        let breaker = RefreshBreaker::new();
+        for _ in 0..REFRESH_BREAKER_THRESHOLD {
+            breaker.record_failure("codex", 1_000);
+        }
+        breaker.record_success("codex");
+        assert_eq!(breaker.failures("codex"), 0);
+    }
+
+    #[tokio::test]
+    async fn reopens_the_breaker_once_the_cooldown_has_elapsed() {
+        let breaker = RefreshBreaker::new();
+        for _ in 0..REFRESH_BREAKER_THRESHOLD {
+            breaker.record_failure("codex", 1_000);
+        }
+        assert!(breaker.is_blocked("codex", 1_000));
+        assert!(
+            !breaker.is_blocked("codex", 1_000 + super::REFRESH_BREAKER_COOLDOWN_SECS + 1),
+            "the cooldown is finite, not a permanent retirement"
+        );
+    }
+
+    #[tokio::test]
+    async fn keeps_a_session_with_more_than_the_lead_on_its_current_token() {
+        // The lead's outside edge. A codex session with six minutes left must
+        // *not* refresh: refreshing now spends a refresh-token use, and codex
+        // invalidates its siblings' refresh tokens when one rotates. This is the
+        // whole reason the lead exists.
+        let refresher = Arc::new(Counting::ok("synthetic-access"));
+        let conn = Connection::pending(
+            Session::new("codex", OAuthKind::Codex).with_token_url("https://auth.test/token"),
+            Arc::new(RotationPool::new()),
+            refresher.clone() as Arc<dyn Refresher>,
+        )
+        .connect(
+            OAuthToken::new(Secret::new("synthetic-access"))
+                .with_refresh(Secret::new("synthetic-refresh"))
+                .with_expiry(1_000 + REFRESH_LEAD_SECS + 60),
+        )
+        .expect("an access token connects");
+
+        assert!(conn.grant_at(Origin::Client, 1_000).await.is_ok());
+        assert_eq!(refresher.calls(), 0, "six minutes left is beyond the five-minute lead");
+    }
+
+    #[tokio::test]
+    async fn refreshes_a_session_inside_the_lead() {
+        // The inside edge, at four minutes. A 5min lead means four minutes *is*
+        // the window — the token cannot be allowed to expire during the round trip
+        // it is about to be sent on. So this one refreshes, which is what makes the
+        // previous test meaningful: the two differ only by the lead.
+        let refresher = Arc::new(Counting::ok("synthetic-access"));
+        let conn = Connection::pending(
+            Session::new("codex", OAuthKind::Codex).with_token_url("https://auth.test/token"),
+            Arc::new(RotationPool::new()),
+            refresher.clone() as Arc<dyn Refresher>,
+        )
+        .connect(
+            OAuthToken::new(Secret::new("synthetic-access"))
+                .with_refresh(Secret::new("synthetic-refresh"))
+                .with_expiry(1_000 + 240),
+        )
+        .expect("an access token connects");
+
+        assert!(conn.grant_at(Origin::Client, 1_000).await.is_ok());
+        assert_eq!(refresher.calls(), 1, "four minutes left is inside the five-minute lead");
+    }
+
+    #[test]
+    fn honours_a_per_session_lead_over_the_per_kind_default() {
+        // The override is the reason the lead is a table *and* a field: one
+        // account can be tuned without changing every other session of the kind.
+        let tuned = Session::new("codex", OAuthKind::Codex).with_refresh_lead_secs(60);
+        assert_eq!(tuned.refresh_lead_secs(), 60);
+        assert_eq!(Session::new("codex", OAuthKind::Codex).refresh_lead_secs(), REFRESH_LEAD_SECS);
+    }
+
+    #[test]
+    fn gives_a_non_rotating_provider_the_longer_lead() {
+        // Google refresh tokens are permanent, so an early refresh buys no safety
+        // and only adds chatter. Every other kind rotates and waits.
+        assert_eq!(OAuthKind::GeminiCli.refresh_lead_secs(), NON_ROTATING_REFRESH_LEAD_SECS);
+        assert_eq!(OAuthKind::Codex.refresh_lead_secs(), REFRESH_LEAD_SECS);
+    }
+
+    #[tokio::test]
+    async fn faults_within_the_bound_when_the_refresh_lock_is_wedged() {
+        // The wedge. A refresher that never settles holds `refresh_lock` for ever,
+        // so every waiter would be parked. Two tasks, one that wedges and one that
+        // arrives after it: the second must get a fault back, not silence.
+        struct Wedged;
+        impl Refresher for Wedged {
+            fn refresh<'a>(
+                &'a self,
+                _session: &'a Session,
+                _current: &'a OAuthToken,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<OAuthToken, RefreshFault>> + Send + 'a>>
+            {
+                Box::pin(std::future::pending())
+            }
+        }
+
+        let conn = Arc::new(
+            Connection::pending(
+                Session::new("codex", OAuthKind::Codex).with_token_url("https://auth.test/token"),
+                Arc::new(RotationPool::new()),
+                Arc::new(Wedged) as Arc<dyn Refresher>,
+            )
+            .with_refresh_lock_bound(Duration::from_millis(50))
+            .connect(
+                OAuthToken::new(Secret::new("synthetic-access"))
+                    .with_refresh(Secret::new("synthetic-refresh")),
+            )
+            .expect("an access token connects"),
+        );
+
+        let holder = Arc::clone(&conn);
+        tokio::spawn(async move { holder.rotate(token_hash("synthetic-access")).await });
+
+        // Let the holder take the lock before the waiter tries.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let fault = conn
+            .rotate(token_hash("synthetic-access"))
+            .await
+            .expect_err("the lock is wedged");
+
+        assert_eq!(fault, RefreshFault::Transient("refresh-lock-wedged"));
+    }
+
+    #[tokio::test]
+    async fn yields_a_non_stale_token_when_the_response_omits_expires_in() {
+        // `expires_in` is optional in §5.1. Treating its absence as "expires now"
+        // would mint a token that is already stale, so every dispatch would decide
+        // it had to refresh — one wasted refresh-token use per request, forever.
+        let (base, _) = token_endpoint((StatusCode::OK, r#"{"access_token":"at-no-expiry"}"#)).await;
+        let session = Session::new("grok-cli", OAuthKind::GrokCli)
+            .with_token_url(format!("{base}/token"));
+        let refresher = HttpRefresher::new(reqwest::Client::new());
+
+        let token = refresher
+            .refresh(&session, &expired_token().with_refresh(Secret::new("rt-grok-1")))
+            .await
+            .expect("the mock grants the refresh");
+
+        assert!(
+            !token.is_expiring_within(unix_now(), REFRESH_LEAD_SECS),
+            "a token with no declared expiry must not be born stale"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_the_grok_lifetime_when_expires_in_is_absent() {
+        // The value itself, not just the behaviour: six hours is what Grok Build
+        // actually issues, so a fallback below that would over-refresh and one far
+        // above it would 401 in production.
+        let parsed = serde_json::json!({"access_token": "at"});
+        assert_eq!(expiry_at(&parsed, 1_000), 1_000 + EXPIRES_IN_FALLBACK_SECS);
+    }
+
+    /// One recorded `persist_rotation` call: provider, token exchanged, token
+    /// received. The sink's whole input, and therefore the guard's.
+    type RotationWrite = (String, Option<String>, String);
+
+    /// A sink that records what it was handed and reports a scripted verdict.
+    ///
+    /// The sink shares its log with the test rather than owning it, because
+    /// [`Connection::with_sink`] takes ownership and the assertion has to read
+    /// through something the test still holds.
+    struct RecordingSink {
+        writes: Arc<Mutex<Vec<RotationWrite>>>,
+        persisted: bool,
+    }
+
+    impl RotationSink for RecordingSink {
+        fn persist_rotation(&self, provider: &str, presented: Option<&str>, renewed: &OAuthToken) -> bool {
+            self.writes
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((
+                    provider.to_owned(),
+                    presented.map(str::to_owned),
+                    renewed.access().expose().to_owned(),
+                ));
+            self.persisted
+        }
+    }
+
+    /// A sink and the log it writes to: one closure, so a test cannot wire the
+    /// assertion to a different sink than the connection holds.
+    fn recording_sink(persisted: bool) -> (Arc<Mutex<Vec<RotationWrite>>>, RecordingSink) {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        (Arc::clone(&writes), RecordingSink { writes, persisted })
+    }
+
+    #[tokio::test]
+    async fn persists_a_rotation_through_the_sink() {
+        // The rotation is only useful if it outlives the connection that made it:
+        // without this write the next process reloads the refresh token this one
+        // just spent. The tuple asserted is the sink's whole input — provider,
+        // token exchanged, token received — so it is also the guard's.
+        let (writes, sink) = recording_sink(true);
+        let conn = Connection::pending(session(), Arc::new(RotationPool::new()), Arc::new(Counting::ok("rotated")))
+            .with_sink(Box::new(sink))
+            .connect(expired_token().with_refresh(Secret::new("rt-1")))
+            .expect("an access token connects");
+
+        conn.rotate(token_hash("synthetic-old-access")).await.expect("the refresh succeeds");
+
+        assert_eq!(
+            *writes.lock().unwrap_or_else(|p| p.into_inner()),
+            vec![("cline".to_owned(), Some("rt-1".to_owned()), "rotated-0".to_owned())]
+        );
+    }
+
+    #[tokio::test]
+    async fn hands_the_token_to_the_request_when_a_concurrent_writer_rotated_first() {
+        // The CAS outcome. A skip is *not* an error for the request: upstream just
+        // accepted this token, so the caller must still get it. Only the stored
+        // state is in question, and it is already fresher.
+        let (_, sink) = recording_sink(false);
+        let conn = Connection::pending(session(), Arc::new(RotationPool::new()), Arc::new(Counting::ok("rotated")))
+            .with_sink(Box::new(sink))
+            .connect(expired_token().with_refresh(Secret::new("rt-1")))
+            .expect("an access token connects");
+
+        let grant = conn.rotate(token_hash("synthetic-old-access")).await.expect("the request still succeeds");
+
+        assert_eq!(grant.token().expose(), "rotated-0");
+    }
+
+    #[tokio::test]
+    async fn refreshes_in_memory_when_no_sink_is_wired() {
+        // A deployment with no credential store is the supported `$VAR`-only
+        // install, and its rotations must keep working exactly as they did.
+        let refresher = Arc::new(Counting::ok("rotated"));
+        let conn = Connection::pending(session(), Arc::new(RotationPool::new()), refresher.clone() as Arc<dyn Refresher>)
+            .connect(expired_token().with_refresh(Secret::new("rt-1")))
+            .expect("an access token connects");
+
+        assert!(conn.rotate(token_hash("synthetic-old-access")).await.is_ok());
+        assert_eq!(refresher.calls(), 1);
     }
 }

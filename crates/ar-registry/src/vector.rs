@@ -64,7 +64,11 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
     let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
     let (na, nb) = (norm(a), norm(b));
-    if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na * nb) }
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na * nb)
+    }
 }
 
 #[cfg(feature = "usearch")]
@@ -85,10 +89,16 @@ impl VectorIndex for Index {
             return Ok(Vec::new());
         };
         if width != query.len() {
-            return Err(VectorError::Width { stored: width, query: query.len() });
+            return Err(VectorError::Width {
+                stored: width,
+                query: query.len(),
+            });
         }
-        let mut scored: Vec<(Strng, f32)> =
-            self.0.iter().map(|(key, v)| (std::sync::Arc::clone(key), cosine(v, query))).collect();
+        let mut scored: Vec<(Strng, f32)> = self
+            .0
+            .iter()
+            .map(|(key, v)| (std::sync::Arc::clone(key), cosine(v, query)))
+            .collect();
         scored.sort_by(|a, b| b.1.total_cmp(&a.1));
         scored.truncate(k);
         Ok(scored)
@@ -133,14 +143,23 @@ mod tests {
     fn rejects_query_of_a_different_width() {
         let mut i = Index::default();
         i.add(Strng::from("a"), vec![1.0, 0.0]).unwrap();
-        assert_eq!(i.search(&[1.0], 1), Err(VectorError::Width { stored: 2, query: 1 }));
+        assert_eq!(
+            i.search(&[1.0], 1),
+            Err(VectorError::Width {
+                stored: 2,
+                query: 1
+            })
+        );
     }
 
     #[cfg(not(feature = "usearch"))]
     #[test]
     fn refuses_rather_than_silently_staying_empty() {
         let mut i = Index;
-        assert_eq!(i.add(Strng::from("a"), vec![1.0]), Err(VectorError::Disabled));
+        assert_eq!(
+            i.add(Strng::from("a"), vec![1.0]),
+            Err(VectorError::Disabled)
+        );
         assert_eq!(i.search(&[1.0], 1), Err(VectorError::Disabled));
         assert!(i.is_empty());
     }

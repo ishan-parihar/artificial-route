@@ -11,9 +11,16 @@
 //! | `/v1/models` | GET | Catalog, stale-while-revalidate 60s |
 //! | `/healthz` | GET | Liveness |
 //! | `/metrics` | GET | Prometheus text exposition |
+//! | anything else | any | JSON 404 carrying the path |
 //!
-//! Layers, outermost first: `trace_id` (mint/echo `x-ar-trace-id`),
-//! `RequestBodyLimitLayer` (2MB), `TimeoutLayer` (120s to response headers).
+//! Layers, outermost first: `cors` (preflight + response headers),
+//! `trace_id` (mint/echo `x-ar-trace-id`), `RequestBodyLimitLayer` (2MB),
+//! `TimeoutLayer` (widest configured model deadline to response headers).
+//!
+//! # The unknown-path fallback
+//!
+//! [`routes::not_found`], not axum's empty one: a client that parses every
+//! error as JSON gets nothing to parse on a typo'd route.
 //!
 //! # What the pipeline does, in order
 //!
@@ -29,6 +36,17 @@
 //! bearer gate by default, so a routable bind would publish a credentialed LLM
 //! proxy — and the flag exists so that decision is written down rather than
 //! inferred from a `host:` line.
+//!
+//! **An unknown `model` is a 400, not a fallback.** With a combo table
+//! configured, the request `model` selects a combo or the request is refused
+//! with the ids that do exist. Routing it to the default chain instead would
+//! answer a different question than the client asked.
+//!
+//! **The gate is armable but off by default.** [`config::HTTP_MASTER_KEY_VAR`]
+//! (32 bytes, hex or raw) builds one; without it a request is anonymous. That is
+//! the same loopback-only bargain the first invariant states, and the reason
+//! [`config::AuthMode::Required`] can be the default: the mode is only consulted
+//! once a gate exists.
 //!
 //! **An unknown `model` is a 400, not a fallback.** With a combo table
 //! configured, the request `model` selects a combo or the request is refused
@@ -61,12 +79,15 @@ pub use ar_exec::oauth::{
 };
 
 pub use app::{
-    AppState, BindError, Components, MAX_BODY_BYTES, REQUEST_TIMEOUT, TRACE_HEADER, app, bind_addr,
-    server,
+    AppState, BindError, Components, CORS_HEADERS, CORS_METHODS, MAX_BODY_BYTES, REQUEST_TIMEOUT,
+    TRACE_HEADER, app, bind_addr, server,
 };
-pub use config::{ComboError, ComboTarget, RouteCombo, ServerConfig};
+pub use config::{
+    AUTH_MODE_VAR, AuthMode, ComboError, ComboTarget, HTTP_MASTER_KEY_VAR, RouteCombo, ServerConfig,
+    STREAM_TIMEOUT_VAR,
+};
 pub use exec::{HttpExec, OAuthAuth, ProviderConfig};
-pub use keys::AuthGate;
+pub use keys::{AuthGate, extract_credential};
 pub use metrics::{Metrics, Outcome};
 pub use models::{MODELS_TTL, ModelCard, ModelCatalog, ModelsCache, StaticCatalog};
-pub use routes::{CACHE_HEADER, DECISION_HEADER, SESSION_HEADER, USAGE_HEADER};
+pub use routes::{CACHE_HEADER, DECISION_HEADER, KEEPALIVE_INTERVAL, SESSION_HEADER, USAGE_HEADER};

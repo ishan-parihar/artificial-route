@@ -2,19 +2,39 @@
 //!
 //! This used to be a second implementation of `ar-exec`. It is now a thin
 //! adapter: [`HttpExec`] holds the provider table and the `ar_exec::ArExec`
-//! client, and every request goes through `ar_exec::ArExec::post` — the wire
-//! gate, the header merge, the response-start budget, the abort race and the
-//! model rewrite all live there exactly once. What stays here is the part that
-//! is *not* dispatch: which provider id maps to which base URL and key, and the
+//! client, and every request goes through the `ar-exec` core — the wire gate, the
+//! header merge, the response-start budget, the abort race and the model rewrite
+//! all live there exactly once. What stays here is the part that is *not*
+//! dispatch: which provider id maps to which base URL and key, and the
 //! translation from `ar_exec`'s [`ar_exec::ExecError`] to the
 //! [`ar_route::ExecError`] the router's trait demands.
 //!
-//! The one thing this layer does *not* do is decide what a non-2xx means.
-//! `ar-exec`'s `post` hands back the live response whatever its status, and
-//! [`ar_exec::ChatStream::into_failure`] reads the bounded body; the router
+//! One rule is hardcoded here: a non-2xx is a verdict the router has to see,
+//! not an executor failure, so it is never an error at this layer. `ar-exec`
+//! hands back the live response whatever its status,
+//! [`ar_exec::ChatStream::into_failure`] reads the bounded body, and the router
 //! classifies it through `ar_route::attempt_loop`. A provider that says 429 and
-//! a provider that says 400 must reach the router differently, and only the
-//! router knows the difference.
+//! one that says 400 must reach the router differently, and only the router
+//! knows the difference.
+//!
+//! # The request direction
+//!
+//! Closed: a canonical body reaches every named wire in that wire's own shape.
+//! [`ar_exec::ArExec::render_request`] does the rendering and
+//! [`ar_exec::outbound_wire`] is the one mapping from a registry label to a
+//! renderer, so the API-key branch in [`HttpExec`] renders there rather than
+//! handing raw canonical bytes to the core — one render, one POST. The OAuth
+//! branch hands `oauth::Connection::dispatch` the canonical bytes and lets it
+//! render, since that function re-posts the same body on a 401 rotation.
+//!
+//! # The response direction
+//!
+//! Not closed, and not presented as closed. The relay hands the client's bytes
+//! through in the *provider's* framing, so a Claude-dialect client receives
+//! Gemini SSE when the router picked a Gemini provider. The two non-streaming
+//! envelopes built for that job are `ar_translate::to_anthropic_response` and
+//! `ar_translate::to_responses_response`, and `ar_translate::missing_pairs` names
+//! every remaining re-framing cell with its reason.
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -28,10 +48,10 @@ use bytes::Bytes;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
-use ar_exec::Dispatch;
 use ar_exec::oauth::{
     Connected, Connection, HttpRefresher, OAuthKind, OAuthToken, Refresher, RotationPool, Session,
 };
+use ar_exec::Dispatch;
 
 /// One configured upstream provider's OAuth credentials, resolved and ready.
 ///
@@ -124,11 +144,13 @@ pub struct ProviderConfig {
     pub upstream_model: String,
     /// Dialect this provider speaks.
     ///
-    /// Defaults to [`WireFormat::Openai`] because that is the only wire this
-    /// build can *send*; a provider discovered to speak anything else is
-    /// refused by `ar-exec`'s gate rather than sent an OpenAI body. That
-    /// refusal is the fix for a defect this crate used to have: it POSTed the
-    /// canonical body to every provider regardless of what the registry said.
+    /// Defaults to [`WireFormat::Openai`], and any of the eight named dialects is
+    /// dispatchable: `ar-exec` renders the canonical body into whichever one this
+    /// says, so a provider discovered to speak Anthropic is posted a Messages
+    /// body rather than refused. Only [`WireFormat::Custom`] has no renderer and
+    /// stays undispatchable — a provider-specific dialect with no shared label is
+    /// a shape this build has no transcription for, and sending it a renamed
+    /// OpenAI body is the defect this gate exists to prevent.
     pub wire_format: WireFormat,
     /// USD per 1M input tokens, for `Strategy::CostOptimized`.
     pub input_usd_per_mtok: Option<f64>,
@@ -225,8 +247,10 @@ impl ProviderConfig {
         self
     }
 
-    /// Sets the wire dialect. Anything but [`WireFormat::Openai`] makes this
-    /// provider undispatchable in this build — see [`ProviderConfig::wire_format`].
+    /// Sets the wire dialect.
+    ///
+    /// Anything but [`WireFormat::Custom`] dispatches — see
+    /// [`ProviderConfig::wire_format`].
     #[must_use]
     pub fn with_wire_format(mut self, wire_format: WireFormat) -> Self {
         self.wire_format = wire_format;
@@ -278,6 +302,13 @@ impl ProviderConfig {
     /// candidate list and never burns one of the three attempt slots on a
     /// guaranteed wrong-wire request.
     ///
+    /// The wire gate is [`ar_exec::outbound_wire`]: a dialect this build has no
+    /// renderer for is refused here, and a dialect it does is rendered into by
+    /// `ar-exec`. The predicate is asked rather than re-derived here, so the
+    /// config-time answer and the dispatch-time gate cannot disagree — that
+    /// disagreement is what put a dispatchable-looking provider in a candidate
+    /// list and then failed it at the socket.
+    ///
     /// An OAuth session is a second gate. A provider the catalog labels `oauth`
     /// with no executor in this build has **no** way to authenticate, so admitting
     /// it would send the `api_key` — an empty string for a session that has none
@@ -286,7 +317,7 @@ impl ProviderConfig {
     /// candidate list until its mechanism is understood.
     #[must_use]
     pub fn is_dispatchable(&self) -> bool {
-        if self.wire_format != WireFormat::Openai {
+        if ar_exec::outbound_wire(self.wire_format).is_none() {
             return false;
         }
         // The free tier answers before the OAuth gate is consulted: it carries a
@@ -310,7 +341,12 @@ impl ProviderConfig {
     }
 
     /// The `ar-exec` dispatch bundle for this provider, borrowed.
-    fn dispatch(&self, stream: bool) -> Dispatch<'_> {
+    ///
+    /// `pub(crate)` rather than private so a dispatch test can render the same
+    /// bundle production posts through. Re-deriving it from this struct's public
+    /// fields would be a second place to forget a field, and a test that rebuilt
+    /// it would pass even if this one dropped the model or the wire.
+    pub(crate) fn dispatch(&self, stream: bool) -> Dispatch<'_> {
         Dispatch {
             base_url: &self.base_url,
             wire_format: self.wire_format,
@@ -355,6 +391,18 @@ impl Clone for HttpExec {
 }
 
 impl HttpExec {
+    /// The `ar-exec` core, for a caller that has to render a request without
+    /// dispatching it.
+    ///
+    /// A seam rather than a public surface: rendering a body is a decision the
+    /// executor owns, so this exists so a dispatch test can assert the wire
+    /// without a socket. A test that needed a live upstream to check the body
+    /// would assert nothing about the body.
+    #[cfg(test)]
+    pub(crate) fn core(&self) -> &ar_exec::ArExec {
+        &self.core
+    }
+
     /// Builds an executor over `providers`. The first entry is the default when
     /// a request names no routable candidate.
     ///
@@ -475,13 +523,33 @@ impl ArRouteExec for HttpExec {
             // the response-start budget.
             let abort = CancellationToken::new();
             let shape = cfg.dispatch(canonical.stream);
-            // An OAuth provider goes through `ar_exec::oauth`'s grant-and-rotate
-            // path, which owns the refresh-on-401 retry and the terminal
-            // quarantine. The API-key path is the same `core.post` it has always
-            // been — one dispatch core, two ways of choosing a bearer.
+            // The provider's wire is rendered by `ar-exec`, not by the caller: the canonical
+            // body is a provider-neutral shape, and translating it into the
+            // registry's declared dialect is the executor's job. The OpenAI arm is
+            // byte-identical to the pre-existing path, so nothing about the default
+            // dispatch changes.
+            //
+            // Rendered here on the API-key branch only. The OAuth branch hands
+            // `oauth::Connection::dispatch` the canonical bytes and lets it render,
+            // because that function re-posts the same body on a 401 rotation and
+            // rendering once outside it would mean either a second render or a body
+            // it would render again.
             let stream = match self.oauth.get(provider) {
                 Some(conn) => conn.dispatch(&self.core, &shape, &canonical.body, &abort).await,
-                None => self.core.post(&shape, &canonical.body, &abort).await,
+                None => {
+                    // Rendered here, once, so the API-key path posts a body already
+                    // in the provider's wire.
+                    let body = match self.core.render_request(&shape, &canonical.body) {
+                        // Rendered once, so the API-key path posts a body already in
+                        // the provider's wire.
+                        Ok(body) => body,
+                        // The provider passed `is_dispatchable` at boot, so a wire with
+                        // no renderer here means the two drifted — a diagnosable error
+                        // rather than a 502-shaped `Upstream`.
+                        Err(e) => return Err(flatten(e)),
+                    };
+                    self.core.post_rendered(&shape, body, &abort).await
+                }
             };
             let stream = match stream {
                 Ok(stream) => stream,
@@ -540,7 +608,7 @@ impl ArRouteExec for HttpExec {
 ///
 /// The router's taxonomy is one opaque string by design (`ar_route::ExecError`),
 /// so there is nothing to map *to* — but the message must keep the typed
-/// detail, because "provider wire format Anthropic is not implemented" and
+/// detail, because "provider wire format custom has no renderer" and
 /// "upstream produced no headers within 110s" send an operator to two entirely
 /// different places.
 fn flatten(e: ar_exec::ExecError) -> ExecError {
@@ -560,12 +628,11 @@ mod tests {
     use ar_registry::WireFormat;
     // The trait `HttpExec` implements. Aliased as in the parent module, so
     // `post_chat` resolves here without a second name for one type.
-    use ar_route::{ArExec as ArRouteExec, ProviderId, QuotaWindow};
+    use ar_route::{ArExec as ArRouteExec, CanonicalRequest, ProviderId, QuotaWindow};
     use axum::http::StatusCode;
     use bytes::Bytes;
 
-    use super::{HttpExec, OAuthAuth, ProviderConfig};
-    use crate::exec::{OAuthKind, Session};
+    use super::{Dispatch, HttpExec, OAuthAuth, OAuthKind, ProviderConfig, Session};
 
     fn cfg(id: &str) -> ProviderConfig {
         ProviderConfig::new(ProviderId::new(id), "https://x/v1", "k")
@@ -581,12 +648,24 @@ mod tests {
         assert!(cfg("p").is_dispatchable());
     }
 
+    /// A provider-specific dialect is not dispatchable: it has no shared shape.
+    ///
+    /// The regression this guards is still the one worth guarding — silently
+    /// POSTing a canonical OpenAI body to a provider whose registry entry says
+    /// something else — it just moved. The guard is now the *absence of a
+    /// renderer* rather than "not OpenAI", and the named dialects that used to
+    /// fail it now dispatch in their own wire.
     #[test]
-    fn a_non_openai_wire_is_not_dispatchable() {
-        // The regression this guards: silently POSTing a canonical OpenAI body
-        // to a provider whose registry entry says Anthropic.
-        let p = cfg("p").with_wire_format(WireFormat::Anthropic);
+    fn a_custom_wire_is_not_dispatchable() {
+        let p = cfg("p").with_wire_format(WireFormat::Custom);
         assert!(!p.is_dispatchable());
+    }
+
+    #[test]
+    fn an_anthropic_wire_is_dispatchable() {
+        // The unblock: a Claude-dialect provider used to be refused here, so it
+        // never entered a candidate list and could not dispatch at all.
+        assert!(cfg("p").with_wire_format(WireFormat::Anthropic).is_dispatchable());
     }
 
     #[test]
@@ -732,11 +811,11 @@ mod tests {
     }
 
     #[test]
-    fn reports_an_anonymous_provider_on_a_non_openai_wire_as_undispatchable() {
+    fn reports_a_custom_wire_on_the_free_tier_as_undispatchable() {
         // The free tier does not buy a second dialect: the wire gate is first for
         // a reason and the anonymous arm deliberately sits below it.
         let p = ProviderConfig::new(ProviderId::new("kilocode"), "https://x/v1", "anonymous")
-            .with_wire_format(WireFormat::Anthropic)
+            .with_wire_format(WireFormat::Custom)
             .with_anonymous(true);
         assert!(!p.is_dispatchable());
     }
@@ -800,5 +879,128 @@ mod tests {
         let text = String::from_utf8(outcome.error_body.to_vec()).expect("utf-8 json");
         assert!(text.contains("oauth_terminal"), "{text}");
         assert!(text.contains("cline"), "{text}");
+    }
+
+    /// One dispatch test per newly-unblocked provider family, at the seam where
+    /// the wire is chosen. Each asserts the *rendered* body reaches the provider
+    /// in its own dialect rather than as a renamed OpenAI one — the defect the
+    /// old OpenAI-only gate was preventing, with the gate moved to "has a
+    /// renderer" instead of "is OpenAI". Rendering needs no socket, so these
+    /// assert the wire without a network round-trip and without a mock upstream.
+    fn renders_for(dialect: WireFormat, model: &str) -> (String, serde_json::Value) {
+        let exec = HttpExec::new(vec![cfg("p").with_wire_format(dialect).with_model(model)])
+            .expect("executor builds");
+        // The production bundle, not a re-derived one: a test that built its own
+        // `Dispatch` would pass even if `ProviderConfig::dispatch` dropped the
+        // model or the wire.
+        let shape: Dispatch<'_> = exec
+            .provider(&ProviderId::new("p"))
+            .expect("configured")
+            .dispatch(true);
+        // The router's canonical body, which is opaque bytes to it and only
+        // `ar-exec` parses it. Built from the same JSON a real inbound dialect
+        // canonicalises to, so the renderers see the shape they will see in
+        // production rather than a hand-rolled subset.
+        let body = CanonicalRequest::new(
+            "auto",
+            Bytes::from_static(
+                br#"{"model":"auto","messages":[
+                    {"role":"system","content":"be terse"},
+                    {"role":"user","content":"hi"}],
+                    "max_tokens":64,"stream":true}"#,
+            ),
+        )
+        .with_stream(true);
+        let rendered = exec
+            .core()
+            .render_request(&shape, &body.body)
+            .expect("a renderable wire");
+        let text = String::from_utf8(rendered.to_vec()).expect("utf-8 body");
+        // Read the parsed value rather than a substring of the text:
+        // `serde_json::Map` is a `BTreeMap` here, so the serialised key order is
+        // alphabetical and a substring assertion would be asserting on that.
+        let value = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("{dialect:?} body is not json: {text}\n{e}"));
+        (text, value)
+    }
+
+    #[test]
+    fn renders_a_claude_family_dispatch_in_the_anthropic_dialect() {
+        let (body, value) = renders_for(WireFormat::Anthropic, "claude-sonnet-4-5");
+        assert_eq!(value["system"][0]["text"], "be terse", "{body}");
+        assert_eq!(value["max_tokens"], 64, "{body}");
+    }
+
+    #[test]
+    fn renders_a_responses_family_dispatch_in_the_responses_dialect() {
+        let (body, value) = renders_for(WireFormat::OpenaiResponses, "gpt-5.4");
+        assert_eq!(value["instructions"], "be terse", "{body}");
+        assert_eq!(value["max_output_tokens"], 64, "{body}");
+    }
+
+    #[test]
+    fn renders_a_gemini_family_dispatch_in_the_gemini_dialect() {
+        let (body, value) = renders_for(WireFormat::Gemini, "gemini-3-pro");
+        assert_eq!(value["systemInstruction"]["parts"][0]["text"], "be terse", "{body}");
+        assert_eq!(value["generationConfig"]["maxOutputTokens"], 64, "{body}");
+    }
+
+    #[test]
+    fn renders_an_antigravity_family_dispatch_with_the_gemini_body() {
+        let (body, value) = renders_for(WireFormat::Antigravity, "gemini-3-pro");
+        assert!(value.get("contents").is_some(), "{body}");
+    }
+
+    #[test]
+    fn renders_a_cursor_family_dispatch_in_the_cursor_dialect() {
+        let (body, value) = renders_for(WireFormat::Cursor, "cursor-small");
+        assert_eq!(value["messages"][0]["content"], "[System Instructions]\nbe terse", "{body}");
+        assert!(value.get("system").is_none(), "cursor has no system field: {body}");
+    }
+
+    #[test]
+    fn renders_a_clova_family_dispatch_in_the_clova_dialect() {
+        let (body, value) = renders_for(WireFormat::Clova, "HCX-005");
+        assert_eq!(value["maxTokens"], 64, "{body}");
+        assert!(value.get("max_tokens").is_none(), "the openai spelling is not a clova key: {body}");
+    }
+
+    #[test]
+    fn renders_a_kiro_family_dispatch_in_the_kiro_dialect() {
+        let (body, value) = renders_for(WireFormat::Kiro, "claude-sonnet-4-5");
+        assert_eq!(
+            value["conversationState"]["currentMessage"]["userInputMessage"]["modelId"],
+            "claude-sonnet-4-5",
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn admits_every_named_wire_into_the_candidate_list() {
+        // The config-time half of the unblock: a provider that can render used to
+        // be refused here, so it never entered a candidate list and could not
+        // dispatch at all however willing the provider was.
+        for dialect in [
+            WireFormat::Anthropic,
+            WireFormat::OpenaiResponses,
+            WireFormat::Gemini,
+            WireFormat::Antigravity,
+            WireFormat::Cursor,
+            WireFormat::Clova,
+            WireFormat::Kiro,
+        ] {
+            assert!(cfg("p").with_wire_format(dialect).is_dispatchable(), "{dialect:?}");
+        }
+    }
+
+    #[test]
+    fn leaves_an_openai_dispatch_byte_identical() {
+        // The default path must not move for a byte.
+        let (body, value) = renders_for(WireFormat::Openai, "llama-3.3-70b");
+        assert_eq!(value["model"], "llama-3.3-70b", "{body}");
+        // The chat-completions system role stays a role rather than being hoisted
+        // onto a top-level `system` block the way the claude arm does.
+        assert_eq!(value["messages"][0]["role"], "system", "{body}");
+        assert!(value.get("system").is_none(), "a claude body leaked onto the openai wire: {body}");
     }
 }

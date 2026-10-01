@@ -69,7 +69,12 @@ fn components(
     // copy; one clone of a handful of four-field structs at boot is cheaper than
     // the seam it would take to share them.
     let exec = HttpExec::new(config.providers.clone())
-        .map_err(|e| commands::fail(e, "the HTTP client could not be built; check the TLS backend"))
+        .map_err(|e| {
+            commands::fail(
+                e,
+                "the HTTP client could not be built; check the TLS backend",
+            )
+        })
         .map(|e| std::sync::Arc::new(e) as std::sync::Arc<dyn ArExec>)?;
 
     Ok(Components::with_exec(config, exec))
@@ -152,11 +157,12 @@ pub async fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<()> {
             );
             id.to_owned()
         }
-        None => cfg
-            .combos
-            .first()
-            .map(|c| c.id.clone())
-            .ok_or_else(|| commands::fail("no combo is configured", "pass --model <ID>, or add a combo to the config"))?,
+        None => cfg.combos.first().map(|c| c.id.clone()).ok_or_else(|| {
+            commands::fail(
+                "no combo is configured",
+                "pass --model <ID>, or add a combo to the config",
+            )
+        })?,
     };
 
     let server = ar_server::server(components(cli, &cfg, None, Some(&model))?);
@@ -170,7 +176,12 @@ pub async fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<()> {
         .uri("/v1/chat/completions")
         .header(axum::http::header::CONTENT_TYPE, "application/json")
         .body(axum::body::Body::from(payload.to_string()))
-        .map_err(|e| commands::fail(format!("cannot build the request: {e}"), "this is a bug in `ar run`"))?;
+        .map_err(|e| {
+            commands::fail(
+                format!("cannot build the request: {e}"),
+                "this is a bug in `ar run`",
+            )
+        })?;
 
     let response = tower::ServiceExt::oneshot(server.router, request).await.map_err(|e| {
         commands::fail(e, "the router failed mid-request; `ar serve` on a port will show the same failure with logs")
@@ -214,9 +225,14 @@ mod tests {
 
     fn candidates_for(yaml: &str, combo: &str) -> Vec<ar_route::Candidate> {
         let cfg = Config::parse(yaml, |_| Ok(Some("v".to_owned()))).expect("the fixture parses");
-        let config =
-            ar_server::ServerConfig::from_ar_config(&cfg, None, Some(PricingTable::global()), false, None)
-                .expect("every target is in the registry");
+        let config = ar_server::ServerConfig::from_ar_config(
+            &cfg,
+            None,
+            Some(PricingTable::global()),
+            false,
+            None,
+        )
+        .expect("every target is in the registry");
         let combo = config.combo(combo).expect("the combo exists").clone();
         config.candidates(Some(&combo))
     }
@@ -224,15 +240,34 @@ mod tests {
     #[test]
     fn picks_cheapest_priced_target_for_cost_optimized() {
         let candidates = candidates_for(CHEAP, "cheap");
-        let picked = ar_route::pick(Strategy::CostOptimized, None, &candidates, &AtomicU64::new(0), None)
-            .expect("two candidates, one pick");
-        assert_eq!(picked, ProviderId::new("openai"), "both tiers sit on one provider");
+        let picked = ar_route::pick(
+            Strategy::CostOptimized,
+            None,
+            &candidates,
+            &AtomicU64::new(0),
+            None,
+        )
+        .expect("two candidates, one pick");
+        assert_eq!(
+            picked,
+            ProviderId::new("openai"),
+            "both tiers sit on one provider"
+        );
 
-        let chosen = candidates.iter().find(|c| c.model.as_ref() == "gpt-5.4-nano").expect("nano is a candidate");
-        let rejected = candidates.iter().find(|c| c.model.as_ref() == "gpt-5.4").expect("the flagship is a candidate");
+        let chosen = candidates
+            .iter()
+            .find(|c| c.model.as_ref() == "gpt-5.4-nano")
+            .expect("nano is a candidate");
+        let rejected = candidates
+            .iter()
+            .find(|c| c.model.as_ref() == "gpt-5.4")
+            .expect("the flagship is a candidate");
         let cheap = chosen.input_usd_per_mtok.expect("the nano tier is priced");
         let pricey = rejected.input_usd_per_mtok.expect("the flagship is priced");
-        assert!(cheap < pricey, "the cheaper tier must be the one cost-optimized prefers: {cheap} vs {pricey}");
+        assert!(
+            cheap < pricey,
+            "the cheaper tier must be the one cost-optimized prefers: {cheap} vs {pricey}"
+        );
     }
 
     #[test]
@@ -246,6 +281,10 @@ mod tests {
             .filter(|c| c.input_usd_per_mtok.is_some())
             .map(|c| c.model.as_ref())
             .collect();
-        assert_eq!(priced, vec!["gpt-5.4"], "a model with no catalog row stays unpriced: {candidates:?}");
+        assert_eq!(
+            priced,
+            vec!["gpt-5.4"],
+            "a model with no catalog row stays unpriced: {candidates:?}"
+        );
     }
 }

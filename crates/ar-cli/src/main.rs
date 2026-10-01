@@ -24,8 +24,8 @@ mod version;
 use std::ffi::OsString;
 use std::process::ExitCode;
 
-use clap::error::{ContextKind, ErrorKind};
 use clap::Parser;
+use clap::error::{ContextKind, ErrorKind};
 
 use crate::cli::Cli;
 
@@ -149,6 +149,9 @@ mod tests {
 
     #[test]
     fn exits_two_when_fields_value_unknown() {
-        assert_eq!(code(&["providers", "--fields", "nope"]), ExitCode::from(EXIT_USAGE));
+        assert_eq!(
+            code(&["providers", "--fields", "nope"]),
+            ExitCode::from(EXIT_USAGE)
+        );
     }
 }

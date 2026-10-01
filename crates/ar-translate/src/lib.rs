@@ -1,10 +1,12 @@
-//! Inbound wire adapters: wire -> canonical -> wire.
+//! Inbound and outbound wire adapters: wire -> canonical -> wire.
 //!
 //! P0 shipped exactly one inbound dialect (OpenAI chat completions) and one
-//! canonical shape. P2 adds the four `docs/05` deferred: Anthropic Messages,
-//! Responses, Ollama and Gemini. Each is one `impl ArTranslate<In>` against the
-//! same [`CanonicalChat`], not a new abstraction — which is why adding a dialect
-//! is a small file and not a registry.
+//! canonical shape, and rendered exactly one outbound wire. P2 added the four
+//! `docs/05` deferred as inbound dialects: Anthropic Messages, Responses, Ollama
+//! and Gemini. Each is one `impl ArTranslate<In>` against the same
+//! [`CanonicalChat`], not a new abstraction — which is why adding a dialect is a
+//! small file and not a registry. The outbound direction grew the same way: one
+//! renderer per provider wire, behind [`render_for_wire`].
 //!
 //! # Contract
 //!
@@ -12,21 +14,38 @@
 //!   [`responses_to_canonical`], [`ollama_to_canonical`],
 //!   [`gemini_to_canonical`] — each one `ArTranslate::to_canonical` for its own
 //!   wire, producing [`CanonicalChat`].
-//! * Outbound request: [`render_openai_body`] — [`CanonicalChat`] -> the bytes
-//!   the server posts upstream.
-//! * Outbound response: [`to_openai`] — [`CanonicalResponse`] -> OpenAI JSON.
+//! * Outbound request: [`render_for_wire`] — [`CanonicalChat`] -> the bytes the
+//!   server posts upstream, in any of the eight wires [`OutboundWire`] names.
+//!   [`render_openai_body`] is the OpenAI arm and stays byte-identical to it:
+//!   the dispatch table delegates rather than reimplementing, so the default path
+//!   cannot drift.
+//! * Outbound response: [`to_openai`] for OpenAI, and — since the response
+//!   direction has to reach back to the *inbound* dialect, not the provider's —
+//!   [`to_anthropic_response`] and [`to_responses_response`] for the two inbound
+//!   dialects. Not fully closed: [`missing_pairs`] names every remaining
+//!   re-framing cell.
 //!
-//! Everything else in the reference's dialect matrix is a named, unimplemented
-//! cell: [`supported_pairs`] is what exists, [`missing_pairs`] is what does not,
-//! and [`pair_named`] errors rather than guessing.
+//! Everything the reference's dialect matrix registers that this build does not
+//! answer is a named cell: [`supported_pairs`] is what exists, [`missing_pairs`]
+//! is what does not, and [`pair_named`] errors rather than guessing. The request
+//! direction is closed — a canonical body reaches every named wire in that wire's
+//! own shape — and the response direction is not.
+//!
+//! # The response direction
+//!
+//! The response direction has two non-streaming envelopes and no wired path
+//! yet: the relay hands the client's bytes through in the *provider's* framing,
+//! so a Claude-dialect client receives Gemini SSE when the router picked a
+//! Gemini provider. [`to_anthropic_response`] and [`to_responses_response`] are
+//! built for that job and [`missing_pairs`] names every remaining re-framing
+//! cell with its reason.
 //!
 //! # Example
 //!
 //! ```
-//! use ar_translate::{Role, to_canonical, OpenAIChat};
+//! use ar_translate::{Role, OpenAIChat, to_canonical};
 //!
-//! let raw = r#"{"model":"gpt-5.4","messages":[
-//!     {"role":"system","content":"be terse"},
+//! let raw = r#"{"model":"gpt-5.4","messages":[{"role":"system","content":"be terse"},
 //!     {"role":"user","content":"hi"}],"stream":true}"#;
 //! let chat: OpenAIChat = serde_json::from_str(raw).unwrap();
 //! let chat = to_canonical(chat).unwrap();
@@ -71,7 +90,8 @@
 //! upstream to ignore:
 //!
 //! ```
-//! use ar_translate::{render_openai_body, to_canonical, OpenAIChat};
+//! use ar_translate::render_openai_body;
+//! use ar_translate::{OpenAIChat, to_canonical};
 //!
 //! let raw = r#"{"model":"gpt-5.4","messages":[{"role":"user","content":[
 //!     {"type":"text","text":"what is this?"},
@@ -83,7 +103,27 @@
 //! assert!(body.contains(r#""image_url":{"url":"http://x/i.png"}"#), "{body}");
 //! assert!(!body.contains("\"media\""), "no dialect invents a `media` key: {body}");
 //! ```
-
+//!
+//! The same canonical request reaches a Claude provider in Anthropic's own
+//! shape, which is what makes the non-OpenAI registry providers dispatchable.
+//! The request direction is closed; the response direction is not — see above.
+//!
+//! ```
+//! use ar_translate::render_for_wire;
+//! use ar_translate::{AnthropicMessages, Msg, OutboundWire, Role, anthropic_to_canonical};
+//!
+//! let raw = r#"{"model":"claude-sonnet-4-5","max_tokens":64,
+//!     "system":"be terse",
+//!     "messages":[{"role":"user","content":"hi"}]}"#;
+//! let canonical = anthropic_to_canonical(serde_json::from_str(raw).unwrap()).unwrap();
+//!
+//! let body: serde_json::Value =
+//!     serde_json::from_slice(&render_for_wire(&canonical, OutboundWire::Claude)).unwrap();
+//!
+//! assert_eq!(canonical.messages[0], Msg::new(Role::System, "be terse"));
+//! assert_eq!(body["system"][0]["text"], "be terse", "{body}");
+//! ```
+//!
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
@@ -93,6 +133,7 @@ mod gemini;
 mod media;
 mod ollama;
 mod openai;
+mod outbound;
 mod responses;
 mod translate;
 
@@ -114,6 +155,11 @@ pub use ollama::{OllamaChat, OllamaMessage, OllamaOptions};
 pub use openai::{
     OpenAIChat, OpenAIChunk, OpenAIChunkChoice, OpenAIContent, OpenAIContentPart, OpenAIDelta,
     OpenAIMessage,
+};
+pub use outbound::{
+    OutboundWire, render_claude_body, render_clova_body, render_cursor_body, render_for_wire,
+    render_gemini_body, render_kiro_body, render_openai_responses_body, to_anthropic_response,
+    to_responses_response,
 };
 pub use responses::{
     ResponsesApi, ResponsesContentPart, ResponsesInput, ResponsesItem, ResponsesItemContent,

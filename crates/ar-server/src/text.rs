@@ -35,7 +35,22 @@ use serde_json::Value;
 /// Header a client sends to choose a compression pipeline.
 pub const COMPRESSION_HEADER: &str = "x-ar-compression";
 
+/// The reference gateway's spelling of [`COMPRESSION_HEADER`], honored as an
+/// alias at *lower* precedence.
+///
+/// A client configured against OmniRoute sends `x-omniroute-compression` and
+/// never learns this name, so reading only the native one ignored its choice
+/// outright. The name match is case-insensitive and a blank value counts as
+/// absent, mirroring `resolveCompressionHeader` in the reference's
+/// `open-sse/handlers/chatCore/headers.ts`. Which of the two supplied a value
+/// is not recorded: the echo names the precedence layer, not the wire name, so
+/// the two are indistinguishable from the outside on purpose.
+pub const COMPRESSION_HEADER_ALIAS: &str = "x-omniroute-compression";
+
 /// Response header naming the pipeline that ran and which layer chose it.
+///
+/// Unchanged by the alias: a client that asked through `x-omniroute-compression`
+/// reads its answer here under the same name and the same value shape.
 pub const COMPRESSION_ECHO: &str = "x-ar-compression";
 
 /// What the guard decided about a whole request body.
@@ -155,6 +170,36 @@ pub fn compression_plan(header: Option<&str>, combo: Option<&[Step]>) -> Plan {
     plan_resolution(&[], &Layers { header, combo, ..Layers::default() })
 }
 
+/// Resolves the compression plan from whichever compression header the request
+/// carried, plus the combo.
+///
+/// The alias is a lower-precedence *spelling* of the same decision, not a second
+/// decision: both values enter one grammar through [`compression_plan`], so
+/// `native > alias > combo > off` and nothing downstream can tell which name
+/// carried it. That is the whole point — an OmniRoute-configured client stops
+/// being silently ignored, and a client sending both still gets its own word
+/// honored.
+///
+/// A blank value is absent, as the reference's reader treats it. Reading a blank
+/// native header as "no opinion" would be a behaviour change on the existing
+/// path, so it is excluded here too rather than at the call site.
+///
+/// `native` is `headers.get(COMPRESSION_HEADER)`, `alias` is
+/// `headers.get(COMPRESSION_HEADER_ALIAS)`; both are `&'static str` names that
+/// `HeaderMap::get` already matches case-insensitively.
+#[must_use]
+pub fn compression_plan_with_alias(
+    native: Option<&str>,
+    alias: Option<&str>,
+    combo: Option<&[Step]>,
+) -> Plan {
+    let honored = [native, alias]
+        .into_iter()
+        .flatten()
+        .find(|value| !value.trim().is_empty());
+    compression_plan(honored, combo)
+}
+
 /// Applies a compression plan to every message string in a body.
 ///
 /// Returns `None` when the plan is `off`, so the caller forwards its own bytes
@@ -178,6 +223,10 @@ pub fn compress_body(body: &[u8], plan: &Plan) -> Option<Vec<u8>> {
 /// non-default level is named `engine@level` (`caveman@ultra`), so the dial is
 /// visible without a second header. It answers "why is my prompt being
 /// rewritten" without an operator having to reproduce the precedence chain.
+///
+/// The value shape is the same whichever header decided, alias included: naming
+/// the *layer* rather than the wire name is what keeps one answer for both
+/// spellings, and a client that switched headers does not have to switch parsers.
 #[must_use]
 pub fn compression_echo(plan: &Plan) -> String {
     if plan.is_off() {
@@ -224,7 +273,8 @@ mod tests {
     use ar_compress::{Engine, Intensity, Plan, Source, Step};
 
     use super::{
-        COMPRESSION_ECHO, GuardVerdict, compress_body, compression_echo, compression_plan, guard_body,
+        COMPRESSION_ECHO, COMPRESSION_HEADER_ALIAS, GuardVerdict, compress_body, compression_echo,
+        compression_plan, compression_plan_with_alias, guard_body,
     };
 
     fn body(text: &str) -> Vec<u8> {
@@ -339,6 +389,71 @@ mod tests {
     #[test]
     fn names_the_echo_header() {
         assert_eq!(COMPRESSION_ECHO, "x-ar-compression");
+    }
+
+    #[test]
+    fn names_the_alias_header() {
+        assert_eq!(COMPRESSION_HEADER_ALIAS, "x-omniroute-compression");
+    }
+
+    /// The gap this closes in one assertion: a client configured against
+    /// OmniRoute sends only the alias, and its choice used to be dropped
+    /// silently rather than refused.
+    #[test]
+    fn honors_the_alias_when_the_native_header_is_absent() {
+        assert_eq!(
+            compression_plan_with_alias(None, Some("engine:caveman"), None),
+            compression_plan(Some("engine:caveman"), None),
+        );
+    }
+
+    /// Ours wins the tie. A client that sends both meant the native one, and the
+    /// alias is a compatibility spelling, never an override.
+    #[test]
+    fn prefers_the_native_header_when_both_are_present() {
+        let plan = compression_plan_with_alias(Some("engine:lite"), Some("engine:caveman"), None);
+        assert_eq!(plan.steps, [Step::new(Engine::Lite)]);
+        assert_eq!(plan.source, Source::Header);
+    }
+
+    /// `off` has to work through either name, or a client cannot turn compression
+    /// off on a combo that turns it on — and must not be re-enabled by an alias.
+    #[test]
+    fn honors_off_through_either_header() {
+        assert!(
+            compression_plan_with_alias(Some("off"), Some("engine:rtk"), Some(COMBO_RTK)).is_off()
+        );
+        assert!(compression_plan_with_alias(None, Some("off"), Some(COMBO_RTK)).is_off());
+    }
+
+    /// The reference's reader trims and treats a blank value as "not set", so a
+    /// blank alias must not shadow the combo the way a live one would.
+    #[test]
+    fn treats_a_blank_alias_as_absent() {
+        let plan = compression_plan_with_alias(None, Some("   "), Some(COMBO_RTK));
+        assert_eq!(plan.source, Source::Combo);
+    }
+
+    /// An unrecognized value is still not a decision on the alias either, so the
+    /// existing fall-through is unchanged for it.
+    #[test]
+    fn treats_an_unknown_alias_value_as_no_decision() {
+        assert!(compression_plan_with_alias(None, Some("engine:nope"), None).is_off());
+        assert_eq!(
+            compression_plan_with_alias(None, Some("nope"), Some(COMBO_RTK)).source,
+            Source::Combo
+        );
+    }
+
+    /// A reference preset reaches its mapped plan through the alias, and the echo
+    /// is byte-identical to the native spelling — one value shape for both names.
+    #[test]
+    fn echoes_the_same_value_for_an_alias_honored_plan() {
+        let alias = compression_plan_with_alias(None, Some("ultra"), None);
+        let native = compression_plan(Some("ultra"), None);
+        assert_eq!(alias.steps, [Step::at(Engine::Caveman, Intensity::Ultra)]);
+        assert_eq!(compression_echo(&alias), compression_echo(&native));
+        assert_eq!(compression_echo(&alias), "header;engines=caveman@ultra");
     }
 
     #[test]
