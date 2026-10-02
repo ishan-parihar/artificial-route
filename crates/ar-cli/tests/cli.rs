@@ -184,7 +184,31 @@ fn renders_check_rows_when_doctor() {
     let out = ar(&["doctor"]);
 
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
-    insta::assert_snapshot!(stdout(&out));
+    insta::assert_snapshot!(frozen_age(stdout(&out)));
+}
+
+/// Rewrites the registry row's day figure to a fixed placeholder.
+///
+/// The row reports the age of the checked-in registry snapshot, so a raw
+/// golden rots the day after it was recorded. Only the digit run between
+/// `snapshot ` and `d old` is replaced; when the row ever stops matching,
+/// the raw (un-normalized) text reaches the comparison and the golden fails
+/// on the real change instead of passing silently.
+fn frozen_age(text: String) -> String {
+    const MARK: &str = "snapshot ";
+    const TAIL: &str = "d old";
+    let Some(mark) = text.find(MARK) else {
+        return text;
+    };
+    let digits = mark + MARK.len();
+    let Some(tail) = text[digits..].find(TAIL) else {
+        return text;
+    };
+    let mut frozen = String::with_capacity(text.len() + 3);
+    frozen.push_str(&text[..digits]);
+    frozen.push_str("<N>");
+    frozen.push_str(&text[digits + tail..]);
+    frozen
 }
 
 #[test]
