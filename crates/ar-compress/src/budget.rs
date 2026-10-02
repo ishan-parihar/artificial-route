@@ -13,6 +13,11 @@
 //! unreachable case is resolved by cutting, and [`Clamp::truncated`] is how the
 //! caller learns fidelity was spent to hold the line.
 //!
+//! Live dispatch never calls into this module: the request path forwards
+//! over-budget bodies unclamped, and this clamp's only caller is the eval
+//! harness — the accepted divergence `docs/audit-notes.md` (d) records. Wiring
+//! it onto the dispatch path requires the explicit opt-in that row names.
+//!
 //! Two stages, in order:
 //!
 //! 1. **Unit drop** — shed whole expendable units, largest first, never an

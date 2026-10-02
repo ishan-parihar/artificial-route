@@ -225,3 +225,16 @@ static SQL CHECK, so it cannot absorb runtime configuration. Accepted as a prope
 of the design rather than a gap: the store constraint is what stops a transient
 `(status, reason)` being recorded as a retirement, and that only holds if the set is
 closed at build time.
+
+**(d) Hard budget clamp: eval-only, live dispatch forwards unclamped.** The
+reference returns an over-budget request body to the upstream with a validation
+warning when its preserve-guards make the target unreachable; our
+`clamp_to_budget` (`crates/ar-compress/src/budget.rs`) instead guarantees
+never-over-budget text by cutting. A silent clamp on the dispatch path would both
+truncate user content and diverge further from the reference's warn-not-clamp
+contract, so live dispatch never calls it — its only caller is the eval harness
+(`crates/ar-compress/src/eval.rs`). Wiring it ever requires an explicit opt-in (a
+config knob plus a request header, both default-off) and a new row here. Pinned by
+`forwards_an_over_budget_body_to_the_executor_unclamped`
+(`crates/ar-server/src/routes.rs` tests): it fails the moment any default-on
+truncation enters the dispatch path.

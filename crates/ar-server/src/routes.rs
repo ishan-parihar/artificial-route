@@ -1581,9 +1581,14 @@ fn json_response(payload: &serde_json::Value, stale: bool) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use ar_route::{AbortReport, AttemptOutcome, ProviderId, Strategy, Upstream};
+    use ar_route::{
+        AbortReport, ArExec, AttemptOutcome, CanonicalRequest, ExecError, ProviderId, Strategy,
+        Upstream,
+    };
     use axum::extract::{Path, State};
     use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
     use axum::response::Response;
@@ -1620,6 +1625,26 @@ mod tests {
     /// edge" from "reached the pipeline", which is exactly what the 415 and Accept
     /// tests are about.
     fn routed() -> AppState {
+        let components = Components::unconfigured(one_provider_config());
+        let exec = components.exec.clone();
+        Components { exec, ..components }.into_state()
+    }
+
+    /// The same one-provider server with the executor swapped, for the tests
+    /// that must observe what dispatch forwards rather than only that it
+    /// refused. `NullExec` records nothing, which is exactly what these tests
+    /// cannot work with.
+    fn routed_under(exec: Arc<dyn ArExec>) -> AppState {
+        Components {
+            exec,
+            ..Components::unconfigured(one_provider_config())
+        }
+        .into_state()
+    }
+
+    /// The config every request-path test dispatches against: provider `p`
+    /// serving model `m` on a loopback URL no test ever dials.
+    fn one_provider_config() -> ServerConfig {
         let mut config = ServerConfig::single(
             0,
             Strategy::Priority,
@@ -1635,7 +1660,26 @@ mod tests {
             Strategy::Priority,
             vec![ComboTarget::new(ProviderId::new("p"), "m")],
         )];
-        Components::unconfigured(config).into_state()
+        config
+    }
+
+    /// Records the canonical body of every dispatch, then answers with an
+    /// empty 200 stream — the smallest upstream an observable dispatch test
+    /// can drive.
+    struct RecordingExec(Arc<Mutex<Vec<Bytes>>>);
+
+    impl ArExec for RecordingExec {
+        fn post_chat<'a>(
+            &'a self,
+            _provider: &'a ProviderId,
+            canonical: &'a CanonicalRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<Upstream, ExecError>> + Send + 'a>> {
+            self.0
+                .lock()
+                .expect("recorder lock")
+                .push(canonical.body.clone());
+            Box::pin(async move { Ok(Upstream::success(Box::pin(futures::stream::empty()))) })
+        }
     }
 
     /// Drives one request through the real router, every layer included.
@@ -2400,6 +2444,34 @@ mod tests {
         let body = body_of(resp).await;
         assert_eq!(body["error"]["code"], "unsupported_media_type");
         assert_eq!(body["error"]["type"], "invalid_request_error");
+    }
+
+    #[tokio::test]
+    async fn forwards_an_over_budget_body_to_the_executor_unclamped() {
+        // The accepted divergence `docs/audit-notes.md` (d) pins here: the
+        // reference warns on an over-budget body rather than truncating it, so
+        // dispatch never clamps. A body far past any plausible token budget
+        // must reach the executor with the user's text intact — wiring
+        // `clamp_to_budget` in with a default-on budget turns this red before
+        // it silently shortens a request.
+        let long = "the quick brown fox. ".repeat(600);
+        let body = format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":{}}}]}}"#,
+            serde_json::to_string(&long).expect("message serializes"),
+        );
+        let recorder = Arc::new(Mutex::new(Vec::new()));
+        let exec = Arc::new(RecordingExec(Arc::clone(&recorder)));
+        let router = crate::app::app(routed_under(exec));
+        drive(&router, chat(&body, &[])).await;
+        let forwarded = recorder
+            .lock()
+            .expect("recorder lock")
+            .pop()
+            .expect("the request reached dispatch exactly once");
+        assert!(
+            String::from_utf8_lossy(&forwarded).contains(&long),
+            "the forwarded body lost user text"
+        );
     }
 
     // A JSON body on a chat route that is a valid canonical request reaches the
