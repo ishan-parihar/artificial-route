@@ -85,30 +85,26 @@ pub const DECISION_HEADER: &str = "x-ar-decision";
 pub const USAGE_HEADER: &str = "x-ar-usage";
 /// Cache verdict: `hit`, `miss` or `bypass`.
 pub const CACHE_HEADER: &str = "x-ar-cache";
-/// Prompt tokens the upstream reported. `0` when it reported none.
+/// Prompt tokens the upstream reported.
 ///
-/// ponytail: `0` today, because the emit point has no body to read. The
-/// upstream's `usage` object is in the payload [`ar_route::Upstream`] relays
-/// opaquely, and reading it would mean buffering that payload — a change to how
-/// responses are delivered, which this wave does not make. Ceiling: these three
-/// report `0` on every response while [`TOKENS_PER_SECOND_HEADER`] is derived
-/// from them. Upgrade path, in order of cost: have `AttemptOutcome::Succeeded`
-/// carry the parsed `usage` beside the stream (ar-route, no delivery change), or
-/// collect the single-chunk non-stream body in [`decorate`] (this file, but it
-/// delays the client's first byte). Both are strictly more work than the header
-/// they enable; until one lands, `ar-tokens`' [`ar_tokens::Ledger::record_response`]
-/// is where a real upstream `usage` object gets priced and persisted.
+/// Counted on non-streaming replies since wave D: the completed body is
+/// buffered there, its `usage` object is read, and the figure is priced by the
+/// same call that writes the ledger row, so the header and `ar cost-report`
+/// cannot drift. Streamed replies stay at `0` — counting them costs SSE
+/// chunk parsing in the hot path, which this build has chosen not to spend
+/// (see `docs/07-parity-closeout.md`, wave D), and `0` remains the answer
+/// when the upstream reported nothing or the reply was not parseable JSON.
 pub const TOKENS_IN_HEADER: &str = "x-ar-tokens-in";
-/// Completion tokens the upstream reported. `0` when it reported none.
+/// Completion tokens the upstream reported.
 ///
-/// See [`TOKENS_IN_HEADER`] for why it reads `0` today.
+/// See [`TOKENS_IN_HEADER`] for which replies carry a count.
 pub const TOKENS_OUT_HEADER: &str = "x-ar-tokens-out";
 /// What the request cost, in USD with six decimals.
 ///
 /// Six decimals because [`ar_tokens::Usd`] is integer micro-dollars and the
 /// ledger prints the same width: a header at a different precision would read
-/// as a different amount. See [`TOKENS_IN_HEADER`] for why it reads `0.000000`
-/// today.
+/// as a different amount. Zero on streamed replies, on which the usage count
+/// is not read at all — see [`TOKENS_IN_HEADER`].
 pub const RESPONSE_COST_HEADER: &str = "x-ar-response-cost";
 /// Prompt tokens compression removed before dispatch.
 pub const SAVINGS_TOKENS_HEADER: &str = "x-ar-savings-tokens";
@@ -354,9 +350,10 @@ async fn handle_chat(
     body: Bytes,
     dialect: Dialect,
 ) -> Response {
-    if let Some(reason) = authorize(state, headers, path) {
-        return reason;
-    }
+    let key_id = match authorize(state, headers, path) {
+        Ok(key_id) => key_id,
+        Err(reason) => return *reason,
+    };
     if !state.config.has_provider() {
         return error_because(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -477,7 +474,7 @@ async fn handle_chat(
     // not this server's own compression pass — the same span the attempt
     // accounting on `x-ar-decision` describes.
     let dispatched = Instant::now();
-    let outcome = match tokio::time::timeout(
+    let mut outcome = match tokio::time::timeout(
         state.config.stream_deadline(canonical.model.as_ref()),
         attempt_loop(
             &canonical,
@@ -535,6 +532,30 @@ async fn handle_chat(
         CacheState::Miss
     };
 
+    // A non-streaming reply is buffered here and only here: the usage ledger
+    // and the accounting headers need the whole body to read `usage`, and the
+    // pieces the response carries report what that buffer held. A streamed
+    // request skips all of it — its frames relay untouched and its usage
+    // headers stay at zero, which is the documented split: counting a stream
+    // costs SSE chunk parsing, which is a hot-path risk this build has chosen
+    // not to take. See `docs/07-parity-closeout.md` (wave D).
+    let meta = if canonical.stream {
+        ResponseMeta::default()
+            .with_latency(dispatched.elapsed())
+            .with_savings_tokens(savings_tokens)
+    } else {
+        buffer_for_accounting(
+            state,
+            &mut outcome,
+            &canonical,
+            dialect,
+            key_id.as_deref(),
+            dispatched.elapsed(),
+            savings_tokens,
+        )
+        .await
+    };
+
     decorate(
         outcome,
         canonical.stream,
@@ -546,10 +567,118 @@ async fn handle_chat(
             cache_key,
             cache,
             model: canonical.model.clone(),
-            meta: ResponseMeta::default().with_latency(dispatched.elapsed()).with_savings_tokens(savings_tokens),
+            meta,
         },
     )
     .with_guard(guard_verdict)
+}
+
+/// Drains a non-streaming reply now that its usage can be counted, records it,
+/// and hands back the accounting figures — while the streamed arm keeps
+/// relaying untouched frames.
+///
+/// Buffering here, rather than in [`decorate`], is what keeps the streamed path
+/// paying nothing: it is the one place the bytes exist before the relay arms
+/// take them. Once drained, the upstream is rebuilt as a one-chunk stream of
+/// the exact same bytes, so what the client receives is byte-identical to the
+/// baseline that streamed it straight through; the RAM the buffer peaks at is
+/// the reply's own size, held once, instead of that size crossing twice.
+///
+/// The recorded figure is the upstream's own `usage` map (Ollama's
+/// `prompt_eval_count`/`eval_count` live at the root, so the root is the usage
+/// object for it), priced against the same [`ar_tokens::PricingTable`] the
+/// config resolved: the headers and the ledger cannot drift, because one
+/// [`ResponseMeta::from_upstream`] call computes both.
+async fn buffer_for_accounting(
+    state: &AppState,
+    outcome: &mut AttemptOutcome,
+    canonical: &CanonicalRequest,
+    dialect: Dialect,
+    key_id: Option<&str>,
+    elapsed: Duration,
+    savings_tokens: u32,
+) -> ResponseMeta {
+    let defaults = || {
+        ResponseMeta::default()
+            .with_latency(elapsed)
+            .with_savings_tokens(savings_tokens)
+    };
+    // Only a 2xx that completed is counted. A failover's last upstream failure
+    // has nothing spent against it, and an abort has no body to read: zero is
+    // the honest figure in both.
+    let AttemptOutcome::Succeeded { upstream, provider, .. } = outcome else {
+        return defaults();
+    };
+
+    let mut buffered = Vec::new();
+    while let Some(chunk) = upstream.stream.next().await {
+        buffered.extend_from_slice(&chunk);
+    }
+    let body = Bytes::from(buffered);
+    upstream.stream = Box::pin(futures::stream::once({
+        // `Bytes::clone` is a refcount bump, not a copy (zero-copy bodies, ch.2).
+        let body = body.clone();
+        async move { body }
+    }));
+
+    let Some(meta) = read_and_record(state, key_id, provider.as_str(), &canonical.model, dialect, &body)
+    else {
+        // Unparseable replies (relay of a provider's HTML error page, say)
+        // have no usage to count; the headers keep their zeros on purpose.
+        return defaults();
+    };
+    meta.with_latency(elapsed).with_savings_tokens(savings_tokens)
+}
+
+/// Unix seconds now, for the ledger row's `created_at`.
+///
+/// Clock skew degrades to a zero timestamp rather than a panic: a row with no
+/// timestamp is an accounting nuisance, an accounting panic is an outage.
+fn epoch_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        // before-epoch clocks are deeply strange but not a reason to refuse a
+        // completion that already happened
+        .unwrap_or(0)
+}
+
+/// Reads the upstream's accounting out of a completed body and, when a ledger
+/// is configured, writes it. Returns `None` when the body is not parseable
+/// JSON — that relay is the error path's own upstream message, which has no
+/// usage to count and no right to be recounted from.
+fn read_and_record(
+    state: &AppState,
+    key_id: Option<&str>,
+    provider: &str,
+    model: &str,
+    dialect: Dialect,
+    body: &[u8],
+) -> Option<ResponseMeta> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let usage: &serde_json::Value = if matches!(dialect, Dialect::Ollama) {
+        // Ollama's count fields live at the body's root
+        // (`prompt_eval_count`, `eval_count`); every other dialect nests them
+        // under `usage`, falling back to the root so a flat reply still counts.
+        &value
+    } else {
+        value.get("usage").unwrap_or(&value)
+    };
+    let pricing = &state.config.prices;
+    let meta = ResponseMeta::from_upstream(pricing, provider, model, usage);
+    if let Some(ledger) = state.ledger.as_ref()
+        && let Err(e) = ledger
+            .lock()
+            .expect("ledger lock")
+            .record_response(key_id.unwrap_or("anonymous"), provider, model, usage, epoch_now(), pricing)
+    {
+        // The response headers already carry the computed figure, and a
+        // ledger write failure must not fail a request that succeeded — the
+        // accounting gap is one operator-visible log line, not the client's
+        // problem to be told about.
+        tracing::warn!(error = %e, "usage ledger write failed");
+    }
+    Some(meta)
 }
 
 /// What the cache and compression stages decided, for the response to carry.
@@ -628,35 +757,51 @@ pub(crate) struct RoutePlan {
     compression: Option<Step>,
 }
 
-/// Checks the credential when an [`crate::keys::AuthGate`] is configured.
+/// Checks the credential when an [`crate::keys::AuthGate`] is configured, and
+/// reports which key passed it.
 ///
 /// No gate means no check, which is only safe because the same configuration
 /// binds loopback-only — see [`crate::app::bind_addr`]. The two decisions live in
 /// one struct on purpose: "no auth" and "public bind" must never be settable
 /// independently.
 ///
-/// Returns the 401 to send, or `None` to serve the request. The body is built
-/// here rather than at the call site so there is one place that knows a refused
+/// `Ok(Some(key_id))` is a request a verified key is spending its own budget on;
+/// `Ok(None)` is anonymous — the usage ledger writes those two apart, because a
+/// server with no gate that recorded under the same id as a verified request
+/// would read them as one. `Err` is the 401 to send: the body is built here
+/// rather than at the call site so there is one place that knows a refused
 /// credential is `code: invalid_api_key` — the OpenAI-compatible spelling a
 /// client branches on — with a `reason` that separates "you sent nothing" from
-/// "what you sent is wrong" without either reaching the client verbatim. That
-/// separation is the reason this returns a `Response` and not a `String`: a
-/// `Result<_, String>` arm would make the whole thing 128 bytes wide, which
-/// clippy's perf gate rightly refuses for a function whose happy path is `None`.
+/// "what you sent is wrong" without either reaching the client verbatim.
+///
+/// The 401 rides in a `Box` because the happy path is a zero-length `Option` and
+/// a `Response` is wide; keeping the error arm a pointer keeps the check
+/// allocation-free until it actually fires, which is the design the old
+/// `Option<Response>` return was earning and the result's own comment refused.
 ///
 /// The reason is never the token, for the reason in [`crate::keys`]: this
 /// response is a cacheable 401 a browser may keep.
-pub(crate) fn authorize(state: &AppState, headers: &HeaderMap, path: &str) -> Option<Response> {
+pub(crate) fn authorize(
+    state: &AppState,
+    headers: &HeaderMap,
+    path: &str,
+) -> Result<Option<String>, Box<Response>> {
     // `path` is only read when a gate exists, which is the only case where a
     // tokenized-alias URL can carry a credential at all.
-    let gate = state.auth.as_deref()?;
+    let Some(gate) = state.auth.as_deref() else {
+        return Ok(None);
+    };
     // Resolved and checked once, and the mode decides what a refusal means — so
     // the matrix and the policy cannot drift into two answers for one request.
-    gate.authorize((headers, path), state.auth_mode)
-        .err()
-        .map(|reason| {
-            error_because(StatusCode::UNAUTHORIZED, "invalid_api_key", "credential_rejected", &reason)
-        })
+    match gate.authorize((headers, path), state.auth_mode) {
+        Ok(key_id) => Ok(key_id),
+        Err(reason) => Err(Box::new(error_because(
+            StatusCode::UNAUTHORIZED,
+            "invalid_api_key",
+            "credential_rejected",
+            &reason,
+        ))),
+    }
 }
 /// The 415 for a body that is not JSON, or `None` when it is.
 ///
@@ -1679,6 +1824,43 @@ mod tests {
         .into_state()
     }
 
+    /// [`routed_under`], plus the in-memory usage ledger an accounting test
+    /// needs to observe the write rather than only the headers.
+    fn routed_with_ledger(exec: Arc<dyn ArExec>, ledger: Arc<Mutex<ar_tokens::Ledger>>) -> AppState {
+        Components {
+            exec,
+            ledger: Some(ledger),
+            ..Components::unconfigured(one_provider_config())
+        }
+        .into_state()
+    }
+
+    /// Answers every chat dispatch with the canned chunks as a stream.
+    struct CannedExec(
+        Vec<&'static str>,
+    );
+
+    impl ArExec for CannedExec {
+        fn post_chat<'a>(
+            &'a self,
+            _provider: &'a ProviderId,
+            _canonical: &'a CanonicalRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<Upstream, ExecError>> + Send + 'a>> {
+            let chunks: Vec<Bytes> = self.0.iter().map(|c| Bytes::from(*c)).collect();
+            Box::pin(async move { Ok(Upstream::success(Box::pin(futures::stream::iter(chunks)))) })
+        }
+
+        fn post_media<'a>(
+            &'a self,
+            _provider: &'a ProviderId,
+            _endpoint: &'a str,
+            _content_type: &'a str,
+            _body: &'a [u8],
+        ) -> Pin<Box<dyn Future<Output = Result<MediaReply, ExecError>> + Send + 'a>> {
+            Box::pin(async move { Err(ExecError("no media dispatch in this fixture".to_owned())) })
+        }
+    }
+
     /// The config every request-path test dispatches against: provider `p`
     /// serving model `m` on a loopback URL no test ever dials.
     fn one_provider_config() -> ServerConfig {
@@ -2545,6 +2727,93 @@ mod tests {
         assert!(
             resp.headers().contains_key(VERSION_HEADER),
             "no version header on a streamed response"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_stream_answer_is_counted_in_the_headers_and_the_ledger() {
+        // Wave D's whole chain in one drive: buffer, read the upstream's own
+        // `usage`, answer with the counted figures, and persist the same row.
+        // The anonymous key id is the accounting name for a request no gate
+        // verified — the config in this fixture arms no gate.
+        let ledger = Arc::new(Mutex::new(
+            ar_tokens::Ledger::open_in_memory().expect("in-memory ledger"),
+        ));
+        let reply = r#"{"id":"r1","usage":{"prompt_tokens":11,"completion_tokens":7}}"#;
+        let exec = Arc::new(CannedExec(vec![reply]));
+        let router = crate::app::app(routed_with_ledger(exec, Arc::clone(&ledger)));
+        let resp = drive(
+            &router,
+            chat(
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            resp.headers()
+                .get(TOKENS_IN_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("11"),
+            "the prompt count rides the header"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(TOKENS_OUT_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("7"),
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body reads");
+        assert_eq!(bytes.as_ref(), reply.as_bytes(), "the buffered relay is the upstream's own bytes");
+        let report = ledger.lock().expect("ledger lock").report(10).expect("report");
+        assert_eq!(
+            report.rows.len(),
+            1,
+            "exactly one row: {rows:?}",
+            rows = report.rows
+        );
+        assert_eq!(report.rows[0].key_id, "anonymous");
+        assert_eq!(report.rows[0].total_tokens, 18);
+    }
+
+    #[tokio::test]
+    async fn a_streamed_answer_is_relayed_byte_for_byte_and_not_counted() {
+        // The other half of wave D's split: no buffering, no usage reading,
+        // and the headers say so with zeros rather than with invented counts.
+        // Two chunks because a one-chunk stream would not distinguish
+        // "streamed" from "buffered then relayed as a single chunk".
+        let exec = Arc::new(CannedExec(vec![
+            "data: {\"a\":1}\n\n",
+            "data: [DONE]\n\n",
+        ]));
+        let router = crate::app::app(routed_under(exec));
+        let resp = drive(
+            &router,
+            chat(
+                r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            resp.headers()
+                .get(TOKENS_IN_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("0"),
+            "a streamed answer must not be counted: {:?}",
+            resp.headers()
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body reads");
+        assert_eq!(
+            bytes.as_ref(),
+            b"data: {\"a\":1}\n\ndata: [DONE]\n\n".as_ref(),
+            "stream bytes must be identical to the upstream's"
         );
     }
 

@@ -241,14 +241,16 @@ impl AuthGate {
         })
     }
 
-    /// Checks `token` for the completions scope.
+    /// Introspects `token` for the completions scope and names the key it
+    /// spends against, so the usage ledger can record against the key that
+    /// actually authorized the request rather than a placeholder.
     ///
     /// # Errors
     ///
     /// A client-facing reason: `ar-keys`' `Display` for a bad signature, an
     /// expiry, a revoked `jti` or a missing scope names which, and none of them
     /// echoes the token.
-    pub fn verify(&self, token: &str) -> Result<(), String> {
+    pub fn verify(&self, token: &str) -> Result<String, String> {
         let verified = self.tokens.introspect(token).map_err(|e| reason(&e))?;
         if !verified.scopes.grants(Scope::ExecuteCompletions) {
             return Err(format!(
@@ -256,7 +258,7 @@ impl AuthGate {
                 Scope::ExecuteCompletions
             ));
         }
-        Ok(())
+        Ok(verified.key_id)
     }
 
     /// Resolves the credential `source` carries and applies `mode` to it.
@@ -287,7 +289,7 @@ impl AuthGate {
         &self,
         source: CredentialSource<'_>,
         mode: AuthMode,
-    ) -> Result<(), String> {
+    ) -> Result<Option<String>, String> {
         let Some(token) = extract_credential(source) else {
             // No credential at all: only `Required` cares, and it is the mode
             // that names its own remedies.
@@ -297,19 +299,19 @@ impl AuthGate {
                      `x-api-key`, or `x-goog-api-key`"
                         .to_owned(),
                 ),
-                AuthMode::DegradeInvalidToAnon | AuthMode::Open => Ok(()),
+                AuthMode::DegradeInvalidToAnon | AuthMode::Open => Ok(None),
             };
         };
         match self.verify(&token) {
-            Ok(()) => Ok(()),
+            Ok(key_id) => Ok(Some(key_id)),
             Err(reason) => match mode {
                 // The stale-CLI-config case: an old key must not turn every request
                 // into a 401, but it must stay visible in the log.
                 AuthMode::DegradeInvalidToAnon => {
                     tracing::warn!(%reason, "credential refused; degrading to anonymous");
-                    Ok(())
+                    Ok(None)
                 }
-                AuthMode::Open => Ok(()),
+                AuthMode::Open => Ok(None),
                 AuthMode::Required => Err(reason),
             },
         }
@@ -559,7 +561,11 @@ mod tests {
         source(&[("authorization", &format!("Bearer {token}"))])
     }
 
-    fn admit(gate: &AuthGate, source: (&HeaderMap, &str), mode: AuthMode) -> Result<(), String> {
+    fn admit(
+        gate: &AuthGate,
+        source: (&HeaderMap, &str),
+        mode: AuthMode,
+    ) -> Result<Option<String>, String> {
         gate.authorize(CredentialSource::from(source), mode)
     }
 
@@ -579,6 +585,29 @@ mod tests {
         let (h, p) = source(&[]);
         assert!(admit(&gate(), (&h, &p), AuthMode::DegradeInvalidToAnon).is_ok());
         assert!(admit(&gate(), (&h, &p), AuthMode::Open).is_ok());
+    }
+
+    #[test]
+    fn a_verified_credential_names_its_key_for_accounting() {
+        // Wave D's whole seam: the gate drops the introspected key id or the
+        // ledger would have nothing to record against — `Ok(Some)` is the
+        // verified answer, `Ok(None)` the anonymous one, and the two must not
+        // be interchangeable.
+        let gate = gate();
+        let token = gate.issue_for_tests("key-1").expect("token mints").access;
+        let (h, p) = source(&[("authorization", &format!("Bearer {token}"))]);
+        assert_eq!(
+            admit(&gate, (&h, &p), AuthMode::Open)
+                .expect("its own token serves")
+                .as_deref(),
+            Some("key-1"),
+        );
+        let (anon, p) = source(&[]);
+        assert_eq!(
+            admit(&gate, (&anon, &p), AuthMode::Open)
+                .expect("anonymous serves under Open"),
+            None,
+        );
     }
 
     #[test]

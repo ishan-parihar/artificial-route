@@ -85,10 +85,12 @@ pub async fn transcriptions(
     // `unwrap_or_default` rather than a rejection: a malformed
     // percent-encoding is not a reason to refuse a request whose only route
     // input is this parameter, and the missing-model case has its own refusal.
-    let model = query.get("model").map(String::as_str).unwrap_or_default();
-    if let Some(reason) = authorize(&state, &headers, uri.path()) {
-        return reason;
+    if let Err(reason) = authorize(&state, &headers, uri.path()) {
+        return *reason;
     }
+    // A malformed percent-encoding is no reason to refuse a request whose only
+    // route input is this parameter; the missing-model case has its own refusal.
+    let model = query.get("model").map(String::as_str).unwrap_or_default();
     if model.trim().is_empty() {
         return error_because(
             StatusCode::BAD_REQUEST,
@@ -115,8 +117,8 @@ async fn json_route(
     endpoint: &'static str,
     body: Bytes,
 ) -> Response {
-    if let Some(reason) = authorize(state, headers, path) {
-        return reason;
+    if let Err(reason) = authorize(state, headers, path) {
+        return *reason;
     }
     if let Some(reason) = require_json(headers) {
         return reason;

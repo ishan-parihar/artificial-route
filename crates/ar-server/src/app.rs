@@ -122,6 +122,15 @@ pub struct AppState {
     /// `None` means no cache at all, which `x-ar-cache` then reports as `miss`
     /// rather than as a `bypass` the client has to interpret.
     pub cache: Option<Arc<ar_cache::Cache>>,
+    /// The usage ledger an answered non-streaming request is recorded in.
+    ///
+    /// `None` means accounting is reported on the response headers but not
+    /// persisted — the headers are computed from the upstream's own `usage`
+    /// either way, so they never claim a count the dispatch did not earn. The
+    /// `Mutex` is not contention so much as `Sync`: `Ledger` is `Send` only
+    /// and this state is shared across tasks, and a serialized write is what
+    /// sqlite does to us anyway.
+    pub ledger: Option<Arc<std::sync::Mutex<ar_tokens::Ledger>>>,
     /// Bearer gate, when one is configured.
     ///
     /// `None` is the default and means every request is anonymous — which is only
@@ -145,6 +154,7 @@ impl std::fmt::Debug for AppState {
             .field("providers", &self.config.providers.len())
             .field("combos", &self.config.combos.len())
             .field("cache", &self.cache.is_some())
+            .field("ledger", &self.ledger.is_some())
             .field("auth", &self.auth.is_some())
             .field("auth_mode", &self.auth_mode)
             .field("public", &self.config.public)
@@ -172,6 +182,9 @@ pub struct Components {
     /// field rather than a constant because a test needs a cache whose behaviour
     /// it can predict, and 32 MB of headroom changes nothing about one.
     pub cache_bytes: Option<Option<u64>>,
+    /// The usage ledger handle. `None` disables persistence only — the
+    /// response headers still carry the computed counts.
+    pub ledger: Option<Arc<std::sync::Mutex<ar_tokens::Ledger>>>,
     /// Master key bytes for the bearer gate. `None` disables the gate.
     ///
     /// Overrides [`ServerConfig::http_master_key`] when set, which is what makes
@@ -198,6 +211,7 @@ impl Components {
             exec: Arc::new(NullExec),
             extra_models: Vec::new(),
             cache_bytes: Some(Some(0)),
+            ledger: None,
             master_key: None,
         }
     }
@@ -272,6 +286,7 @@ impl Components {
             metrics: Arc::new(Metrics::new()),
             models: Arc::new(ModelsCache::new(catalog)),
             cache: build_cache(self.cache_bytes),
+            ledger: self.ledger,
             auth_mode,
             // `Secret` has no `Deref`, so the gate takes the bytes rather than the
             // wrapper; the wrapper stays in `master` so it is zeroized on drop.
