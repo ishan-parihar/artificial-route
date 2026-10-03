@@ -1,14 +1,20 @@
 //! `/v1/models` catalog with stale-while-revalidate.
 //!
-//! P0: the catalog comes from config, so "revalidate" re-derives it rather than
-//! hitting a provider. The SWR machinery is the part that matters and it is
-//! real — a slow or failing refresh never blocks a caller, and a caller never
-//! waits longer than it has to. Swapping [`ModelCatalog`] for a live provider
-//! client in P1 changes no caller.
+//! Two sources ship. [`StaticCatalog`] reads config and cannot fail, which is
+//! what a client sees when no discovery URL is configured. [`DiscoveredCatalog`]
+//! unions the models.dev overlay over the configured cards so an operator's own
+//! models survive an upstream document that does not mention them, and refreshes
+//! in the background — [`DiscoveredCatalog::prefetch`] is called off the request
+//! path so `ModelsCache::load` only ever reads an already-populated cache.
+//!
+//! The SWR machinery is the part that matters and it is real: a slow or failing
+//! refresh never blocks a caller, and a caller never waits longer than it has to.
 
-use std::sync::Mutex;
+use std::future::Future;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use ar_registry::discovery::{self, DiscoveryError, LiveCatalog};
 use serde::Serialize;
 
 /// Freshness window for `/v1/models`, per `docs/05-roadmap.md` P0.
@@ -77,6 +83,199 @@ impl ModelCatalog for StaticCatalog {
     }
 }
 
+/// How long a models.dev fetch is cached before `/v1/models` triggers another.
+///
+/// Distinct from [`MODELS_TTL`], which is how long a *loaded* card list is served:
+/// this is how long the upstream document is kept before it is refetched. They are
+/// the same 60s by coincidence of "an hour is too long for a model list"; they are
+/// separate knobs because refetching upstream and re-reading config are different
+/// costs.
+pub const DISCOVERY_TTL: Duration = Duration::from_secs(60);
+
+/// Upper bound on one models.dev fetch, in seconds.
+///
+/// Short enough that a `/v1/models` reader is never held for a noticeable
+/// period, long enough that a slow-but-working upstream still succeeds. It is a
+/// bound on one refresh attempt, not on the request: a refresh that exceeds it
+/// takes the stale path, which is the behaviour the offline-first contract wants.
+pub const DISCOVERY_WAIT_SECS: u64 = 5;
+
+/// A [`ModelCatalog`] that discovers models from models.dev instead of config.
+///
+/// This is the seam P0's [`ModelsCache`] doc comment predicted: `load()` is the
+/// one function that had to change, and it changed rather than grew. The async
+/// fetch is done with a bounded wait inside `load()` rather than by spawning,
+/// because `ModelsCache` calls `load()` on the request path and a spawn would
+/// mean the caller is served a value that may not exist yet. [`LiveCatalog`]
+/// already keeps the last good parse, so a failure degrades to "keep serving
+/// what you have" — the same contract `StaticCatalog` could not fail into.
+///
+/// Two deliberate choices:
+/// - **Merged, not replaced.** Config-declared cards are unioned in *after* the
+///   discovered ones so an operator's explicit `models:` list is never dropped
+///   from a model picker by an upstream document that happens not to mention a
+///   self-hosted model. Duplicates collapse on `id`.
+/// - **Bounded wait.** A proxy's boot and its `/v1/models` must not hang on an
+///   unreachable models.dev, so the fetch is capped. Exceeding it is a normal
+///   refresh failure and takes the stale path.
+pub struct DiscoveredCatalog {
+    inner: LiveCatalog,
+    /// Cards the config declares. Merged in after the discovered set so a
+    /// discovered model never shadows an operator's own.
+    configured: Vec<ModelCard>,
+    ttl: Duration,
+    /// Upper bound on one upstream fetch, in seconds.
+    ///
+    /// Not a timeout on the whole request: [`ModelsCache::get`] already
+    /// re-serves a stale value on error, so the only thing this bounds is how
+    /// long a *refresh attempt* may hold a reader.
+    wait_secs: u64,
+}
+
+impl std::fmt::Debug for DiscoveredCatalog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiscoveredCatalog")
+            .field("providers", &self.inner.providers())
+            .field("configured", &self.configured.len())
+            .field("ttl", &self.ttl)
+            .field("wait_secs", &self.wait_secs)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DiscoveredCatalog {
+    /// Builds a catalog that discovers from models.dev over `configured` cards.
+    #[must_use]
+    pub fn new(configured: Vec<ModelCard>) -> Self {
+        Self {
+            inner: LiveCatalog::default(),
+            configured,
+            ttl: DISCOVERY_TTL,
+            wait_secs: DISCOVERY_WAIT_SECS,
+        }
+    }
+
+    /// Replaces both bounds, for tests and for a config that wants its own.
+    #[must_use]
+    pub fn with_bounds(configured: Vec<ModelCard>, ttl: Duration, wait_secs: u64) -> Self {
+        Self {
+            inner: LiveCatalog::default(),
+            configured,
+            ttl,
+            wait_secs,
+        }
+    }
+
+    /// Why the last discovery failed, if it did.
+    ///
+    /// Surfaced on `/metrics` and the doctor report: a running proxy serving a
+    /// stale catalog for a week should say so rather than look healthy.
+    #[must_use]
+    pub fn last_error(&self) -> Option<String> {
+        self.inner.last_error()
+    }
+
+    /// Discovered providers currently held, for a log line that says whether the
+    /// fallback is serving anything.
+    #[must_use]
+    pub fn providers_hint(&self) -> usize {
+        self.inner.providers()
+    }
+
+    /// Fetches models.dev once, off the request path.
+    ///
+    /// [`ModelsCache::get`] calls [`ModelCatalog::load`] synchronously, and this
+    /// is why that is safe: the network call lives here, called from the
+    /// background refresh loop, while `load` only ever reads an
+    /// already-populated [`LiveCatalog`]. No request-path thread ever waits on a
+    /// socket.
+    pub async fn prefetch(&self) -> Result<usize, String> {
+        self.prefetch_with(|| self.fetch_once()).await
+    }
+
+    /// [`Self::prefetch`] with the fetch injected.
+    ///
+    /// The seam the tests use, and the one that keeps the merge logic testable
+    /// without a network — the same reason [`LiveCatalog::refresh`] takes a
+    /// closure rather than performing an HTTP call itself.
+    pub async fn prefetch_with<F, Fut>(&self, fetch: F) -> Result<usize, String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<String, DiscoveryError>>,
+    {
+        if !self
+            .inner
+            .is_stale(discovery::unix_now(), self.ttl.as_secs())
+        {
+            return Ok(self.inner.providers());
+        }
+        self.inner
+            .refresh_async(discovery::unix_now(), fetch)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// One HTTP GET of the models.dev document.
+    async fn fetch_once(&self) -> Result<String, DiscoveryError> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(self.wait_secs))
+            .build()
+            .map_err(|e| DiscoveryError::Fetch(e.to_string()))?;
+        let body = client
+            .get(discovery::MODELS_DEV_URL)
+            .send()
+            .await
+            .map_err(|e| DiscoveryError::Fetch(e.to_string()))?
+            .error_for_status()
+            .map_err(|e| DiscoveryError::Fetch(e.to_string()))?
+            .text()
+            .await
+            .map_err(|e| DiscoveryError::Fetch(e.to_string()))?;
+        Ok(body)
+    }
+
+    /// Discovered cards, merged with the configured ones.
+    fn merged(&self) -> Vec<ModelCard> {
+        // Everything the last successful refresh installed is served, however old
+        // it is. Staleness decides whether to *refetch*, never whether to *serve*:
+        // dropping the discovered set once the TTL lapsed would mean a failing
+        // refresh emptied `/v1/models`, which is the exact failure
+        // `LiveCatalog` documents itself as refusing. An empty inner catalog
+        // contributes nothing, so a never-populated one needs no check here.
+        let discovered = self
+            .inner
+            .catalog()
+            .into_iter()
+            .flat_map(|(provider, entry)| {
+                entry
+                    .models
+                    .into_iter()
+                    .map(move |m| ModelCard::new((*provider).to_owned(), (*m).to_owned()))
+            });
+        let mut seen = std::collections::HashSet::new();
+        discovered
+            .chain(self.configured.iter().cloned())
+            .filter(|c| seen.insert(c.id.clone()))
+            .collect()
+    }
+}
+
+impl ModelCatalog for DiscoveredCatalog {
+    fn load(&self) -> Result<Vec<ModelCard>, String> {
+        let cards = self.merged();
+        if cards.is_empty() {
+            // Distinguish "upstream unreachable AND nothing configured" from a
+            // genuinely empty catalog, so the log says which.
+            let why = self
+                .inner
+                .last_error()
+                .unwrap_or_else(|| "no discovered or configured models".to_owned());
+            return Err(why);
+        }
+        Ok(cards)
+    }
+}
+
 /// A cached catalog plus the age of the value it holds.
 #[derive(Debug)]
 struct Entry {
@@ -109,16 +308,22 @@ pub struct Cached {
 
 /// Single-flight SWR cache.
 ///
-/// Refreshes are synchronous here, not spawned: P0's `load()` is a config read
-/// that cannot block. A live provider client (P1) needs `tokio::spawn`, and at
-/// that point this is the one function that changes.
-pub struct ModelsCache<'a> {
-    catalog: &'a dyn ModelCatalog,
+/// Refreshes call [`ModelCatalog::load`] synchronously: config is a memory read
+/// and [`DiscoveredCatalog`] is fed off the request path by its own
+/// `prefetch`, so neither blocks a caller. That split is the reason a live
+/// source could be added without touching this cache.
+///
+/// The catalog is owned rather than borrowed: it was a `&'a dyn ModelCatalog`,
+/// which forced every long-lived holder to manufacture a `'static` reference —
+/// `Components::into_state` leaked a `Box` to satisfy it. Owning an
+/// [`Arc`] costs one pointer and removes the lifetime parameter entirely.
+pub struct ModelsCache {
+    catalog: Arc<dyn ModelCatalog>,
     entry: Mutex<Option<Entry>>,
     ttl: Duration,
 }
 
-impl std::fmt::Debug for ModelsCache<'_> {
+impl std::fmt::Debug for ModelsCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // `ModelCatalog` is a trait object with no `Debug`; the cache's own
         // state is the interesting part.
@@ -129,10 +334,10 @@ impl std::fmt::Debug for ModelsCache<'_> {
     }
 }
 
-impl<'a> ModelsCache<'a> {
+impl ModelsCache {
     /// Builds an empty cache over `catalog` with [`MODELS_TTL`].
     #[must_use]
-    pub fn new(catalog: &'a dyn ModelCatalog) -> Self {
+    pub fn new(catalog: Arc<dyn ModelCatalog>) -> Self {
         Self {
             catalog,
             entry: Mutex::new(None),
@@ -142,7 +347,7 @@ impl<'a> ModelsCache<'a> {
 
     /// Builds an empty cache with an explicit TTL.
     #[must_use]
-    pub fn with_ttl(catalog: &'a dyn ModelCatalog, ttl: Duration) -> Self {
+    pub fn with_ttl(catalog: Arc<dyn ModelCatalog>, ttl: Duration) -> Self {
         Self {
             catalog,
             entry: Mutex::new(None),
@@ -243,10 +448,13 @@ impl<'a> ModelsCache<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
-    use super::{ModelCard, ModelCatalog, ModelsCache, StaticCatalog};
+    use ar_registry::discovery::DiscoveryError;
+
+    use super::{DiscoveredCatalog, ModelCard, ModelCatalog, ModelsCache, StaticCatalog};
     use crate::metrics::Metrics;
 
     fn card() -> ModelCard {
@@ -276,11 +484,12 @@ mod tests {
                 self.inner.load()
             }
         }
-        let cat = Counting {
+        let calls = AtomicU64::new(0);
+        let cat = Arc::new(Counting {
             inner: StaticCatalog::new(vec![card()]),
-            calls: AtomicU64::new(0),
-        };
-        let cache = ModelsCache::new(&cat);
+            calls,
+        });
+        let cache = ModelsCache::new(cat.clone());
         let first = cache.get();
         let second = cache.get();
         assert_eq!(
@@ -292,7 +501,7 @@ mod tests {
     #[test]
     fn reports_the_first_load_as_a_revalidation() {
         let cat = StaticCatalog::new(vec![card()]);
-        let cache = ModelsCache::new(&cat);
+        let cache = ModelsCache::new(Arc::new(cat));
         assert!(cache.get().revalidated, "the first load is a revalidation");
     }
 
@@ -301,7 +510,7 @@ mod tests {
         // What `ar_models_refresh_total` counts. Counting every request instead
         // would make the counter a request counter wearing another name.
         let cat = StaticCatalog::new(vec![card()]);
-        let cache = ModelsCache::new(&cat);
+        let cache = ModelsCache::new(Arc::new(cat));
         let _ = cache.get();
         assert!(!cache.get().revalidated);
     }
@@ -311,7 +520,7 @@ mod tests {
         // With a static catalog `load()` cannot fail, so a `stale` that only a
         // failure can produce would never be emitted by a healthy server.
         let cat = StaticCatalog::new(vec![card()]);
-        let cache = ModelsCache::with_ttl(&cat, Duration::from_nanos(1));
+        let cache = ModelsCache::with_ttl(Arc::new(cat), Duration::from_nanos(1));
         let _ = cache.get();
         std::thread::sleep(Duration::from_millis(2));
         assert!(
@@ -334,7 +543,7 @@ mod tests {
         let cat = Rotating {
             calls: AtomicU64::new(0),
         };
-        let cache = ModelsCache::with_ttl(&cat, Duration::from_nanos(1));
+        let cache = ModelsCache::with_ttl(Arc::new(cat), Duration::from_nanos(1));
         assert_eq!(
             cache.get().cards[0].id,
             "p/m0",
@@ -357,7 +566,7 @@ mod tests {
     #[test]
     fn marks_value_stale_past_ttl() {
         let cat = StaticCatalog::new(vec![card()]);
-        let cache = ModelsCache::with_ttl(&cat, Duration::from_nanos(1));
+        let cache = ModelsCache::with_ttl(Arc::new(cat), Duration::from_nanos(1));
         let _ = cache.get();
         std::thread::sleep(Duration::from_millis(2));
         assert!(cache.is_stale());
@@ -380,11 +589,120 @@ mod tests {
         let cat = Flaky {
             calls: AtomicU64::new(0),
         };
-        let cache = ModelsCache::with_ttl(&cat, Duration::from_nanos(1));
+        let cache = ModelsCache::with_ttl(Arc::new(cat), Duration::from_nanos(1));
         let first = cache.get();
         std::thread::sleep(Duration::from_millis(2));
         let second = cache.get();
         assert_eq!(first.cards.len(), second.cards.len());
+    }
+
+    /// A models.dev-shaped document with two providers, as `ar-registry`'s own
+    /// discovery tests use.
+    const UPSTREAM: &str = r#"{
+      "openai": {"api":"https://api.openai.com/v1","env":["OPENAI_API_KEY"],
+        "models":{"gpt-4o":{},"gpt-4o-mini":{}}},
+      "anthropic": {"api":"https://api.anthropic.com/v1","env":["ANTHROPIC_API_KEY"],
+        "models":{"claude-sonnet-4":{}}}
+    }"#;
+
+    /// Two cards for a `(provider, model)` pair list.
+    fn discovered(pairs: &[(&str, &str)]) -> DiscoveredCatalog {
+        DiscoveredCatalog::new(pairs.iter().map(|(p, m)| ModelCard::new(*p, *m)).collect())
+    }
+
+    #[tokio::test]
+    async fn unions_discovered_models_over_the_configured_ones() {
+        // The configured set is what an operator declared; discovery may only
+        // add to it. `gpt-4o-mini` appears in both, and must appear once.
+        let cat = discovered(&[("self", "llama-3")]);
+        cat.prefetch_with(|| async { Ok(UPSTREAM.to_owned()) })
+            .await
+            .expect("prefetch installs");
+
+        let ids: Vec<String> = ModelCatalog::load(&cat)
+            .expect("cards load")
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert!(ids.contains(&"openai/gpt-4o".to_owned()), "{ids:?}");
+        assert!(
+            ids.contains(&"anthropic/claude-sonnet-4".to_owned()),
+            "a discovered model is qualified by its provider like any other: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"self/llama-3".to_owned()),
+            "a configured model must survive discovery: {ids:?}"
+        );
+        assert_eq!(
+            ids.iter().filter(|i| *i == "openai/gpt-4o-mini").count(),
+            1,
+            "a model in both sets is one card, not two: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn serves_configured_models_when_discovery_never_succeeds() {
+        // Offline-first, and the reason the overlay is a union rather than a
+        // replacement: a proxy that cannot reach models.dev must still list what
+        // its config declares.
+        let cat = discovered(&[("self", "llama-3")]);
+        let err = cat
+            .prefetch_with(|| async { Err(DiscoveryError::Fetch("dns".into())) })
+            .await
+            .expect_err("offline is a failure");
+        assert!(err.contains("dns"), "{err}");
+
+        let ids: Vec<String> = ModelCatalog::load(&cat)
+            .expect("configured cards still load")
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(ids, vec!["self/llama-3".to_owned()], "{ids:?}");
+    }
+
+    #[tokio::test]
+    async fn keeps_the_last_good_catalog_when_a_refresh_fails() {
+        // The load-bearing offline-first property: a refresh that fails *after*
+        // a success keeps what the success installed. This is what `ar import`
+        // already relies on and what a running proxy's `/v1/models` now does too.
+        let cat = DiscoveredCatalog::with_bounds(
+            vec![ModelCard::new("self", "llama-3")],
+            Duration::from_nanos(1),
+            5,
+        );
+        cat.prefetch_with(|| async { Ok(UPSTREAM.to_owned()) })
+            .await
+            .expect("first refresh installs");
+        let fresh = ModelCatalog::load(&cat).expect("cards load");
+        assert_eq!(fresh.len(), 4, "1 configured + 3 upstream: {fresh:?}");
+
+        // TTL is 1ns, so this prefetch is not short-circuited and really fails.
+        let err = cat
+            .prefetch_with(|| async { Err(DiscoveryError::Fetch("dns".into())) })
+            .await
+            .expect_err("the second refresh fails");
+        assert!(err.contains("dns"), "{err}");
+
+        let after = ModelCatalog::load(&cat).expect("still loadable");
+        assert_eq!(
+            after.len(),
+            fresh.len(),
+            "a failed refresh must not empty the catalog"
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_the_error_when_nothing_is_configured_and_upstream_is_down() {
+        // The distinction the `Err` arm carries: "upstream is down" and "there
+        // are genuinely no models" are different facts, and the message says
+        // which. Without this, a model picker empties with no explanation.
+        let cat = DiscoveredCatalog::new(Vec::new());
+        let _ = cat
+            .prefetch_with(|| async { Err(DiscoveryError::Fetch("dns".into())) })
+            .await;
+        let err = ModelCatalog::load(&cat).expect_err("nothing to serve");
+        assert!(err.contains("dns"), "{err}");
+        assert_eq!(cat.last_error().as_deref(), Some(err.as_str()));
     }
 
     #[test]
@@ -395,7 +713,7 @@ mod tests {
                 Err("nope".to_owned())
             }
         }
-        let cache = ModelsCache::new(&Broken);
+        let cache = ModelsCache::new(Arc::new(Broken));
         assert!(cache.get().cards.is_empty());
     }
 
@@ -410,13 +728,12 @@ mod tests {
                 Ok(vec![card()])
             }
         }
-        let cat = Counting {
-            calls: AtomicU64::new(0),
-        };
+        let calls = AtomicU64::new(0);
+        let cat = Arc::new(Counting { calls });
         let m = Metrics::new();
         // A TTL long enough that the second read is fresh, so exactly one
         // revalidation happens.
-        let cache = ModelsCache::with_ttl(&cat, Duration::from_secs(60));
+        let cache = ModelsCache::with_ttl(cat.clone(), Duration::from_secs(60));
         let reads = [cache.get(), cache.get()];
         // The counter follows `revalidated`, so a fresh read adds nothing.
         for got in reads {

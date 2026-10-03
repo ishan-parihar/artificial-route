@@ -39,7 +39,7 @@ use crate::config::ServerConfig;
 use crate::keys::AuthGate;
 use crate::media;
 use crate::metrics::{Metrics, Outcome};
-use crate::models::{ModelsCache, StaticCatalog};
+use crate::models::{DiscoveredCatalog, ModelCatalog, ModelsCache, StaticCatalog};
 use crate::routes;
 
 /// Request body ceiling. A chat request is kilobytes; 2MB is a client's runaway
@@ -116,7 +116,14 @@ pub struct AppState {
     /// Counters for `/metrics`.
     pub metrics: Arc<Metrics>,
     /// `/v1/models` cache, revalidated every 60s.
-    pub models: Arc<ModelsCache<'static>>,
+    pub models: Arc<ModelsCache>,
+    /// The discovery overlay, when [`ServerConfig::model_discovery`] armed it.
+    ///
+    /// `None` is the default configuration, and is what keeps `/v1/models` a
+    /// memory read. A second handle on the same object as
+    /// `models`' catalog, so the background refresh loop can write to it without
+    /// reaching into the cache.
+    pub discovery: Option<Arc<DiscoveredCatalog>>,
     /// Exact response cache, when one is configured.
     ///
     /// `None` means no cache at all, which `x-ar-cache` then reports as `miss`
@@ -277,10 +284,19 @@ impl Components {
         let config = Arc::new(self.config);
         let mut cards = config.model_cards();
         cards.extend(self.extra_models);
-        // The catalog is leaked for `'static` because a `StaticCatalog` is
-        // immutable and lives as long as the process. A leaked `Vec` here is a
-        // few dozen bytes once, not a leak in the growing sense.
-        let catalog: &'static StaticCatalog = Box::leak(Box::new(StaticCatalog::new(cards)));
+        let mut discovery = None;
+        // The discovery overlay, when armed, unions the models.dev catalog *over*
+        // these cards. Both catalogs own their card list: `DiscoveredCatalog`
+        // because it has interior mutability and a refresh loop holds it, the
+        // static one because the cache owns an `Arc` rather than borrowing — the
+        // lifetime that used to force a `Box::leak` here is gone.
+        let catalog: Arc<dyn ModelCatalog> = if config.model_discovery {
+            let discovered = Arc::new(DiscoveredCatalog::new(cards));
+            discovery = Some(discovered.clone());
+            discovered
+        } else {
+            Arc::new(StaticCatalog::new(cards))
+        };
 
         AppState {
             config,
@@ -290,6 +306,7 @@ impl Components {
             rr: Arc::new(AtomicU64::new(0)),
             metrics: Arc::new(Metrics::new()),
             models: Arc::new(ModelsCache::new(catalog)),
+            discovery,
             cache: build_cache(self.cache_bytes),
             ledger: self.ledger,
             auth_mode,
@@ -714,6 +731,39 @@ pub struct Server {
     pub router: Router,
     /// The state backing it, kept so tests can read counters.
     pub state: AppState,
+}
+
+impl Server {
+    /// Starts the discovery refresh loop, when discovery is armed.
+    ///
+    /// Spawned rather than awaited: the listener must bind whether or not
+    /// models.dev is reachable, and a proxy that will not start is harder to
+    /// diagnose than one that reports which layer came up. The loop's own
+    /// failures are logged and the previous catalog keeps serving, which is the
+    /// offline-first contract of [`crate::models::DiscoveredCatalog`].
+    ///
+    /// Returns the task handle so a test or a future shutdown path can join it.
+    /// `None` when discovery is off, so there is no idle task in the default
+    /// configuration.
+    pub fn spawn_discovery_refresh(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let discovery = self.state.discovery.clone()?;
+        let ttl = crate::models::DISCOVERY_TTL;
+        Some(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(ttl);
+            loop {
+                ticker.tick().await;
+                // `prefetch` is itself stale-guarded, so this is a no-op when the
+                // last tick already succeeded inside the TTL.
+                if let Err(e) = discovery.prefetch().await {
+                    tracing::warn!(
+                        error = %e,
+                        providers = discovery.providers_hint(),
+                        "model discovery refresh failed; serving the cached catalog"
+                    );
+                }
+            }
+        }))
+    }
 }
 
 /// Builds [`Server`] from components.

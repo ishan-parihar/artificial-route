@@ -132,10 +132,27 @@ pub async fn serve(cli: &Cli, args: &ServeArgs) -> anyhow::Result<()> {
         server.state.config.combos.len()
     );
 
+    // Started after the bind, so a boot that cannot reach models.dev has already
+    // produced a listening socket and a diagnostic: the proxy is up and serving
+    // its configured models while discovery warms. A failure inside the loop is
+    // logged and retried on the next tick, never fatal — see
+    // `ar_server::app::Server::spawn_discovery_refresh`.
+    let discovery_task = server.spawn_discovery_refresh();
+    if discovery_task.is_some() {
+        eprintln!("model discovery armed ({})", ar_server::DISCOVERY_VAR);
+    }
+
     axum::serve(listener, server.router)
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .map_err(|e| commands::fail(e, "the listener stopped unexpectedly"))
+        .map_err(|e| commands::fail(e, "the listener stopped unexpectedly"))?;
+
+    // The loop outlives the listener otherwise: it is an infinite interval task,
+    // so the process would not return after a clean shutdown without this.
+    if let Some(task) = discovery_task {
+        task.abort();
+    }
+    Ok(())
 }
 
 /// Resolves on SIGINT/SIGTERM so a Ctrl-C drains rather than cutting a streamed

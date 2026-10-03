@@ -14,6 +14,7 @@
 //! because a proxy that loses the network must keep routing.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -159,9 +160,33 @@ impl LiveCatalog {
     where
         F: FnOnce() -> Result<String, DiscoveryError>,
     {
+        self.install(now, fetch())
+    }
+
+    /// [`Self::refresh`] for a fetch that has to await.
+    ///
+    /// The parse-and-install transition is shared, so the offline-first
+    /// guarantee — a failed refresh keeps the previous catalog and body and only
+    /// records the error — cannot be implemented twice and drift. This arm exists
+    /// because the server's refresh loop has a runtime and the importing CLI's
+    /// synchronous path does not; both write the same cache.
+    pub async fn refresh_async<F, Fut>(&self, now: u64, fetch: F) -> Result<usize, DiscoveryError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<String, DiscoveryError>>,
+    {
+        self.install(now, fetch().await)
+    }
+
+    /// Installs a fetched document, or keeps the old snapshot and records why.
+    fn install(
+        &self,
+        now: u64,
+        fetched: Result<String, DiscoveryError>,
+    ) -> Result<usize, DiscoveryError> {
         let mut snap = self.lock();
         snap.refreshes += 1;
-        match fetch().and_then(|body| parse_catalog(&body).map(|catalog| (catalog, body))) {
+        match fetched.and_then(|body| parse_catalog(&body).map(|catalog| (catalog, body))) {
             Ok((catalog, body)) => {
                 let providers = catalog.len();
                 snap.catalog = catalog;

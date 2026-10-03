@@ -1,16 +1,29 @@
 //! Prometheus text exposition, hand-rolled.
 //!
-//! `docs/03-crates-and-deps.md` lists the `prometheus` client crate, and P0 does
-//! not need it: there are four counters, all of which are `u64` adds behind an
-//! atomic, and the exposition format for a fixed set of counters is a dozen
-//! lines of `write!`. A client would add a registry, a label-validation layer
-//! and a protobuf dependency to print the same four lines — against the
-//! "minimal-RAM" budget in `docs/00-overview.md`.
+//! `docs/03-crates-and-deps.md` lists the `prometheus` client crate, and neither
+//! the HTTP layer nor the routing layer needs it: there are five HTTP counters,
+//! all of which are `u64` adds behind an atomic, and the exposition format for a
+//! fixed set of counters is a dozen lines of `write!`. A client would add a
+//! registry, a label-validation layer and a protobuf dependency to print the same
+//! lines — against the "minimal-RAM" budget in `docs/00-overview.md`.
 //!
 //! Cardinality is capped at `path|status|provider|decision`, per
 //! `docs/04-subsystems.md`. **No prompt, model name, key, or session ever
 //! reaches this module** — `observe_*` takes only the four bounded labels, so
 //! there is no field a caller could accidentally fill with user content.
+//!
+//! # Two layers, one endpoint
+//!
+//! [`Metrics`] counts *transport*: outcomes, failovers, attempts, catalog
+//! refreshes. [`ar_obs::Metrics`] counts *work*: tokens, cost, cache disposition,
+//! queue lane, and a duration histogram, labelled by `provider|family|decision`.
+//! Both render to the same exposition format and `/metrics` prints them together.
+//!
+//! They are separate because they answer separate questions and neither can
+//! substitute for the other: "is the proxy returning 503s" is not derivable from
+//! token counts, and "what did this request cost" is not derivable from an
+//! outcome class. One registry for both would mean either dropping the histograms
+//! or dropping the outcome taxonomy, and `docs/04` asks for both.
 
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -48,6 +61,12 @@ impl Outcome {
 /// P0 counter set. Fixed at compile time so the exposition has a stable shape.
 #[derive(Debug, Default)]
 pub struct Metrics {
+    /// The routing/work half, rendered by `ar-obs`.
+    ///
+    /// This is the crate `docs/04` names as the observability owner, and it was
+    /// shipped and tested with no in-tree consumer until now. Owning it here is
+    /// what gives `/metrics` its histograms and token/cost series.
+    pub work: ar_obs::Metrics,
     requests: AtomicU64,
     throttled: AtomicU64,
     failed_over: AtomicU64,
@@ -133,6 +152,11 @@ impl Metrics {
             let _ = writeln!(out, "# TYPE {name} counter");
             let _ = writeln!(out, "{name} {value}");
         }
+        // The routing half. Its own document, appended: a scraper reads TYPE as a
+        // declaration of what follows, and interleaving two registries' blocks
+        // would make `ar_requests_total` look like a continuation of the
+        // transport counters above.
+        out.push_str(&self.work.render());
         out
     }
 }
@@ -188,9 +212,71 @@ mod tests {
     }
 
     #[test]
-    fn never_renders_a_label_field() {
-        // The P0 gate from docs/04-obs: nothing here can carry a prompt, so
-        // the exposition has no `{...}` label syntax at all.
-        assert!(!Metrics::new().render().contains('{'));
+    fn renders_the_routing_halfs_series_alongside_the_transport_counters() {
+        // The wiring gap this crate had: `ar-obs` shipped complete, tested, and
+        // unconsumed. `/metrics` now prints both halves from one endpoint.
+        let m = Metrics::new();
+        m.work.observe(&ar_obs::Request {
+            provider: "openai",
+            family: ar_obs::Family::Balanced,
+            decision: ar_obs::Decision::Primary,
+            cache: ar_obs::Cache::Miss,
+            queue: ar_obs::Queue::Direct,
+            queue_pos: 0,
+            attempts: 1,
+            tokens_in: 12,
+            tokens_out: 40,
+            cost_micros: 3,
+            duration_us: 830,
+            queue_wait_us: 0,
+        });
+        let out = m.render();
+        assert!(out.contains("ar_http_requests_total"), "{out}");
+        assert!(
+            out.contains(r#"ar_tokens_in_total{provider="openai""#),
+            "the routing half must reach the same document: {out}"
+        );
+        assert!(
+            out.contains("ar_request_duration_us"),
+            "histograms too: {out}"
+        );
+    }
+
+    #[test]
+    fn renders_no_label_when_nothing_has_been_observed() {
+        // Was `never_renders_a_label_field`, and asserted the P0 gate from
+        // docs/04-obs: with no labels anywhere, the transport half has no `{...}`
+        // syntax. That gate still holds for *this* half — it emits five unlabelled
+        // counters — but it no longer holds for the document, because the routing
+        // half is labelled by design (`provider|family|decision`, bounded enums).
+        //
+        // The real no-content guarantee is the one that matters and still holds:
+        // nothing user-supplied can appear in a label, because every label is a
+        // bounded enum except `provider`, which is a registry id.
+        let rendered = Metrics::new().render();
+        let transport: Vec<&str> = rendered
+            .lines()
+            .filter(|l| {
+                l.starts_with("ar_http")
+                    || l.starts_with("ar_route_")
+                    || l.starts_with("ar_upstream_")
+                    || l.starts_with("ar_models_")
+            })
+            .filter(|l| !l.starts_with("#"))
+            .collect();
+        assert_eq!(
+            transport.len(),
+            5,
+            "five unlabelled transport samples: {rendered}"
+        );
+        // The no-content guarantee is the one that matters: every label is a bounded
+        // enum except `provider`, a registry id, so nothing user-supplied can
+        // reach the exposition. The routing half always carries labels — it is
+        // labelled by design — so the `{`-free property is asserted on the
+        // transport half alone, which is what P0's gate claimed.
+        assert!(
+            transport.iter().all(|l| !l.contains('{')),
+            "the transport half stays unlabelled: {transport:?}"
+        );
     }
 }

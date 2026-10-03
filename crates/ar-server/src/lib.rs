@@ -84,11 +84,14 @@ pub use app::{
     TRACE_HEADER, app, bind_addr, server,
 };
 pub use config::{
-    AUTH_MODE_VAR, AuthMode, ComboError, ComboTarget, HTTP_MASTER_KEY_VAR, RouteCombo,
-    STREAM_TIMEOUT_VAR, ServerConfig,
+    AUTH_MODE_VAR, AuthMode, ComboError, ComboTarget, DISCOVERY_VAR, HTTP_MASTER_KEY_VAR,
+    RouteCombo, STREAM_TIMEOUT_VAR, ServerConfig,
 };
 pub use exec::{HttpExec, OAuthAuth, ProviderConfig};
 pub use keys::{AuthGate, extract_credential};
 pub use metrics::{Metrics, Outcome};
-pub use models::{MODELS_TTL, ModelCard, ModelCatalog, ModelsCache, StaticCatalog};
+pub use models::{
+    DISCOVERY_TTL, DISCOVERY_WAIT_SECS, DiscoveredCatalog, MODELS_TTL, ModelCard, ModelCatalog,
+    ModelsCache, StaticCatalog,
+};
 pub use routes::{CACHE_HEADER, DECISION_HEADER, KEEPALIVE_INTERVAL, SESSION_HEADER, USAGE_HEADER};

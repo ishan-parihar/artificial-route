@@ -28,6 +28,7 @@
 //! | [`ServerConfig::http_master_key`] | `AR_HTTP_MASTER_KEY` | `None` — no gate |
 //! | [`ServerConfig::auth_mode`] | `AR_AUTH_MODE` | [`AuthMode::Required`], inert without a gate |
 //! | [`ServerConfig::timeouts`] | `AR_STREAM_TIMEOUT_SECS` | empty — 120s everywhere |
+//! | [`ServerConfig::model_discovery`] | `AR_MODEL_DISCOVERY` | `false` — config-only catalog |
 //!
 //! The gate defaults *closed on paper and open in practice*: there is no gate until
 //! a master key names one, and no shipped command named one until
@@ -112,6 +113,13 @@ pub const STREAM_TIMEOUT_VAR: &str = "AR_STREAM_TIMEOUT_SECS";
 /// different decisions, and a boolean cannot say the first without lying about
 /// the second.
 pub const AUTH_MODE_VAR: &str = "AR_AUTH_MODE";
+
+/// Environment variable arming the models.dev discovery overlay.
+///
+/// A switch, not a URL. models.dev is the only upstream this speaks and the URL
+/// is [`ar_registry::discovery::MODELS_DEV_URL`]; an operator who needs a mirror
+/// needs a fork of the fetch, and a half-honoured URL is worse than none.
+pub const DISCOVERY_VAR: &str = "AR_MODEL_DISCOVERY";
 
 /// The key [`STREAM_TIMEOUT_VAR`]'s bare-number form writes under.
 ///
@@ -406,6 +414,17 @@ pub struct ServerConfig {
     /// [`Self::stream_deadline`] resolves a miss to the `*` entry and then to
     /// [`REQUEST_TIMEOUT`].
     pub timeouts: BTreeMap<String, Duration>,
+    /// Whether `/v1/models` overlays the models.dev discovery catalog.
+    ///
+    /// Off by default. The overlay is a network call on a timer that a proxy with
+    /// a complete compiled-in catalog does not need, and an operator who wants a
+    /// model list that cannot change under them — an air-gapped or
+    /// reproducibility-minded deployment — must be able to say so. When on, the
+    /// discovered models are *unioned over* the configured ones, so turning it on
+    /// can only add cards, never remove one a config named.
+    ///
+    /// Read from [`DISCOVERY_VAR`] by both constructors.
+    pub model_discovery: bool,
 }
 
 impl ServerConfig {
@@ -427,6 +446,7 @@ impl ServerConfig {
             auth_mode: AuthMode::default(),
             http_master_key: None,
             timeouts: BTreeMap::new(),
+            model_discovery: false,
         }
     }
 
@@ -535,6 +555,24 @@ impl ServerConfig {
     pub fn with_auth_mode_from_env(mut self) -> Self {
         if let Some(raw) = env(AUTH_MODE_VAR) {
             self.auth_mode = AuthMode::parse(&raw);
+        }
+        self
+    }
+
+    /// Reads [`DISCOVERY_VAR`] into [`Self::model_discovery`].
+    ///
+    /// A switch rather than a parsed mode, so the truthy spelling is the narrow
+    /// one: only `1`/`true`/`on`/`yes` (case-insensitive) arm it. Anything else
+    /// leaves it off. That direction is deliberate — this overlay makes a network
+    /// call a proxy did not previously make, so an unrecognised value must not be
+    /// read as consent to start dialling out.
+    #[must_use]
+    pub fn with_model_discovery_from_env(mut self) -> Self {
+        if let Some(raw) = env(DISCOVERY_VAR) {
+            self.model_discovery = matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            );
         }
         self
     }
@@ -666,10 +704,12 @@ impl ServerConfig {
             auth_mode: AuthMode::default(),
             http_master_key: None,
             timeouts: BTreeMap::new(),
+            model_discovery: false,
         }
         .with_http_master_key_from_env()
         .with_auth_mode_from_env()
-        .with_timeouts_from_env())
+        .with_timeouts_from_env()
+        .with_model_discovery_from_env())
     }
 
     /// The combo a client's `model` names.
@@ -875,6 +915,7 @@ impl ServerConfig {
         .with_http_master_key_from_env()
         .with_auth_mode_from_env()
         .with_timeouts_from_env()
+        .with_model_discovery_from_env()
     }
 
     /// Builds a single-chain config from already-resolved values.
@@ -1379,8 +1420,8 @@ mod tests {
     use ar_config::Config;
 
     use super::{
-        AUTH_MODE_VAR, AuthMode, ComboError, ComboTarget, DefaultChain, HTTP_MASTER_KEY_VAR,
-        RouteCombo, STREAM_TIMEOUT_VAR, ServerConfig, split_target,
+        AUTH_MODE_VAR, AuthMode, ComboError, ComboTarget, DISCOVERY_VAR, DefaultChain,
+        HTTP_MASTER_KEY_VAR, RouteCombo, STREAM_TIMEOUT_VAR, ServerConfig, split_target,
     };
     use crate::exec::ProviderConfig;
 
@@ -2330,6 +2371,28 @@ combos:
     #[test]
     fn the_auth_mode_is_parsed_from_its_spelling() {
         assert_eq!(AuthMode::parse("degrade"), AuthMode::DegradeInvalidToAnon);
+    }
+
+    #[test]
+    fn arms_model_discovery_only_on_an_explicit_yes() {
+        // The narrow direction matters: this overlay makes a network call the
+        // proxy did not previously make, so a typo must not read as consent.
+        let base = || ServerConfig::from_env();
+        let on = |v: &str| with_env(&[(DISCOVERY_VAR, v)], base).model_discovery;
+        for v in ["1", "true", "on", "yes", "ON", " True "] {
+            assert!(on(v), "{v:?} should arm discovery");
+        }
+        for v in ["0", "false", "off", "", "maybe", "2"] {
+            assert!(!on(v), "{v:?} must not arm discovery");
+        }
+    }
+
+    #[test]
+    fn leaves_model_discovery_off_when_the_env_names_nothing() {
+        // The default configuration must make no network call it did not
+        // previously make, so an unset variable is the whole test.
+        let cfg = ServerConfig::from_env();
+        assert!(!cfg.model_discovery, "an unset variable arms nothing");
     }
 
     /// Sets every named variable, builds, then clears them all.

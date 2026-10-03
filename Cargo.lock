@@ -328,6 +328,7 @@ dependencies = [
  "ar-exec",
  "ar-guard",
  "ar-keys",
+ "ar-obs",
  "ar-registry",
  "ar-route",
  "ar-tokens",

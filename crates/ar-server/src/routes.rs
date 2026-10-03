@@ -722,6 +722,24 @@ async fn buffer_for_accounting(
         .with_savings_tokens(savings_tokens)
 }
 
+/// The price/latency class a completed request falls into.
+///
+/// Derived from the cost that was actually computed rather than from the model
+/// name: a label derived from a name is unbounded cardinality, which is the one
+/// thing the metrics cardinality cap exists to prevent.
+fn price_family(meta: &ar_tokens::ResponseMeta) -> ar_obs::Family {
+    if !meta.cost().priced {
+        // No pricing row: the request still happened, and saying "unpriced" is
+        // more useful to an operator than bucketing it by a zero cost.
+        return ar_obs::Family::Unpriced;
+    }
+    match meta.cost().usd.micros {
+        1..=1_000 => ar_obs::Family::Balanced,
+        0 => ar_obs::Family::Economy,
+        _ => ar_obs::Family::Frontier,
+    }
+}
+
 /// Unix seconds now, for the ledger row's `created_at`.
 ///
 /// Clock skew degrades to a zero timestamp rather than a panic: a row with no
@@ -758,6 +776,27 @@ fn read_and_record(
     };
     let pricing = &state.config.prices;
     let meta = ResponseMeta::from_upstream(pricing, provider, model, usage);
+    // The observability half. Here rather than at the response site because this
+    // is the one function every completed request passes through — a stream
+    // included, via `account_stream` — so the counters cannot miss the streaming
+    // path the way the non-streaming header builder would.
+    state.metrics.work.observe(&ar_obs::Request {
+        provider,
+        // The price/latency class of the model that served the request. Derived
+        // from the pricing table rather than the model name so an operator's
+        // naming cannot inflate the label set.
+        family: price_family(&meta),
+        decision: ar_obs::Decision::Primary,
+        cache: ar_obs::Cache::Miss,
+        queue: ar_obs::Queue::Direct,
+        queue_pos: 0,
+        attempts: 1,
+        tokens_in: u64::from(meta.tokens_in()),
+        tokens_out: u64::from(meta.tokens_out()),
+        cost_micros: meta.cost().usd.micros,
+        duration_us: meta.latency_ms().saturating_mul(1_000),
+        queue_wait_us: 0,
+    });
     if let Some(ledger) = state.ledger.as_ref()
         && let Err(e) = ledger.lock().expect("ledger lock").record_response(
             key_id.unwrap_or("anonymous"),

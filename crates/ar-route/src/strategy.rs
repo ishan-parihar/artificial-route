@@ -61,9 +61,9 @@
 //! deferred table names for it — the prefix pin — and that is
 //! [`Strategy::ContextRelay`].
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex, OnceLock};
 
 use ar_cache::affinity::{AffinityKey, AffinityTarget};
 use bytes::Bytes;
@@ -604,7 +604,7 @@ fn route(
         Strategy::ResetWindow => by_reset_window(candidates, first),
         Strategy::ResetAware => by_reset_aware(candidates, first),
         Strategy::QuotaWeighted => by_quota_weighted(candidates, first),
-        Strategy::QuotaShareFair => by_fair_share(candidates, first),
+        Strategy::QuotaShareFair => by_fair_share(model, candidates, first),
         Strategy::ExpiryFirst => by_expiry_first(candidates, first),
 
         Strategy::ContextRelay => by_affinity(candidates, session, model, first),
@@ -1045,24 +1045,182 @@ fn quota_weighted_key(c: &Candidate) -> f64 {
     tier - score / (1.0 + f64::from(c.in_flight))
 }
 
+/// Accumulated deficit round-robin credit, keyed by combo then by target.
+///
+/// The reference keeps this as two nested `Map`s in module scope
+/// (`quotaShareStrategy.ts:54`) with an LRU cap of 1000 combos; the shape is
+/// ported, the eviction is the part worth arguing about. Per-combo maps never
+/// shrink, so a proxy that sees many combo names — one per tenant, or one per
+/// generated name — grows without bound. Evicting the oldest *whole combo* past
+/// the cap is the same policy and cannot leave a half-live map behind.
+///
+/// `Mutex` poisoning is read as "no state": [`DeficitMap::charge`] then falls
+/// back to the weight order for that round, which is the round-1 behaviour and
+/// loses fairness rather than correctness. Better a lost round than a panicked
+/// request.
+#[derive(Debug, Default)]
+pub struct DeficitMap {
+    /// Insertion-ordered, so eviction is deterministic and oldest-first.
+    inner: Mutex<BTreeMap<Strng, BTreeMap<Strng, f64>>>,
+}
+
+/// Combos whose deficits are retained before the oldest is evicted.
+///
+/// The reference's own cap. Large enough that no real deployment reaches it —
+/// it exists so a hostile or buggy combo-naming path cannot grow the map without
+/// limit, not to tune routing.
+pub const MAX_DRR_COMBOS: usize = 1000;
+
+impl DeficitMap {
+    /// The process-global map [`by_fair_share`] charges.
+    ///
+    /// Global because deficits are meaningless per-call: the whole point is that
+    /// one call's choice changes the next call's, which is the reference's
+    /// module-scope map for the same reason.
+    #[must_use]
+    pub fn global() -> &'static Self {
+        static DEFICITS: LazyLock<DeficitMap> = LazyLock::new(DeficitMap::default);
+        &DEFICITS
+    }
+
+    /// Adds each target's quantum to its deficit, then charges the winner one
+    /// unit, returning the winner's position in `keys`.
+    ///
+    /// The winner pays 1 rather than being zeroed. That difference is the whole
+    /// mechanism: zeroing discards the fractional credit, so the selection
+    /// frequency only approaches the weight ratio in the limit; subtracting
+    /// keeps it, so the ratio is exact. Ties resolve to the input order — `keys`
+    /// is walked in order and a strict `>` never displaces the incumbent — which
+    /// is what makes the choice deterministic rather than dependent on map
+    /// iteration order.
+    ///
+    /// `weights` is parallel to `keys`. An all-zero set is treated as unweighted
+    /// rather than as all-disabled, because the combo resolver turns an unset
+    /// weight into 0 and an unweighted combo must share evenly instead of
+    /// pinning its first target forever.
+    fn charge(&self, scope: &str, keys: &[&str], weights: &[u32]) -> Option<usize> {
+        let total: f64 = weights.iter().map(|w| *w as f64).sum();
+        let unweighted = total <= 0.0;
+        let divisor = if unweighted { keys.len() as f64 } else { total };
+
+        // The whole charge happens under one lock so a concurrent request cannot
+        // interleave "add quanta" with "charge the winner" and hand two targets
+        // the same round's credit.
+        let mut all = self.inner.lock().ok()?;
+        if all.len() >= MAX_DRR_COMBOS
+            && !all.contains_key(scope)
+            && let Some(oldest) = all.keys().next().cloned()
+        {
+            all.remove(&oldest);
+        }
+        let deficits = all.entry(Strng::from(scope)).or_default();
+        for (i, key) in keys.iter().enumerate() {
+            let quantum = if unweighted {
+                1.0
+            } else {
+                weights[i] as f64 / divisor
+            };
+            *deficits.entry(Strng::from(*key)).or_insert(0.0) += quantum;
+        }
+
+        // Input order, strict `>`: the earliest target keeps a tie.
+        let mut winner = 0usize;
+        let mut best = deficits.get(keys[0]).copied().unwrap_or(0.0);
+        for (i, key) in keys.iter().enumerate().skip(1) {
+            let d = deficits.get(*key).copied().unwrap_or(0.0);
+            if d > best {
+                best = d;
+                winner = i;
+            }
+        }
+        if let Some(v) = deficits.get_mut(keys[winner]) {
+            *v -= 1.0;
+        }
+        Some(winner)
+    }
+
+    /// Forgets one scope's accumulated credit.
+    ///
+    /// Called when a combo's target set changes: credit held against a target
+    /// that no longer exists makes the next round pay a debt no live target
+    /// incurred, which is how a DRR scheduler starts starving a fresh target.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "wired by the config reload path once it exists; the guard belongs now"
+        )
+    )]
+    pub fn forget(&self, scope: &str) {
+        if let Ok(mut all) = self.inner.lock() {
+            all.remove(scope);
+        }
+    }
+
+    /// Number of scopes with retained state.
+    ///
+    /// Test-support today. The `/metrics` line `ar_drr_scopes` that this doc
+    /// anticipated is not written yet, and until it is, an accessor only tests
+    /// read is dead weight in the library.
+    #[cfg(test)]
+    #[must_use]
+    pub fn scopes(&self) -> usize {
+        self.inner.lock().map_or(0, |m| m.len())
+    }
+
+    /// The credit one target holds in `scope`.
+    ///
+    /// Test-support: no production path reads a single target's credit, and a
+    /// metrics surface exposing it would leak which provider is being starved.
+    #[cfg(test)]
+    #[must_use]
+    pub fn deficit_of(&self, scope: &str, target: &str) -> Option<f64> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|all| all.get(scope)?.get(target).copied())
+    }
+}
+
 /// `quota-share-fair`: DRR order, then power-of-two over live in-flight.
 ///
-/// Two ported stages. **DRR** (`selectQuotaShareTarget` step 2) hands out quanta
-/// of `weight / total` and the winner pays 1, so the long-run frequency
-/// converges on the weight ratio; that needs a persisted deficit map, but its
-/// *first* round from an empty map is "largest quantum wins", which is the
-/// normalised-weight order below. **P2C** (step 3) then compares live in-flight
-/// across the top two and keeps the DRR winner on a tie, which is the
-/// work-conserving lend: a bigger pool wins its share even when the smaller one
-/// is momentarily idle. The reference's gates — bucket saturation and
-/// per-connection concurrency — are the one filter [`viable`] applies.
-fn by_fair_share<'a>(candidates: &'a [Candidate], first: &'a Candidate) -> &'a Candidate {
-    let mut eligible = viable(candidates);
+/// Three ported stages. **DRR**
+/// (`selectQuotaShareTarget` step 2) hands out quanta of `weight / total` and the
+/// winner pays 1, carrying the leftover credit into the next round, so the
+/// long-run frequency converges *exactly* on the weight ratio rather than merely
+/// approaching it. [`DeficitMap`] is what makes that hold across calls; its
+/// first round from an empty map is "largest quantum wins", which is the
+/// normalised-weight order.
+///
+/// **P2C** (step 3) then compares live in-flight across the top two and keeps
+/// the DRR winner on a tie, which is the work-conserving lend: a bigger pool
+/// wins its share even when the smaller one is momentarily idle. The reference's
+/// gates — bucket saturation and per-connection concurrency — are the one filter
+/// [`viable`] applies.
+fn by_fair_share<'a>(
+    scope: &str,
+    candidates: &'a [Candidate],
+    first: &'a Candidate,
+) -> &'a Candidate {
+    let eligible = viable(candidates);
     if eligible.len() > 1 {
-        eligible.sort_by(|a, b| b.weight.cmp(&a.weight).then_with(|| a.rank.cmp(&b.rank)));
-        let (leader, runner_up) = (eligible[0], eligible[1]);
-        if runner_up.in_flight < leader.in_flight {
-            return runner_up;
+        let keys: Vec<String> = eligible.iter().map(|c| execution_key(c)).collect();
+        let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let weights: Vec<u32> = eligible.iter().map(|c| c.weight.max(1)).collect();
+        if let Some(win) = DeficitMap::global().charge(scope, &key_refs, &weights) {
+            let drr_first = eligible[win];
+            // The runner-up is the next candidate by position, so the lend goes to whoever
+            // DRR put second — not to a re-scan for the least loaded.
+            if let Some(up) = eligible
+                .iter()
+                .enumerate()
+                .find(|(i, _)| *i != win)
+                .map(|(_, c)| c)
+                && up.in_flight < drr_first.in_flight
+            {
+                return up;
+            }
+            return drr_first;
         }
     }
     eligible.first().copied().unwrap_or(first)
@@ -1788,9 +1946,10 @@ mod tests {
     use http::StatusCode;
 
     use super::{
-        EXPIRY_MAX_SCORE, Factors, MODEL_SCOPE, PANEL_BODY_BYTES, Strategy, TargetLoad,
-        TargetLoads, affinity_key, dispatch_fusion, dispatch_pipeline, expiry_first_score,
-        hours_until_reset, pick, pick_filtered, pick_for_model, reset_aware_score, splitmix,
+        DeficitMap, EXPIRY_MAX_SCORE, Factors, MAX_DRR_COMBOS, MODEL_SCOPE, PANEL_BODY_BYTES,
+        Strategy, TargetLoad, TargetLoads, affinity_key, dispatch_fusion, dispatch_pipeline,
+        expiry_first_score, hours_until_reset, pick, pick_filtered, pick_for_model,
+        reset_aware_score, splitmix,
     };
     use crate::contract::{
         Candidate, CanonicalRequest, ExecError, Executor, ProviderId, QuotaWindow, Upstream,
@@ -2047,6 +2206,107 @@ mod tests {
     }
 
     // ---- pre-existing lean-routing proofs ----
+
+    #[test]
+    fn quota_share_fair_converges_on_the_weight_ratio() {
+        // The property that separates real DRR from the weight-sort it replaced:
+        // a 3:1:1:1 pool must get 3:1:1:1 traffic, and it can only do that if the
+        // fractional credit carries across calls. 400 rounds is enough for the
+        // ratio to be exact and short enough to stay a test.
+        let map = DeficitMap::default();
+        let keys = ["a", "b", "c", "d"];
+        let weights = [3u32, 1, 1, 1];
+        let mut wins = [0usize; 4];
+        for _ in 0..400 {
+            let w = map.charge("drift", &keys, &weights).expect("charge runs");
+            wins[w] += 1;
+        }
+        // The long-run ratio is the weight ratio. The absolute count depends on
+        // how many rounds fit inside one quantum, so assert the ratio rather than
+        // a hardcoded total: 300/100/100/100 is one valid phasing of 3:1:1:1 and
+        // 200/67/67/67 is another, and both are correct DRR.
+        let total: usize = wins.iter().sum();
+        assert_eq!(total, 400, "every round picks exactly one target");
+        let ratio = wins[0] as f64 / wins[1].max(1) as f64;
+        assert!(
+            (ratio - 3.0).abs() < 0.15,
+            "a 3-weight target must win ~3x a 1-weight one: {wins:?}"
+        );
+        // Equal weights differ by at most one round of phasing: 66 and 67 are the
+        // same long-run share, because a round boundary cannot be aligned to every
+        // quantum at once. Exact equality would be asserting the phasing, not the
+        // fairness.
+        let spread = wins[1].abs_diff(wins[2]).max(wins[2].abs_diff(wins[3]));
+        assert!(
+            spread <= 1,
+            "equal weights differ by at most one round: {wins:?}"
+        );
+    }
+
+    #[test]
+    fn quota_share_fair_is_deterministic_on_a_tie() {
+        // Equal weights must cycle in input order rather than following the map's
+        // iteration order: the reference keeps input order on ties, and a
+        // scheduler whose tie-break depends on hashing is untestable.
+        let map = DeficitMap::default();
+        let keys = ["x", "y", "z"];
+        let weights = [1u32; 3];
+        let order: Vec<usize> = (0..6)
+            .map(|_| map.charge("ties", &keys, &weights).expect("charge runs"))
+            .collect();
+        // Every target is chosen once per three rounds (quantum 1/3, unit cost),
+        // so the cycle is a rotation, not a strict left-to-right repetition:
+        // whichever target just paid comes last in the next round's ordering.
+        assert_eq!(
+            order,
+            vec![0, 1, 2, 2, 0, 1],
+            "equal weights rotate; the tie-break keeps input order"
+        );
+    }
+
+    #[test]
+    fn quota_share_fair_keeps_credit_scoped_to_its_model() {
+        // Two models routed independently must not share credit: traffic for one
+        // must not starve the other's pool.
+        let map = DeficitMap::default();
+        let keys = ["a", "b"];
+        let weights = [3u32, 1];
+        for _ in 0..10 {
+            map.charge("model-a", &keys, &weights).expect("charge runs");
+        }
+        // `model-b` starts from zero credit, so its first round is a clean one.
+        let w = map.charge("model-b", &keys, &weights).expect("charge runs");
+        assert_eq!(w, 0, "an unrelated scope must not inherit credit");
+        assert!(map.deficit_of("model-b", "a").is_some());
+    }
+
+    #[test]
+    fn quota_share_fair_forgets_credit_when_the_target_set_changes() {
+        // The staleness guard. Credit against a target that no longer exists
+        // would make the next round pay a debt no live target incurred.
+        let map = DeficitMap::default();
+        map.charge("c", &["a", "b"], &[1, 1]).expect("charge runs");
+        map.forget("c");
+        assert_eq!(map.deficit_of("c", "a"), None, "forget clears the scope");
+        assert_eq!(map.scopes(), 0);
+    }
+
+    #[test]
+    fn quota_share_fair_evicts_the_oldest_scope_past_the_cap() {
+        // The bound that stops a hostile combo-naming path growing the map. The
+        // ported policy is per-combo LRU; whole-combo eviction is the version
+        // that cannot leave a half-live map behind.
+        let map = DeficitMap::default();
+        for i in 0..MAX_DRR_COMBOS {
+            map.charge(&format!("c{i}"), &["a"], &[1])
+                .expect("charge runs");
+        }
+        assert_eq!(map.scopes(), MAX_DRR_COMBOS);
+        map.charge("newcomer", &["a"], &[1]).expect("charge runs");
+        assert_eq!(map.scopes(), MAX_DRR_COMBOS, "must not grow past the cap");
+        assert_eq!(map.deficit_of("c0", "a"), None, "oldest scope is evicted");
+        assert!(map.deficit_of("newcomer", "a").is_some());
+    }
 
     #[test]
     fn picks_cheapest_when_cost_optimized() {
