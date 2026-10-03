@@ -38,13 +38,13 @@ P0 `priority|round-robin|cost-optimized|lkgp` = lean-routing (~80% traffic). Wha
 | `simulate_route|explain_route` | `statusDecisionTable|decisionTrace` | both call one `rank()`, so a dry run and its explanation cannot disagree |
 | `quota-share-fair` | `quotaShare*` | DRR order then power-of-two over live in-flight; a persisted deficit map is the only gap |
 | `fusion` fan-out, `pipeline` chaining | `dispatchPrelude.ts::tryFusionDispatch|tryPipelineDispatch`, `fusion.ts`, `services/pipeline.ts` | `dispatch_fusion()` returns the first 2xx with a full verdict trace; `dispatch_pipeline()` chains stage output into the next request. The fusion *judge* is still open — see below. |
+| Inbound wire-in: Anthropic Messages, Responses, Ollama | `translator/request/*` | landed: `ar-server/src/translate.rs` dispatches each dialect into `ar-translate` (`anthropic_to_canonical`/`responses_to_canonical`/`ollama_to_canonical`), and `ar-translate/src/outbound.rs` renders canonical back to every provider wire; the OpenAI route alone forwards the client's bytes verbatim |
 
 | Still deferred | Source | Cost |
 |---|---|---|
 | `expiry-first` | `ACCOUNT_FALLBACK_STRATEGY_VALUES` | account-scoped ordering over key expiry, not quota windows; needs a key-expiry signal `Candidate` does not carry |
 | fusion judge synthesis | `fusion.ts::handleFusionChat` + `judgeModel` | a second dispatch over a composed prompt, needing a body composer (panel answers are a `ChunkStream`) and a place to name the judge model — `TODO(#P2-fusion-judge)`. Returning one panel answer is honest; faking a synthesis is not. |
-| Wire in: Anthropic Messages, Responses, Ollama | `translator/request/*` | one adapter each, P2 |
-| Modality: vision/audio/video, `/v1/ocr`, `/v1/audio/translations`, image-gen | executors media family | P6, separate adapters |
+| `/v1/audio/translations` | executors media family | the one media route in scope that wave C did not land; same shape as transcriptions (multipart verbatim, `?model=` routing) |
 
 ### Strategy-name notes
 

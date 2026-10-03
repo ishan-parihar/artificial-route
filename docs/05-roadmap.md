@@ -3,9 +3,9 @@
 **Status (2026-10-03):** P0–P4 shipped in v0.1.0/v0.1.1; P5's guard/obs
 shipped with the `ar-guard`/`ar-obs` crates. P6's media family landed under
 the parity closeout (`docs/07-parity-closeout.md`, wave C: embeddings,
-transcriptions, image-generations, OCR — the declared `docs/02` modality
-scope); live discovery, vector search and the 12h soak remain deferred. The
-parity-closeout waves A–O are the live plan; the phase gates below still apply
+transcriptions, image-generations, OCR); `/v1/audio/translations`, live
+discovery (docs/02 sync row, P1) and the 12h soak remain deferred. The
+parity-closeout waves A–O are complete; the phase gates below still apply
 to anything a P-phase takes on.
 
 Gate every phase: `cargo test --release` + `cargo clippy --all-targets --all-features --locked -- -D warnings` + RAM check.
@@ -17,6 +17,6 @@ AXI gates in `06-axi-mcp.md` apply from P0 (`TOON`, `--fields`, `--version` fast
 * **P3 compress (wk6):** `lite+rtk+caveman` + `planResolution` + `hardBudget` dial. Accept: `eval:compression` fidelity vs savings reported.
 * **P4 cli+mcp-essential (wk7):** `serve|models|providers|combo|doctor|run|configure` AXI-clean + `ar-mcp --features mcp` 12-tool catalog wrapping same fns + `tool_search` + scopes + hashed audit. Accept: `cargo tree` default has no rmcp; agent `health->best_combo->route` loop works.
 * **P5 guard+obs (wk8):** PII+injection 2-stage, secrets redact bidi, redacted audit, BigQuery off. Accept: red-team corpus + p95 guard <5ms.
-* **P6 modality+import (wk9+):** embeddings full, vision/audio/video + `/v1/ocr`, live discovery, vector P1 `usearch`, `import --from omniroute|litellm`. Accept: 12h soak RSS flat.
+* **P6 modality+import (wk9+):** embeddings landed; transcriptions/image-gen/`/v1/ocr` landed (wave C); remaining in scope: `/v1/audio/translations`, live discovery (`modelDiscovery.ts+reactiveModelSync.ts`, P1), `import --from omniroute|litellm`. The earlier "vector P1 `usearch`" phrase is dropped: no reference surface carries it. Accept: 12h soak RSS flat.
 
 Out: full 110-tool MCP, xDS, HBONE, UI, ONNX, cloud sync. Each needs proposal + RAM budget to re-enter.
