@@ -59,7 +59,7 @@ The plan's original wording vs what the tree at `d24ea9a` actually holds:
 | E | exact savings: `count_text` before and after, on the rewrite branch only | header = before − after; estimator stays in `eval` |
 | D | key_id threading, non-stream buffering, usage parse → `record_response`; document the stream/non-stream split | non-stream headers match ledger math; stream bytes byte-identical |
 | F1 | cache control request-header family (`no-store`, `cache-key`, `cache-ttl` if the cache API supports it), reference alias names honored | per-header probe tests; unknown headers stay ignored |
-| H1 | quota: 429-marking + preflight cutoff, local state only | forced-429 flips a provider to exhausted and selection skips it |
+| H1 | quota: 429-marking + preflight cutoff, local state only — **verified present**: `classify_fault`'s terminal-code gate, the `lock_model(QuotaExhausted)` timestamp mark and the loop's `is_cooling_for` preflight skip all predate this wave; the commit adds the cross-request proof the acceptance names | forced-429 flips a provider to exhausted and the next request skips it (`a_quota_locked_provider_is_skipped_by_the_next_request`) |
 | J1 | upstream code + `Retry-After` passthrough, envelope shape unchanged | a 429 from upstream reaches the client with its code and retry window |
 | I1 | disconnect-aware abort: client-gone cancels the upstream token; mid-stream drop truncates cleanly | kill-upstream → clean close; client-drop → upstream abort observed |
 | M | README parity table, `AUDIT-REPORT.md`, `docs/audit-notes.md`, `docs/05` final state | every landed wave reflected; every divergence rowed |

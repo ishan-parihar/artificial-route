@@ -929,6 +929,28 @@ use crate::resilience::Resilience;
     }
 
     #[test]
+    fn a_quota_locked_provider_is_skipped_by_the_next_request() {
+        // The preflight half of the quota split, across requests: the mark the
+        // first loop wrote has to reach the *next* request's candidate walk, or
+        // every request pays one round trip to relearn what the last one
+        // already recorded. One `Ok` verdict is scripted for the second loop —
+        // if the walk still reached the locked provider first, that verdict
+        // would answer as p1 and the assertion names it.
+        let r = Resilience::new();
+        let exec = Scripted::new(vec![QUOTA_429]);
+        let _ = block(attempt_loop(&req(), &chain(&["p1"]), &exec, &r));
+        assert!(r.is_cooling_for("p1", "m"), "the quota mark did not land");
+
+        let exec = Scripted::new(vec![Verdict::Ok]);
+        let Ok(AttemptOutcome::Succeeded { provider, .. }) =
+            block(attempt_loop(&req(), &chain(&["p1", "p2"]), &exec, &r))
+        else {
+            panic!("expected success");
+        };
+        assert_eq!(provider.as_str(), "p2", "the quota-locked provider was walked");
+    }
+
+    #[test]
     fn a_retired_model_does_not_retire_its_provider() {
         // A 404 on one model is the case the whole lockout layer exists for:
         // retiring the provider would take its healthy siblings with it.
