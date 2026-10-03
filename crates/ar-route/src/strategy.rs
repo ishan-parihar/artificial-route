@@ -357,6 +357,13 @@ impl Strategy {
     /// auto-minted `qtSd/` combos); `"quota-share-fair"` is the visible one. Same
     /// strategy, both spellings — the variant keeps the visible name so
     /// `as_str` and the decision header never leak an internal value.
+    ///
+    /// The four aliases are the reference's `normalizeRoutingStrategy`
+    /// (`routingStrategies.ts:68-73`): `usage`, `context`, `weekly-reset` and
+    /// `reset-window-order` are spellings upstream *accepts on input* and this
+    /// build resolves them to the same variants. Without them a combo ported
+    /// from an OmniRoute config that used one would resolve to
+    /// [`Strategy::Deferred`] and 501 on a strategy this build ships.
     #[must_use]
     pub fn parse(name: &str) -> Self {
         match name {
@@ -367,16 +374,16 @@ impl Strategy {
             "weighted" => Self::Weighted,
             "fill-first" => Self::FillFirst,
             "p2c" => Self::P2c,
-            "least-used" => Self::LeastUsed,
+            "least-used" | "usage" => Self::LeastUsed,
             "random" => Self::Random,
             "strict-random" => Self::StrictRandom,
             "headroom" => Self::Headroom,
-            "reset-window" => Self::ResetWindow,
+            "reset-window" | "weekly-reset" | "reset-window-order" => Self::ResetWindow,
             "reset-aware" => Self::ResetAware,
             "quota-weighted" => Self::QuotaWeighted,
             "quota-share" | "quota-share-fair" => Self::QuotaShareFair,
             "context-relay" => Self::ContextRelay,
-            "context-optimized" => Self::ContextOptimized,
+            "context-optimized" | "context" => Self::ContextOptimized,
             "cache-optimized" => Self::CacheOptimized,
             "fusion" => Self::Fusion,
             "pipeline" => Self::Pipeline,
@@ -956,6 +963,16 @@ const SECONDS_PER_HOUR: f64 = 3600.0;
 /// special case.
 const EXPIRY_MAX_SCORE: f64 = 4.0;
 
+/// Ceiling on one fusion panel member's buffered body.
+///
+/// The server's request-body cap is 2MB (`ar-server`'s `MAX_BODY_BYTES`); a
+/// completion answer is orders of magnitude smaller, and a member whose reply
+/// exceeds this is not an answer worth putting in front of a judge. At the
+/// `MAX_PANEL` ceiling the whole panel is therefore bounded at 160MB, which is
+/// a number a caller can reason about rather than a function of whatever the
+/// largest provider happens to return.
+const PANEL_BODY_BYTES: usize = 4 * 1024 * 1024;
+
 /// `quota-weighted`: reset-aware score, divided by live load.
 ///
 /// Ported from `orderTargetsByQuotaWeighted`
@@ -1384,9 +1401,24 @@ fn non_streaming_body(body: &Bytes) -> Bytes {
 /// Buffers one upstream body. A fusion panel member is a complete non-stream
 /// answer by construction (the fan-out asks the same body for every member), so
 /// this is one body read once, not a relay.
+///
+/// Stops at [`PANEL_BODY_BYTES`] and reports the overflow, rather than growing
+/// with the provider: a member over the cap is dropped from the panel (it can
+/// never win, and its text never reaches the judge), which bounds a
+/// `MAX_PANEL`-wide fan-out at `MAX_PANEL * PANEL_BODY_BYTES`. The alternative —
+/// reading a member to completion — is exactly the #1905 heap case the panel
+/// ceiling exists to prevent, and `MAX_PANEL` alone bounds only the member
+/// *count*. Truncating instead would be worse than dropping: a JSON body cut
+/// mid-answer does not parse, so the member would contribute an empty answer
+/// while still costing its bytes.
 async fn read_body(mut stream: ChunkStream) -> Result<Bytes, ExecError> {
     let mut out = Vec::new();
     while let Some(chunk) = stream.next().await {
+        if out.len() + chunk.len() > PANEL_BODY_BYTES {
+            return Err(ExecError(format!(
+                "panel member body exceeded {PANEL_BODY_BYTES} bytes"
+            )));
+        }
         out.extend_from_slice(&chunk);
     }
     Ok(Bytes::from(out))
@@ -1739,8 +1771,8 @@ mod tests {
     use http::StatusCode;
 
     use super::{
-        EXPIRY_MAX_SCORE, Factors, MODEL_SCOPE, Strategy, TargetLoad, TargetLoads, affinity_key,
-        dispatch_fusion, dispatch_pipeline, expiry_first_score, hours_until_reset, pick,
+        EXPIRY_MAX_SCORE, Factors, MODEL_SCOPE, PANEL_BODY_BYTES, Strategy, TargetLoad, TargetLoads,
+        affinity_key, dispatch_fusion, dispatch_pipeline, expiry_first_score, hours_until_reset, pick,
         pick_filtered, pick_for_model, reset_aware_score, splitmix,
     };
     use crate::contract::{
@@ -1905,6 +1937,57 @@ mod tests {
         futures::executor::block_on(f)
     }
 
+    /// Answers one member with a body of `bytes` real payload, so the reader's
+    /// ceiling has something to overrun. Not part of [`Recorder`] because only
+    /// the cap tests want a body that is not a completion JSON.
+    struct Oversize(StatusCode, usize);
+
+    impl Executor for Oversize {
+        fn call<'a>(
+            &'a self,
+            _provider: &'a ProviderId,
+            _canonical: &'a CanonicalRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Upstream, ExecError>> + Send + 'a>,
+        > {
+            let (status, bytes) = (self.0, self.1);
+            Box::pin(async move {
+                // `b` is not JSON, which is the point: this member must be
+                // dropped for its SIZE, not for failing to parse, so a test
+                // that passed on a parse error would not be testing the cap.
+                let payload = Bytes::from(vec![b'b'; bytes]);
+                Ok(answer(status, payload))
+            })
+        }
+    }
+
+    /// Answers with `body` verbatim, for a boundary test whose payload has to be
+    /// readable and not merely large: a filler body would make the assertion pass
+    /// whether the reader kept the bytes or dropped them.
+    struct Body(StatusCode, Bytes);
+
+    impl Executor for Body {
+        fn call<'a>(
+            &'a self,
+            _provider: &'a ProviderId,
+            _canonical: &'a CanonicalRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Upstream, ExecError>> + Send + 'a>,
+        > {
+            let (status, payload) = (self.0, self.1.clone());
+            Box::pin(async move { Ok(answer(status, payload)) })
+        }
+    }
+
+    /// A 2xx body is one frame of the stream; a refusal is a single error body.
+    fn answer(status: StatusCode, payload: Bytes) -> Upstream {
+        if status.is_success() {
+            Upstream::success(Box::pin(futures::stream::iter([payload])))
+        } else {
+            Upstream::failure(status, payload, None)
+        }
+    }
+
     /// The turn texts the recorded requests actually carried, in call order.
     fn request_turns(recorder: &Recorder) -> Vec<Vec<String>> {
         recorder
@@ -2002,6 +2085,30 @@ mod tests {
         // combos); `quota-share-fair` is the visible one. Both must dispatch.
         assert_eq!(Strategy::parse("quota-share"), Strategy::QuotaShareFair);
         assert_eq!(Strategy::parse("quota-share-fair"), Strategy::QuotaShareFair);
+    }
+
+    /// The reference's `normalizeRoutingStrategy` aliases resolve to the variant
+    /// they stand for, not to `Deferred`. A combo ported from an OmniRoute config
+    /// spells its strategy the way that config spells it, and a strategy this
+    /// build *does* ship must not 501 because the alias was missed.
+    #[test]
+    fn parses_the_reference_aliases_to_their_own_strategy() {
+        // (routingStrategies.ts:71-73)
+        for (alias, canonical) in [
+            ("usage", "least-used"),
+            ("context", "context-optimized"),
+            ("weekly-reset", "reset-window"),
+            ("reset-window-order", "reset-window"),
+        ] {
+            // Equality with the canonical spelling is the whole proof: the
+            // canonical names are all routable, so an alias equal to one cannot
+            // be deferred.
+            assert_eq!(
+                Strategy::parse(alias),
+                Strategy::parse(canonical),
+                "{alias} must resolve to {canonical}"
+            );
+        }
     }
 
     #[test]
@@ -2708,6 +2815,90 @@ mod tests {
             got.trace[0].provider.as_str(),
             "p0",
             "truncation keeps panel order, so the leader still leads"
+        );
+    }
+
+    /// The panel ceiling bounds the member COUNT, not the bytes: a panel of
+    /// members whose replies are unbounded is the same heap case one level down.
+    /// An over-cap member is dropped from the panel rather than truncated — a
+    /// body cut mid-answer does not parse, so truncating would keep the cost and
+    /// lose the answer.
+    #[test]
+    fn drops_a_panel_member_whose_body_exceeds_the_cap() {
+        let cands = vec![
+            Candidate::new(p("small"), "m").with_rank(0),
+            Candidate::new(p("huge"), "m").with_rank(1),
+        ];
+        // The first member answers with a real completion, well under the cap;
+        // the second overruns it. Under-cap must still win the request.
+        let exec = Oversize(StatusCode::OK, PANEL_BODY_BYTES + 1);
+        let got = block(dispatch_fusion(
+            None,
+            "gpt-4o",
+            &cands,
+            &request(&["hi"]),
+            &exec,
+        ));
+
+        assert!(
+            got.upstream.is_none(),
+            "a panel whose only member overruns the cap has no winner"
+        );
+        assert!(
+            got.answers.is_empty(),
+            "an over-cap member must not reach the judge's panel"
+        );
+        assert_eq!(
+            got.trace.len(),
+            2,
+            "both members are asked and both are traced, so the operator sees why"
+        );
+        assert!(
+            got.trace.iter().all(|v| !v.winner),
+            "no member may be marked winner when its body could not be read"
+        );
+    }
+
+    /// The cap is a ceiling, not a quota: a body exactly at it is still read and
+    /// its text reaches the judge. A `>` where `<=` belonged would drop this
+    /// member and the panel would carry no text at all — which is the assertion
+    /// below, and why the payload is a real completion body, not filler: filler
+    /// makes it pass whether the bytes were kept or dropped.
+    #[test]
+    fn reads_a_panel_member_whose_body_is_exactly_at_the_cap() {
+        let wrap = |pad: usize| {
+            serde_json::to_vec(&serde_json::json!({
+                "choices": [{
+                    "message": { "role": "assistant", "content": "x".repeat(pad) }
+                }]
+            }))
+            .expect("body builds")
+        };
+        let overhead = wrap(0).len();
+        let body = Bytes::from(wrap(PANEL_BODY_BYTES - overhead));
+        assert_eq!(
+            body.len(),
+            PANEL_BODY_BYTES,
+            "the fixture must sit EXACTLY at the cap, since that is the boundary under test"
+        );
+
+        let exec = Body(StatusCode::OK, body);
+        let got = block(dispatch_fusion(
+            None,
+            "gpt-4o",
+            &[Candidate::new(p("edge"), "m").with_rank(0)],
+            &request(&["hi"]),
+            &exec,
+        ));
+
+        assert_eq!(
+            got.answers.len(),
+            1,
+            "a body of exactly the cap is read and its text reaches the judge"
+        );
+        assert!(
+            got.upstream.is_some(),
+            "so the member also wins the request"
         );
     }
 

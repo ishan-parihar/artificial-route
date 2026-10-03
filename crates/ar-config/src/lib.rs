@@ -216,6 +216,14 @@ pub enum Strategy {
     QuotaWeighted,
     /// Deficit-round-robin order by normalised weight.
     QuotaShareFair,
+    /// Spends the quota closest to being lost: highest usable fraction per hour
+    /// until its window rolls (`expiryFirstAccountSelection.ts`).
+    ///
+    /// Present here as a combo-level ranking, the way its siblings
+    /// (`cost-optimized`, `fill-first`, `strict-random`) already are: the
+    /// reference ranks a provider's several OAuth *connections* here, which a
+    /// one-key-per-provider model has no home for — audit-notes row (g).
+    ExpiryFirst,
 
     // ---- context-shaped (`promptCacheAffinity` / `sortTargetsByContextSize`) ----
     /// Pure prefix pin: the HRW leader for this conversation.
@@ -261,16 +269,23 @@ impl Strategy {
             "weighted" => Self::Weighted,
             "fill-first" => Self::FillFirst,
             "p2c" => Self::P2c,
-            "least-used" => Self::LeastUsed,
+            // The aliases are the reference's `normalizeRoutingStrategy`
+            // (`routingStrategies.ts:71-73`), which upstream accepts on config
+            // input. Resolving them here and in `ar_route::Strategy::parse`
+            // keeps a combo ported from an OmniRoute config routable instead of
+            // deferred — the two parsers must agree, or the strategy that loads
+            // is not the one that routes.
+            "least-used" | "usage" => Self::LeastUsed,
             "random" => Self::Random,
             "strict-random" => Self::StrictRandom,
             "headroom" => Self::Headroom,
-            "reset-window" => Self::ResetWindow,
+            "reset-window" | "weekly-reset" | "reset-window-order" => Self::ResetWindow,
             "reset-aware" => Self::ResetAware,
             "quota-weighted" => Self::QuotaWeighted,
-            "quota-share-fair" => Self::QuotaShareFair,
+            "quota-share" | "quota-share-fair" => Self::QuotaShareFair,
+            "expiry-first" => Self::ExpiryFirst,
             "context-relay" => Self::ContextRelay,
-            "context-optimized" => Self::ContextOptimized,
+            "context-optimized" | "context" => Self::ContextOptimized,
             "cache-optimized" => Self::CacheOptimized,
             "fusion" => Self::Fusion,
             "pipeline" => Self::Pipeline,
@@ -305,6 +320,7 @@ impl Strategy {
             Self::ResetAware => "reset-aware",
             Self::QuotaWeighted => "quota-weighted",
             Self::QuotaShareFair => "quota-share-fair",
+            Self::ExpiryFirst => "expiry-first",
             Self::ContextRelay => "context-relay",
             Self::ContextOptimized => "context-optimized",
             Self::CacheOptimized => "cache-optimized",
@@ -1246,12 +1262,16 @@ combos:
     }
 
     /// Every name `ar-route::Strategy::parse` claims, so a rename there fails
-    /// here instead of silently routing under [`Strategy::Deferred`].
-    const ROUTE_STRATEGIES: [&str; 20] = [
+    /// here instead of silently routing under [`Strategy::Deferred`]. The
+    /// reference's aliases (`usage`, `context`, `weekly-reset`,
+    /// `reset-window-order`) are deliberately absent: they resolve to names
+    /// already in this list, and [`Strategy::parse`] pins each of them to its
+    /// canonical spelling in `ar-route`'s own tests.
+    const ROUTE_STRATEGIES: [&str; 22] = [
         "priority", "round-robin", "cost-optimized", "lkgp", "weighted", "fill-first", "p2c",
         "least-used", "random", "strict-random", "headroom", "reset-window", "reset-aware",
-        "quota-weighted", "quota-share-fair", "context-relay", "context-optimized",
-        "cache-optimized", "fusion", "pipeline",
+        "quota-weighted", "quota-share", "quota-share-fair", "expiry-first", "context-relay",
+        "context-optimized", "cache-optimized", "fusion", "pipeline",
     ];
 
     #[test]
@@ -1259,7 +1279,27 @@ combos:
         for name in ROUTE_STRATEGIES {
             assert!(Strategy::parse(name).is_routable(), "{name}");
         }
-        assert_eq!(ROUTE_STRATEGIES.len(), 20);
+        assert_eq!(ROUTE_STRATEGIES.len(), 22);
+    }
+
+    /// The alias arms in *this* parser have to agree with `ar-route`'s, or a
+    /// config that loads resolves to one strategy and the router dispatches
+    /// another. Equality with the canonical spelling is the proof: a deferred
+    /// alias could not equal a routable canonical name.
+    #[test]
+    fn parses_the_reference_aliases_to_their_own_strategy() {
+        for (alias, canonical) in [
+            ("usage", "least-used"),
+            ("context", "context-optimized"),
+            ("weekly-reset", "reset-window"),
+            ("reset-window-order", "reset-window"),
+        ] {
+            assert_eq!(
+                Strategy::parse(alias),
+                Strategy::parse(canonical),
+                "{alias} must resolve to {canonical}"
+            );
+        }
     }
 
     #[test]

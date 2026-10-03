@@ -533,6 +533,32 @@ impl Weights {
         }
     }
 
+    /// Upstream `offline-friendly` — quota availability dominates, because the
+    /// provider with quota left is the one that can still answer. `taskFit` goes
+    /// to zero and `tierPriority` takes its share, which is the reference's own
+    /// rebalance (`modePacks.ts:71-88`). `auto/offline`.
+    #[must_use]
+    pub const fn offline_friendly() -> Self {
+        Self {
+            quota: 0.3324,
+            health: 0.2667,
+            cost_inv: 0.0752,
+            latency_inv: 0.0476,
+            task_fit: 0.0,
+            stability: 0.0952,
+            tier_priority: 0.0376,
+            tier_affinity: 0.0,
+            specificity_match: 0.0,
+            context_affinity: 0.0,
+            cache_affinity: 0.0,
+            session_availability: 0.0476,
+            reset_window_affinity: 0.0,
+            connection_density: 0.0476,
+            quality: 0.02,
+            reliability: 0.03,
+        }
+    }
+
     /// Upstream `chaos-mode` — health, stability and task fit dominate, quota
     /// almost silent. `auto/chaos` fans out over a panel, where quota
     /// diversity is secondary to picking the most stable providers.
@@ -735,12 +761,13 @@ mod tests {
     };
     use crate::contract::ProviderId;
 
-    fn all_weights() -> [Weights; 5] {
+    fn all_weights() -> [Weights; 6] {
         [
             Weights::balanced(),
             Weights::quality_first(),
             Weights::ship_fast(),
             Weights::cost_saver(),
+            Weights::offline_friendly(),
             Weights::chaos_mode(),
         ]
     }

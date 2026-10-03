@@ -15,7 +15,7 @@ use crate::auto::scoring::Weights;
 
 /// How many `auto/*` variants this build carries. Every spelling in a
 /// `/v1/models` listing that starts with `auto` is one of these.
-pub const AUTO_VARIANTS: usize = 6;
+pub const AUTO_VARIANTS: usize = 8;
 
 /// The `auto/*` variants this build carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -32,18 +32,33 @@ pub enum AutoVariant {
     Smart,
     /// `auto/chaos` — most stable panel, no exploration.
     Chaos,
+    /// `auto/offline` — most quota / rate-limit headroom first.
+    ///
+    /// `quota` nearly triples against the balanced pack while `taskFit` goes to
+    /// zero, which is the point: the provider with quota left is the one that
+    /// can still answer.
+    Offline,
+    /// `auto/lkgp` — explicit last-known-good-provider stickiness.
+    ///
+    /// Not a different weighting: upstream every `auto` variant scores with the
+    /// balanced pack and applies stickiness separately
+    /// (`routerStrategy = "lkgp"`). This variant is the explicit spelling of
+    /// that, so a config can ask for it by name.
+    Lkgp,
 }
 
 impl AutoVariant {
     /// Every variant, in the upstream README's order. For `ar combo` and for
     /// iterating a pool in a test.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::Balanced,
         Self::Coding,
         Self::Fast,
         Self::Cheap,
         Self::Smart,
         Self::Chaos,
+        Self::Offline,
+        Self::Lkgp,
     ];
 
     /// The model name a client sends. This is the string that has to survive
@@ -58,6 +73,8 @@ impl AutoVariant {
             Self::Cheap => "auto/cheap",
             Self::Smart => "auto/smart",
             Self::Chaos => "auto/chaos",
+            Self::Offline => "auto/offline",
+            Self::Lkgp => "auto/lkgp",
         }
     }
 
@@ -84,6 +101,10 @@ impl AutoVariant {
             Self::Fast => Weights::ship_fast(),
             Self::Cheap => Weights::cost_saver(),
             Self::Chaos => Weights::chaos_mode(),
+            Self::Offline => Weights::offline_friendly(),
+            // Balanced weights plus the sticky pin upstream gives every `auto`
+            // variant; naming the pin is the whole difference.
+            Self::Lkgp => Weights::balanced(),
         }
     }
 
@@ -226,6 +247,7 @@ mod tests {
     use super::{
         AUTO_VARIANTS, AutoCombo, AutoVariant, VirtualFactory, auto_variant_for_model, virtual_combo,
     };
+    use crate::Weights;
     use crate::error::RouteError;
 
     #[test]
@@ -258,6 +280,23 @@ mod tests {
     fn gives_cheap_the_cost_saver_pack() {
         let combo = virtual_combo("auto/cheap").expect("known alias");
         assert_eq!(combo.weights().cost_inv, 0.3324);
+    }
+
+    /// `auto/offline` is in the reference's advertised variant table
+    /// (`README.md:356`) and resolves to its own mode pack, so "the provider with
+    /// quota left wins" is reachable rather than a deferred name.
+    #[test]
+    fn gives_offline_the_quota_first_pack() {
+        let combo = virtual_combo("auto/offline").expect("known alias");
+        let w = combo.weights();
+        assert_eq!(w.quota, Weights::offline_friendly().quota);
+        assert!(
+            w.quota > AutoVariant::Balanced.weights().quota,
+            "offline must out-weigh the balanced pack on quota, {} vs {}",
+            w.quota,
+            AutoVariant::Balanced.weights().quota
+        );
+        assert_eq!(w.task_fit, 0.0, "offline scores no task fit at all");
     }
 
     #[test]
@@ -306,6 +345,8 @@ mod tests {
             ("auto/smart", AutoVariant::Smart),
             ("auto/balanced", AutoVariant::Balanced),
             ("auto/chaos", AutoVariant::Chaos),
+            ("auto/offline", AutoVariant::Offline),
+            ("auto/lkgp", AutoVariant::Lkgp),
         ] {
             assert_eq!(auto_variant_for_model(name), Some(want), "{name}");
         }
