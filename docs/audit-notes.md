@@ -275,6 +275,55 @@ absent is multi-connection-per-provider ranking, which is a credential-model
 feature rather than a strategy. Multi-account support, when it comes, is where
 this belongs.
 
+**(j) `ar-obs` ships as a library with no in-tree consumer.** The crate is
+complete and tested (`crates/ar-obs/tests/p5.rs` drives `Metrics`,
+`TraceWriter` and `AuditLedger`), and `docs/05-roadmap.md` lists P5's obs half as
+shipped. Nothing calls it: no crate's `Cargo.toml` depends on `ar-obs`, and
+`ar serve` exposes its own four Prometheus counters from
+`ar-server/src/metrics.rs`, which its own doc explains is a deliberate
+hand-rolled substitute for the `prometheus` client crate. So the JSON trace
+writer, the 7-day-rotating trace file and the `AuditLedger` are capabilities
+this build *has* and does not *use*. This is the F-HIGH-5 "dead code that
+advertises capability is a trust bug" shape, one phase along, and it is recorded
+here rather than left for a reader to infer from a green build. Wiring it means
+choosing one metrics owner — two crates emitting `/metrics` is worse than one —
+so it is a decision, not a diff.
+
+**(i) The strategy surface had two parsers and they had drifted.** Three
+divergences, all of the same kind — a name one parser accepted and the other did
+not — and every one of them was a shipped strategy that a config could not name.
+
+`ar-config`'s `Strategy` enum never grew an `ExpiryFirst` arm, so
+`expiry-first:` in a `config.yaml` parsed to `Deferred("expiry-first")`: the
+strategy existed in `ar-route` and was unreachable from the file that configures
+it. Fixed by the variant plus its `parse` and `as_str` arms — serde round-trips
+through those two, so both directions have to be complete or serialization drops
+it. The reference's `normalizeRoutingStrategy` aliases
+(`routingStrategies.ts:71-73`) — `usage`, `context`, `weekly-reset`,
+`reset-window-order` — resolved to `Deferred("unknown")` in both parsers, so a
+combo ported from an OmniRoute config that used one 501'd on a strategy this
+build ships; both now carry all four. And the assertion that was supposed to
+catch the first one, `ROUTE_STRATEGIES.len()` in `ar-config` — "every name
+`ar-route` claims" — had drifted from the list beside it and was passing on a
+list that omitted `expiry-first` entirely; it now asserts 22 and includes both
+missing names.
+
+`parses_the_reference_aliases_to_their_own_strategy` pins each alias to its
+canonical spelling in *both* crates, because the two parsers must agree: a
+strategy that loads as one variant and dispatches as another is worse than one
+that defers, since it fails silently. The alias tests assert equality with the
+canonical name rather than `is_routable()` directly, so the proof does not depend
+on a second property holding at once.
+
+The same shape appeared one level up: `AutoVariant` carried six variants where
+the reference advertises eight (`README.md:351-362`). `auto/offline` and
+`auto/lkgp` resolved to `UnknownAutoVariant`, so a client asking for either got
+an error on a name the reference answers. `auto/offline` now carries the
+`offline-friendly` mode pack (`modePacks.ts:72-88` — quota 0.3324 with `taskFit`
+at zero, because the provider with quota left is the one that can still answer),
+and `auto/lkgp` is the explicit spelling of the stickiness upstream applies to
+every `auto` variant separately from its weights.
+
 **(h) The fusion judge is a second dispatch, not a merge, and it relays the
 judge's own body.** The reference's `judgeModel` path (`fusion.ts`
 `handleFusionChat`) synthesizes by *asking* a judge model to write one answer
@@ -290,3 +339,26 @@ rather than a per-request 502. The panel ceiling is `MAX_PANEL = 40`
 rejects an oversized panel with a 400 before fan-out, this build truncates to 40
 members and asks those, because the ceiling lives in `ar-route` where there is no
 HTTP layer to answer from — audit row, truncation keeps panel order.
+
+Three exposures this row owns rather than hides. **(i) A panel member's body is
+buffered under a ceiling.** `read_body` (`crates/ar-route/src/strategy.rs`) stops at
+`PANEL_BODY_BYTES` (4MB) and drops that member from the panel — it cannot win and
+its text never reaches the judge — so a `MAX_PANEL`-wide fan-out is bounded at
+160MB. `MAX_PANEL` alone bounded only the member *count*, which is the same #1905
+heap case one level down. Dropping rather than truncating is deliberate: a JSON
+body cut mid-answer does not parse, so truncation would keep the cost and lose
+the answer. Pinned by `drops_a_panel_member_whose_body_exceeds_the_cap` and
+`reads_a_panel_member_whose_body_is_exactly_at_the_cap`, the second verified to
+fail when the reader's `>` becomes `>=`. **(ii) A fused request is accounted once,
+not N+1.** `buffer_for_accounting` records a single ledger row for whichever body
+wins, so the operator paid for 40 panel calls and one judge call and the budget
+cap saw one — the same shape as the stream-usage gap closed in `9e5044f`, and it
+under-counts exactly where spend is highest. **(iii) The panel request contradicts
+`CanonicalRequest`'s documented invariant** that routing must not be able to
+change the request it is routing: `non_streaming_body` (strategy.rs) rewrites the
+`stream` field inside the body, because a provider honours the body and not the
+struct flag. A body that does not parse as a JSON object is passed through
+unchanged, which is the one case where a streaming client can still reach the
+panel — the resulting empty panel is caught downstream by `synthesize`'s
+`usable_count() < 2` guard, so it degrades to the first 2xx rather than
+synthesizing from nothing.

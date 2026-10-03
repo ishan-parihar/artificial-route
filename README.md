@@ -8,7 +8,7 @@ A minimal-RAM Rust port of the [OmniRoute](https://github.com/ishan-parihar/Omni
 
 ## Features
 
-- **20 routing strategies + `auto/*`** — priority, least-used, quota-weighted/fair, cost-optimized, reset-aware, fusion, pipeline… plus a 6-variant auto factory scored over 16 factors, with `simulate`/`explain` in the library
+- **21 routing strategies + `auto/*`** — priority, least-used, quota-weighted/fair, cost-optimized, expiry-first, reset-aware, fusion, pipeline… plus an 8-variant auto factory scored over 16 factors, with `simulate`/`explain` in the library
 - **276 providers, 1559 models** compiled in — same provider set as OmniRoute's registry, verified byte-identical
 - **6 wire dialects** — OpenAI, Anthropic, OpenAI-Responses, Gemini, Ollama inbound, OpenAI render; 18 further pairs named loudly instead of half-ported
 - **3 compression engines** (lite, rtk, caveman) with honor-and-echo semantics, per-combo in `config.yaml` and per-request via header, on an intensity dial (`rtk` minimal/standard/aggressive, `caveman` lite/full/ultra) rather than a dozen half-wired engine ids
@@ -37,7 +37,7 @@ The OmniRoute figure is its full Next.js desktop/PWA server, not just its proxy 
 | Surface | Artificial Route | OmniRoute | agentgateway |
 |---|---|---|---|
 | providers | **276** (identical set) | 276 | 8 + 13 presets |
-| strategies | **20** + 6-variant auto | 20 + auto | 3 (+LB modes) |
+| strategies | **21** + 8-variant auto | 20 + auto | 3 (+LB modes) |
 | dialects | 6 in, 18 named-missing | 24 cells | 8 formats |
 | compression | 3 engines + intensity dial, per-combo **and** per-request | 12 (+stubs), per-combo | 4, reactive, no knob |
 | upstream auth | apikey + OAuth dispatch (codex, cline, claude, gemini-cli, cursor) | apikey + 24-entry OAuth | 9 strategies, exchange-only |
@@ -63,7 +63,7 @@ Measured 2026-10-01, `ar` 0.1.1 against a live OmniRoute v16.3.1, both on loopba
 | CLI verbs | 10: `serve`, `models`, `providers`, `combo`, `doctor`, `run`, `configure`, `auth`, `import`, plus `mcp` behind `--features mcp` | ~78 |
 | MCP tools | 12-tool catalog + `tool_search`, behind the default-off `mcp` feature | 110 tools + A2A |
 | terminal-status list | 6 rows + 1 carve-out-only, generated into the store's CHECK | taxonomy it was reconciled against |
-| test gate | 42 suites, 1282 passed, 0 failed; clippy `-D warnings` clean | not measured |
+| test gate | 42 suites, 1741 passed, 0 failed; clippy `-D warnings` clean | not measured |
 
 No upstream chat call was made in either column, so the shared-route row is a
 surface match, not verified call parity. The classifiers agree except for one

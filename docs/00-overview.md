@@ -6,7 +6,7 @@
 
 One OpenAI-compatible endpoint `http://127.0.0.1:20128/v1` serving 300+ providers.
 P0 ships **lean-routing** (4 strategies, ~80% traffic) at <50MB RSS idle.
-P2 reaches **full-strategies** parity (19 strategies + 16-factor `auto/*`).
+P2 reaches **full-strategies** parity (21 strategies + 16-factor `auto/*`).
 Agent-native operation via optional `ar-mcp` (12 tools, default off).
 
 ## Non-goals (explicit)
@@ -21,7 +21,7 @@ Agent-native operation via optional `ar-mcp` (12 tools, default off).
 ## Routing parity law
 
 P0 `priority|round-robin|cost-optimized|lkgp` is **lean-routing, not done**.
-Call it done only after P2: all 19 strategies + `auto/*` virtual factory +
+Call it done only after P2: all 21 strategies + `auto/*` virtual factory +
 `simulate_route` dry-run + `explain_route` trace. See `02-port-from-omniroute.md`
 deferred table and `05-roadmap.md` gates.
 

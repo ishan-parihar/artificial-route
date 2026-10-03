@@ -1023,21 +1023,30 @@ async fn fusion_response(
         // The judge answered: its own body is the response, relayed exactly as
         // it arrived, and the panel's members plus the judge's dispatch is the
         // request's real cost.
-        Some(synthesis) if synthesis.judged => {
-            let upstream = synthesis
-                .upstream
-                .expect("a judged outcome carries the judge's response");
-            (upstream, plan.judge.clone(), panel_attempts.saturating_add(1) as u16)
-        }
+        //
+        // A judged outcome always carries the judge's response — `synthesize`
+        // clears `judged` on the two paths that produce none (a refused panel,
+        // and a 2xx whose body extracted to nothing) — but the type cannot say
+        // so, so an unreachable state degrades to the panel's winner rather than
+        // panicking a request.
+        Some(JudgeOutcome {
+            judged: true,
+            upstream: Some(upstream),
+            ..
+        }) => (
+            upstream,
+            plan.judge.clone(),
+            panel_attempts.saturating_add(1) as u16,
+        ),
         // No judge, or a judge that failed: the panel's first 2xx is the answer.
         // The provider is read before the upstream is moved out of the outcome.
         _ => {
             let provider = outcome.winner().cloned();
             match outcome.upstream {
-            Some(upstream) => (upstream, provider, panel_attempts as u16),
-            None => {
-                return fusion_empty_panel(&outcome);
-            }
+                Some(upstream) => (upstream, provider, panel_attempts as u16),
+                None => {
+                    return fusion_empty_panel(&outcome);
+                }
             }
         }
     };

@@ -3,10 +3,17 @@
 **Scope:** compression settings, API keys, OAuth/token-refresh, provider/model
 management. Read-only survey of the live OmniRoute (`v16.3.1`, this machine),
 the agentgateway checkout, and `ar` at `v0.1.1`.
-**Verdict:** `ar` is not production-grade yet. 3 critical + 5 high gaps below.
+**Verdict:** `ar` is not production-grade yet. Of the 8 critical/high gaps this
+audit opened, 6 are FIXED, 1 is PARTIAL (model discovery) and 1 (per-connection
+quota) has landed its circuits but not its store; the list below says which is
+which per row.
 No secrets were read or moved during this audit.
-**Update:** F-CRIT-1 (OAuth dispatch), the circuit half of F-HIGH-4 and F-MED-2
-have landed; each entry below says what is done and what is not.
+**Update:** F-CRIT-1 (OAuth dispatch), F-CRIT-2 (credential store), F-CRIT-3
+(custom providers), F-HIGH-1 (per-combo compression), F-HIGH-2 (candidate pool),
+F-MED-2 and the circuit half of F-HIGH-4 have landed; each entry below says what
+is done and what is not. The strategy count in the summary below was 19 and is
+now 21 — `expiry-first` and the fusion judge's own dispatch landed after that
+line was written; `Strategy::all()` (strategy.rs:424) is the arbiter.
 
 ## Live inventory (OmniRoute, this machine — counts only)
 
@@ -83,7 +90,7 @@ mechanism instead of only refusing, because "no executor" is no longer the same 
 "no way to authenticate". The store's `SessionKind` has a `device` and an
 `anonymous` arm for the rows those two produce.
 
-### F-CRIT-2: No local credential store
+### F-CRIT-2: No local credential store — FIXED
 Provider keys resolve from env vars only. There is nowhere to port the 49
 live credentials: no local db, no file-backed secret, no AEAD envelope
 (`ar-keys` has the crypto — AES-GCM-capable hash/secret modules — but no
@@ -91,6 +98,15 @@ provider-credential table, and the ledger never persists to disk).
 **Fix:** gitignored local sqlite (`*.db` already ignored), AEAD-encrypted at
 rest, `$VAR` as fallback/override. Mirror OmniRoute's `enc:v1` envelope
 discipline, not its static-salt derivation. Never commit; never log values.
+**Shipped:** `crates/ar-keys/src/store.rs` is that table — `CredentialStore` over
+`rusqlite`, `open_with_env_key` / `open_with_material` (a `$VAR` master key,
+because `config.yaml` has no config entry for it), every value sealed before it
+touches disk, and the refresh row written compare-and-swap so a sibling writer
+that rotated first is not clobbered. `ar serve` opens it through
+`commands::credential_store(cli)` (`serve.rs:59`) and the resolution path prefers
+the store over `$VAR` (`config.rs:1337`), so `ar auth login` writes rows the
+server then reads. The usage ledger sits beside the same file (`serve.rs:87`).
+Tests: `crates/ar-keys/tests/{store,keys,admit}.rs`.
 
 ### F-CRIT-3: Custom providers unroutable — FIXED
 Live uses custom nodes (`openai-compatible-chat-<uuid>`, `clinepass`,
@@ -113,12 +129,19 @@ Residual: only the OpenAI wire dispatches, so an `anthropic-compatible` node is
 accepted and named but refused at dispatch, exactly like the compiled-in
 `anthropic`.
 
-### F-HIGH-1: Per-combo compression not wired
+### F-HIGH-1: Per-combo compression not wired — FIXED
 All live combos run `compressionMode: lite`, but `ar-config` has no
 compression field and the server calls `plan_resolution(&[], …)` — only the
 `x-ar-compression` request header engages engines.
 **Fix:** `compression:` per combo (engine + intensity), header overrides
 file, file overrides off. Then mirror the live `lite` setting.
+**Shipped:** `Combo.compression: Option<Compression>` (`ar-config/src/lib.rs:436`,
+carried through `Wire` at :467/:491), `RouteCombo.compression` with a
+`with_compression` builder (`ar-server/src/config.rs:296`/`:332`), and the load
+copy at `:628`. `Step` is what the server already planned with, so the combo
+value and the `x-ar-compression` header are one dial rather than two paths.
+Mirror coverage: the config's own mirror template carries three `lite` combos and
+`ar-config/src/lib.rs:1682` asserts it.
 
 ### F-HIGH-2: No candidate-pool bench — **FIXED**
 free-stack lists 2 targets but 7 candidate providers. `ar` had no pool
@@ -157,12 +180,14 @@ fires eight concurrent grants at one expired session and asserts one refresh.
 supplies; nothing snapshots, rolls over or persists it per connection.
 
 ### F-HIGH-5: MCP tools orphaned — CLOSED
-8 tools exist as a library no binary wires up. OmniRoute exposes 84+ tools;
+12 tools exist as a library no binary wires up. OmniRoute exposes 84+ tools;
 agentgateway acts as an MCP OAuth server (DCR + refresh_token).
 **Fix:** `ar-mcp` behind the `mcp` feature on `ar`, or cut the crate until
 it's wired. Dead code that advertises capability is a trust bug.
 **Done (option a):** `ar mcp` behind the same default-off `mcp` feature, serving
-the essential-8 + `ar_tool_search` over stdio through `rmcp/transport-io`. Every
+the essential-12 (`ar-mcp/src/lib.rs:147`) + `ar_tool_search` over stdio through
+`rmcp/transport-io`; the catalog is 12 + `tool_search` = 13, pinned by
+`ar-cli/src/mcp.rs:428`. Every
 call goes through `guard()`, so the scope check and the audit row cannot be
 skipped; `ar mcp --list` prints the catalog as TOON with no config; `AR_MCP_SCOPE`
 is the grant and is default-deny for whatever it does not name. The seven
@@ -288,7 +313,7 @@ nothing. `Retry` carries `tried` now. Name and exposition unchanged.
 ## What `ar` already leads on (hold these)
 
 Memory (2.2 vs ~994 MiB same combos), 10 MB static binary, TOON/AXI CLI,
-doctor/serve single grammar, 20 strategies vs agentgateway's 3, per-key
+doctor/serve single grammar, 21 strategies vs agentgateway's 3, per-key
 backoff with `Retry-After` precedence, fail-loud unknown flags/strategies.
 
 ## Correction to prior briefs

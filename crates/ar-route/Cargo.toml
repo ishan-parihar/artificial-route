@@ -3,7 +3,7 @@ name = "ar-route"
 version = "0.1.1"
 edition = "2024"
 rust-version = "1.90"
-description = "Routing: 19 strategies, attempt loop, per-key backoff (Artificial Route)"
+description = "Routing: 21 strategies, attempt loop, per-key backoff (Artificial Route)"
 license = "Apache-2.0"
 
 [lints]

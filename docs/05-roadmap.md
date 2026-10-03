@@ -1,12 +1,22 @@
 # 05 — Roadmap P0-P6
 
 **Status (2026-10-03):** P0–P4 shipped in v0.1.0/v0.1.1; P5's guard/obs
-shipped with the `ar-guard`/`ar-obs` crates. P6's media family landed under
+shipped as crates — `ar-guard` is wired into the request path
+(`ar-server/src/text.rs:32`), while `ar-obs` is a shipped library with **no
+in-tree consumer**: its `Metrics`/`TraceWriter`/`AuditLedger` are not called by
+`ar serve`, which serves its own four counters from `ar-server/src/metrics.rs`.
+Both crates exist and are tested; only the guard is on the request path.
+P6's media family landed under
 the parity closeout (`docs/07-parity-closeout.md`, wave C: embeddings,
-transcriptions, image-generations, OCR); `/v1/audio/translations`, live
-discovery (docs/02 sync row, P1) and the 12h soak remain deferred. The
-parity-closeout waves A–O are complete; the phase gates below still apply
-to anything a P-phase takes on.
+transcriptions, image-generations, OCR) and `/v1/audio/translations` landed
+afterwards, closing the modality scope; `import --from omniroute|litellm` shipped
+in v0.1.0 (`5cccd13`). The parity-closeout waves A–O are
+complete. Three rows are still open and none is claimed: server-side live
+discovery (`LiveCatalog` is written and tested in `ar-registry::discovery` but
+the server's `/v1/models` is still config-static), `quota-share-fair`'s persisted
+deficit map, and the 12-hour soak run itself — the harness is `scripts/soak.sh`
+and a 3-minute proof run is recorded, but 12 hours is not. The phase gates below
+still apply to anything a P-phase takes on.
 
 Gate every phase: `cargo test --release` + `cargo clippy --all-targets --all-features --locked -- -D warnings` + RAM check.
 AXI gates in `06-axi-mcp.md` apply from P0 (`TOON`, `--fields`, `--version` fast path, no prompts).

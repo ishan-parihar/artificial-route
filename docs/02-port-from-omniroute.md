@@ -34,17 +34,30 @@ P0 `priority|round-robin|cost-optimized|lkgp` = lean-routing (~80% traffic). Wha
 | `weighted|fill-first|p2c|least-used|random|strict-random` | `combo/targetSorters.ts` | seeded, so a decision is reproducible from its inputs |
 | `headroom|reset-window|reset-aware|quota-weighted` | `quotaStrategies|headroomRanking` | no clock; the rollover is the quota store's job, upstream of the sorter |
 | `context-relay|context-optimized|cache-optimized` | `promptCacheAffinity|comboContextCache` | stateless HRW prefix pin, scoped by the requested model |
-| `auto/*` 16-factor + `virtualFactory.ts` | `autoCombo/scoring.ts+engine.ts` | `auto,auto/coding,auto/fast,auto/cheap,auto/smart,auto/chaos`; `auto_variant_for_model()` is the pure "is this requested model an alias?" check the server stream calls |
+| `auto/*` 16-factor + `virtualFactory.ts` | `autoCombo/scoring.ts+engine.ts` | all eight names the reference advertises (`README.md:351-362`): `auto,auto/coding,auto/fast,auto/cheap,auto/offline,auto/smart,auto/lkgp,auto/chaos`; `auto/offline` carries its own `offline-friendly` pack and `auto/lkgp` the explicit spelling of the stickiness every `auto` variant applies; `auto_variant_for_model()` is the pure "is this requested model an alias?" check the server stream calls |
 | `simulate_route|explain_route` | `statusDecisionTable|decisionTrace` | both call one `rank()`, so a dry run and its explanation cannot disagree |
 | `quota-share-fair` | `quotaShare*` | DRR order then power-of-two over live in-flight; a persisted deficit map is the only gap |
-| `fusion` fan-out, `pipeline` chaining | `dispatchPrelude.ts::tryFusionDispatch|tryPipelineDispatch`, `fusion.ts`, `services/pipeline.ts` | `dispatch_fusion()` returns the first 2xx with a full verdict trace; `dispatch_pipeline()` chains stage output into the next request. The fusion *judge* is still open — see below. |
+| `fusion` fan-out, `pipeline` chaining | `dispatchPrelude.ts::tryFusionDispatch|tryPipelineDispatch`, `fusion.ts`, `services/pipeline.ts` | `dispatch_fusion()` returns the first 2xx with a full verdict trace; `dispatch_pipeline()` chains stage output into the next request; the judge synthesis the TODO recorded as blocked now ships end to end — `ar-route/src/fusion_judge.rs` + the server's `fusion_response` branch |
 | Inbound wire-in: Anthropic Messages, Responses, Ollama | `translator/request/*` | landed: `ar-server/src/translate.rs` dispatches each dialect into `ar-translate` (`anthropic_to_canonical`/`responses_to_canonical`/`ollama_to_canonical`), and `ar-translate/src/outbound.rs` renders canonical back to every provider wire; the OpenAI route alone forwards the client's bytes verbatim |
 
 | Still deferred | Source | Cost |
 |---|---|---|
-| `expiry-first` | `ACCOUNT_FALLBACK_STRATEGY_VALUES` + `expiryFirstAccountSelection.ts` | landed 2026-10-03 at combo level with the reference's scoring verbatim; the reference ranks OAuth *connections* inside credential selection, which this build's one-key-per-provider model has no home for — audit-notes row (g) |
-| fusion judge synthesis | `fusion.ts::handleFusionChat` + `judgeModel` | landed 2026-10-03: the judge directive ported verbatim, `judge_model:` in config validated at load, the panel's texts composed from the fan-out's own buffer, and the judge's body relayed verbatim — audit-notes row (h) |
-| `/v1/audio/translations` | executors media family | landed 2026-10-03: same handler body as transcriptions (multipart verbatim, `?model=` routing), one endpoint over — the modality row of this table is now empty |
+| server-side live discovery | `modelDiscovery.ts+reactiveModelSync.ts` | `ar-registry::discovery` ships the models.dev overlay with tests, and `ar import --from omniroute` uses it, but the running server's `/v1/models` is still `StaticCatalog` over config (models.rs:70); wiring `LiveCatalog` in is a P1 one-liner and no caller changes |
+| `quota-share-fair` deficit persistence | `quotaShare*` DRR | `by_fair_share` (strategy.rs:1026) implements the first DRR round from an empty map — normalised-weight order then power-of-two over live in-flight; the persisted deficit map that makes round 2+ diverge is absent, so a restart resets the accounting |
+| the 12-hour soak run itself | `docs/05-roadmap.md` P6 accept line | harness is `scripts/soak.sh` and the 3-minute proof is recorded; the 12h run is one command and is **not yet claimed** |
+| `ar-obs` has no in-tree consumer | this build's own state | the crate ships and is tested, but `ar serve` serves its own four Prometheus counters from `ar-server/src/metrics.rs` and nothing calls `TraceWriter` or `AuditLedger`; the P5 obs half is a library, not a request path |
+
+### Landed since the deferred table was written (2026-10-03)
+
+These rows were deferred when this table was first written and have since landed; they are recorded here so the deferred table above stays true to its own contract.
+
+| Landed | Commit | Evidence |
+|---|---|---|
+| `expiry-first` | `481bbbb` | the reference's scoring verbatim at combo level; the reference ranks OAuth *connections* inside credential selection, which this build's one-key-per-provider model has no home for — audit-notes row (g) |
+| per-panel-member byte cap on `read_body` | pending (this commit) | `PANEL_BODY_BYTES` = 4MB, over-cap member dropped rather than truncated mid-answer; pinned by a test verified to fail when the reader's `>` becomes `>=` — audit-notes row (h) |
+| fusion judge synthesis | `f9ce2da` | `judge_model:` in config validated at load, the judge directive ported verbatim, the panel's texts composed from the fan-out's own buffer, the judge's body relayed verbatim — audit-notes row (h) |
+| `/v1/audio/translations` | `3b3252b` | same handler body as transcriptions (multipart verbatim, `?model=` routing); the modality row of the deferred table is now empty |
+| `import --from omniroute\|litellm` | `5cccd13` | both readers exist and both write `config.yaml` + `registry.json`: `from_omniroute` (import/mod.rs:143) parses a models.dev-shaped map, `from_litellm` (:167) a LiteLLM `model_list`; `assemble` (:210) emits one combo per alias group, and `commands.rs:1322` dispatches the two modes |
 
 ### Strategy-name notes
 
