@@ -124,6 +124,22 @@ pub const LATENCY_MS_HEADER: &str = "x-ar-latency-ms";
 /// Restates [`USAGE_HEADER`]'s `attempts=` for a client that reads only the
 /// accounting headers, so the two cannot be read as different counts.
 pub const FALLBACK_ATTEMPTS_HEADER: &str = "x-ar-fallback-attempts";
+/// The model this request named — the routing id the client sent, not the
+/// upstream's spelling, which stays private to the dispatch.
+pub const MODEL_HEADER: &str = "x-ar-model";
+/// The provider the verdict describes, stamped only when there is one — an
+/// absent header reads as "the router answered before any provider did",
+/// which is the reference gateway's own conditional behaviour.
+pub const PROVIDER_HEADER: &str = "x-ar-provider";
+/// This server's own version, so a client can pin a behaviour without a
+/// round trip to a health endpoint. The reference stamps its `APP_CONFIG`
+/// version on every response the same way.
+pub const VERSION_HEADER: &str = "x-ar-version";
+
+/// The version [`VERSION_HEADER`] reports: this crate's, because the header is
+/// this crate's product. Workspace members move together, and a split
+/// version here would mean exactly the drift the header exists to expose.
+pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Ceiling on the response body the cache will buffer for storage.
 ///
@@ -530,6 +546,7 @@ async fn handle_chat(
             cache_state,
             cache_key,
             cache,
+            model: canonical.model.clone(),
             meta: ResponseMeta::default().with_latency(dispatched.elapsed()).with_savings_tokens(savings_tokens),
         },
     )
@@ -551,6 +568,11 @@ struct Stages {
     cache_key: Option<CacheKey>,
     /// The cache itself, when one is configured.
     cache: Option<Arc<Cache>>,
+    /// The model the client named, for [`MODEL_HEADER`]. Carried rather than
+    /// a sixth parameter because `decorate` is the one emit point and the
+    /// request's own spelling is the one a client comparing headers to its
+    /// request can recognize.
+    model: Strng,
     /// What the request spent and how long it took, for the `x-ar-*` accounting
     /// headers.
     ///
@@ -937,7 +959,7 @@ fn decorate(
         outcome.attempts()
     );
 
-    let Stages { compression, cache_state, cache_key, cache, meta } = stages;
+    let Stages { compression, cache_state, cache_key, cache, model, meta } = stages;
 
     // Every accounting number the response reports, from one [`ResponseMeta`].
     // Cost is priced in `ar-tokens` against the same row the ledger stores, so a
@@ -948,12 +970,21 @@ fn decorate(
         .header(USAGE_HEADER, format!("attempts={}", outcome.attempts()))
         .header(CACHE_HEADER, cache_state.as_header())
         .header(COMPRESSION_ECHO, compression)
+        .header(MODEL_HEADER, model.as_ref())
+        .header(VERSION_HEADER, SERVER_VERSION)
         .header(TOKENS_IN_HEADER, meta.tokens_in().to_string())
         .header(TOKENS_OUT_HEADER, meta.tokens_out().to_string())
         .header(RESPONSE_COST_HEADER, meta.cost().usd.as_decimal_string())
         .header(SAVINGS_TOKENS_HEADER, meta.savings_tokens().to_string())
         .header(LATENCY_MS_HEADER, meta.latency_ms().to_string())
         .header(FALLBACK_ATTEMPTS_HEADER, outcome.attempts().to_string());
+
+    // Conditional, matching the reference: an outcome with no provider — the
+    // router answering before any dispatch — omits the header rather than
+    // reporting a placeholder in a field a client may branch on.
+    if let Some(provider) = outcome.provider() {
+        builder = builder.header(PROVIDER_HEADER, provider.as_str());
+    }
 
     // Conditional, not a zero: an elapsed time too short to divide by would make
     // every downstream division nonsense, and an absent header reads as unknown.
@@ -1601,10 +1632,11 @@ mod tests {
     use bytes::Bytes;
     use super::{
         COMPRESSION_ECHO, Dialect, FALLBACK_ATTEMPTS_HEADER, Keepalive, LATENCY_MS_HEADER,
-        RESPONSE_COST_HEADER, SAVINGS_TOKENS_HEADER, Stages, TOKENS_IN_HEADER, TOKENS_OUT_HEADER,
-        TOKENS_PER_SECOND_HEADER, accept_forces_stream, build_chain, card_json, declares_stream,
-        decorate, error, error_because, kind_for, model, models_head, not_found, outcome_label,
-        require_json, terminator_seen, unknown_model,
+        MODEL_HEADER, PROVIDER_HEADER, RESPONSE_COST_HEADER, SAVINGS_TOKENS_HEADER, Stages,
+        TOKENS_IN_HEADER, TOKENS_OUT_HEADER, TOKENS_PER_SECOND_HEADER, VERSION_HEADER,
+        accept_forces_stream, build_chain, card_json, declares_stream, decorate, error,
+        error_because, kind_for, model, models_head, not_found, outcome_label, require_json,
+        terminator_seen, unknown_model,
     };
     use crate::app::{AppState, Components};
     use crate::config::{ComboTarget, ServerConfig};
@@ -1798,6 +1830,7 @@ mod tests {
                 cache_state: ar_cache::CacheState::Miss,
                 cache_key: None,
                 cache: None,
+                model: ar_route::Strng::from("m"),
                 meta,
             },
         );
@@ -2464,6 +2497,56 @@ mod tests {
         let body = body_of(resp).await;
         assert_eq!(body["error"]["code"], "unsupported_media_type");
         assert_eq!(body["error"]["type"], "invalid_request_error");
+    }
+
+    #[test]
+    fn stamps_the_model_provider_and_version_the_response_carries() {
+        let headers = headers_for(ar_tokens::ResponseMeta::default(), 1);
+        assert_eq!(
+            headers.get(MODEL_HEADER).and_then(|v| v.to_str().ok()),
+            Some("m"),
+            "the client's own model spelling is the one it can recognize"
+        );
+        assert_eq!(
+            headers.get(PROVIDER_HEADER).and_then(|v| v.to_str().ok()),
+            Some("openai"),
+            "a succeeded outcome names the provider that answered"
+        );
+        assert_eq!(
+            headers.get(VERSION_HEADER).and_then(|v| v.to_str().ok()),
+            Some(super::SERVER_VERSION),
+            "the version header and the crate must move together"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_response_carries_the_model_and_version_headers() {
+        // The streamed arm shares the builder, so the cheap meta headers ride
+        // the first flush rather than appearing only on buffered replies.
+        let recorder = Arc::new(Mutex::new(Vec::new()));
+        let exec = Arc::new(RecordingExec(Arc::clone(&recorder)));
+        let router = crate::app::app(routed_under(exec));
+        let resp = drive(
+            &router,
+            chat(
+                r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ),
+        )
+        .await;
+        assert_eq!(
+            resp.headers().get(axum::http::header::CONTENT_TYPE),
+            Some(&axum::http::HeaderValue::from_static("text/event-stream")),
+            "the fixture must actually stream for the arm to be the streamed one"
+        );
+        assert!(
+            resp.headers().contains_key(MODEL_HEADER),
+            "no model header on a streamed response"
+        );
+        assert!(
+            resp.headers().contains_key(VERSION_HEADER),
+            "no version header on a streamed response"
+        );
     }
 
     #[tokio::test]
