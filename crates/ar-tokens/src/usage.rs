@@ -95,15 +95,22 @@ fn logged_input_tokens(usage: &Value) -> u32 {
             .saturating_add(finite_at(usage, "cache_read_input_tokens"))
             .saturating_add(finite_at(usage, "cache_creation_input_tokens"));
     }
-    0
+    // Ollama keeps its counts at the reply's root, outside any `usage` map.
+    finite_at(usage, "prompt_eval_count")
 }
 
 fn logged_output_tokens(usage: &Value) -> u32 {
     if let Some(value) = present(usage, "output") {
         return finite(value);
     }
-    present(usage, "completion_tokens")
-        .map_or_else(|| finite_at(usage, "output_tokens"), finite)
+    if let Some(value) = present(usage, "completion_tokens") {
+        return finite(value);
+    }
+    if present(usage, "output_tokens").is_some() {
+        return finite_at(usage, "output_tokens");
+    }
+    // Ollama's root spelling of the same count.
+    finite_at(usage, "eval_count")
 }
 
 #[cfg(test)]
@@ -155,5 +162,21 @@ mod tests {
     #[test]
     fn reads_zero_when_usage_object_is_empty() {
         assert_eq!(NormalizedUsage::from_usage(&json!({})), NormalizedUsage::new(0, 0));
+    }
+
+    #[test]
+    fn counts_ollamas_root_eval_fields_when_no_usage_map() {
+        // Ollama answers carry `prompt_eval_count`/`eval_count` at the reply's
+        // root, never nested under `usage`; before this key the normalizer
+        // read every Ollama reply as zero while the server's own comment
+        // claimed the root was the usage.
+        let usage = json!({ "prompt_eval_count": 9, "eval_count": 4 });
+        assert_eq!(NormalizedUsage::from_usage(&usage), NormalizedUsage::new(9, 4));
+    }
+
+    #[test]
+    fn prefers_standard_keys_over_ollama_root_when_both_present() {
+        let usage = json!({ "prompt_tokens": 5, "eval_count": 4 });
+        assert_eq!(NormalizedUsage::from_usage(&usage), NormalizedUsage::new(5, 4));
     }
 }

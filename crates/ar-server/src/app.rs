@@ -122,7 +122,9 @@ pub struct AppState {
     /// `None` means no cache at all, which `x-ar-cache` then reports as `miss`
     /// rather than as a `bypass` the client has to interpret.
     pub cache: Option<Arc<ar_cache::Cache>>,
-    /// The usage ledger an answered non-streaming request is recorded in.
+    /// The usage ledger an answered request is recorded in — buffered whole
+    /// for a non-streaming reply, and parsed from the dialect's final frames
+    /// for a stream (`routes::UsageTee`).
     ///
     /// `None` means accounting is reported on the response headers but not
     /// persisted — the headers are computed from the upstream's own `usage`

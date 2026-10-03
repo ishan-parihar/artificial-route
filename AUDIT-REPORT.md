@@ -315,8 +315,11 @@ instead of rebuilding.
   own 25MB sub-router, `/v1/completions` legacy alias, typed envelopes.
 - **D** — real usage accounting: key id threaded out of the gate (anonymous
   sentinel), the non-stream arm buffers and records against the ledger `serve`
-  opens beside the config; headers match ledger math by construction; streams
-  stay zeroed — the documented split.
+  opens beside the config; headers match ledger math by construction. Streams
+  recorded zero at closeout (the documented split); the follow-up commit the
+  same day closes that half — a capped first+tail frame collector records a
+  stream's usage when the upstream ends, headers stay zero because they are
+  sent before the first byte.
 - **E** — `x-ar-savings-tokens` counted, not estimated, on the rewrite branch.
 - **F1** — cache-control headers: `no-cache` (both sides), `cache-no-store`
   (write only), `cache-key` (namespaces the digest, both sides),

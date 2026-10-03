@@ -66,8 +66,10 @@ use axum::extract::{OriginalUri, Path, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use serde::Serialize;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use crate::app::AppState;
 use crate::config::{DefaultChain, RouteCombo};
@@ -576,11 +578,13 @@ async fn handle_chat(
     // A non-streaming reply is buffered here and only here: the usage ledger
     // and the accounting headers need the whole body to read `usage`, and the
     // pieces the response carries report what that buffer held. A streamed
-    // request skips all of it — its frames relay untouched and its usage
-    // headers stay at zero, which is the documented split: counting a stream
-    // costs SSE chunk parsing, which is a hot-path risk this build has chosen
-    // not to take. See `docs/07-parity-closeout.md` (wave D).
+    // request relays untouched and its usage headers stay at zero — the count
+    // is not knowable before the first byte goes out — but its usage is no
+    // longer lost: `account_stream` wraps the relay so the ledger records
+    // whatever the dialect's final frames carried. See `docs/07` (wave D) for
+    // the split this half closes.
     let meta = if canonical.stream {
+        account_stream(&mut outcome, state, dialect, key_id.as_deref(), &canonical.model);
         ResponseMeta::default()
             .with_latency(dispatched.elapsed())
             .with_savings_tokens(savings_tokens)
@@ -721,6 +725,216 @@ fn read_and_record(
         tracing::warn!(error = %e, "usage ledger write failed");
     }
     Some(meta)
+}
+
+/// A frame kept for accounting is capped at this many bytes: usage frames are
+/// tiny, and a chunk bigger than this is payload, not bookkeeping.
+const USAGE_FRAME_CAP: usize = 64 * 1024;
+/// How many trailing frames are kept: the frame before the terminator is
+/// where three of the four dialects carry usage, and one spare covers a
+/// terminator that arrives as its own chunk.
+const USAGE_TAIL_FRAMES: usize = 2;
+
+/// Records a streamed reply's usage when the upstream ends.
+///
+/// Wave D buffered only the non-streaming arm, on the argument that counting a
+/// stream costs SSE parsing on the hot path — which left the ledger blank for
+/// exactly the traffic agentic clients send most, and left the pre-dispatch
+/// budget gate under-enforcing it. This closes that split without putting any
+/// parsing on the frame path: the tee keeps a first frame and a two-frame tail
+/// (each capped at [`USAGE_FRAME_CAP`]), relays every byte untouched, and only
+/// when the upstream ends does it parse what it kept for the dialect's usage
+/// shape and record it. A stream no ledger is configured for is not wrapped at
+/// all — the relay keeps its zero-overhead shape, same as before.
+///
+/// # What this deliberately does not do
+///
+/// * No record on a client disconnect: the tee drops with the response, and a
+///   stream that never delivered its final frame is one whose usage was
+///   never observed. Billing a guess is worse than billing nothing.
+/// * No record when the dialect's usage frame is absent — an OpenAI stream
+///   without `stream_options.include_usage` carries no counts in-band at all,
+///   and the honest entry is none, not an estimate.
+/// * Headers stay zeroed on streams: they are sent before the first byte, so
+///   the count is not knowable yet; the ledger is where a stream's usage
+///   lands.
+/// * A usage frame split across chunk boundaries is skipped, not pieced
+///   together: whole events per write is how every SSE server this relay
+///   speaks to behaves, and a framing-scanner is a parser by another name.
+struct UsageTee {
+    /// The upstream stream, wrapped in place inside [`Upstream::stream`].
+    inner: Pin<Box<dyn Stream<Item = Bytes> + Send>>,
+    /// The first frame seen — Anthropic puts its input count in `message_start`.
+    head: Option<Bytes>,
+    /// The trailing [`USAGE_TAIL_FRAMES`] frames — where every dialect's final
+    /// counts ride.
+    tail: Vec<Bytes>,
+    /// State cloned once per request (all `Arc`s); read only at record time.
+    state: AppState,
+    /// Accounting name for whoever the gate verified, or the anonymous
+    /// sentinel — the same spelling the non-streaming arm records under.
+    key_id: String,
+    provider: String,
+    model: String,
+    dialect: Dialect,
+}
+
+impl Stream for UsageTee {
+    type Item = Bytes;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Bytes>> {
+        let this = self.get_mut();
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(chunk)) => {
+                this.retain(&chunk);
+                Poll::Ready(Some(chunk))
+            }
+            Poll::Ready(None) => {
+                this.record();
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl UsageTee {
+    /// Keeps a frame for accounting, cheapest-first: first frame once, then a
+    /// two-frame tail. A frame over the cap is not kept — usage never rides in
+    /// megabytes.
+    fn retain(&mut self, chunk: &Bytes) {
+        if chunk.len() > USAGE_FRAME_CAP {
+            return;
+        }
+        if self.head.is_none() {
+            self.head = Some(chunk.clone());
+            return;
+        }
+        self.tail.push(chunk.clone());
+        if self.tail.len() > USAGE_TAIL_FRAMES {
+            self.tail.remove(0);
+        }
+    }
+
+    /// Parses what was kept and records it — the only place this tee reads
+    /// frame content, on the last poll, after every byte has been relayed.
+    fn record(&self) {
+        let Some(usage) = usage_from_frames(self.dialect, self.head.as_ref(), &self.tail) else {
+            return;
+        };
+        let Some(ledger) = self.state.ledger.as_ref() else {
+            return;
+        };
+        if let Err(e) = ledger
+            .lock()
+            .expect("ledger lock")
+            .record_response(&self.key_id, &self.provider, &self.model, &usage, epoch_now(), &self.state.config.prices)
+        {
+            // Same contract as the non-streaming arm: a ledger write failure is
+            // an operator-visible gap, never the client's problem.
+            tracing::warn!(error = %e, "usage ledger write failed for a streamed reply");
+        }
+    }
+}
+
+/// Wraps a succeeded stream so its usage is recorded, or leaves it alone.
+///
+/// Only the arm that can carry usage is touched: a non-stream outcome is
+/// buffered and recorded by [`read_and_record`] before this runs, and a failed
+/// dispatch has no usage to count.
+fn account_stream(
+    outcome: &mut AttemptOutcome,
+    state: &AppState,
+    dialect: Dialect,
+    key_id: Option<&str>,
+    model: &str,
+) {
+    let AttemptOutcome::Succeeded { provider, upstream, .. } = outcome else {
+        return;
+    };
+    if state.ledger.is_none() {
+        return;
+    }
+    let inner = std::mem::replace(&mut upstream.stream, Box::pin(futures::stream::empty()));
+    upstream.stream = Box::pin(UsageTee {
+        inner,
+        head: None,
+        tail: Vec::with_capacity(USAGE_TAIL_FRAMES),
+        state: state.clone(),
+        key_id: key_id.unwrap_or("anonymous").to_owned(),
+        provider: provider.as_str().to_owned(),
+        model: model.to_owned(),
+        dialect,
+    });
+}
+
+/// Reads the usage value out of what a stream retained, per dialect.
+///
+/// Every branch works on whole `data:` lines and whole NDJSON lines only; a
+/// line that fails to parse is dropped, which is the split-frame ceiling
+/// documented on [`UsageTee`].
+fn usage_from_frames(
+    dialect: Dialect,
+    head: Option<&Bytes>,
+    tail: &[Bytes],
+) -> Option<serde_json::Value> {
+    let data_frames = |chunk: &Bytes| {
+        chunk
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| line.strip_prefix(b"data: "))
+            .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+            .collect::<Vec<_>>()
+    };
+    match dialect {
+        Dialect::OpenAi => tail.iter().rev().find_map(|chunk| {
+            data_frames(chunk)
+                .into_iter()
+                .rev()
+                .find_map(|frame| frame.get("usage").filter(|usage| usage.is_object()).cloned())
+        }),
+        Dialect::Anthropic => {
+            // Input rides in the very first frame (`message_start`), output in
+            // the last (`message_delta`) — both are kept, so the compose is
+            // one lookup each.
+            let input = head
+                .and_then(|chunk| {
+                    data_frames(chunk).into_iter().find(|frame| frame.get("type").and_then(serde_json::Value::as_str) == Some("message_start"))
+                })
+                .and_then(|frame| frame.pointer("/message/usage").cloned());
+            let output = tail.iter().rev().find_map(|chunk| {
+                data_frames(chunk)
+                    .into_iter()
+                    .rev()
+                    .find(|frame| frame.get("type").and_then(serde_json::Value::as_str) == Some("message_delta"))
+            })
+            .and_then(|frame| frame.get("usage").cloned());
+            match (input, output) {
+                (Some(input), Some(output)) => Some(serde_json::json!({
+                    "input_tokens": input.get("input_tokens").cloned().unwrap_or(serde_json::Value::Null),
+                    "cache_read_input_tokens": input.get("cache_read_input_tokens").cloned().unwrap_or(serde_json::Value::Null),
+                    "cache_creation_input_tokens": input.get("cache_creation_input_tokens").cloned().unwrap_or(serde_json::Value::Null),
+                    "output_tokens": output.get("output_tokens").cloned().unwrap_or(serde_json::Value::Null),
+                })),
+                (Some(input), None) if input.get("input_tokens").is_some() => Some(input),
+                _ => None,
+            }
+        }
+        Dialect::Responses => tail.iter().rev().find_map(|chunk| {
+            data_frames(chunk)
+                .into_iter()
+                .rev()
+                .find(|frame| frame.get("type").and_then(serde_json::Value::as_str) == Some("response.completed"))
+                .and_then(|frame| frame.pointer("/response/usage").cloned())
+        }),
+        Dialect::Ollama => tail.iter().rev().find_map(|chunk| {
+            chunk
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+                .rev()
+                .find(|frame| frame.get("done").and_then(serde_json::Value::as_bool) == Some(true))
+        }),
+    }
 }
 
 /// What the cache and compression stages decided, for the response to carry.
@@ -1955,9 +2169,10 @@ mod tests {
         CACHE_HEADER, COMPRESSION_ECHO, CacheControl, Dialect, FALLBACK_ATTEMPTS_HEADER,
         Keepalive, LATENCY_MS_HEADER, MODEL_HEADER, PROVIDER_HEADER, RESPONSE_COST_HEADER,
         SAVINGS_TOKENS_HEADER, Stages, TOKENS_IN_HEADER, TOKENS_OUT_HEADER,
-        TOKENS_PER_SECOND_HEADER, VERSION_HEADER, accept_forces_stream, build_chain, card_json,
-        declares_stream, decorate, error, error_because, kind_for, model, models_head, not_found,
-        outcome_label, require_json, terminator_seen, unknown_model,
+        TOKENS_PER_SECOND_HEADER, USAGE_FRAME_CAP, VERSION_HEADER, UsageTee, accept_forces_stream,
+        build_chain, card_json, declares_stream, decorate, error, error_because, kind_for, model,
+        models_head, not_found, outcome_label, require_json, terminator_seen, unknown_model,
+        usage_from_frames,
     };
     use crate::app::{AppState, Components};
     use crate::config::{ComboTarget, ServerConfig};
@@ -2763,6 +2978,293 @@ mod tests {
         .await;
         assert_eq!(frames.len(), 2, "a terminated stream gained a frame: {frames:?}");
         assert!(frames[1].contains("[DONE]"), "the terminator was not relayed: {frames:?}");
+    }
+
+    /// A chat POST to any dialect's own path — the same shape as [`chat`] with
+    /// the route swapped.
+    fn post_to(path: &str, body: &str) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body.to_owned()))
+            .expect("request builds")
+    }
+
+    /// The single usage row a drained ledger holds, or none.
+    ///
+    /// Every stream test here records at most one reply, so "the report" is the
+    /// clearest way to say "exactly the row this test claims and no more".
+    fn only_row(ledger: &Mutex<ar_tokens::Ledger>) -> Option<ar_tokens::LedgerRow> {
+        let report = ledger.lock().expect("ledger lock").report(10).expect("report");
+        let mut rows = report.rows;
+        (rows.len() == 1).then(|| rows.remove(0))
+    }
+
+    #[tokio::test]
+    async fn a_streamed_reply_records_its_usage_when_the_stream_completes() {
+        // The half of the wave D split this closes: frames relay untouched —
+        // the byte identity below is asserted, not assumed — and the usage the
+        // final frame carried lands in the ledger under the same accounting
+        // name the non-streaming arm uses.
+        let ledger = Arc::new(Mutex::new(
+            ar_tokens::Ledger::open_in_memory().expect("in-memory ledger"),
+        ));
+        let chunks = [
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}\n\n",
+            "data: [DONE]\n\n",
+        ];
+        let exec = Arc::new(CannedExec(chunks.to_vec()));
+        let router = crate::app::app(routed_with_ledger(exec, Arc::clone(&ledger)));
+        let resp = drive(
+            &router,
+            chat(
+                r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ),
+        )
+        .await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("stream drains");
+        assert_eq!(
+            body.as_ref(),
+            chunks.concat().as_bytes(),
+            "the tee must relay the upstream's exact bytes"
+        );
+        let row = only_row(&ledger).expect("the streamed usage was recorded");
+        // The row stores the sum; the prompt/completion split is pinned by the
+        // `usage_from_frames` unit tests below.
+        assert_eq!(row.total_tokens, 18);
+        assert_eq!(row.key_id, "anonymous");
+        assert_eq!(row.provider, "p");
+        assert_eq!(row.model, "m");
+    }
+
+    #[tokio::test]
+    async fn a_stream_without_a_usage_frame_records_nothing() {
+        // An OpenAI stream that did not opt into `include_usage` carries no
+        // counts in-band; the honest entry is none, not an estimate.
+        let ledger = Arc::new(Mutex::new(
+            ar_tokens::Ledger::open_in_memory().expect("in-memory ledger"),
+        ));
+        let exec = Arc::new(CannedExec(vec![
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        ]));
+        let router = crate::app::app(routed_with_ledger(exec, Arc::clone(&ledger)));
+        let resp = drive(
+            &router,
+            chat(
+                r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ),
+        )
+        .await;
+        drain_body(resp).await;
+        let report = ledger.lock().expect("ledger lock").report(10).expect("report");
+        assert!(report.rows.is_empty(), "a usage-free stream recorded {report:?}");
+    }
+
+    #[tokio::test]
+    async fn an_anthropic_stream_composes_usage_from_its_first_and_last_frames() {
+        // Anthropic splits its counts: input in `message_start`, output in the
+        // final `message_delta` — the tee keeps exactly those two frames.
+        let ledger = Arc::new(Mutex::new(
+            ar_tokens::Ledger::open_in_memory().expect("in-memory ledger"),
+        ));
+        let exec = Arc::new(CannedExec(vec![
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":21}}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":5}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ]));
+        let router = crate::app::app(routed_with_ledger(exec, Arc::clone(&ledger)));
+        let resp = drive(
+            &router,
+            post_to(
+                "/v1/messages",
+                r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+            ),
+        )
+        .await;
+        drain_body(resp).await;
+        let row = only_row(&ledger).expect("the composed usage was recorded");
+        assert_eq!(row.total_tokens, 26);
+    }
+
+    #[tokio::test]
+    async fn a_responses_stream_records_the_completed_events_usage() {
+        // The Responses dialect carries the whole response object — usage
+        // included — in the `response.completed` frame, which is the tail the
+        // tee keeps.
+        let ledger = Arc::new(Mutex::new(
+            ar_tokens::Ledger::open_in_memory().expect("in-memory ledger"),
+        ));
+        let exec = Arc::new(CannedExec(vec![
+            "data: {\"type\":\"response.in_progress\",\"sequence_number\":1}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
+        ]));
+        let router = crate::app::app(routed_with_ledger(exec, Arc::clone(&ledger)));
+        let resp = drive(
+            &router,
+            post_to("/v1/responses", "{\"model\":\"m\",\"input\":\"hi\",\"stream\":true}"),
+        )
+        .await;
+        drain_body(resp).await;
+        let row = only_row(&ledger).expect("the completed response's usage was recorded");
+        assert_eq!(row.total_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn an_ollama_stream_records_the_final_counts() {
+        // Ollama's NDJSON stream ends with one `done:true` line that carries
+        // both counts at its root — the normalizer reads that spelling since
+        // this same wave fixed it.
+        let ledger = Arc::new(Mutex::new(
+            ar_tokens::Ledger::open_in_memory().expect("in-memory ledger"),
+        ));
+        let exec = Arc::new(CannedExec(vec![
+            "{\"model\":\"m\",\"response\":\"hi\",\"done\":false}\n",
+            "{\"model\":\"m\",\"done\":true,\"prompt_eval_count\":9,\"eval_count\":4}\n",
+        ]));
+        let router = crate::app::app(routed_with_ledger(exec, Arc::clone(&ledger)));
+        let resp = drive(
+            &router,
+            post_to(
+                "/api/chat",
+                r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+            ),
+        )
+        .await;
+        drain_body(resp).await;
+        let row = only_row(&ledger).expect("the final counts were recorded");
+        assert_eq!(row.total_tokens, 13);
+    }
+
+    #[tokio::test]
+    async fn an_ollama_non_stream_reply_counts_its_root_fields() {
+        // The wave D bug this wave found while building it: the server passed
+        // Ollama's reply root to a normalizer that could not read it, so every
+        // non-streaming Ollama reply counted as zero in headers and ledger.
+        let ledger = Arc::new(Mutex::new(
+            ar_tokens::Ledger::open_in_memory().expect("in-memory ledger"),
+        ));
+        let reply = "{\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"content\":\"hi\"},\"prompt_eval_count\":9,\"eval_count\":4,\"done\":true}";
+        let exec = Arc::new(CannedExec(vec![reply]));
+        let router = crate::app::app(routed_with_ledger(exec, Arc::clone(&ledger)));
+        let resp = drive(
+            &router,
+            post_to(
+                "/api/chat",
+                "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
+            ),
+        )
+        .await;
+        assert_eq!(
+            resp.headers().get(TOKENS_IN_HEADER).and_then(|v| v.to_str().ok()),
+            Some("9"),
+            "the prompt count rides the header"
+        );
+        assert_eq!(
+            resp.headers().get(TOKENS_OUT_HEADER).and_then(|v| v.to_str().ok()),
+            Some("4"),
+        );
+        drain_body(resp).await;
+        let row = only_row(&ledger).expect("the reply was recorded");
+        assert_eq!(row.total_tokens, 13);
+    }
+
+    #[test]
+    fn the_frame_parser_reads_each_dialects_usage_shape() {
+        // The ledger row stores only the sum, so the split is pinned here, at
+        // the parser, where prompt and completion are still separate numbers.
+        let usage = |value: serde_json::Value| {
+            ar_tokens::NormalizedUsage::from_usage(&value)
+        };
+
+        // OpenAI: usage rides in the last data frame that carries one.
+        let tail = [
+            Bytes::from_static(
+                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}\n\n",
+            ),
+            Bytes::from_static(b"data: [DONE]\n\n"),
+        ];
+        let got = usage_from_frames(Dialect::OpenAi, None, &tail).expect("openai usage frame");
+        assert_eq!(usage(got), ar_tokens::NormalizedUsage::new(11, 7));
+
+        // Anthropic: input in the first frame, output in the last.
+        let head = Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":21}}}\n\n",
+        );
+        let tail = [
+            Bytes::from_static(
+                b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":5}}\n\n",
+            ),
+            Bytes::from_static(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
+        ];
+        let got = usage_from_frames(Dialect::Anthropic, Some(&head), &tail).expect("anthropic compose");
+        assert_eq!(usage(got), ar_tokens::NormalizedUsage::new(21, 5));
+
+        // Responses: the completed event carries the response object with
+        // its usage inside.
+        let tail = [
+            Bytes::from_static(
+                b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
+            ),
+        ];
+        let got = usage_from_frames(Dialect::Responses, None, &tail).expect("responses completed");
+        assert_eq!(usage(got), ar_tokens::NormalizedUsage::new(3, 2));
+
+        // Ollama: the final `done:true` NDJSON line carries both counts at
+        // its root.
+        let tail = [
+            Bytes::from_static(
+                b"{\"model\":\"m\",\"done\":true,\"prompt_eval_count\":9,\"eval_count\":4}\n",
+            ),
+        ];
+        let got = usage_from_frames(Dialect::Ollama, None, &tail).expect("ollama final line");
+        assert_eq!(usage(got), ar_tokens::NormalizedUsage::new(9, 4));
+    }
+
+    #[test]
+    fn the_frame_parser_stays_silent_when_no_usage_was_seen() {
+        // Every dialect's "no counts arrived" answer is the same: nothing,
+        // so the tee records nothing rather than a zero row that would read
+        // as a free request.
+        let frames = [
+            Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"),
+            Bytes::from_static(b"data: [DONE]\n\n"),
+        ];
+        assert!(usage_from_frames(Dialect::OpenAi, None, &frames).is_none());
+    }
+
+    #[test]
+    fn a_frame_over_the_cap_is_not_kept_for_accounting() {
+        // The cap is what keeps the tee's retention bounded against an
+        // upstream that ships its whole reply in one write: a frame that
+        // big is payload, not bookkeeping, and the tee must drop it rather
+        // than hold it.
+        let huge = Bytes::from(vec![b'x'; USAGE_FRAME_CAP + 1]);
+        let state = routed_with_ledger(
+            Arc::new(CannedExec(vec![])),
+            Arc::new(Mutex::new(
+                ar_tokens::Ledger::open_in_memory().expect("in-memory ledger"),
+            )),
+        );
+        let mut tee = UsageTee {
+            inner: Box::pin(futures::stream::iter([Bytes::from_static(b"data: [DONE]\n\n")])),
+            head: None,
+            tail: Vec::new(),
+            state,
+            key_id: "anonymous".to_owned(),
+            provider: "p".to_owned(),
+            model: "m".to_owned(),
+            dialect: Dialect::OpenAi,
+        };
+        tee.retain(&huge);
+        assert!(tee.head.is_none(), "an over-cap frame was kept");
     }
 
     /// An upstream that never sends a byte, for the idle-path tests.
