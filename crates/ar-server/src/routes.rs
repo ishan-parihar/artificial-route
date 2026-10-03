@@ -445,16 +445,15 @@ async fn handle_chat(
     );
     let mut savings_tokens = 0;
     if let Some(rewritten) = compress_body(&canonical.body, &compression) {
-        // `Stats` estimates from character counts, not BPE: a savings *figure* on
-        // the header is not a billing figure, and paying two tiktoken passes per
-        // request for one would buy precision nothing here bills against.
-        savings_tokens = ar_compress::Stats::between(
-            &String::from_utf8_lossy(&canonical.body),
-            &String::from_utf8_lossy(&rewritten),
-        )
-        .saved_tokens
-        .try_into()
-        .unwrap_or(u32::MAX);
+        // Counted, not estimated: the reference's `X-OmniRoute-Savings-Tokens`
+        // is an exact BPE figure, so a client comparing the two gateways sees
+        // the same number for the same body. Both counts run on the rewrite
+        // branch only — a request compression did not touch pays nothing, and
+        // the character-count estimator that used to live here stays in `eval`,
+        // where a savings *figure* really is a fidelity metric rather than a
+        // counted promise.
+        savings_tokens = ar_tokens::count_text(&String::from_utf8_lossy(&canonical.body))
+            .saturating_sub(ar_tokens::count_text(&String::from_utf8_lossy(&rewritten)));
         canonical.body = Bytes::from(rewritten);
     }
 
@@ -2546,6 +2545,51 @@ mod tests {
         assert!(
             resp.headers().contains_key(VERSION_HEADER),
             "no version header on a streamed response"
+        );
+    }
+
+    #[tokio::test]
+    async fn savings_tokens_count_exactly_what_compression_removed() {
+        // The savings header is a counted promise: the exact BPE count of the
+        // text compression removed, not a character-based estimate. The
+        // guard proves caveman actually rewrote this content — without it,
+        // `0 == 0` would pass on a body compression never touched.
+        let long = "Please summarize the following text for me. ".repeat(60);
+        let body = format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":{}}}]}}"#,
+            serde_json::to_string(&long).expect("message serializes"),
+        );
+        let recorder = Arc::new(Mutex::new(Vec::new()));
+        let exec = Arc::new(RecordingExec(Arc::clone(&recorder)));
+        let router = crate::app::app(routed_under(exec));
+        let resp = drive(
+            &router,
+            chat(&body, &[("x-ar-compression", "engine:caveman")]),
+        )
+        .await;
+        let forwarded = recorder
+            .lock()
+            .expect("recorder lock")
+            .pop()
+            .expect("the request reached dispatch");
+        let forwarded_json = serde_json::from_slice::<serde_json::Value>(&forwarded)
+            .expect("the forwarded body is JSON");
+        let after = forwarded_json["messages"][0]["content"]
+            .as_str()
+            .expect("the canonical content is a string");
+        assert_ne!(after, long, "caveman did not rewrite the fixture content");
+        let reported = resp
+            .headers()
+            .get(SAVINGS_TOKENS_HEADER)
+            .expect("savings ride the response")
+            .to_str()
+            .expect("ASCII")
+            .parse::<u32>()
+            .expect("the header is an integer");
+        assert_eq!(
+            reported,
+            ar_tokens::count_text(&long) - ar_tokens::count_text(after),
+            "the header must equal count(before) - count(after)"
         );
     }
 
