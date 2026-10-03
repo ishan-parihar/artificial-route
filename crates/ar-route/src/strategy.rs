@@ -310,6 +310,15 @@ pub enum Strategy {
     QuotaWeighted,
     /// DRR order by normalised weight, then power-of-two over live in-flight.
     QuotaShareFair,
+    /// Spends the quota closest to being lost: highest usable fraction per hour
+    /// until its window rolls, so a full window closing soon outranks an equally
+    /// full one that holds for days.
+    ///
+    /// **Placement divergence** from the reference, which ranks a provider's
+    /// multiple OAuth *connections* inside credential selection; this build is
+    /// one credential per provider, so the strategy ranks combo targets
+    /// instead. See `docs/audit-notes.md`.
+    ExpiryFirst,
 
     // ---- context-shaped (promptCacheAffinity / sortTargetsByContextSize) ----
     /// Pure prefix pin: the HRW leader for this conversation.
@@ -370,9 +379,7 @@ impl Strategy {
             "fusion" => Self::Fusion,
             "pipeline" => Self::Pipeline,
             other if other.starts_with("auto") => Self::Deferred("auto"),
-            // Account-scoped upstream names, not yet carried. Naming them beats
-            // filing them as typos: the 501 then says which strategy is missing.
-            "expiry-first" => Self::Deferred("expiry-first"),
+            "expiry-first" => Self::ExpiryFirst,
             _ => Self::Deferred("unknown"),
         }
     }
@@ -396,6 +403,7 @@ impl Strategy {
             Self::ResetAware => "reset-aware",
             Self::QuotaWeighted => "quota-weighted",
             Self::QuotaShareFair => "quota-share-fair",
+            Self::ExpiryFirst => "expiry-first",
             Self::ContextRelay => "context-relay",
             Self::ContextOptimized => "context-optimized",
             Self::CacheOptimized => "cache-optimized",
@@ -412,9 +420,9 @@ impl Strategy {
     #[must_use]
     pub fn all() -> &'static [Strategy] {
         use Strategy::{
-            CacheOptimized, ContextOptimized, ContextRelay, CostOptimized, Deferred, FillFirst,
-            Fusion, Headroom, Lkgp, LeastUsed, P2c, Pipeline, Priority, QuotaShareFair, QuotaWeighted,
-            Random, ResetAware, ResetWindow, RoundRobin, StrictRandom, Weighted,
+            CacheOptimized, ContextOptimized, ContextRelay, CostOptimized, Deferred, ExpiryFirst,
+            FillFirst, Fusion, Headroom, Lkgp, LeastUsed, P2c, Pipeline, Priority, QuotaShareFair,
+            QuotaWeighted, Random, ResetAware, ResetWindow, RoundRobin, StrictRandom, Weighted,
         };
         &[
             Priority,
@@ -432,6 +440,7 @@ impl Strategy {
             ResetAware,
             QuotaWeighted,
             QuotaShareFair,
+            ExpiryFirst,
             ContextRelay,
             ContextOptimized,
             CacheOptimized,
@@ -574,6 +583,7 @@ fn route(
         Strategy::ResetAware => by_reset_aware(candidates, first),
         Strategy::QuotaWeighted => by_quota_weighted(candidates, first),
         Strategy::QuotaShareFair => by_fair_share(candidates, first),
+        Strategy::ExpiryFirst => by_expiry_first(candidates, first),
 
         Strategy::ContextRelay => by_affinity(candidates, session, model, first),
         Strategy::ContextOptimized => by_context_window(candidates, first),
@@ -859,6 +869,84 @@ fn reset_aware_score(c: &Candidate) -> f64 {
     }
     remaining * (remaining / EXHAUSTION_GUARD).max(0.05)
 }
+
+/// The floor a window's free fraction must clear to count as spendable: at or
+/// below 1% remaining, burning more requests against it wastes the capacity it
+/// has left without meaningfully changing the balance.
+const EXPIRY_FLOOR: f64 = 0.01;
+/// The shortest deadline an urgency denominator may take, in hours. A window
+/// that has already rolled (`reset_at_secs` in the past) is maximally urgent,
+/// and dividing by a vanishing number of hours would otherwise make its
+/// urgency unbounded.
+const EXPIRY_MIN_HOURS: f64 = 0.25;
+
+/// `expiry-first`: how much usable quota must be spent PER HOUR to avoid losing
+/// it at the next reset.
+///
+/// The port of the reference's `scoreExpiryFirstQuota`; the scoring half
+/// survives verbatim, the placement does not (see the variant's doc).
+///
+/// * `usable` is the tightest window's free fraction, because nested windows
+///   all decrement together and no account can spend more than its most
+///   constrained window allows.
+/// * The deadline is the NEAREST reset: that is when the first tranche is lost.
+/// * Exhausted scores `-inf`; no reset time at all falls back to plain
+///   leftover, ranked below anything under a real deadline.
+///
+/// Deliberately not [`reset_aware_score`], which is a recovery signal favouring
+/// a nearly-empty pool about to refresh — "who will be useful soon", where this
+/// answers "whose quota is about to be thrown away".
+fn by_expiry_first<'a>(candidates: &'a [Candidate], first: &'a Candidate) -> &'a Candidate {
+    candidates
+        .iter()
+        .max_by(|a, b| {
+            expiry_first_score(a)
+                .total_cmp(&expiry_first_score(b))
+                .then_with(|| a.rank.cmp(&b.rank))
+        })
+        .unwrap_or(first)
+}
+
+/// The `expiry-first` score for one candidate: **higher is more urgent to spend.**
+///
+/// A window with no deadline ranks by leftover, and the clamping floors keep the
+/// whole function finite: `score == f64::INFINITY` is legal for `total_cmp` but
+/// two infinities would then fall through to `rank`, which is the ordering the
+/// reference's tieband produces anyway — pinned by
+/// `an_exhausted_window_never_outranks_a_spendable_one`.
+fn expiry_first_score(c: &Candidate) -> f64 {
+    let Some(quota) = c.quota else {
+        // No quota record: nothing known to waste, so nothing to spend first.
+        return 0.0;
+    };
+    let usable = quota.headroom();
+    if usable <= EXPIRY_FLOOR {
+        return f64::NEG_INFINITY;
+    }
+    match hours_until_reset(quota.reset_at_secs) {
+        None => usable,
+        Some(hours) => (usable / hours.max(EXPIRY_MIN_HOURS)).min(EXPIRY_MAX_SCORE),
+    }
+}
+
+/// Hours until `reset_at_secs`, or `None` when the window reported no reset.
+///
+/// A past instant yields [`EXPIRY_MIN_HOURS`]: the snapshot predates the reset
+/// it describes, and treating that as maximally urgent is the safe direction —
+/// a just-rolled window is full, and re-reading it costs nothing.
+fn hours_until_reset(reset_at_secs: u64) -> Option<f64> {
+    if reset_at_secs == 0 {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64());
+    Some(reset_at_secs as f64 - now)
+}
+
+/// The urgency ceiling, `1 / EXPIRY_MIN_HOURS`. Clamped rather than infinite so
+/// the ordering stays a total order over finite scores without a special case.
+const EXPIRY_MAX_SCORE: f64 = 4.0;
 
 /// `quota-weighted`: reset-aware score, divided by live load.
 ///
@@ -1548,8 +1636,9 @@ mod tests {
     use http::StatusCode;
 
     use super::{
-        Factors, MODEL_SCOPE, Strategy, TargetLoad, TargetLoads, affinity_key, dispatch_fusion,
-        dispatch_pipeline, pick, pick_filtered, pick_for_model, reset_aware_score, splitmix,
+        EXPIRY_MAX_SCORE, Factors, MODEL_SCOPE, Strategy, TargetLoad, TargetLoads, affinity_key,
+        dispatch_fusion, dispatch_pipeline, expiry_first_score, pick, pick_filtered,
+        pick_for_model, reset_aware_score, splitmix,
     };
     use crate::contract::{
         CanonicalRequest, Candidate, ExecError, Executor, ProviderId, QuotaWindow, Upstream,
@@ -1562,6 +1651,30 @@ mod tests {
             Candidate::new("groq".into(), "llama-3.3-70b").with_price(0.59).with_rank(1),
             Candidate::new("together".into(), "mixtral").with_price(0.20).with_rank(2),
         ]
+    }
+
+    /// Unix seconds now, for windows built relative to the current instant.
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs()
+    }
+
+    /// The provider id a strategy picks, by name.
+    fn winner(strategy: &str, candidates: &[Candidate]) -> ProviderId {
+        pick(
+            Strategy::parse(strategy),
+            None,
+            candidates,
+            &AtomicU64::new(0),
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{strategy} picked nothing: {e:?}"))
+    }
+
+    fn p(id: &str) -> ProviderId {
+        ProviderId::new(id)
     }
 
     /// One-arg pick for the strategies that read no session and no pins.
@@ -1789,26 +1902,106 @@ mod tests {
     }
 
     #[test]
-    fn names_expiry_first_in_the_501_instead_of_reporting_a_typo() {
-        // An account-scoped upstream strategy this build does not carry. Reported
-        // as itself, so the operator's config line is the thing the 501 quotes.
-        assert_eq!(
-            Strategy::parse("expiry-first"),
-            Strategy::Deferred("expiry-first")
-        );
-        let got = pick(
-            Strategy::parse("expiry-first"),
-            None,
-            &cands(),
-            &AtomicU64::new(0),
-            None,
+    fn expiry_first_spends_the_window_that_rolls_sooner() {
+        // The reference's own claim, made executable: two windows holding the
+        // same share, one closing today and one in three days — the one about to
+        // waste its quota must win, or the leftover is simply lost.
+        let now = now_secs();
+        let cands = [
+            Candidate::new(p("a"), "m")
+                .with_quota(QuotaWindow::new(100, 50, now + 6 * 3600)),
+            Candidate::new(p("b"), "m")
+                .with_quota(QuotaWindow::new(100, 50, now + 72 * 3600)),
+        ];
+        assert_eq!(winner("expiry-first", &cands).as_str(), "a");
+    }
+
+    #[test]
+    fn expiry_first_prefers_more_usable_quota_at_the_same_deadline() {
+        let now = now_secs();
+        let cands = [
+            Candidate::new(p("a"), "m")
+                .with_quota(QuotaWindow::new(100, 90, now + 3600)),
+            Candidate::new(p("b"), "m")
+                .with_quota(QuotaWindow::new(100, 10, now + 3600)),
+        ];
+        assert_eq!(winner("expiry-first", &cands).as_str(), "b");
+    }
+
+    #[test]
+    fn an_exhausted_window_never_outranks_a_spendable_one() {
+        // The guard that keeps the urgency half finite: an exhausted pool has
+        // zero to spend, so no deadline can make it a better first choice. This
+        // also pins that the clamp keeps `total_cmp` a total order.
+        let now = now_secs();
+        let cands = [
+            Candidate::new(p("a"), "m")
+                .with_quota(QuotaWindow::new(100, 100, now + 60)),
+            Candidate::new(p("b"), "m")
+                .with_quota(QuotaWindow::new(100, 20, now + 3600 * 24 * 365)),
+        ];
+        assert_eq!(winner("expiry-first", &cands).as_str(), "b");
+        let ranked = [expiry_first_score(&cands[0]), expiry_first_score(&cands[1])];
+        assert!(
+            ranked[0] == f64::NEG_INFINITY,
+            "an exhausted window scores -inf by contract: {ranked:?}"
         );
         assert!(
-            matches!(
-                got,
-                Err(RouteError::DeferredStrategy(Strategy::Deferred("expiry-first")))
-            ),
-            "got {got:?}"
+            ranked[1].is_finite(),
+            "the urgency clamp must keep a long-deadline score finite: {ranked:?}"
+        );
+    }
+
+    #[test]
+    fn expiry_first_ranks_on_leftover_when_no_window_reports_a_reset() {
+        // No deadline means the urgency half is unknowable; leftover is the
+        // honest fallback rather than an invented deadline.
+        let cands = [
+            Candidate::new(p("a"), "m").with_quota(QuotaWindow::new(100, 80, 0)),
+            Candidate::new(p("b"), "m").with_quota(QuotaWindow::new(100, 20, 0)),
+        ];
+        assert_eq!(winner("expiry-first", &cands).as_str(), "b");
+    }
+
+    #[test]
+    fn expiry_first_spends_a_just_rolled_window_first() {
+        // A snapshot whose reset instant has passed describes a window that has
+        // just refreshed: it is full, and it is the most perishable quota in the
+        // pool. Bounded, not `inf` — see `expiry_first_score`.
+        let now = now_secs();
+        let cands = [
+            Candidate::new(p("a"), "m")
+                .with_quota(QuotaWindow::new(100, 50, now - 3600)),
+            Candidate::new(p("b"), "m")
+                .with_quota(QuotaWindow::new(100, 50, now + 30 * 3600)),
+        ];
+        assert_eq!(winner("expiry-first", &cands).as_str(), "a");
+        assert!(
+            expiry_first_score(&cands[0]) <= EXPIRY_MAX_SCORE,
+            "a past reset must clamp, not diverge"
+        );
+    }
+
+    #[test]
+    fn expiry_first_ignores_a_candidate_with_no_quota_record() {
+        // Nothing is known to be wasted there, so it never leads — but it is
+        // still routable when it is the only candidate.
+        let now = now_secs();
+        let cands = [
+            Candidate::new(p("a"), "m").with_quota(QuotaWindow::new(100, 50, now + 3600)),
+            Candidate::new(p("b"), "m"),
+        ];
+        assert_eq!(winner("expiry-first", &cands).as_str(), "a");
+        assert_eq!(
+            pick(
+                Strategy::parse("expiry-first"),
+                None,
+                &[Candidate::new(p("solo"), "m")],
+                &AtomicU64::new(0),
+                None,
+            )
+            .expect("a single unmonitored candidate still routes"),
+            p("solo")
         );
     }
 

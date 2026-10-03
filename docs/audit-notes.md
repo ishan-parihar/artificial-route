@@ -259,3 +259,18 @@ headers are ignored rather than approximated. A client sending them loses
 nothing it was promised: the two knobs tune a subsystem that does not exist
 here, and pretending to honor them (say, by treating a threshold as a
 bypass trigger) would make the header lie about what it moved.
+**(g) `expiry-first` ranks combo targets, not account connections.** The
+reference places this strategy inside per-provider *credential* selection:
+`expiryFirstAccountSelection.ts` ranks a provider's several OAuth connections by
+`scoreExpiryFirstQuota` so quota about to be lost gets spent. This build has one
+credential per provider id (`ProviderConfig` carries a single `key_ref`; the
+CLI's `auth` is token storage, not an account pool), so the connection-level
+home does not exist here. The scoring half is ported faithfully — usable
+fraction ÷ hours to the nearest reset, `1%` floor, `0.25h` deadline floor,
+leftover as the no-reset fallback, and a `4.0` clamp so the ordering stays a
+total order over finite scores — and it ranks **combo targets**. Every sibling
+account-fallback name (`cost-optimized`, `fill-first`, `strict-random`) is
+already carried at combo level, so the strategy surface is consistent; what is
+absent is multi-connection-per-provider ranking, which is a credential-model
+feature rather than a strategy. Multi-account support, when it comes, is where
+this belongs.
