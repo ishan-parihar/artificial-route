@@ -43,7 +43,7 @@ The OmniRoute figure is its full Next.js desktop/PWA server, not just its proxy 
 | upstream auth | apikey + OAuth dispatch (codex, cline, claude, gemini-cli, cursor) | apikey + 24-entry OAuth | 9 strategies, exchange-only |
 | key storage | encrypted local sqlite + `$VAR` fallback | encrypted DB | env/file/`ate-secret://` |
 | model refresh | snapshot + import | sync + overlays | catalog + refresh API |
-| routes | 13 (`chat`, `messages`, `responses`, `api/chat`, `/v1/completions` legacy alias, `embeddings`, `audio/transcriptions`, `images/generations`, `ocr`, `models`, `healthz`, `metrics`) | full gateway + UI | 22 data-plane |
+| routes | 14 (`chat`, `messages`, `responses`, `api/chat`, `/v1/completions` legacy alias, `embeddings`, `audio/transcriptions`, `audio/translations`, `images/generations`, `ocr`, `models`, `healthz`, `metrics`) | full gateway + UI | 22 data-plane |
 
 ## Artificial Route vs OmniRoute v16.3.1
 
@@ -53,7 +53,7 @@ Measured 2026-10-01, `ar` 0.1.1 against a live OmniRoute v16.3.1, both on loopba
 |---|---|---|
 | shared routes | `POST /v1/chat/completions`, `/v1/messages`, `/v1/responses`, `GET /v1/models`, `GET /healthz` | the same five |
 | `GET /healthz` | `ok` 200 in **0.4 ms** | `ok` 200 in **4.4 ms** |
-| routes beyond those five | `GET /metrics` (Prometheus), `POST /api/chat` (Ollama), `POST /v1/completions` (legacy alias), the media family: `POST /v1/embeddings` (typed reply re-render), `/v1/audio/transcriptions` (multipart verbatim, `?model=` routing), `/v1/images/generations`, `/v1/ocr` | **~723 more**: dashboard, rerank, search, files, batches, WebSocket, tokenized aliases, A2A |
+| routes beyond those five | `GET /metrics` (Prometheus), `POST /api/chat` (Ollama), `POST /v1/completions` (legacy alias), the media family: `POST /v1/embeddings` (typed reply re-render), `/v1/audio/transcriptions` + `/v1/audio/translations` (multipart verbatim, `?model=` routing), `/v1/images/generations`, `/v1/ocr` | **~723 more**: dashboard, rerank, search, files, batches, WebSocket, tokenized aliases, A2A |
 | unknown model | 400, names the routable combos | 400, suggests a `provider/` prefix |
 | malformed JSON | 400 | 400 |
 | unknown path | 404, JSON envelope carrying the path and the routable list | 404, JSON envelope carrying the path |

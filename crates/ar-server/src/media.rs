@@ -82,10 +82,35 @@ pub async fn transcriptions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    // `unwrap_or_default` rather than a rejection: a malformed
-    // percent-encoding is not a reason to refuse a request whose only route
-    // input is this parameter, and the missing-model case has its own refusal.
-    if let Err(reason) = authorize(&state, &headers, uri.path()) {
+    audio_route(&state, &headers, uri.path(), "transcriptions", "/audio/transcriptions", query, body)
+        .await
+}
+
+/// `POST /v1/audio/translations` — multipart audio in, English text out,
+/// verbatim. Route and forwarding are [`transcriptions`]'s, one endpoint over.
+pub async fn translations(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    audio_route(&state, &headers, uri.path(), "translations", "/audio/translations", query, body)
+        .await
+}
+
+/// The shared body of the two multipart audio routes: auth, `?model=` route
+/// input, verbatim forward.
+async fn audio_route(
+    state: &AppState,
+    headers: &HeaderMap,
+    path: &str,
+    route_name: &str,
+    endpoint: &'static str,
+    query: HashMap<String, String>,
+    body: Bytes,
+) -> Response {
+    if let Err(reason) = authorize(state, headers, path) {
         return *reason;
     }
     // A malformed percent-encoding is no reason to refuse a request whose only
@@ -96,8 +121,10 @@ pub async fn transcriptions(
             StatusCode::BAD_REQUEST,
             "invalid_request",
             "missing_model",
-            "transcriptions route by the `?model=` query parameter in this build; \
-             the multipart form's model field is not parsed",
+            &format!(
+                "{route_name} route by the `?model=` query parameter in this build; \
+                 the multipart form's model field is not parsed"
+            ),
         );
     }
     // No `require_json`: the body is the client's own multipart payload, and
@@ -106,7 +133,7 @@ pub async fn transcriptions(
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream");
-    respond_media(&state, &headers, model, "/audio/transcriptions", content_type, body).await
+    respond_media(state, headers, model, endpoint, content_type, body).await
 }
 
 /// The shared body of the three JSON routes: auth, 415, model from the body.
@@ -482,6 +509,68 @@ mod tests {
         assert_eq!(
             recorded[0].0,
             "/audio/transcriptions",
+            "wrong endpoint: {:?}",
+            recorded[0]
+        );
+        assert_eq!(
+            recorded[0].2, b"--b\r\n\r\nfile-bytes",
+            "multipart bytes were not forwarded verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn translations_require_a_model_query_parameter() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let exec = Arc::new(MediaExec {
+            seen: Arc::clone(&seen),
+            reply: "{}",
+            status: StatusCode::OK,
+            error: false,
+        });
+        let router = crate::app::app(routed_under(exec));
+        let resp = drive(
+            &router,
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/audio/translations")
+                .header(header::CONTENT_TYPE, "multipart/form-data; boundary=b")
+                .body(axum::body::Body::from("--b\r\n\r\n"))
+                .expect("request builds"),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_of(resp).await;
+        assert_eq!(body["error"]["code"], "invalid_request");
+        assert!(seen.lock().expect("recorder").is_empty());
+    }
+
+    #[tokio::test]
+    async fn translations_forward_the_multipart_body_verbatim() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let exec = Arc::new(MediaExec {
+            seen: Arc::clone(&seen),
+            reply: r#"{"text":"bonjour"}"#,
+            status: StatusCode::OK,
+            error: false,
+        });
+        let router = crate::app::app(routed_under(exec));
+        let resp = drive(
+            &router,
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/audio/translations?model=m")
+                .header(header::CONTENT_TYPE, "multipart/form-data; boundary=b")
+                .body(axum::body::Body::from("--b\r\n\r\nfile-bytes"))
+                .expect("request builds"),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let recorded = seen.lock().expect("recorder");
+        assert_eq!(
+            recorded[0].0,
+            "/audio/translations",
             "wrong endpoint: {:?}",
             recorded[0]
         );

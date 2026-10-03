@@ -418,6 +418,10 @@ pub fn app(state: AppState) -> Router {
             axum::routing::post(media::transcriptions),
         )
         .route(
+            "/v1/audio/translations",
+            axum::routing::post(media::translations),
+        )
+        .route(
             "/v1/images/generations",
             axum::routing::post(media::image_generations),
         )

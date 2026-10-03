@@ -1918,7 +1918,8 @@ pub async fn not_found(req: Request) -> Response {
             "unknown_route",
             "no route matches this path; the routable paths are the four chat dialects, \
              /v1/completions (the legacy alias), /v1/embeddings, /v1/audio/transcriptions, \
-             /v1/images/generations, /v1/ocr, /v1/models, /healthz and /metrics",
+             /v1/audio/translations, /v1/images/generations, /v1/ocr, /v1/models, /healthz \
+             and /metrics",
         )
         .because("unknown_route")
         .at(&path),
