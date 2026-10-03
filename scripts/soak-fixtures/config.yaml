@@ -1,0 +1,35 @@
+# Soak config — the always-200 loopback stubs, not the compiled catalog.
+#
+# The CLI fixtures point at dummy keys and soak the failure path; a soak that
+# claims "RSS flat under real traffic" has to run the success path too, so
+# this config declares a `custom_providers` node aimed at
+# `scripts/serve_stub_upstreams.py` and a combo over it. Start the stub first:
+#
+#   python scripts/serve_stub_upstreams.py --ports 19001
+#   SOAK_DURATION=600 scripts/soak.sh
+#
+# Keys are literals, no dollar signs (the loader expands env refs in prose too).
+
+server:
+  host: 127.0.0.1
+  port: 20128
+
+keys:
+  stub: sk-soak-stub
+
+custom_providers:
+  - id: soak-stub
+    protocol: openai-compatible
+    base_url: http://127.0.0.1:19001
+    key_ref: stub
+
+combos:
+  - id: default
+    strategy: priority
+    targets:
+      - soak-stub/stub-model
+
+  - id: m
+    strategy: priority
+    targets:
+      - soak-stub/stub-model
