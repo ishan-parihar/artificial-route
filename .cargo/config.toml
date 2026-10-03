@@ -1,7 +1,8 @@
-# Build behaviour only. Deliberately no `[build] rustflags`: a rustflags entry here
-# would silently override the workspace lint table in `Cargo.toml` and break the
-# `--locked` clippy gate in docs/03.
-
-[net]
-retry = 2
-git-fetch-with-cli = true
+[env]
+# jemalloc's stock default opens 4 arenas per CPU — 96 arenas on a 24-core
+# host, which was the ~120MB idle VmRSS the 2026-10-03 closeout measured.
+# jemalloc-sys compiles this string in as the allocator's default conf (via
+# `--with-malloc-conf=`): two arenas with a 1s decay measured ~21MB idle on
+# the same host, inside the docs/00 <35MB budget with headroom. Runtime
+# override stays available through `_RJEM_MALLOC_CONF`.
+JEMALLOC_SYS_WITH_MALLOC_CONF = "narenas:2,dirty_decay_ms:1000,muzzy_decay_ms:1000"

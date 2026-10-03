@@ -1,6 +1,6 @@
 # Artificial Route
 
-**One OpenAI-compatible endpoint over 276 providers — a 16 MB static binary idling at ~120 MiB RSS, dominated by allocator arenas rather than request state (see the RAM re-measure in the head-to-head).**
+**One OpenAI-compatible endpoint over 276 providers — a 16 MB static binary idling at ~21 MiB RSS (allocator default tuned 2026-10-03: the ~120 MiB the closeout first measured was jemalloc's 4-arenas-per-CPU default, not request state).**
 
 [![release](https://img.shields.io/github/v/release/ishan-parihar/artificial-route)](https://github.com/ishan-parihar/artificial-route/releases) [![license](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE) [![musl](https://img.shields.io/badge/binary-static--musl-lightgrey)](https://github.com/ishan-parihar/artificial-route/releases) ![tests](https://img.shields.io/badge/tests-800%2B_passing-green)
 
@@ -58,7 +58,7 @@ Measured 2026-10-01, `ar` 0.1.1 against a live OmniRoute v16.3.1, both on loopba
 | malformed JSON | 400 | 400 |
 | unknown path | 404, JSON envelope carrying the path and the routable list | 404, JSON envelope carrying the path |
 | `/v1/*` auth | none, see below | API key required, 401 JSON envelope without one |
-| RSS | **~120MB** (re-measured 2026-10-03, `/proc/PID/status` VmRSS: ~110MB of it is anonymous allocator/runtime pages, ~10MB file-backed; the 2026-10-01 figure of ~14.6MB no longer reproduces on the binary the d24ea9a parity program produces) | **~823MB** (**~7x**) |
+| RSS | **~21.7MB** (2026-10-03 re-measure, `/proc/PID/status` VmRSS, with `narenas:2,dirty_decay_ms:1000,muzzy_decay_ms:1000` compiled in after the closeout traced the ~120MB untuned figure to jemalloc's 4-arenas-per-CPU default) | **~823MB** (**~38x**) |
 | cold boot | ~1s | not measured |
 | CLI verbs | 10: `serve`, `models`, `providers`, `combo`, `doctor`, `run`, `configure`, `auth`, `import`, plus `mcp` behind `--features mcp` | ~78 |
 | MCP tools | 12-tool catalog + `tool_search`, behind the default-off `mcp` feature | 110 tools + A2A |

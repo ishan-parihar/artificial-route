@@ -29,7 +29,7 @@ deferred table and `05-roadmap.md` gates.
 
 | State | Target RSS | Measured (2026-10-03) |
 |---|---|---|
-| idle, no traffic | <35MB | **~120MB** — exceeded, and not by request state: `/proc/PID/status` on the release binary reads ~110MB `RssAnon` (the `jemalloc` arenas the d24ea9a parity program's dependency set brought in) against ~10MB `RssFile`. The number was ~11MB on the v0.1.1 binary, so the budget row predates the growth; either tune the allocator (`narenas`, decay) or restate the budget — the wave A–O closeout added no resident per-request state beyond one sqlite handle. |
+| idle, no traffic | <35MB | **21.7MB** (2026-10-03, `/proc/PID/status` VmRSS with the compiled-in allocator conf — the un-tuned default measured ~120MB, and the ~110MB of anonymous pages was jemalloc's 4-arenas-per-CPU default, not request state; `.cargo/config.toml` pins `narenas:2,dirty_decay_ms:1000,muzzy_decay_ms:1000`, runtime override `_RJEM_MALLOC_CONF`) |
 | 1 streaming chat | +<3MB | unchanged — streams relay un-buffered |
 | 20 heavy `/v1/responses` concurrent | <400MB, no FATAL | not re-measured; wave D's one-buffer-per-non-stream-reply is bounded by the provider's reply size, typically KBs |
 | cache full 32MB | bounded, `quick_cache` sharded | unchanged |

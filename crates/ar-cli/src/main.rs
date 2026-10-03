@@ -42,6 +42,12 @@ const EXIT_USAGE: u8 = 2;
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
+// The allocator's own default conf lives in `.cargo/config.toml`
+// (`JEMALLOC_SYS_WITH_MALLOC_CONF`), which jemalloc-sys compiles in via
+// `--with-malloc-conf=`: jemalloc's stock default of 4 arenas per CPU was the
+// ~120MB idle RSS the closeout measured on this 24-core host; two arenas with
+// a 1s decay measure at ~21MB. Runtime override: `_RJEM_MALLOC_CONF`.
+
 fn main() -> ExitCode {
     // `try_init` rather than `init`: a library that already installed a
     // subscriber is not a reason to abort the CLI.
