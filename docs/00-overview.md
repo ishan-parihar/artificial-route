@@ -27,13 +27,13 @@ deferred table and `05-roadmap.md` gates.
 
 ## RAM budget
 
-| State | Target RSS |
-|---|---|
-| idle, no traffic | <35MB |
-| 1 streaming chat | +<3MB |
-| 20 heavy `/v1/responses` concurrent | <400MB, no FATAL |
-| cache full 32MB | bounded, `quick_cache` sharded |
-| `+mcp` feature on, idle | +<25MB (rmcp tree) |
+| State | Target RSS | Measured (2026-10-03) |
+|---|---|---|
+| idle, no traffic | <35MB | **~120MB** — exceeded, and not by request state: `/proc/PID/status` on the release binary reads ~110MB `RssAnon` (the `jemalloc` arenas the d24ea9a parity program's dependency set brought in) against ~10MB `RssFile`. The number was ~11MB on the v0.1.1 binary, so the budget row predates the growth; either tune the allocator (`narenas`, decay) or restate the budget — the wave A–O closeout added no resident per-request state beyond one sqlite handle. |
+| 1 streaming chat | +<3MB | unchanged — streams relay un-buffered |
+| 20 heavy `/v1/responses` concurrent | <400MB, no FATAL | not re-measured; wave D's one-buffer-per-non-stream-reply is bounded by the provider's reply size, typically KBs |
+| cache full 32MB | bounded, `quick_cache` sharded | unchanged |
+| `+mcp` feature on, idle | +<25MB (rmcp tree) | unchanged |
 
 Enforced by: `jemalloc` decay 5s, `Strng` interning, `BufList` zero-copy,
 `AssertSize::<4K>` on futures, bounded log channel 128k lines lossy.
