@@ -1673,6 +1673,13 @@ combos:
     #[test]
     fn carries_expiry_first_from_the_config_to_the_dispatcher() {
         let yaml = TWO_COMBO_YAML.replace("strategy: cost-optimized", "strategy: expiry-first");
+        // A silent no-op here leaves the combo cost-optimized, so the assert
+        // below would fail either way — but as a routing bug, not the fixture
+        // drift it actually is. Naming the drift keeps the failure honest.
+        assert_ne!(
+            yaml, TWO_COMBO_YAML,
+            "fixture no longer contains the strategy line being replaced"
+        );
         let cfg = parse(&yaml).expect("config parses");
         let server =
             ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
