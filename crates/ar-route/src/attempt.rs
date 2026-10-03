@@ -17,6 +17,7 @@
 
 use std::time::Duration;
 
+use bytes::Bytes;
 use http::StatusCode;
 
 use crate::contract::{CanonicalRequest, ExecError, Executor, ProviderId, Upstream};
@@ -71,6 +72,18 @@ pub enum AttemptOutcome {
         provider: ProviderId,
         /// How many providers were tried.
         tried: u16,
+        /// The last upstream's own error body, bounded by the failure cap.
+        ///
+        /// Carried so the response can name the provider's error code when
+        /// it is one this build passes through — the same projection the
+        /// reference performs on its way to the client envelope.
+        error_body: Bytes,
+        /// `Retry-After` the last upstream sent, when it sent a usable one.
+        ///
+        /// A 503-with-window that failed over still tells the client when to
+        /// come back; dropping it would be the router deciding the provider's
+        /// own answer was not worth relaying.
+        retry_after: Option<Duration>,
     },
     /// Terminal: the request itself is bad, or there was nothing to route to.
     /// Retrying the same body anywhere produces the same answer.
@@ -410,9 +423,11 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
     }
 
     let mut tried: u16 = 0;
-    // Last verdict: (status, provider, cooldown, was_rate_limit). Transport
-    // failures record 502 so the Failover arm never has to invent a status.
-    let mut last: Option<(u16, ProviderId, Duration, bool)> = None;
+    // Last verdict: status, provider, cooldown, was_rate_limit, the
+    // upstream's own error body, and the window it asked for. Transport
+    // failures record 502 so the Failover arm never has to invent a status;
+    // they carry no body and no window.
+    let mut last: Option<(u16, ProviderId, Duration, bool, Bytes, Option<Duration>)> = None;
     // Only *throttled* attempts contribute to the aggregate window. A transport
     // failure gets our own 3s guess, and min()-ing that into the client's
     // deadline would advertise "come back in 3 seconds" when a provider has
@@ -487,7 +502,14 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
                         cooldown_ms = cooldown.as_millis() as u64,
                         "attempt failed over"
                     );
-                    (status, provider.clone(), cooldown, throttled)
+                    (
+                        status,
+                        provider.clone(),
+                        cooldown,
+                        throttled,
+                        upstream.error_body.clone(),
+                        upstream.retry_after,
+                    )
                 }
             },
             Err(ExecError(msg)) => {
@@ -503,7 +525,7 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
                     None,
                 );
                 tracing::warn!(provider = %provider, error = %msg, "transport failure, failing over");
-                (502, provider.clone(), cooldown, false)
+                (502, provider.clone(), cooldown, false, Bytes::new(), None)
             }
         };
         if verdict.3 {
@@ -528,12 +550,12 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
 /// backoff: a dead socket's 3s guess is our own, and advertising it would invite
 /// the client back before the one provider that actually said "not before 30s".
 fn terminate(
-    last: Option<(u16, ProviderId, Duration, bool)>,
+    last: Option<(u16, ProviderId, Duration, bool, Bytes, Option<Duration>)>,
     throttled_by: Option<ProviderId>,
     earliest: Option<Duration>,
     tried: u16,
 ) -> AttemptOutcome {
-    let Some((status, provider, cooldown, _)) = last else {
+    let Some((status, provider, cooldown, _, error_body, retry_after)) = last else {
         // Nothing was tried: every key was already cooling.
         return AttemptOutcome::Abort(AbortReport {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -548,7 +570,13 @@ fn terminate(
             .max(Duration::from_millis(1));
         return AttemptOutcome::Retry { after, provider: throttled, tried };
     }
-    AttemptOutcome::Failover { status, provider, tried }
+    AttemptOutcome::Failover {
+        status,
+        provider,
+        tried,
+        error_body,
+        retry_after,
+    }
 }
 
 /// UTF-8 body of a failed upstream, lossily decoded and capped.
@@ -663,6 +691,32 @@ use crate::resilience::Resilience;
     const MODEL_GONE: Verdict = Verdict::Status(404, "this model is no longer available");
     const GEMINI_RPM: Verdict =
         Verdict::Status(429, "Resource has been exhausted (e.g. check quota).");
+
+    #[test]
+    fn a_failover_carries_the_last_upstreams_body_and_window() {
+        // The response layer projects the provider's own code out of the
+        // error body and relays the window the provider asked for — both die
+        // at the loop's outcome if the loop never carried them. (Wave J1.)
+        let r = Resilience::new();
+        let exec = Scripted::new(vec![Verdict::Status(
+            503,
+            r#"{"error":{"code":"insufficient_quota","message":"over"}}"#,
+        ), Verdict::Status(503, r#"{"code":"upstream_died"}"#)]);
+        let got = block(attempt_loop(&req(), &chain(&["p1", "p2"]), &exec, &r));
+        let Ok(AttemptOutcome::Failover { error_body, retry_after, .. }) = got else {
+            panic!("expected failover, got {got:?}");
+        };
+        assert_eq!(retry_after, None, "the 503 verdict asked for no window");
+        assert!(
+            String::from_utf8_lossy(&error_body).contains("upstream_died"),
+            "the last upstream's body did not reach the outcome: {}...",
+            String::from_utf8_lossy(&error_body)
+        );
+        assert!(
+            !String::from_utf8_lossy(&error_body).contains("insufficient_quota"),
+            "the FIRST upstream's body must not survive the failover"
+        );
+    }
 
     fn req() -> CanonicalRequest {
         CanonicalRequest::new("m", Bytes::from_static(b"{}"))

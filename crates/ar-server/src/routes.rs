@@ -1294,12 +1294,28 @@ fn decorate(
                     .because("chain_throttled"),
                 ))
         }
-        AttemptOutcome::Failover { status, provider, .. } => {
+        AttemptOutcome::Failover { status, provider, error_body, retry_after, .. } => {
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+            // The last provider's own identifier, when it is one this build
+            // passes through. The reference projects upstream codes through
+            // an allowlist (`open-sse/utils/error.ts:43-352`, ~310 entries)
+            // before they reach the client, and collapses anything unknown
+            // onto the status-derived default — the projection below is that
+            // behaviour with the six identifiers a client of this build can
+            // actually branch on. Grow the list when a real client needs a new
+            // one; never by echoing whatever a provider sent.
+            let code = upstream_code(&error_body).unwrap_or("upstream_unavailable");
             let message = format!("all providers failed; last was {provider}");
+            if let Some(retry_after) = retry_after {
+                // A window the provider stated is information the client can
+                // use; keeping it costs the same header the retry arm already
+                // stamps. Sub-second rounds up, as there.
+                builder = builder
+                    .header(header::RETRY_AFTER, retry_after.as_secs().max(1).to_string());
+            }
             builder.status(status).body(json_body(ErrorSpec::of(
                 status,
-                "upstream_unavailable",
+                code,
                 &message,
             )))
         }
@@ -1733,6 +1749,42 @@ fn route_error(e: RouteError) -> Response {
     error(e.status(), &e.to_string())
 }
 
+/// Upstream error codes this build passes through to the client envelope.
+///
+/// Closed on purpose, and short on the same purpose: the reference does the
+/// same thing at ~310 entries (`SAFE_PUBLIC_ERROR_IDENTIFIERS`,
+/// `open-sse/utils/error.ts:43-352`) so a client may branch on `code` without
+/// a provider inventing a value it was never promised to parse. Anything not
+/// on the list collapses to the router's own `upstream_unavailable`, exactly
+/// as an unknown identifier collapses to the reference's status-derived
+/// default. Grow only when a real client branches on a new one.
+const PASSTHROUGH_ERROR_CODES: &[&str] = &[
+    "insufficient_quota",
+    "rate_limit_exceeded",
+    "model_not_found",
+    "context_length_exceeded",
+    "invalid_api_key",
+    "billing_hard_limit_reached",
+];
+
+/// The upstream's error code, when it is one this build passes through.
+///
+/// Extraction order mirrors the reference (`error.ts:867-868`):
+/// `error.code` first, then a top-level `code`; a non-JSON body names nothing,
+/// which is the collapse case and not an error.
+fn upstream_code(body: &[u8]) -> Option<&'static str> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let code = value
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .or_else(|| value.get("code"))
+        .and_then(serde_json::Value::as_str)?;
+    PASSTHROUGH_ERROR_CODES
+        .iter()
+        .copied()
+        .find(|known| *known == code)
+}
+
 /// `GET /healthz` — liveness only.
 ///
 /// Readiness is P1: there is nothing to be un-ready about until a provider chain
@@ -2004,6 +2056,38 @@ mod tests {
             vec![ComboTarget::new(ProviderId::new("p"), "m")],
         )];
         config
+    }
+
+    /// Refuses every dispatch with the canned upstream verdict — the
+    /// projection tests' provider-surfaces-errors fixture.
+    struct FailingExec(u16, &'static str);
+
+    impl ArExec for FailingExec {
+        fn post_chat<'a>(
+            &'a self,
+            _provider: &'a ProviderId,
+            _canonical: &'a CanonicalRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<Upstream, ExecError>> + Send + 'a>> {
+            let status = self.0;
+            let body = self.1;
+            Box::pin(async move {
+                Ok(Upstream::failure(
+                    StatusCode::from_u16(status).expect("a status the fixture picked"),
+                    Bytes::from_static(body.as_bytes()),
+                    None,
+                ))
+            })
+        }
+
+        fn post_media<'a>(
+            &'a self,
+            _provider: &'a ProviderId,
+            _endpoint: &'a str,
+            _content_type: &'a str,
+            _body: &'a [u8],
+        ) -> Pin<Box<dyn Future<Output = Result<MediaReply, ExecError>> + Send + 'a>> {
+            Box::pin(async move { Err(ExecError("no media dispatch in this fixture".to_owned())) })
+        }
     }
 
     /// Records the canonical body of every dispatch, then answers with an
@@ -2964,6 +3048,47 @@ mod tests {
     /// usage block the accounting path can read.
     const CANNED: &str =
         r#"{"id":"r1","choices":[{"message":{"role":"assistant","content":"hi"}}],"usage":{"prompt_tokens":3,"completion_tokens":2}}"#;
+
+    #[tokio::test]
+    async fn a_failover_the_client_sees_names_the_upstreams_code() {
+        // Wave J1: the envelope is unchanged — same fields, same shape — but
+        // the code is the provider's own, because the reference projects it
+        // through an allowlist the same way rather than swallow it as
+        // `upstream_unavailable`. `upstream_details`-style body passthrough is
+        // stayed out of: the message stays router-authored, the code is the
+        // one identifier a client may branch on, and the body keeps its
+        // provider-account identifiers out of client reach.
+        let exec = Arc::new(FailingExec(
+            503,
+            r#"{"error":{"code":"insufficient_quota","message":"over"}}"#,
+        ));
+        let router = crate::app::app(routed_under(exec));
+        let resp = drive(
+            &router,
+            chat(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#, &[]),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_of(resp).await;
+        assert_eq!(body["error"]["code"], "insufficient_quota");
+        assert_eq!(body["error"]["type"], "server_error");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_upstream_code_collapses_to_the_router_default() {
+        // The other half of the projection: a provider-invented identifier
+        // reaches the client only after collapsing to the status-derived
+        // default, exactly as the reference's allowlist behaves for unknowns.
+        let exec = Arc::new(FailingExec(503, r#"{"error":{"code":"weird_error"}}"#));
+        let router = crate::app::app(routed_under(exec));
+        let resp = drive(
+            &router,
+            chat(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#, &[]),
+        )
+        .await;
+        let body = body_of(resp).await;
+        assert_eq!(body["error"]["code"], "upstream_unavailable");
+    }
 
     #[tokio::test]
     async fn a_no_cache_header_kills_both_cache_sides() {
