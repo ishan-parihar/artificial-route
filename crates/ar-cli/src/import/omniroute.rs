@@ -1661,6 +1661,7 @@ fn combos(defs: &BTreeMap<Strng, ProviderDef>) -> Vec<Combo> {
                 // candidate pool to read and must not fabricate one.
                 pool: Vec::new(),
                 compression: None,
+                judge_model: None,
             });
         }
     }

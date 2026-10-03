@@ -272,6 +272,7 @@ fn assemble(rows: Vec<Row>) -> anyhow::Result<Imported> {
                 // and an operator adds `pool:` by hand.
                 pool: Vec::new(),
                 compression: None,
+                judge_model: None,
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;

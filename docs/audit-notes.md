@@ -274,3 +274,19 @@ already carried at combo level, so the strategy surface is consistent; what is
 absent is multi-connection-per-provider ranking, which is a credential-model
 feature rather than a strategy. Multi-account support, when it comes, is where
 this belongs.
+
+**(h) The fusion judge is a second dispatch, not a merge, and it relays the
+judge's own body.** The reference's `judgeModel` path (`fusion.ts`
+`handleFusionChat`) synthesizes by *asking* a judge model to write one answer
+from anonymized panel answers — no response-level merging exists anywhere in the
+reference either, so the scoring is 1:1. Three deliberate differences: (1) the
+judge's body is relayed **verbatim** rather than re-rendered in the inbound
+dialect, because a router-invented body carries invented ids, `finish_reason` and
+usage; (2) a tool-bearing request bypasses synthesis and routes to the judge with
+tools intact, as upstream does; (3) `judge_model` is validated at config load
+(`provider/model`, provider must resolve), so a dangling judge is a load error
+rather than a per-request 502. The panel ceiling is `MAX_PANEL = 40`
+(`FUSION_DEFAULTS.maxPanel`, #1905) but the *action* differs: the reference
+rejects an oversized panel with a 400 before fan-out, this build truncates to 40
+members and asks those, because the ceiling lives in `ar-route` where there is no
+HTTP layer to answer from — audit row, truncation keeps panel order.

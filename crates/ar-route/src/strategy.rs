@@ -71,7 +71,9 @@ use futures::StreamExt;
 use http::StatusCode;
 
 use crate::auto::Factors;
-use crate::contract::{CanonicalRequest, Candidate, ExecError, Executor, ProviderId, Strng, Upstream};
+use crate::contract::{
+    CanonicalRequest, Candidate, ChunkStream, ExecError, Executor, ProviderId, Strng, Upstream,
+};
 use crate::error::RouteError;
 
 /// Model slot for the prefix-pin key when the caller supplied no model.
@@ -941,11 +943,17 @@ fn hours_until_reset(reset_at_secs: u64) -> Option<f64> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |d| d.as_secs_f64());
-    Some(reset_at_secs as f64 - now)
+    Some((reset_at_secs as f64 - now) / SECONDS_PER_HOUR)
 }
 
-/// The urgency ceiling, `1 / EXPIRY_MIN_HOURS`. Clamped rather than infinite so
-/// the ordering stays a total order over finite scores without a special case.
+/// Seconds in an hour. Named so the divisor above is a unit conversion and not
+/// a bare 3600 that can be dropped.
+const SECONDS_PER_HOUR: f64 = 3600.0;
+
+/// The urgency ceiling, `1 / EXPIRY_MIN_HOURS`, expressed in score units: a
+/// fully usable window reaching its deadline scores this. Clamped rather than
+/// infinite so the ordering stays a total order over finite scores without a
+/// special case.
 const EXPIRY_MAX_SCORE: f64 = 4.0;
 
 /// `quota-weighted`: reset-aware score, divided by live load.
@@ -1197,6 +1205,15 @@ pub struct FusionOutcome {
     /// which members were slow, which refused, and which were never reached. The
     /// trace is provider ids and status codes only — no body, no prompt.
     pub trace: Vec<PanelVerdict>,
+    /// Each successful member's assistant text, in panel order, paired with the
+    /// provider that produced it.
+    ///
+    /// Collected from the same bodies the fan-out already buffered to find the
+    /// winner, so the judge's second dispatch costs no extra upstream reads.
+    /// `None` for a member whose body could not be parsed as a completion —
+    /// the judge sees a panel with a hole rather than an invented answer, and
+    /// `extract_panel_text` drops blank entries anyway.
+    pub answers: Vec<(ProviderId, String)>,
 }
 
 impl FusionOutcome {
@@ -1238,16 +1255,11 @@ impl FusionOutcome {
 /// deterministic function of the inputs rather than a race; the reference reaches
 /// the same place by collecting the panel and reading it in order.
 ///
-/// This returns one panel answer, not a synthesis. Upstream then hands the whole
-/// panel to `judgeModel`, which writes a single merged answer.
-///
-/// TODO(#P2-fusion-judge): the judge is a second dispatch over a composed
-/// prompt, and it needs two things this crate does not have — a body composer
-/// (the panel answers are a `ChunkStream`, and a judge needs them as one text
-/// turn) and a place to name the judge model. Guessing either would produce a
-/// `FusionOutcome` that claims to be a fusion and is a race with extra steps, so
-/// the judge stays out until the seam is real. The full trace above is what
-/// makes the interim behaviour inspectable rather than silent.
+/// This returns one panel answer, not a synthesis — and that is the reference's
+/// own default: without a configured `judgeModel`, the panel's first 2xx IS the
+/// answer. When a judge is configured, [`FusionOutcome::answers`] carries every
+/// member's text (read from the same bodies this fan-out already buffered) and
+/// [`crate::fusion_judge::synthesize`] runs the second dispatch over them.
 ///
 /// # Errors
 /// Never. A panel that cannot be reached at all is an [`FusionOutcome`] with no
@@ -1259,25 +1271,79 @@ pub async fn dispatch_fusion<E: Executor + ?Sized>(
     canonical: &CanonicalRequest,
     exec: &E,
 ) -> FusionOutcome {
-    let panel = fusion_panel(candidates, session, model);
+    let mut panel = fusion_panel(candidates, session, model);
+    // The reference rejects an oversized panel BEFORE fan-out (#1905): every
+    // member is called in parallel and its full body buffered at once, so a
+    // large panel (reported: ~73 models) can exceed the heap ceiling and OOM the
+    // whole process. Truncating to the ceiling is what this build does instead
+    // of a 400, and the difference is deliberate and recorded: the router here
+    // has no HTTP layer to answer from, so it keeps the first
+    // [`crate::fusion_judge::MAX_PANEL`] members by panel order (the ranking a
+    // caller can see in the trace) and lets the rest go unasked. A caller that
+    // needs the refusal should validate panel size in config.
+    if panel.len() > crate::fusion_judge::MAX_PANEL {
+        panel.truncate(crate::fusion_judge::MAX_PANEL);
+    }
+    // Every panel member is asked NON-STREAMING, whatever the client asked for:
+    // the fan-out buffers each member's complete answer to read its text (for
+    // the winner's relay and for the judge's panel), and an SSE body is a
+    // sequence of frames this module cannot read as one answer. The reference
+    // builds the same `panelBody` (`{ ...rest, stream: false }`,
+    // `fusion.ts::handleFusionChat`) and keeps the client's own stream flag for
+    // the *judge's* response.
+    //
+    // Without this a streaming client gets a panel of empty texts and a judge
+    // that synthesizes a confident answer from nothing — the worst possible
+    // failure for a feature whose whole purpose is grounding.
+    let panel_request = CanonicalRequest {
+        stream: false,
+        body: non_streaming_body(&canonical.body),
+        ..canonical.clone()
+    };
     let settled = futures::future::join_all(
         panel
             .iter()
-            .map(|c| exec.call(&c.provider, canonical)),
+            .map(|c| exec.call(&c.provider, &panel_request)),
     )
     .await;
 
     let mut trace = Vec::with_capacity(panel.len());
+    let mut answers: Vec<(ProviderId, String)> = Vec::with_capacity(panel.len());
     let mut upstream = None;
     for (candidate, result) in panel.iter().zip(settled) {
-        let (status, response) = match result {
-            Ok(u) if u.status.is_success() => (Some(u.status.as_u16()), Some(u)),
+        // A successful member's body is read here, once, for two consumers: the
+        // winner's bytes are relayed and every member's text feeds the judge.
+        // That read is why the fan-out already buffered these bodies, and why
+        // the panel ceiling exists at all (#1905).
+        let (status, text) = match result {
+            Ok(mut u) if u.status.is_success() => {
+                let body = match read_body(u.stream).await {
+                    Ok(body) => body,
+                    Err(ExecError(e)) => {
+                        trace.push(PanelVerdict {
+                            provider: candidate.provider.clone(),
+                            status: Some(u.status.as_u16()),
+                            winner: false,
+                        });
+                        tracing::warn!(provider = %candidate.provider, error = %e, "fusion panel member body could not be read");
+                        continue;
+                    }
+                };
+                let text = crate::fusion_judge::extract_panel_text(&body);
+                u.stream = Box::pin(futures::stream::iter([body]));
+                (Some(u.status.as_u16()), Some((text, u)))
+            }
             Ok(u) => (Some(u.status.as_u16()), None),
             Err(ExecError(_)) => (None, None),
         };
-        let winner = upstream.is_none() && response.is_some();
-        if winner {
-            upstream = response;
+        let winner = upstream.is_none() && text.is_some();
+        if let Some((panel_text, response)) = text {
+            if !panel_text.trim().is_empty() {
+                answers.push((candidate.provider.clone(), panel_text));
+            }
+            if winner {
+                upstream = Some(response);
+            }
         }
         trace.push(PanelVerdict {
             provider: candidate.provider.clone(),
@@ -1286,7 +1352,44 @@ pub async fn dispatch_fusion<E: Executor + ?Sized>(
         });
     }
 
-    FusionOutcome { upstream, trace }
+    FusionOutcome {
+        upstream,
+        trace,
+        answers,
+    }
+}
+
+/// The same body with `stream` forced off, for the panel's non-streaming ask.
+///
+/// Setting [`CanonicalRequest::stream`] alone is not enough: providers honour the
+/// `stream` field *inside* the body, so a body that still says `"stream":true`
+/// gets SSE frames back regardless of what the struct claims. This is the one
+/// place the router rewrites a request body, and the reference does the same
+/// (`panelBody: { ...rest, stream: false }`) — every other path leaves the body
+/// byte-identical, which is what keeps routing unable to change the request.
+///
+/// A body that is not JSON is passed through unchanged: it could not be
+/// dispatched as canonical anyway, and a rewrite that fails must not be a second
+/// reason for the fan-out to see nothing.
+fn non_streaming_body(body: &Bytes) -> Bytes {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.clone();
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.insert("stream".to_owned(), serde_json::Value::Bool(false));
+    }
+    serde_json::to_vec(&value).map_or_else(|_| body.clone(), Bytes::from)
+}
+
+/// Buffers one upstream body. A fusion panel member is a complete non-stream
+/// answer by construction (the fan-out asks the same body for every member), so
+/// this is one body read once, not a relay.
+async fn read_body(mut stream: ChunkStream) -> Result<Bytes, ExecError> {
+    let mut out = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        out.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(out))
 }
 
 /// One stage's verdict in a `pipeline` chain.
@@ -1637,8 +1740,8 @@ mod tests {
 
     use super::{
         EXPIRY_MAX_SCORE, Factors, MODEL_SCOPE, Strategy, TargetLoad, TargetLoads, affinity_key,
-        dispatch_fusion, dispatch_pipeline, expiry_first_score, pick, pick_filtered,
-        pick_for_model, reset_aware_score, splitmix,
+        dispatch_fusion, dispatch_pipeline, expiry_first_score, hours_until_reset, pick,
+        pick_filtered, pick_for_model, reset_aware_score, splitmix,
     };
     use crate::contract::{
         CanonicalRequest, Candidate, ExecError, Executor, ProviderId, QuotaWindow, Upstream,
@@ -1979,6 +2082,35 @@ mod tests {
         assert!(
             expiry_first_score(&cands[0]) <= EXPIRY_MAX_SCORE,
             "a past reset must clamp, not diverge"
+        );
+    }
+
+    #[test]
+    fn expiry_first_scores_in_hours_so_the_floor_means_hours() {
+        // The unit assertion, and the reason it exists: every other test here
+        // compares ORDER, and order is invariant to a missing 3600x. This one
+        // reads the magnitude — 80% of a window closing in one hour scores 0.8
+        // per hour — so the constants are pinned by a measurement rather than
+        // by prose, and a dropped divisor fails here instead of silently
+        // pushing every real deadline into the clamp.
+        let now = now_secs();
+        let hour_away = Candidate::new(p("a"), "m").with_quota(QuotaWindow::new(100, 20, now + 3600));
+        let score = expiry_first_score(&hour_away);
+        assert!(
+            (score - 0.8).abs() < 0.01,
+            "80% usable one hour out must score ~0.8/h, got {score}"
+        );
+
+        // The two boundary readings the unit decides.
+        assert_eq!(hours_until_reset(0), None, "no reset reported is no deadline");
+        let rolled = Candidate::new(p("a"), "m").with_quota(QuotaWindow::new(100, 20, now));
+        assert!(
+            expiry_first_score(&rolled) > score,
+            "a just-rolled window must outrank an hour of runway"
+        );
+        assert!(
+            expiry_first_score(&rolled) <= EXPIRY_MAX_SCORE,
+            "the 15-minute floor must bound the urgency, not the 4.0 clamp"
         );
     }
 
@@ -2546,6 +2678,36 @@ mod tests {
             got.trace.iter().filter(|v| v.winner).count(),
             1,
             "exactly one member may be marked the winner"
+        );
+    }
+
+    #[test]
+    fn caps_the_fan_out_at_the_reference_ceiling() {
+        // #1905: every member is called in parallel and its body buffered, so
+        // an unbounded panel is an OOM with extra steps. The reference rejects
+        // with a 400; this build has no HTTP layer here and truncates to
+        // `MAX_PANEL` in panel order, which is what this pins.
+        let many: Vec<Candidate> = (0..50)
+            .map(|i| Candidate::new(format!("p{i}").into(), "m").with_rank(i))
+            .collect();
+        let exec = Recorder::ok(1);
+        let got = block(dispatch_fusion(
+            None,
+            "gpt-4o",
+            &many,
+            &request(&["hi"]),
+            &exec,
+        ));
+        assert_eq!(
+            got.trace.len(),
+            crate::fusion_judge::MAX_PANEL,
+            "fan-out must stop at the ceiling"
+        );
+        assert_eq!(exec.calls().len(), crate::fusion_judge::MAX_PANEL);
+        assert_eq!(
+            got.trace[0].provider.as_str(),
+            "p0",
+            "truncation keeps panel order, so the leader still leads"
         );
     }
 

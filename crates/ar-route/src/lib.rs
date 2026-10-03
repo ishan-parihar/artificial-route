@@ -75,6 +75,8 @@ mod auto;
 mod contract;
 mod error;
 mod explain;
+pub mod fusion_judge;
+pub use fusion_judge::{JudgeOutcome, JudgePanel, JudgeTarget, synthesize};
 mod lkgp;
 mod pipeline;
 mod resilience;

@@ -43,7 +43,7 @@ P0 `priority|round-robin|cost-optimized|lkgp` = lean-routing (~80% traffic). Wha
 | Still deferred | Source | Cost |
 |---|---|---|
 | `expiry-first` | `ACCOUNT_FALLBACK_STRATEGY_VALUES` + `expiryFirstAccountSelection.ts` | landed 2026-10-03 at combo level with the reference's scoring verbatim; the reference ranks OAuth *connections* inside credential selection, which this build's one-key-per-provider model has no home for — audit-notes row (g) |
-| fusion judge synthesis | `fusion.ts::handleFusionChat` + `judgeModel` | a second dispatch over a composed prompt, needing a body composer (panel answers are a `ChunkStream`) and a place to name the judge model — `TODO(#P2-fusion-judge)`. Returning one panel answer is honest; faking a synthesis is not. |
+| fusion judge synthesis | `fusion.ts::handleFusionChat` + `judgeModel` | landed 2026-10-03: the judge directive ported verbatim, `judge_model:` in config validated at load, the panel's texts composed from the fan-out's own buffer, and the judge's body relayed verbatim — audit-notes row (h) |
 | `/v1/audio/translations` | executors media family | landed 2026-10-03: same handler body as transcriptions (multipart verbatim, `?model=` routing), one endpoint over — the modality row of this table is now empty |
 
 ### Strategy-name notes

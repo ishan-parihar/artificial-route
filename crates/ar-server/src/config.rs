@@ -294,6 +294,15 @@ pub struct RouteCombo {
     /// a multi-engine pipeline is the header's and the panel's business, and
     /// `ar-compress` composes the two.
     pub compression: Option<Step>,
+    /// The `fusion` combo's judge: a `provider/model` or a combo id whose
+    /// provider synthesizes the panel.
+    ///
+    /// `None` is the reference's default and the honest one: with no judge
+    /// configured, a fusion panel returns its first 2xx answer rather than
+    /// spending a second dispatch synthesizing one, because synthesizing a
+    /// single answer through a judge is a degradation, not fusion. Naming a
+    /// judge turns on the synthesis half (`fusion.ts::handleFusionChat`).
+    pub judge_model: Option<String>,
 }
 
 impl RouteCombo {
@@ -307,6 +316,7 @@ impl RouteCombo {
             targets,
             pool: Vec::new(),
             compression: None,
+            judge_model: None,
         }
     }
 
@@ -617,6 +627,28 @@ impl ServerConfig {
             .with_pool(pool);
             if let Some(compression) = combo.compression {
                 route.compression = Some(compression.step());
+            }
+            // The judge's provider is resolved on the same terms a target is,
+            // so a `judge_model:` naming an absent provider fails at load
+            // rather than costing a round trip per fused request.
+            if let Some(judge) = combo.judge_model.as_deref() {
+                let (provider, model) =
+                    judge
+                        .split_once('/')
+                        .ok_or_else(|| ComboError::MalformedJudgeModel {
+                            id: combo.id.clone(),
+                            judge: judge.to_owned(),
+                        })?;
+                resolve_target(
+                    &format!("{provider}/{model}"),
+                    u32::MAX,
+                    1,
+                    &catalog,
+                    cfg,
+                    store,
+                    &mut providers,
+                )?;
+                route.judge_model = Some(judge.to_owned());
             }
             combos.push(route);
         }
@@ -1003,6 +1035,14 @@ pub enum ComboError {
     EmptyCombo {
         /// The combo id.
         id: String,
+    },
+    /// A `judge_model:` was written without the `provider/model` shape.
+    #[error("combo {id:?} has judge_model {judge:?}, which must be provider/model")]
+    MalformedJudgeModel {
+        /// The combo id.
+        id: String,
+        /// The judge's target string as written.
+        judge: String,
     },
 
     /// A provider's credential is in neither the credential store nor `keys:`.

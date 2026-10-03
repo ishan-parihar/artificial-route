@@ -434,6 +434,14 @@ pub struct Combo {
     /// `x-ar-compression` header still wins over it.
     #[serde(default)]
     pub compression: Option<Compression>,
+    /// The `fusion` judge: a `provider/model` whose provider synthesizes the
+    /// panel into one answer (`fusion.ts::handleFusionChat`'s `judgeModel`).
+    ///
+    /// Absent means no synthesis, which is the reference's own default: the
+    /// panel answers and the first 2xx is returned. Naming a judge turns the
+    /// second dispatch on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_model: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for Combo {
@@ -457,6 +465,8 @@ impl<'de> Deserialize<'de> for Combo {
             pool: Vec<String>,
             #[serde(default)]
             compression: Option<Compression>,
+            #[serde(default)]
+            judge_model: Option<String>,
         }
 
         let wire = Wire::deserialize(d)?;
@@ -472,7 +482,15 @@ impl<'de> Deserialize<'de> for Combo {
                 }
             })
             .collect();
-        Ok(Self { id: wire.id, strategy: wire.strategy, targets, weights, pool: wire.pool, compression: wire.compression })
+        Ok(Self {
+            id: wire.id,
+            strategy: wire.strategy,
+            targets,
+            weights,
+            pool: wire.pool,
+            compression: wire.compression,
+            judge_model: wire.judge_model,
+        })
     }
 }
 

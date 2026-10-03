@@ -58,8 +58,9 @@ use ar_cache::{Cache, CacheKey, CacheState};
 use ar_compress::Step;
 use ar_tokens::ResponseMeta;
 use ar_route::{
-    AttemptOutcome, AutoCandidate, AutoSelector, CanonicalRequest, Candidate, ProviderId, RouteError,
-    Strng, Strategy, attempt_loop, pick, simulate_route, virtual_combo,
+    AttemptOutcome, AutoCandidate, AutoSelector, CanonicalRequest, Candidate, JudgeOutcome,
+    JudgePanel, JudgeTarget, ProviderId, RouteError, Strng, Strategy, attempt_loop, pick,
+    simulate_route, synthesize, virtual_combo,
 };
 use axum::body::Body;
 use axum::extract::{OriginalUri, Path, Request, State};
@@ -517,6 +518,16 @@ async fn handle_chat(
     // not this server's own compression pass — the same span the attempt
     // accounting on `x-ar-decision` describes.
     let dispatched = Instant::now();
+    // `fusion` is the one strategy with no chain semantics: every panel member
+    // is asked in parallel and the winner is decided over the panel, not down a
+    // chain. A judge, when the combo names one, synthesizes the whole panel
+    // afterwards, which is a second dispatch over a composed prompt
+    // (`fusion.ts::handleFusionChat`).
+    if plan.strategy == Strategy::Fusion {
+        return fusion_response(state, &canonical, &plan, dialect, dispatched, savings_tokens)
+            .await
+            .with_guard(guard_verdict);
+    }
     let mut outcome = match tokio::time::timeout(
         state.config.stream_deadline(canonical.model.as_ref()),
         attempt_loop(
@@ -937,6 +948,182 @@ fn usage_from_frames(
     }
 }
 
+/// Runs one `fusion` request: fan the panel out, then optionally synthesize.
+///
+/// The panel fan-out is [`ar_route::dispatch_fusion`], unchanged — it returns the
+/// first member's 2xx and the full trace. With no judge configured (the
+/// reference's default) that IS the answer and it is relayed as one. With a
+/// judge, the panel's texts are composed into a second dispatch whose answer
+/// replaces it; any failure of that second call — refused, non-2xx, unreadable —
+/// degrades to the panel answer, because throwing away a completed fan-out over
+/// one synthesis call is the worse outcome for the client.
+async fn fusion_response(
+    state: &AppState,
+    canonical: &CanonicalRequest,
+    plan: &RoutePlan,
+    dialect: Dialect,
+    dispatched: Instant,
+    savings_tokens: u32,
+) -> Response {
+    let combo = state.config.combo(canonical.model.as_ref());
+    let panel_candidates = state.config.candidates(combo);
+    if panel_candidates.is_empty() {
+        return error_because(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_provider",
+            "nothing_configured",
+            "the fusion panel has no dispatchable target; `ar doctor` lists what is missing",
+        );
+    }
+    let mut outcome = match tokio::time::timeout(
+        state.config.stream_deadline(canonical.model.as_ref()),
+        ar_route::dispatch_fusion(
+            canonical.session.as_deref(),
+            canonical.model.as_ref(),
+            &panel_candidates,
+            canonical,
+            state.exec.as_ref(),
+        ),
+    )
+    .await
+    {
+        Err(_elapsed) => {
+            let deadline = state.config.stream_deadline(canonical.model.as_ref());
+            return error_because(
+                StatusCode::GATEWAY_TIMEOUT,
+                "upstream_timeout",
+                "model_deadline",
+                &format!(
+                    "model {:?} produced no panel answer within {}s",
+                    canonical.model.as_ref(),
+                    deadline.as_secs()
+                ),
+            );
+        }
+        Ok(outcome) => outcome,
+    };
+
+    let panel_attempts = outcome.trace.len();
+    state.metrics.observe_attempts(panel_attempts as u64);
+
+    // Build the panel texts before the winner's stream is consumed: the
+    // synthesis needs every member's answer, and a streamed panel member would
+    // have to be read twice otherwise.
+    // The panel texts move into the judge call rather than being borrowed: an
+    // outcome's own `Upstream` is a boxed stream that is `Send` but not `Sync`,
+    // so holding `&outcome` across this await would make the handler's future
+    // non-`Send`. The texts are all this needs, and they are plain data.
+    let panel_answers = std::mem::take(&mut outcome.answers);
+    let synthesized = match plan.judge.as_ref() {
+        Some(judge) => Some(fusion_synthesis(state, canonical, panel_answers, judge).await),
+        None => None,
+    };
+
+    let (upstream, provider, attempts) = match synthesized {
+        // The judge answered: its own body is the response, relayed exactly as
+        // it arrived, and the panel's members plus the judge's dispatch is the
+        // request's real cost.
+        Some(synthesis) if synthesis.judged => {
+            let upstream = synthesis
+                .upstream
+                .expect("a judged outcome carries the judge's response");
+            (upstream, plan.judge.clone(), panel_attempts.saturating_add(1) as u16)
+        }
+        // No judge, or a judge that failed: the panel's first 2xx is the answer.
+        // The provider is read before the upstream is moved out of the outcome.
+        _ => {
+            let provider = outcome.winner().cloned();
+            match outcome.upstream {
+            Some(upstream) => (upstream, provider, panel_attempts as u16),
+            None => {
+                return fusion_empty_panel(&outcome);
+            }
+            }
+        }
+    };
+
+    let outcome = AttemptOutcome::Succeeded {
+        provider: provider.unwrap_or_else(|| ProviderId::new("unknown")),
+        attempts,
+        upstream,
+    };
+    let meta = ResponseMeta::default()
+        .with_latency(dispatched.elapsed())
+        .with_savings_tokens(savings_tokens);
+    decorate(
+        outcome,
+        canonical.stream,
+        dialect,
+        plan.strategy,
+        Stages {
+            compression: String::new(),
+            cache_state: CacheState::Bypass,
+            cache_key: None,
+            cache: None,
+            model: canonical.model.clone(),
+            cache_control: CacheControl::default(),
+            meta,
+        },
+    )
+}
+
+/// The judge dispatch for one fusion panel, with its failure captured rather
+/// than propagated.
+///
+/// The panel texts come from the fan-out's own buffer ([`FusionOutcome::answers`]),
+/// so synthesis costs one upstream call and no extra reads. The judge's request
+/// is non-streaming: a fusion answer is a complete answer, and relaying the
+/// judge's token stream would hand the client a stream in place of the fusion
+/// it asked for.
+async fn fusion_synthesis(
+    state: &AppState,
+    canonical: &CanonicalRequest,
+    answers: Vec<(ProviderId, String)>,
+    judge: &ProviderId,
+) -> JudgeOutcome {
+    let panel = JudgePanel::new(answers);
+    let task = request_text(canonical);
+    synthesize(&panel, &JudgeTarget::provider(judge.as_str()), &task, state.exec.as_ref()).await
+}
+
+/// The user's request as the judge should see it: the original messages, or a
+/// `task` label when the inbound body carried no readable text.
+fn request_text(canonical: &CanonicalRequest) -> String {
+    canonical
+        .body
+        .iter()
+        .filter(|b| !b.is_ascii_whitespace())
+        .map(|b| *b as char)
+        .take(4096)
+        .collect::<String>()
+        .replace("\n", " ")
+        .replace("\r", " ")
+        .replace('"', " ")
+}
+
+/// The 502/503 a fusion panel produces when no member answered.
+fn fusion_empty_panel(outcome: &ar_route::FusionOutcome) -> Response {
+    let status = outcome.status();
+    error_because(
+        status,
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            "no_panel"
+        } else {
+            "panel_unavailable"
+        },
+        "fusion_panel",
+        &format!(
+            "no fusion panel member answered: {}",
+            outcome
+                .trace
+                .iter()
+                .map(|v| format!("{}={:?}", v.provider.as_str(), v.status))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )
+}
+
 /// What the cache and compression stages decided, for the response to carry.
 ///
 /// One struct because these four are one decision, made in one order and read in
@@ -1072,6 +1259,9 @@ pub(crate) struct RoutePlan {
     pub(crate) strategy: Strategy,
     /// The resolved combo's compression setting, if it declared one.
     compression: Option<Step>,
+    /// The `fusion` judge to synthesize the panel with, when the combo named
+    /// one. `None` is the reference's own default and means the panel answers.
+    judge: Option<ProviderId>,
 }
 
 /// Checks the credential when an [`crate::keys::AuthGate`] is configured, and
@@ -1215,6 +1405,7 @@ pub(crate) fn resolve(state: &AppState, canonical: &CanonicalRequest) -> Result<
             chain,
             strategy: state.config.strategy,
             compression: state.config.default_compression(),
+            judge: None,
         });
     }
 
@@ -1226,6 +1417,7 @@ pub(crate) fn resolve(state: &AppState, canonical: &CanonicalRequest) -> Result<
                 chain: chain(state, combo),
                 strategy: combo.strategy,
                 compression: combo.compression,
+                judge: judge(state, combo),
             }),
             None => Err(RouteReject::UnknownModel(unknown_model(model, &state.config.combo_ids()))),
         },
@@ -1233,8 +1425,30 @@ pub(crate) fn resolve(state: &AppState, canonical: &CanonicalRequest) -> Result<
             chain: order(state, state.config.candidates(None)),
             strategy: state.config.strategy,
             compression: None,
+            judge: None,
         }),
     }
+}
+
+/// The `fusion` combo's judge provider, when it named one.
+///
+/// A `provider/model` string whose provider serves the synthesis. Resolved at
+/// config load (a dangling judge name is a load-time error there), so this is a
+/// lookup, not a parse. `None` on any non-fusion combo: a judge is a fusion
+/// concept and silently honouring one elsewhere would be a second dispatch
+/// nobody asked for.
+fn judge(state: &AppState, combo: &RouteCombo) -> Option<ProviderId> {
+    if combo.strategy != Strategy::Fusion {
+        return None;
+    }
+    let judge = combo.judge_model.as_deref()?;
+    let provider = judge.split_once('/').map_or(judge, |(provider, _)| provider);
+    state
+        .config
+        .providers
+        .iter()
+        .find(|p| p.id.as_str() == provider && p.is_dispatchable())
+        .map(|p| p.id.clone())
 }
 
 /// Winner-first chain over the combo's targets, then its `pool:` bench.
@@ -2275,6 +2489,40 @@ mod tests {
         config
     }
 
+    /// A config whose combo is a `fusion` panel over two providers, with an
+    /// optional named judge — the shape the judge half exists for.
+    fn fusion_config(judge: Option<&str>) -> ServerConfig {
+        let mut config = ServerConfig::single(
+            0,
+            Strategy::Fusion,
+            vec![
+                crate::exec::ProviderConfig::new(ProviderId::new("a"), "http://127.0.0.1:1/v1", "k")
+                    .with_model("m"),
+                crate::exec::ProviderConfig::new(ProviderId::new("b"), "http://127.0.0.1:1/v1", "k")
+                    .with_model("m"),
+            ],
+        );
+        let mut combo = crate::config::RouteCombo::new(
+            "m",
+            Strategy::Fusion,
+            vec![
+                ComboTarget::new(ProviderId::new("a"), "m"),
+                ComboTarget::new(ProviderId::new("b"), "m"),
+            ],
+        );
+        combo.judge_model = judge.map(str::to_owned);
+        config.combos = vec![combo];
+        config
+    }
+
+    fn routed_fusion(exec: Arc<dyn ArExec>, judge: Option<&str>) -> AppState {
+        Components {
+            exec,
+            ..Components::unconfigured(fusion_config(judge))
+        }
+        .into_state()
+    }
+
     /// Refuses every dispatch with the canned upstream verdict — the
     /// projection tests' provider-surfaces-errors fixture.
     struct FailingExec(u16, &'static str);
@@ -3266,6 +3514,245 @@ mod tests {
         };
         tee.retain(&huge);
         assert!(tee.head.is_none(), "an over-cap frame was kept");
+    }
+
+    /// A panel of two that answers distinctly, and (optionally) a judge.
+    ///
+    /// The judge is provider `b`, which is also a panel member, so `b` is asked
+    /// twice; the reply distinguishes panel from judge by request body, which is
+    /// also how the judge test proves the panel texts reached it.
+    struct ScriptedPanelJudge {
+        refuse_judge: bool,
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl ScriptedPanelJudge {
+        fn ok() -> Self {
+            Self {
+                refuse_judge: false,
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn refusing() -> Self {
+            Self {
+                refuse_judge: true,
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ArExec for ScriptedPanelJudge {
+        fn post_chat<'a>(
+            &'a self,
+            provider: &'a ProviderId,
+            canonical: &'a CanonicalRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<Upstream, ExecError>> + Send + 'a>> {
+            let body = String::from_utf8_lossy(&canonical.body).into_owned();
+            // The judge directive is the only body that names sources, so it is
+            // how a panel request and a judge request are told apart.
+            let is_judge = body.contains("model-fusion panel");
+            self.seen.lock().expect("recorder").push(body);
+            let text = if is_judge {
+                if self.refuse_judge {
+                    "refused".to_owned()
+                } else {
+                    "synthesized answer".to_owned()
+                }
+            } else if provider.as_str() == "a" {
+                "from a".to_owned()
+            } else {
+                "from b".to_owned()
+            };
+            let refused = is_judge && self.refuse_judge;
+            let payload = format!("{{\"choices\":[{{\"message\":{{\"content\":\"{text}\"}}}}]}}");
+            Box::pin(async move {
+                if refused {
+                    Ok(Upstream::failure(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Bytes::from_static(b"judge refused"),
+                        None,
+                    ))
+                } else {
+                    Ok(Upstream::success(Box::pin(futures::stream::iter([Bytes::from(
+                        payload,
+                    )]))))
+                }
+            })
+        }
+
+        fn post_media<'a>(
+            &'a self,
+            _provider: &'a ProviderId,
+            _endpoint: &'a str,
+            _content_type: &'a str,
+            _body: &'a [u8],
+        ) -> Pin<Box<dyn Future<Output = Result<MediaReply, ExecError>> + Send + 'a>> {
+            Box::pin(async move { Err(ExecError("no media here".to_owned())) })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fusion_panel_without_a_judge_answers_with_the_first_2xx() {
+        // The reference's default: no judge configured means the panel's first
+        // 2xx IS the answer. A judge must never be invented.
+        let exec = Arc::new(ScriptedPanelJudge::ok());
+        let router = crate::app::app(routed_fusion(exec, None));
+        let resp = drive(
+            &router,
+            chat(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#, &[]),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get(PROVIDER_HEADER).and_then(|v| v.to_str().ok()), Some("a"));
+        let body = body_of(resp).await;
+        assert_eq!(body["choices"][0]["message"]["content"], "from a");
+    }
+
+    #[tokio::test]
+    async fn a_fusion_judge_replaces_the_panel_answer_with_its_own() {
+        // With a judge named, the synthesis IS the response and the judge is the
+        // provider that served it — the panel answers are its input, not the
+        // client's answer.
+        let exec = Arc::new(ScriptedPanelJudge::ok());
+        let router = crate::app::app(routed_fusion(exec, Some("b/m")));
+        let resp = drive(
+            &router,
+            chat(r#"{"model":"m","messages":[{"role":"user","content":"which?"}]}"#, &[]),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get(PROVIDER_HEADER).and_then(|v| v.to_str().ok()), Some("b"));
+        let body = body_of(resp).await;
+        assert_eq!(body["choices"][0]["message"]["content"], "synthesized answer");
+    }
+
+    #[tokio::test]
+    async fn a_fusion_judge_failure_degrades_to_the_panel_answer() {
+        // A refused judge must not throw away a completed fan-out: the panel's
+        // first 2xx is still a usable answer.
+        let exec = Arc::new(ScriptedPanelJudge::refusing());
+        let router = crate::app::app(routed_fusion(exec, Some("b/m")));
+        let resp = drive(
+            &router,
+            chat(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#, &[]),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get(PROVIDER_HEADER).and_then(|v| v.to_str().ok()), Some("a"));
+        let body = body_of(resp).await;
+        assert_eq!(body["choices"][0]["message"]["content"], "from a");
+    }
+
+    #[tokio::test]
+    async fn a_fusion_panel_from_a_streaming_client_still_has_answers() {
+        // The failure this pins: the fan-out buffers each member's answer to read
+        // its text, and an SSE body is frames, not one answer — so a streaming
+        // client asked with the fan-out passing its `stream: true` through would
+        // yield a panel of empty texts and a judge synthesizing prose from
+        // nothing. Every panel member must be asked non-streaming, whatever the
+        // client asked for (the reference's `panelBody`, `stream: false`).
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let exec = Arc::new(StreamingAwarePanel {
+            seen: Arc::clone(&seen),
+        });
+        let router = crate::app::app(routed_fusion(exec, Some("b/m")));
+        let resp = drive(
+            &router,
+            chat(
+                r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let requests = seen.lock().expect("recorder").clone();
+        let panel_calls = requests.iter().filter(|b| !b.contains("model-fusion panel")).count();
+        assert_eq!(panel_calls, 2, "both members were asked");
+        assert!(
+            requests
+                .iter()
+                .filter(|b| !b.contains("model-fusion panel"))
+                .all(|b| !b.contains("\"stream\":true")),
+            "a panel member must not be asked for a stream: {requests:?}"
+        );
+        // The judge's own ask is deliberately non-streaming too, and deliberately
+        // asserted rather than left incidental: a fusion answer is one complete
+        // answer, and relaying the judge's token stream would hand the client a
+        // stream in place of the fusion it requested.
+        let judge_bodies: Vec<&String> =
+            requests.iter().filter(|b| b.contains("model-fusion panel")).collect();
+        assert_eq!(judge_bodies.len(), 1, "one judge dispatch");
+        assert!(
+            judge_bodies[0].contains("\"stream\":false"),
+            "the judge is asked non-streaming: {:?}",
+            judge_bodies[0]
+        );
+    }
+
+    /// A panel that refuses to answer as a stream: an SSE body instead of a
+    /// completion, which is what a member would send if the fan-out passed the
+    /// client's `stream: true` through.
+    struct StreamingAwarePanel {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ArExec for StreamingAwarePanel {
+        fn post_chat<'a>(
+            &'a self,
+            _provider: &'a ProviderId,
+            canonical: &'a CanonicalRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<Upstream, ExecError>> + Send + 'a>> {
+            let body = String::from_utf8_lossy(&canonical.body).into_owned();
+            let streaming = canonical.stream;
+            let is_judge = body.contains("model-fusion panel");
+            self.seen.lock().expect("recorder").push(body);
+            Box::pin(async move {
+                if streaming {
+                    // The frame shape a real streamed member sends: no
+                    // `choices[].message.content`, so an extractor reading it
+                    // finds nothing.
+                    let frame = concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"text\"}}]}\n\n",
+                        "data: [DONE]\n\n"
+                    );
+                    Ok(Upstream::success(Box::pin(futures::stream::iter([Bytes::from(
+                        frame,
+                    )]))))
+                } else {
+                    let text = if is_judge { "synthesized answer" } else { "a complete answer" };
+                    let payload =
+                        format!("{{\"choices\":[{{\"message\":{{\"content\":\"{text}\"}}}}]}}");
+                    Ok(Upstream::success(Box::pin(futures::stream::iter([Bytes::from(
+                        payload,
+                    )]))))
+                }
+            })
+        }
+
+        fn post_media<'a>(
+            &'a self,
+            _provider: &'a ProviderId,
+            _endpoint: &'a str,
+            _content_type: &'a str,
+            _body: &'a [u8],
+        ) -> Pin<Box<dyn Future<Output = Result<MediaReply, ExecError>> + Send + 'a>> {
+            Box::pin(async move { Err(ExecError("no media here".to_owned())) })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fusion_panel_whose_members_all_refuse_answers_502() {
+        let exec = Arc::new(FailingExec(429, "slow down"));
+        let router = crate::app::app(routed_fusion(exec, None));
+        let resp = drive(
+            &router,
+            chat(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#, &[]),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let body = body_of(resp).await;
+        assert_eq!(body["error"]["code"], "panel_unavailable");
     }
 
     /// An upstream that never sends a byte, for the idle-path tests.

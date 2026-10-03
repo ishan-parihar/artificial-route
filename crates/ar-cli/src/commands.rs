@@ -1517,6 +1517,7 @@ mod tests {
                 weights: std::collections::BTreeMap::new(),
                 pool: vec![],
                 compression: None,
+                judge_model: None,
             }],
             &registry().clone(),
         );
