@@ -3091,6 +3091,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_disconnected_client_takes_the_upstream_stream_with_it() {
+        // Wave I1's pin, one half: a client that hangs up aborts the upstream
+        // read, by construction rather than by a cancellation channel — the
+        // relay chain owns the upstream stream, so dropping the response drops
+        // the read. The flag lives in the stream itself so the assertion
+        // observes the exact object the upstream connection is, and not a
+        // proxy that could outlive it.
+        use futures::Stream;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::{Context, Poll};
+
+        /// A stream that never yields and never ends, and says so when it is
+        /// dropped: the shape of an upstream that is between frames.
+        struct GuardedStream(Arc<AtomicBool>);
+
+        impl Stream for GuardedStream {
+            type Item = Bytes;
+
+            fn poll_next(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Bytes>> {
+                Poll::Pending
+            }
+        }
+
+        impl Drop for GuardedStream {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+
+        struct HangingExec(Arc<AtomicBool>);
+
+        impl ArExec for HangingExec {
+            fn post_chat<'a>(
+                &'a self,
+                _provider: &'a ProviderId,
+                _canonical: &'a CanonicalRequest,
+            ) -> Pin<Box<dyn Future<Output = Result<Upstream, ExecError>> + Send + 'a>> {
+                let guarded = GuardedStream(Arc::clone(&self.0));
+                Box::pin(async move {
+                    Ok(Upstream::success(Box::pin(guarded)))
+                })
+            }
+
+            fn post_media<'a>(
+                &'a self,
+                _provider: &'a ProviderId,
+                _endpoint: &'a str,
+                _content_type: &'a str,
+                _body: &'a [u8],
+            ) -> Pin<Box<dyn Future<Output = Result<MediaReply, ExecError>> + Send + 'a>> {
+                Box::pin(async move { Err(ExecError("no media in this fixture".to_owned())) })
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let exec = Arc::new(HangingExec(Arc::clone(&dropped)));
+        let router = crate::app::app(routed_under(exec));
+        let resp = drive(
+            &router,
+            chat(
+                r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ),
+        )
+        .await;
+        assert_eq!(
+            resp.headers().get(axum::http::header::CONTENT_TYPE),
+            Some(&axum::http::HeaderValue::from_static("text/event-stream")),
+            "the fixture must stream for the disconnect to mean anything"
+        );
+        drop(resp);
+        assert!(
+            dropped.load(Ordering::Relaxed),
+            "the upstream stream outlived the client that hung up"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_dies_mid_flight_is_described_in_band() {
+        // Wave I1's pin, other half: an upstream that ends without its
+        // terminator is named to the client in the dialect's own error frame
+        // — the keepalive's truncation signal, end to end through the relay —
+        // so a silent clean close is not the client's only experience of a
+        // cut-off generation.
+        let exec = Arc::new(CannedExec(vec!["data: {\"delta\":\"x\"}\n\n"]));
+        let router = crate::app::app(routed_under(exec));
+        let resp = drive(
+            &router,
+            chat(
+                r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ),
+        )
+        .await;
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("the relay ends when the upstream does");
+        let relayed = String::from_utf8_lossy(&bytes);
+        assert!(
+            relayed.contains("stream_error"),
+            "a truncated stream was not described: {relayed}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_no_cache_header_kills_both_cache_sides() {
         // The reference's both-sides bypass, strict-"true" grammar: both
         // spellings must answer `bypass` and neither may leave an entry —
