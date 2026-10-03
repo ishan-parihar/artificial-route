@@ -72,8 +72,8 @@ use serde::Serialize;
 use crate::app::AppState;
 use crate::config::{DefaultChain, RouteCombo};
 use crate::text::{
-    COMPRESSION_ECHO, COMPRESSION_HEADER, GUARD_HEADER, GuardVerdict, compression_echo,
-    compression_plan, compress_body, guard_body,
+    COMPRESSION_ECHO, COMPRESSION_HEADER, COMPRESSION_HEADER_ALIAS, GUARD_HEADER, GuardVerdict,
+    compression_echo, compression_plan_with_alias, compress_body, guard_body,
 };
 use crate::translate::to_canonical_for_route;
 
@@ -417,8 +417,14 @@ async fn handle_chat(
 
     // Compression runs after the guard, so a rewrite cannot un-redact anything,
     // and before the cache lookup, so the key covers exactly what is dispatched.
-    let compression = compression_plan(
+    //
+    // Routed through the alias resolver so a client configured against
+    // OmniRoute's `x-omniroute-compression` stops being silently ignored:
+    // native spelling wins, then the alias, then the combo, and the echo
+    // still names the layer that chose, never the wire name that asked.
+    let compression = compression_plan_with_alias(
         headers.get(COMPRESSION_HEADER).and_then(|v| v.to_str().ok()),
+        headers.get(COMPRESSION_HEADER_ALIAS).and_then(|v| v.to_str().ok()),
         plan.compression.as_ref().map(std::slice::from_ref),
     );
     let mut savings_tokens = 0;
@@ -1594,8 +1600,8 @@ mod tests {
     use axum::response::Response;
     use bytes::Bytes;
     use super::{
-        Dialect, FALLBACK_ATTEMPTS_HEADER, Keepalive, LATENCY_MS_HEADER, RESPONSE_COST_HEADER,
-        SAVINGS_TOKENS_HEADER, Stages, TOKENS_IN_HEADER, TOKENS_OUT_HEADER,
+        COMPRESSION_ECHO, Dialect, FALLBACK_ATTEMPTS_HEADER, Keepalive, LATENCY_MS_HEADER,
+        RESPONSE_COST_HEADER, SAVINGS_TOKENS_HEADER, Stages, TOKENS_IN_HEADER, TOKENS_OUT_HEADER,
         TOKENS_PER_SECOND_HEADER, accept_forces_stream, build_chain, card_json, declares_stream,
         decorate, error, error_because, kind_for, model, models_head, not_found, outcome_label,
         require_json, terminator_seen, unknown_model,
@@ -2458,6 +2464,61 @@ mod tests {
         let body = body_of(resp).await;
         assert_eq!(body["error"]["code"], "unsupported_media_type");
         assert_eq!(body["error"]["type"], "invalid_request_error");
+    }
+
+    #[tokio::test]
+    async fn an_omniroute_spelled_compression_header_is_honored() {
+        // A client configured against OmniRoute sends `x-omniroute-compression`
+        // and never learns the native name; the echo answering the engine it
+        // named is the alias earning its two lines of routing.
+        let recorder = Arc::new(Mutex::new(Vec::new()));
+        let exec = Arc::new(RecordingExec(Arc::clone(&recorder)));
+        let router = crate::app::app(routed_under(exec));
+        let resp = drive(
+            &router,
+            chat(
+                r#"{"model":"m","messages":[{"role":"user","content":"hey there partner"}]}"#,
+                &[("x-omniroute-compression", "engine:caveman")],
+            ),
+        )
+        .await;
+        let echo = resp
+            .headers()
+            .get(COMPRESSION_ECHO)
+            .expect("a 200 carries the compression echo");
+        assert!(
+            echo.to_str().expect("ASCII").contains("caveman"),
+            "alias spelling was not honored: {echo:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_native_compression_spelling_wins_over_the_alias() {
+        // `native > alias` is the precedence the alias resolver pins: a client
+        // sending both spellings gets its native word, and the alias cannot
+        // override it.
+        let recorder = Arc::new(Mutex::new(Vec::new()));
+        let exec = Arc::new(RecordingExec(Arc::clone(&recorder)));
+        let router = crate::app::app(routed_under(exec));
+        let resp = drive(
+            &router,
+            chat(
+                r#"{"model":"m","messages":[{"role":"user","content":"hey there partner"}]}"#,
+                &[(
+                    "x-ar-compression",
+                    "engine:caveman",
+                ), ("x-omniroute-compression", "off")],
+            ),
+        )
+        .await;
+        let echo = resp
+            .headers()
+            .get(COMPRESSION_ECHO)
+            .expect("a 200 carries the compression echo");
+        assert!(
+            echo.to_str().expect("ASCII").contains("caveman"),
+            "the alias overrode the native spelling: {echo:?}"
+        );
     }
 
     #[tokio::test]

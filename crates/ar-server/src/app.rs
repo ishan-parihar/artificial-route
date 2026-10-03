@@ -91,8 +91,8 @@ pub const CORS_METHODS: &str = "GET, POST, PUT, DELETE, PATCH, OPTIONS";
 /// slot [`crate::keys::extract_credential`] reads, and a preflight that omitted it
 /// would fail in the browser before the request ever reached the matrix.
 pub const CORS_HEADERS: &str = "Content-Type, Authorization, x-api-key, x-goog-api-key, \
-     anthropic-version, x-ar-compression, x-ar-session, accept, user-agent, \
-     x-omniroute-connection, X-OmniRoute-Lease-Owner, X-OmniRoute-Lease-Generation, \
+     anthropic-version, x-ar-compression, x-omniroute-compression, x-ar-session, accept, \
+     user-agent, x-omniroute-connection, X-OmniRoute-Lease-Owner, X-OmniRoute-Lease-Generation, \
      x-internal-test";
 
 /// Shared server state. `Arc`-ed once by `app()` and cloned per request by
@@ -858,6 +858,42 @@ mod tests {
                 .expect("body reads"),
         )
         .expect("body is JSON")
+    }
+
+    #[tokio::test]
+    async fn a_preflight_admits_the_omniroute_compression_alias() {
+        // A browser client configured against OmniRoute names the alias in its
+        // preflight; answering it in `CORS_HEADERS` is the difference between a
+        // browser client that works and one that never sends its first real
+        // request. The 204 is every preflight's answer — the assertion is
+        // about the allow-list, which is answered wholesale.
+        let req = axum::http::Request::builder()
+            .method("OPTIONS")
+            .uri("/v1/chat/completions")
+            .header(axum::http::header::ORIGIN, "http://localhost:5173")
+            .header(
+                axum::http::header::ACCESS_CONTROL_REQUEST_METHOD,
+                "POST",
+            )
+            .header(
+                axum::http::header::ACCESS_CONTROL_REQUEST_HEADERS,
+                "x-omniroute-compression",
+            )
+            .body(axum::body::Body::empty())
+            .expect("request builds");
+        let resp = send(router(), req).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::NO_CONTENT);
+        let allow = resp
+            .headers()
+            .get(axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS)
+            .expect("the preflight answers an allow-list");
+        assert!(
+            allow
+                .to_str()
+                .expect("ASCII list")
+                .contains("x-omniroute-compression"),
+            "alias missing from the allow-list: {allow:?}"
+        );
     }
 
     #[tokio::test]
