@@ -42,7 +42,7 @@ P0 `priority|round-robin|cost-optimized|lkgp` = lean-routing (~80% traffic). Wha
 
 | Still deferred | Source | Cost |
 |---|---|---|
-| server-side live discovery | `modelDiscovery.ts+reactiveModelSync.ts` | `ar-registry::discovery` ships the models.dev overlay with tests, and `ar import --from omniroute` uses it, but the running server's `/v1/models` is still `StaticCatalog` over config (models.rs:70); wiring `LiveCatalog` in is a P1 one-liner and no caller changes |
+| server-side live discovery | `modelDiscovery.ts+reactiveModelSync.ts` | `ar-registry::discovery` ships the whole models.dev overlay — `parse_catalog`, `LiveCatalog`, `refresh`, offline-first semantics — and `ar import` uses it today (`import/mod.rs:444`). What is absent is the server: `ar-server` has no `discovery` reference and `/v1/models` is `StaticCatalog` over config. Not "a missing subsystem" — a wiring task, though it does reverse a recorded drop (`discovery.rs:5-6` lists the 24-hour scheduler as a deliberate drop), so it wants a decision, not a diff |
 | `quota-share-fair` deficit persistence | `quotaShare*` DRR | `by_fair_share` (strategy.rs:1026) implements the first DRR round from an empty map — normalised-weight order then power-of-two over live in-flight; the persisted deficit map that makes round 2+ diverge is absent, so a restart resets the accounting |
 | the 12-hour soak run itself | `docs/05-roadmap.md` P6 accept line | harness is `scripts/soak.sh` and the 3-minute proof is recorded; the 12h run is one command and is **not yet claimed** |
 | `ar-obs` has no in-tree consumer | this build's own state | the crate ships and is tested, but `ar serve` serves its own four Prometheus counters from `ar-server/src/metrics.rs` and nothing calls `TraceWriter` or `AuditLedger`; the P5 obs half is a library, not a request path |
@@ -54,7 +54,7 @@ These rows were deferred when this table was first written and have since landed
 | Landed | Commit | Evidence |
 |---|---|---|
 | `expiry-first` | `481bbbb` | the reference's scoring verbatim at combo level; the reference ranks OAuth *connections* inside credential selection, which this build's one-key-per-provider model has no home for — audit-notes row (g) |
-| per-panel-member byte cap on `read_body` | pending (this commit) | `PANEL_BODY_BYTES` = 4MB, over-cap member dropped rather than truncated mid-answer; pinned by a test verified to fail when the reader's `>` becomes `>=` — audit-notes row (h) |
+| per-panel-member byte cap on `read_body` | pending (this commit) | `PANEL_BODY_BYTES` = 256KB, over-cap member dropped rather than truncated mid-answer, so a panel is bounded at 10MB; pinned three ways, including a product assertion so neither bound can drift alone — audit-notes row (h) |
 | fusion judge synthesis | `f9ce2da` | `judge_model:` in config validated at load, the judge directive ported verbatim, the panel's texts composed from the fan-out's own buffer, the judge's body relayed verbatim — audit-notes row (h) |
 | `/v1/audio/translations` | `3b3252b` | same handler body as transcriptions (multipart verbatim, `?model=` routing); the modality row of the deferred table is now empty |
 | `import --from omniroute\|litellm` | `5cccd13` | both readers exist and both write `config.yaml` + `registry.json`: `from_omniroute` (import/mod.rs:143) parses a models.dev-shaped map, `from_litellm` (:167) a LiteLLM `model_list`; `assemble` (:210) emits one combo per alias group, and `commands.rs:1322` dispatches the two modes |

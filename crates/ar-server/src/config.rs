@@ -1629,6 +1629,26 @@ combos:
         ));
     }
 
+    /// The config→server strategy bridge is `Strategy::parse(combo.as_str())`,
+    /// so a name `ar-config` parses and `ar-route` does not would reach a client
+    /// as `Deferred` with no error anywhere. `expiry-first` is the one that
+    /// actually diverged — the variant shipped in `ar-route` before `ar-config`
+    /// had an arm for it — so it is the one that pins the whole chain.
+    #[test]
+    fn carries_expiry_first_from_the_config_to_the_dispatcher() {
+        let yaml = TWO_COMBO_YAML.replace(
+            "strategy: cost-optimized",
+            "strategy: expiry-first",
+        );
+        let cfg = parse(&yaml).expect("config parses");
+        let server = ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
+        assert_eq!(
+            server.combo("cheap").map(|c| c.strategy),
+            Some(Strategy::ExpiryFirst),
+            "a config naming expiry-first must reach the router as itself"
+        );
+    }
+
     #[test]
     fn resolves_a_provider_only_once_across_combos() {
         // `openai` appears in both combos; two dispatch rows would make the

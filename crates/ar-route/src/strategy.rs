@@ -965,13 +965,14 @@ const EXPIRY_MAX_SCORE: f64 = 4.0;
 
 /// Ceiling on one fusion panel member's buffered body.
 ///
-/// The server's request-body cap is 2MB (`ar-server`'s `MAX_BODY_BYTES`); a
-/// completion answer is orders of magnitude smaller, and a member whose reply
-/// exceeds this is not an answer worth putting in front of a judge. At the
-/// `MAX_PANEL` ceiling the whole panel is therefore bounded at 160MB, which is
-/// a number a caller can reason about rather than a function of whatever the
-/// largest provider happens to return.
-const PANEL_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// Sized against the RAM budget in `docs/00-overview.md`, not against what a
+/// provider might return: `MAX_PANEL` x this must stay inside the ceiling for a
+/// heavy concurrent request, so 256KB x 40 = 10MB against the <400MB-for-20
+/// row. A completion answer is KBs, so the cap is not felt in normal operation;
+/// what it bounds is a member streaming without end, which is the same heap case
+/// `MAX_PANEL` exists to prevent one level down. Pinned by
+/// `panel_bounds_fit_the_ram_budget`.
+const PANEL_BODY_BYTES: usize = 256 * 1024;
 
 /// `quota-weighted`: reset-aware score, divided by live load.
 ///
@@ -1779,6 +1780,7 @@ mod tests {
         CanonicalRequest, Candidate, ExecError, Executor, ProviderId, QuotaWindow, Upstream,
     };
     use crate::error::RouteError;
+    use crate::fusion_judge::MAX_PANEL;
 
     fn cands() -> Vec<Candidate> {
         vec![
@@ -2823,8 +2825,24 @@ mod tests {
     /// An over-cap member is dropped from the panel rather than truncated — a
     /// body cut mid-answer does not parse, so truncating would keep the cost and
     /// lose the answer.
-    #[test]
-    fn drops_a_panel_member_whose_body_exceeds_the_cap() {
+/// The cap and the panel ceiling are independent bounds on the same buffer, so
+/// their PRODUCT is the real ceiling and only one of them being pinned proves
+/// nothing: `AUTO_VARIANTS` and `ROUTE_STRATEGIES` both drifted to numbers that
+/// were individually plausible and jointly wrong. This is the budget row of
+/// `docs/00-overview.md` — 20 heavy concurrent requests under 400MB — so the
+/// fan-out's share is asserted rather than asserted-in-prose.
+#[test]
+fn panel_bounds_fit_the_ram_budget() {
+    let panel = crate::fusion_judge::MAX_PANEL * PANEL_BODY_BYTES;
+    assert!(
+        panel <= 32 * 1024 * 1024,
+        "one fan-out buffers up to {panel} bytes ({MAX_PANEL} x {PANEL_BODY_BYTES}); \
+         20 of those must fit docs/00's <400MB heavy-request row"
+    );
+}
+
+#[test]
+fn drops_a_panel_member_whose_body_exceeds_the_cap() {
         let cands = vec![
             Candidate::new(p("small"), "m").with_rank(0),
             Candidate::new(p("huge"), "m").with_rank(1),

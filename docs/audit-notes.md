@@ -340,16 +340,21 @@ rejects an oversized panel with a 400 before fan-out, this build truncates to 40
 members and asks those, because the ceiling lives in `ar-route` where there is no
 HTTP layer to answer from — audit row, truncation keeps panel order.
 
-Three exposures this row owns rather than hides. **(i) A panel member's body is
-buffered under a ceiling.** `read_body` (`crates/ar-route/src/strategy.rs`) stops at
-`PANEL_BODY_BYTES` (4MB) and drops that member from the panel — it cannot win and
-its text never reaches the judge — so a `MAX_PANEL`-wide fan-out is bounded at
-160MB. `MAX_PANEL` alone bounded only the member *count*, which is the same #1905
-heap case one level down. Dropping rather than truncating is deliberate: a JSON
-body cut mid-answer does not parse, so truncation would keep the cost and lose
-the answer. Pinned by `drops_a_panel_member_whose_body_exceeds_the_cap` and
-`reads_a_panel_member_whose_body_is_exactly_at_the_cap`, the second verified to
-fail when the reader's `>` becomes `>=`. **(ii) A fused request is accounted once,
+Three exposures this row owns rather than hides. **(i) A panel member's body is buffered under a ceiling.** `read_body` stops at
+`PANEL_BODY_BYTES` (256KB) and drops that member from the panel — it cannot win
+and its text never reaches the judge — so a `MAX_PANEL`-wide fan-out is bounded
+at 10MB, which fits the <400MB heavy-request row of `docs/00-overview.md`. A
+4MB cap was the first number tried and it was wrong in the direction the cap
+exists to prevent: 40 x 4MB is 160MB for one request, which is the same heap
+case `MAX_PANEL` addresses. Dropping rather than truncating is the other
+half of the decision: a JSON body cut mid-answer does not parse, so truncation
+would keep the cost and lose the answer. Pinned three ways —
+`drops_a_panel_member_whose_body_exceeds_the_cap`,
+`reads_a_panel_member_whose_body_is_exactly_at_the_cap` (verified to fail when
+the reader's `>` becomes `>=`), and `panel_bounds_fit_the_ram_budget`, which
+asserts the *product* so neither bound can drift alone. That third pin exists
+because `AUTO_VARIANTS` and `ROUTE_STRATEGIES` both drifted to numbers that were
+individually plausible and jointly wrong. **(ii) A fused request is accounted once,
 not N+1.** `buffer_for_accounting` records a single ledger row for whichever body
 wins, so the operator paid for 40 panel calls and one judge call and the budget
 cap saw one — the same shape as the stream-usage gap closed in `9e5044f`, and it
