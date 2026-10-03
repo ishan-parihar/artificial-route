@@ -33,7 +33,10 @@ async fn spawn_upstream(body: &'static str) -> (String, Arc<Mutex<Vec<String>>>)
         let recorder = Arc::clone(&recorder);
         let reply = Arc::clone(&reply);
         async move {
-            recorder.lock().expect("recorder lock").push(uri.path().to_owned());
+            recorder
+                .lock()
+                .expect("recorder lock")
+                .push(uri.path().to_owned());
             Response::builder()
                 .status(StatusCode::OK)
                 .body(Body::from(reply.as_ref().clone()))
@@ -78,11 +81,12 @@ fn paths(seen: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
 
 #[tokio::test]
 async fn embeds_when_valid() {
-    let (base_url, seen) =
-        spawn_upstream(r#"{"data":[{"embedding":[0.1,0.2],"index":0}],
+    let (base_url, seen) = spawn_upstream(
+        r#"{"data":[{"embedding":[0.1,0.2],"index":0}],
             "model":"text-embedding-3-small",
-            "usage":{"prompt_tokens":3,"total_tokens":3}}"#)
-        .await;
+            "usage":{"prompt_tokens":3,"total_tokens":3}}"#,
+    )
+    .await;
     let exec = ArExec::new().expect("client builds");
 
     let body: EmbeddingRequest =
@@ -90,11 +94,7 @@ async fn embeds_when_valid() {
             .expect("fixture is valid embeddings");
 
     let rendered = exec
-        .post_embeddings(
-            &body,
-            &dispatch(&base_url),
-            &CancellationToken::new(),
-        )
+        .post_embeddings(&body, &dispatch(&base_url), &CancellationToken::new())
         .await
         .expect("guard passes and mock upstream answers 200");
 
@@ -107,16 +107,11 @@ async fn rejects_embeddings_when_model_outside_registry() {
     let (base_url, seen) = spawn_upstream(r#"{"data":[]}"#).await;
     let exec = ArExec::new().expect("client builds");
 
-    let body: EmbeddingRequest =
-        serde_json::from_str(r#"{"model":"my-local-embed","input":"a"}"#)
-            .expect("fixture is valid embeddings");
+    let body: EmbeddingRequest = serde_json::from_str(r#"{"model":"my-local-embed","input":"a"}"#)
+        .expect("fixture is valid embeddings");
 
     let err = exec
-        .post_embeddings(
-            &body,
-            &dispatch(&base_url),
-            &CancellationToken::new(),
-        )
+        .post_embeddings(&body, &dispatch(&base_url), &CancellationToken::new())
         .await
         .err();
 
@@ -148,7 +143,10 @@ async fn routes_vision_when_image_part() {
         .post_media(
             endpoint,
             &dispatch(&base_url),
-            &MediaBody { content_type: "application/json", bytes: b"{}" },
+            &MediaBody {
+                content_type: "application/json",
+                bytes: b"{}",
+            },
             &CancellationToken::new(),
         )
         .await
@@ -168,7 +166,10 @@ async fn transcribes_when_audio() {
             MediaEndpoint::Transcriptions,
             &dispatch(&base_url),
             // The audio endpoints are multipart; the bytes are the caller's.
-            &MediaBody { content_type: "multipart/form-data", bytes: b"--b\r\n\r\n" },
+            &MediaBody {
+                content_type: "multipart/form-data",
+                bytes: b"--b\r\n\r\n",
+            },
             &CancellationToken::new(),
         )
         .await
@@ -186,7 +187,10 @@ async fn forwards_translations_when_audio_targeted_english() {
     exec.post_media(
         MediaEndpoint::Translations,
         &dispatch(&base_url),
-        &MediaBody { content_type: "multipart/form-data", bytes: b"--b\r\n\r\n" },
+        &MediaBody {
+            content_type: "multipart/form-data",
+            bytes: b"--b\r\n\r\n",
+        },
         &CancellationToken::new(),
     )
     .await
@@ -203,7 +207,10 @@ async fn forwards_ocr_when_document_route_requested() {
     exec.post_media(
         MediaEndpoint::Ocr,
         &dispatch(&base_url),
-        &MediaBody { content_type: "application/json", bytes: br#"{"model":"ocr-1"}"# },
+        &MediaBody {
+            content_type: "application/json",
+            bytes: br#"{"model":"ocr-1"}"#,
+        },
         &CancellationToken::new(),
     )
     .await
@@ -233,7 +240,10 @@ async fn surfaces_message_when_media_upstream_errors() {
         .post_media(
             MediaEndpoint::Ocr,
             &dispatch(&format!("http://{addr}")),
-            &MediaBody { content_type: "application/json", bytes: b"{}" },
+            &MediaBody {
+                content_type: "application/json",
+                bytes: b"{}",
+            },
             &CancellationToken::new(),
         )
         .await
@@ -241,7 +251,9 @@ async fn surfaces_message_when_media_upstream_errors() {
     server.abort();
 
     match err {
-        Some(ar_exec::ExecError::Upstream { status, message, .. }) => {
+        Some(ar_exec::ExecError::Upstream {
+            status, message, ..
+        }) => {
             assert_eq!(status, 422);
             assert_eq!(message, "bad document");
         }

@@ -78,13 +78,17 @@ mod token;
 pub(crate) use codec::{b64, hex};
 
 pub use admit::{
-    AdmitError, Admission, DEFAULT_IDLE_TTL, DEFAULT_MAX_CONNS, HEAVY_SHARE_DEN, HEAVY_SHARE_NUM, Lane, LaneSpec, Lease,
+    Admission, AdmitError, DEFAULT_IDLE_TTL, DEFAULT_MAX_CONNS, HEAVY_SHARE_DEN, HEAVY_SHARE_NUM,
+    Lane, LaneSpec, Lease,
 };
 pub use audit::{Action, Audit, AuditLine, Outcome};
 pub use error::KeyError;
-pub use hash::{HashParams, LEGACY_PREFIX, NONCE_LEN, PREFIX, SALT_LEN, TAG_LEN, VERSION, decrypt, encrypt, verify};
+pub use hash::{
+    HashParams, LEGACY_PREFIX, NONCE_LEN, PREFIX, SALT_LEN, TAG_LEN, VERSION, decrypt, encrypt,
+    verify,
+};
 pub use revoke::{DEFAULT_CAP, Revocation};
-pub use secret::{KeyMeta, MasterKey, MasterKeySource, Salt, Secret, KEY_LEN};
+pub use secret::{KEY_LEN, KeyMeta, MasterKey, MasterKeySource, Salt, Secret};
 pub use store::{CredentialStore, MASTER_KEY_VAR, OAuthSession, SessionKind};
 pub use token::{
     ACCESS_TTL, DEFAULT_LEEWAY, Issue, Issued, REFRESH_TTL, Scope, ScopeSet, Tokens, Verified,

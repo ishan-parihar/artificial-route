@@ -197,11 +197,11 @@ pub fn auto_variant_for_model(model: &str) -> Option<AutoVariant> {
 /// caller resolves `auto/*` before the router ever sees a request, so this is
 /// only ever called on a name that already looks like an alias.
 pub fn virtual_combo(name: &str) -> Result<AutoCombo, crate::error::RouteError> {
-    AutoVariant::parse(name)
-        .map(AutoCombo::new)
-        .ok_or_else(|| crate::error::RouteError::UnknownAutoVariant {
+    AutoVariant::parse(name).map(AutoCombo::new).ok_or_else(|| {
+        crate::error::RouteError::UnknownAutoVariant {
             name: name.to_owned(),
-        })
+        }
+    })
 }
 
 /// The factory seam: name in, candidate pool out.
@@ -245,7 +245,8 @@ impl VirtualFactory {
 #[cfg(test)]
 mod tests {
     use super::{
-        AUTO_VARIANTS, AutoCombo, AutoVariant, VirtualFactory, auto_variant_for_model, virtual_combo,
+        AUTO_VARIANTS, AutoCombo, AutoVariant, VirtualFactory, auto_variant_for_model,
+        virtual_combo,
     };
     use crate::Weights;
     use crate::error::RouteError;
@@ -359,7 +360,10 @@ mod tests {
 
     #[test]
     fn accepts_the_auto_prefix_case_insensitively() {
-        assert_eq!(auto_variant_for_model("AUTO/CHAOS"), Some(AutoVariant::Chaos));
+        assert_eq!(
+            auto_variant_for_model("AUTO/CHAOS"),
+            Some(AutoVariant::Chaos)
+        );
     }
 
     #[test]

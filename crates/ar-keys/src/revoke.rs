@@ -188,7 +188,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{Revocation};
+    use super::Revocation;
     use crate::error::KeyError;
 
     /// A unique path per call, so parallel tests never share a redb file —
@@ -196,7 +196,10 @@ mod tests {
     fn temp_path(tag: &str) -> std::path::PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("ar-keys-revoke-{tag}-{}-{n}.redb", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "ar-keys-revoke-{tag}-{}-{n}.redb",
+            std::process::id()
+        ))
     }
 
     fn open(tag: &str, cap: usize) -> (Revocation, std::path::PathBuf) {
@@ -206,7 +209,13 @@ mod tests {
     }
 
     fn now() -> i64 {
-        i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_secs()).expect("fits")
+        i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_secs(),
+        )
+        .expect("fits")
     }
 
     #[test]
@@ -260,7 +269,8 @@ mod tests {
         r.revoke("dead-a", now() - 10).expect("revoke");
         r.revoke("dead-b", now() - 10).expect("revoke");
         assert_eq!(r.len().expect("len"), 2);
-        r.revoke("live-a", now() + 600).expect("an expired entry must be collectable at the cap");
+        r.revoke("live-a", now() + 600)
+            .expect("an expired entry must be collectable at the cap");
         r.revoke("live-b", now() + 600).expect("now there is room");
         assert!(r.is_revoked("live-a").expect("lookup") && r.is_revoked("live-b").expect("lookup"));
         let _ = std::fs::remove_file(path);
@@ -271,7 +281,10 @@ mod tests {
         let (r, path) = open("full", 2);
         r.revoke("live-a", now() + 600).expect("revoke");
         r.revoke("live-b", now() + 600).expect("revoke");
-        assert!(matches!(r.revoke("live-c", now() + 600), Err(KeyError::RevokeListFull { cap: 2 })));
+        assert!(matches!(
+            r.revoke("live-c", now() + 600),
+            Err(KeyError::RevokeListFull { cap: 2 })
+        ));
         let _ = std::fs::remove_file(path);
     }
 
@@ -281,7 +294,10 @@ mod tests {
         r.revoke("live-a", now() + 600).expect("revoke");
         r.revoke("live-b", now() + 600).expect("revoke");
         let _ = r.revoke("live-c", now() + 600);
-        assert!(r.is_revoked("live-a").expect("lookup"), "evicting a live revocation un-revokes a stolen token");
+        assert!(
+            r.is_revoked("live-a").expect("lookup"),
+            "evicting a live revocation un-revokes a stolen token"
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -294,7 +310,10 @@ mod tests {
             r.revoke("durable", now() + 600).expect("revoke");
         }
         let r = Revocation::open(&path, 16).expect("reopen");
-        assert!(r.is_revoked("durable").expect("lookup"), "a restart must not un-revoke");
+        assert!(
+            r.is_revoked("durable").expect("lookup"),
+            "a restart must not un-revoke"
+        );
         let _ = std::fs::remove_file(path);
     }
 }

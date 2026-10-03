@@ -61,7 +61,9 @@ pub fn count_text(text: &str) -> u32 {
     // `encode_with_special_tokens` never rejects input, which is the property
     // the TS port relies on. It allocates one `usize` per token (~100 KB for a
     // 50 kB prompt) and frees it here.
-    let n = tiktoken_rs::cl100k_base_singleton().encode_with_special_tokens(text).len();
+    let n = tiktoken_rs::cl100k_base_singleton()
+        .encode_with_special_tokens(text)
+        .len();
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
@@ -82,7 +84,9 @@ fn estimate_string_tokens(text: &str) -> u32 {
 }
 
 fn text_of(value: Option<&Value>) -> u32 {
-    value.and_then(Value::as_str).map_or(0, estimate_string_tokens)
+    value
+        .and_then(Value::as_str)
+        .map_or(0, estimate_string_tokens)
 }
 
 /// `content` is either a bare string or an array of parts carrying `text`.
@@ -147,7 +151,9 @@ pub fn estimate_request(body: &Value) -> Estimate {
     input += u64::from(text_of(obj.get("system")));
 
     let output = reserved_output(obj);
-    let over = input.saturating_mul(OVER_PROVISION_NUM).div_ceil(OVER_PROVISION_DEN);
+    let over = input
+        .saturating_mul(OVER_PROVISION_NUM)
+        .div_ceil(OVER_PROVISION_DEN);
     let total = u32::try_from(over.saturating_add(u64::from(output))).unwrap_or(u32::MAX);
     Estimate {
         input: u32::try_from(input).unwrap_or(u32::MAX),
@@ -159,7 +165,8 @@ pub fn estimate_request(body: &Value) -> Estimate {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_OUTPUT_ALLOWANCE, Estimate, MAX_EXACT_TOKEN_COUNT_CHARS, count_text, estimate_request,
+        DEFAULT_OUTPUT_ALLOWANCE, Estimate, MAX_EXACT_TOKEN_COUNT_CHARS, count_text,
+        estimate_request,
     };
     use serde_json::json;
 

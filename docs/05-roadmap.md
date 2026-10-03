@@ -11,13 +11,14 @@ the parity closeout (`docs/07-parity-closeout.md`, wave C: embeddings,
 transcriptions, image-generations, OCR) and `/v1/audio/translations` landed
 afterwards, closing the modality scope; `import --from omniroute|litellm` shipped
 in v0.1.0 (`5cccd13`). The parity-closeout waves A–O are
-complete. Three rows are still open and none is claimed: server-side live
-discovery — the models.dev overlay ships in `ar-registry` and `ar import` uses
-it, but the running server's `/v1/models` is still config-static, and wiring it
-reverses a recorded drop of the scheduler — `quota-share-fair`'s persisted
-deficit map, and the 12-hour soak run itself: the harness is `scripts/soak.sh`
-and a 3-minute proof run is recorded, but 12 hours is not. One more that is not
-a P-phase row: `ar-obs` is a shipped, tested library with no in-tree consumer.
+complete. Three rows are still open and none is claimed. First, server-side
+live discovery: the models.dev overlay ships in `ar-registry` and `ar import`
+uses it, but the running server's `/v1/models` is still config-static, and
+wiring it reverses a recorded drop of the scheduler. Second,
+`quota-share-fair`'s persisted deficit map. Third, the 12-hour soak run
+itself: the harness is `scripts/soak.sh` and a 3-minute proof run is recorded,
+but 12 hours is not. One more that is not a P-phase row: `ar-obs` is a shipped,
+tested library with no in-tree consumer.
 The phase gates below still apply to anything a P-phase takes on.
 
 Gate every phase: `cargo test --release` + `cargo clippy --all-targets --all-features --locked -- -D warnings` + RAM check.

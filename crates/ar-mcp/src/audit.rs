@@ -148,7 +148,13 @@ impl Audit {
                 // which is the double-ended one -- so this is a one-element
                 // walk from the end, not a full scan.
                 Ok(table) => {
-                    match table.iter().map_err(redb_err)?.next_back().transpose().map_err(redb_err)? {
+                    match table
+                        .iter()
+                        .map_err(redb_err)?
+                        .next_back()
+                        .transpose()
+                        .map_err(redb_err)?
+                    {
                         Some((k, _)) => k.value().saturating_add(1),
                         None => 0,
                     }
@@ -163,7 +169,10 @@ impl Audit {
             // overwrite the trail.
             Err(e) => return Err(redb_err(e)),
         };
-        Ok(Self { db, next: AtomicU64::new(next) })
+        Ok(Self {
+            db,
+            next: AtomicU64::new(next),
+        })
     }
 
     /// Appends one row and returns its sequence number.
@@ -196,7 +205,10 @@ impl Audit {
             cut,
         );
         let tx = self.db.begin_write().map_err(redb_err)?;
-        tx.open_table(AUDIT).map_err(redb_err)?.insert(seq, row).map_err(redb_err)?;
+        tx.open_table(AUDIT)
+            .map_err(redb_err)?
+            .insert(seq, row)
+            .map_err(redb_err)?;
         tx.commit()?;
         Ok(seq)
     }
@@ -250,7 +262,14 @@ mod tests {
     fn audits_when_tool_called() {
         let audit = Audit::open(&tmp("basic.redb")).expect("open");
         let seq = audit
-            .record("ar_get_health", Duration::from_millis(3), "k1", "{}", "ok", CallOutcome::Ok)
+            .record(
+                "ar_get_health",
+                Duration::from_millis(3),
+                "k1",
+                "{}",
+                "ok",
+                CallOutcome::Ok,
+            )
             .expect("record");
         let row = audit.get(seq).expect("get").expect("row");
         assert!(row.starts_with("ar_get_health|3|k1|"), "{row}");
@@ -260,7 +279,14 @@ mod tests {
     fn truncates_output_to_the_documented_limit() {
         let audit = Audit::open(&tmp("trunc.redb")).expect("open");
         let seq = audit
-            .record("ar_cost_report", Duration::ZERO, "k1", "{}", &"x".repeat(500), CallOutcome::Ok)
+            .record(
+                "ar_cost_report",
+                Duration::ZERO,
+                "k1",
+                "{}",
+                &"x".repeat(500),
+                CallOutcome::Ok,
+            )
             .expect("record");
         let row = audit.get(seq).expect("get").expect("row");
         assert_eq!(row.matches('x').count(), AUDIT_OUTPUT_LIMIT);
@@ -270,11 +296,21 @@ mod tests {
     fn marks_a_truncated_row_with_its_true_length() {
         let audit = Audit::open(&tmp("trunc-mark.redb")).expect("open");
         let seq = audit
-            .record("ar_cost_report", Duration::ZERO, "k1", "{}", &"x".repeat(500), CallOutcome::Ok)
+            .record(
+                "ar_cost_report",
+                Duration::ZERO,
+                "k1",
+                "{}",
+                &"x".repeat(500),
+                CallOutcome::Ok,
+            )
             .expect("record");
         let row = audit.get(seq).expect("get").expect("row");
         let fields: Vec<&str> = row.split('|').collect();
-        assert_eq!(fields[5], "500", "out_len is the pre-truncation length: {row}");
+        assert_eq!(
+            fields[5], "500",
+            "out_len is the pre-truncation length: {row}"
+        );
         assert_eq!(fields[6], "true", "truncated is an explicit marker: {row}");
     }
 
@@ -282,7 +318,14 @@ mod tests {
     fn leaves_a_short_row_unmarked() {
         let audit = Audit::open(&tmp("no-trunc-mark.redb")).expect("open");
         let seq = audit
-            .record("ar_get_health", Duration::ZERO, "k1", "{}", "ok", CallOutcome::Ok)
+            .record(
+                "ar_get_health",
+                Duration::ZERO,
+                "k1",
+                "{}",
+                "ok",
+                CallOutcome::Ok,
+            )
             .expect("record");
         let row = audit.get(seq).expect("get").expect("row");
         assert_eq!(row.split('|').nth(6), Some("false"), "{row}");
@@ -292,7 +335,14 @@ mod tests {
     fn records_a_denial_without_the_body_having_run() {
         let audit = Audit::open(&tmp("denied.redb")).expect("open");
         let seq = audit
-            .record("ar_switch_combo", Duration::ZERO, "k1", "{}", "", CallOutcome::Denied)
+            .record(
+                "ar_switch_combo",
+                Duration::ZERO,
+                "k1",
+                "{}",
+                "",
+                CallOutcome::Denied,
+            )
             .expect("record");
         let row = audit.get(seq).expect("get").expect("row");
         assert_eq!(row.split('|').nth(4), Some("denied"), "{row}");
@@ -303,7 +353,14 @@ mod tests {
         let path = tmp("resume.redb");
         let first = Audit::open(&path).expect("open");
         let a = first
-            .record("ar_list_models", Duration::ZERO, "k1", "{}", "one", CallOutcome::Ok)
+            .record(
+                "ar_list_models",
+                Duration::ZERO,
+                "k1",
+                "{}",
+                "one",
+                CallOutcome::Ok,
+            )
             .expect("record");
         drop(first);
 
@@ -311,7 +368,14 @@ mod tests {
         // would have overwritten row 0.
         let second = Audit::open(&path).expect("reopen");
         let b = second
-            .record("ar_list_models", Duration::ZERO, "k1", "{}", "two", CallOutcome::Ok)
+            .record(
+                "ar_list_models",
+                Duration::ZERO,
+                "k1",
+                "{}",
+                "two",
+                CallOutcome::Ok,
+            )
             .expect("record");
         assert_eq!((a, b), (0, 1));
         assert_eq!(second.len(), 2);

@@ -100,7 +100,11 @@ fn rewrite(text: &str) -> String {
         }
         let verbatim = fenced || is_fence;
 
-        let kept = if verbatim { line } else { strip_comment(line).trim_end() };
+        let kept = if verbatim {
+            line
+        } else {
+            strip_comment(line).trim_end()
+        };
         // A blank line inside a fence is code, so the run cap must not see it.
         let blank = !verbatim && kept.is_empty();
         if blank && prev_blank {
@@ -164,7 +168,9 @@ fn comment_cut(line: &str) -> Option<usize> {
             b'/' if b.get(i + 1) == Some(&b'/') && (i == 0 || b[i - 1].is_ascii_whitespace()) => {
                 return Some(i);
             }
-            b'#' if (i == 0 || b[i - 1].is_ascii_whitespace()) && hash_is_comment(&line[i + 1..]) => {
+            b'#' if (i == 0 || b[i - 1].is_ascii_whitespace())
+                && hash_is_comment(&line[i + 1..]) =>
+            {
                 return Some(i);
             }
             _ => i += 1,
@@ -207,7 +213,10 @@ mod tests {
 
     #[test]
     fn borrows_when_text_already_clean() {
-        assert!(matches!(lite("fn main() { println!(\"hi\"); }"), Cow::Borrowed(_)));
+        assert!(matches!(
+            lite("fn main() { println!(\"hi\"); }"),
+            Cow::Borrowed(_)
+        ));
     }
 
     #[test]

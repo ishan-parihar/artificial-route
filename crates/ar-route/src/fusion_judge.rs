@@ -362,7 +362,9 @@ pub fn extract_panel_text(body: &[u8]) -> String {
         return text;
     }
     // Gemini: parts carry bare `text`, with no type discriminator.
-    if let Some(parts) = value.pointer("/candidates/0/content/parts").and_then(|p| p.as_array())
+    if let Some(parts) = value
+        .pointer("/candidates/0/content/parts")
+        .and_then(|p| p.as_array())
     {
         let joined = parts
             .iter()
@@ -523,8 +525,14 @@ mod tests {
             let seen = judge.body();
             assert!(seen.contains("[Source 1]"), "sources are numbered: {seen}");
             assert!(seen.contains("[Source 2]"), "{seen}");
-            assert!(seen.contains("rusted metal has poor conductivity"), "{seen}");
-            assert!(seen.contains("pure copper conducts better than alloy"), "{seen}");
+            assert!(
+                seen.contains("rusted metal has poor conductivity"),
+                "{seen}"
+            );
+            assert!(
+                seen.contains("pure copper conducts better than alloy"),
+                "{seen}"
+            );
             assert!(
                 seen.contains("which metal conducts?"),
                 "the original request reaches the judge: {seen}"
@@ -552,7 +560,11 @@ mod tests {
         futures::executor::block_on(async {
             let judge = ScriptedJudge::ok();
             let out = synthesize(&panel(), &judge_target(), "q", &judge).await;
-            assert_eq!(relayed_body(out).await, judge.reply, "the body is the judge's own");
+            assert_eq!(
+                relayed_body(out).await,
+                judge.reply,
+                "the body is the judge's own"
+            );
         });
     }
 
@@ -585,7 +597,10 @@ mod tests {
             };
             let out = synthesize(&panel(), &judge_target(), "q", &judge).await;
             assert!(!out.judged);
-            assert!(out.upstream.is_none(), "an unreadable judge body is not relayed");
+            assert!(
+                out.upstream.is_none(),
+                "an unreadable judge body is not relayed"
+            );
             assert_eq!(
                 out.error.as_deref(),
                 Some("judge body carried no readable text")
@@ -690,10 +705,7 @@ mod tests {
     fn empty_answers_do_not_count_toward_synthesis() {
         futures::executor::block_on(async {
             let judge = ScriptedJudge::ok();
-            let p = JudgePanel::new([
-                ("vendor-alpha", "the real answer"),
-                ("vendor-beta", "   "),
-            ]);
+            let p = JudgePanel::new([("vendor-alpha", "the real answer"), ("vendor-beta", "   ")]);
             assert_eq!(p.usable_count(), 1);
             assert_eq!(p.len(), 2, "the failed member is still in the trace");
             let out = synthesize(&p, &judge_target(), "q", &judge).await;
@@ -710,7 +722,9 @@ mod tests {
             assert!(!out.judged);
             assert!(out.upstream.is_none());
             assert!(
-                out.error.as_deref().is_some_and(|e| e.contains("needs no synthesis")),
+                out.error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("needs no synthesis")),
                 "the reason is reported: {out:?}"
             );
         });
@@ -722,8 +736,14 @@ mod tests {
             let judge = ScriptedJudge::failing();
             let out = synthesize(&panel(), &judge_target(), "q", &judge).await;
             assert!(!out.judged, "a refused judge did not judge");
-            assert_eq!(out.error.as_deref(), Some("judge call failed: judge refused"));
-            assert!(out.upstream.is_none(), "the caller falls back to a panel answer");
+            assert_eq!(
+                out.error.as_deref(),
+                Some("judge call failed: judge refused")
+            );
+            assert!(
+                out.upstream.is_none(),
+                "the caller falls back to a panel answer"
+            );
         });
     }
 

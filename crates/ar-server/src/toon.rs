@@ -20,7 +20,11 @@ pub const DEFAULT_FIELDS: &[&str] = &["id", "provider", "model"];
 /// after filtering renders the empty-state line rather than a bare header.
 #[must_use]
 pub fn models(cards: &[ModelCard], fields: &[&str]) -> String {
-    let mut cols: Vec<&str> = fields.iter().copied().filter(|f| DEFAULT_FIELDS.contains(f)).collect();
+    let mut cols: Vec<&str> = fields
+        .iter()
+        .copied()
+        .filter(|f| DEFAULT_FIELDS.contains(f))
+        .collect();
     if cols.is_empty() {
         cols = DEFAULT_FIELDS.to_vec();
     }

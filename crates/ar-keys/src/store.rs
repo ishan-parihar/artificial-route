@@ -137,7 +137,12 @@ pub const MASTER_KEY_VAR: &str = "AR_MASTER_KEY";
 /// than written out, so a fourth session kind cannot be added to the enum and
 /// forgotten here.
 fn session_kind_check() -> String {
-    format!("CHECK (kind IN ({}))", SessionKind::ALL.map(|k| format!("'{}'", k.as_str())).join(", "))
+    format!(
+        "CHECK (kind IN ({}))",
+        SessionKind::ALL
+            .map(|k| format!("'{}'", k.as_str()))
+            .join(", ")
+    )
 }
 
 /// The whole schema, with the terminal CHECK **generated**.
@@ -228,8 +233,9 @@ const ADDED_COLUMNS: &[(&str, &str)] = &[("oauth_sessions", "refresh_key TEXT NU
 /// the column already existing.
 fn add_missing_columns(conn: &Connection) -> Result<(), KeyError> {
     for (table, column) in ADDED_COLUMNS {
-        let mut stmt =
-            conn.prepare(&format!("PRAGMA table_info({table})")).map_err(sql)?;
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(sql)?;
         let present = stmt
             .query_map([], |row| row.get::<_, String>(1))
             .map_err(sql)?
@@ -239,7 +245,8 @@ fn add_missing_columns(conn: &Connection) -> Result<(), KeyError> {
         if present.iter().any(|held| held == name) {
             continue;
         }
-        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column};")).map_err(sql)?;
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column};"))
+            .map_err(sql)?;
     }
     Ok(())
 }
@@ -482,7 +489,14 @@ impl OAuthSession {
     /// A session of `kind` for `provider`, with nothing recorded yet beyond that.
     #[must_use]
     pub fn new(provider: impl Into<String>, kind: SessionKind) -> Self {
-        Self { provider: provider.into(), kind, access_key: None, refresh_key: None, terminal_status: None, terminal_reason: None }
+        Self {
+            provider: provider.into(),
+            kind,
+            access_key: None,
+            refresh_key: None,
+            terminal_status: None,
+            terminal_reason: None,
+        }
     }
 
     /// Records which `credentials` row holds the session's token.
@@ -608,7 +622,8 @@ impl CredentialStore {
             Some(meta) => MasterKey::new(material.to_owned_secret(), meta)?,
             None => {
                 let master = MasterKey::new(material.to_owned_secret(), KeyMeta::generate())?;
-                conn.execute(INSERT_META, [master.meta().to_json()?]).map_err(sql)?;
+                conn.execute(INSERT_META, [master.meta().to_json()?])
+                    .map_err(sql)?;
                 master
             }
         };
@@ -625,7 +640,9 @@ impl CredentialStore {
     /// or raw key. The reason names the variable and never echoes its value.
     pub fn open_with_env_key(path: &Path) -> Result<Self, KeyError> {
         let raw = std::env::var(MASTER_KEY_VAR).map_err(|_| {
-            KeyError::MasterKey(format!("{MASTER_KEY_VAR} is unset; the store cannot be read without it"))
+            KeyError::MasterKey(format!(
+                "{MASTER_KEY_VAR} is unset; the store cannot be read without it"
+            ))
         })?;
         let material = Secret::from_slice(&decode_key_material(raw.trim())?)?;
         Self::open_with_material(path, &material)
@@ -685,7 +702,12 @@ impl CredentialStore {
         };
         // The AAD is rebuilt from the row's own `provider`, so an envelope lifted
         // into another row cannot authenticate. This is the v1 splice, closed.
-        Ok(Some(hash::decrypt(&self.master, &provider, name, &envelope)?))
+        Ok(Some(hash::decrypt(
+            &self.master,
+            &provider,
+            name,
+            &envelope,
+        )?))
     }
 
     /// [`Self::get`] as a header value.
@@ -715,7 +737,10 @@ impl CredentialStore {
     ///
     /// [`KeyError::Store`] on a write failure.
     pub fn remove(&self, name: &str) -> Result<bool, KeyError> {
-        self.conn.execute(DELETE_CREDENTIAL, [name]).map(|n| n > 0).map_err(sql)
+        self.conn
+            .execute(DELETE_CREDENTIAL, [name])
+            .map(|n| n > 0)
+            .map_err(sql)
     }
 
     /// Every credential name in the store, sorted.
@@ -729,7 +754,9 @@ impl CredentialStore {
     /// [`KeyError::Store`] on a read failure.
     pub fn list_names(&self) -> Result<Vec<String>, KeyError> {
         let mut stmt = self.conn.prepare(SELECT_NAMES).map_err(sql)?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0)).map_err(sql)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(sql)?;
         rows.collect::<Result<Vec<String>, _>>().map_err(sql)
     }
 
@@ -753,8 +780,12 @@ impl CredentialStore {
     /// `(status, reason)` pair, which is how a transient status is kept out of a
     /// durable retirement.
     pub fn insert_session(&self, session: &OAuthSession) -> Result<(), KeyError> {
-        if let (SessionKind::Anonymous, Some(placement)) = (session.kind, session.access_key.as_deref()) {
-            return Err(KeyError::AnonymousCredential { placement: placement.to_owned() });
+        if let (SessionKind::Anonymous, Some(placement)) =
+            (session.kind, session.access_key.as_deref())
+        {
+            return Err(KeyError::AnonymousCredential {
+                placement: placement.to_owned(),
+            });
         }
         self.conn
             .execute(
@@ -807,7 +838,10 @@ impl CredentialStore {
     ///
     /// [`KeyError::Store`] on a write failure.
     pub fn remove_session(&self, provider: &str) -> Result<bool, KeyError> {
-        self.conn.execute(DELETE_SESSION, [provider]).map(|n| n > 0).map_err(sql)
+        self.conn
+            .execute(DELETE_SESSION, [provider])
+            .map(|n| n > 0)
+            .map_err(sql)
     }
 
     /// How many session rows the store holds, for `ar doctor`'s `store` row.
@@ -821,7 +855,10 @@ impl CredentialStore {
     ///
     /// [`KeyError::Store`] on a read failure.
     pub fn session_count(&self) -> Result<usize, KeyError> {
-        self.conn.query_row(COUNT_SESSIONS, [], |row| row.get::<_, i64>(0)).map(|n| n.max(0) as usize).map_err(sql)
+        self.conn
+            .query_row(COUNT_SESSIONS, [], |row| row.get::<_, i64>(0))
+            .map(|n| n.max(0) as usize)
+            .map_err(sql)
     }
 
     /// Where one provider's renewal lands: the two `credentials` row names and
@@ -851,7 +888,11 @@ impl CredentialStore {
             }
             _ => None,
         };
-        Ok(Some(Placement { access_key, refresh_key, stored_refresh: stored }))
+        Ok(Some(Placement {
+            access_key,
+            refresh_key,
+            stored_refresh: stored,
+        }))
     }
 
     /// Appends one quota reading.
@@ -903,27 +944,33 @@ impl CredentialStore {
     ) -> Result<Option<QuotaSnapshot>, KeyError> {
         let row = self
             .conn
-            .query_row(SELECT_LATEST_QUOTA_SNAPSHOT, params![provider, window_key], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<f64>>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                    row.get::<_, i64>(4)?,
-                ))
-            })
+            .query_row(
+                SELECT_LATEST_QUOTA_SNAPSHOT,
+                params![provider, window_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<f64>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
             .optional()
             .map_err(sql)?;
-        row.map(|(window_key, remaining, exhausted, next_reset_at, recorded_at)| {
-            Ok(QuotaSnapshot {
-                provider: provider.to_owned(),
-                window_key,
-                remaining_percentage: remaining,
-                exhausted: exhausted != 0,
-                next_reset_at: next_reset_at.map(|n| u64::try_from(n).unwrap_or(0)),
-                recorded_at: u64::try_from(recorded_at).unwrap_or(0),
-            })
-        })
+        row.map(
+            |(window_key, remaining, exhausted, next_reset_at, recorded_at)| {
+                Ok(QuotaSnapshot {
+                    provider: provider.to_owned(),
+                    window_key,
+                    remaining_percentage: remaining,
+                    exhausted: exhausted != 0,
+                    next_reset_at: next_reset_at.map(|n| u64::try_from(n).unwrap_or(0)),
+                    recorded_at: u64::try_from(recorded_at).unwrap_or(0),
+                })
+            },
+        )
         .transpose()
     }
 
@@ -933,7 +980,12 @@ impl CredentialStore {
     ///
     /// [`KeyError::Store`] on a read failure.
     pub fn quota_snapshot_count(&self) -> Result<usize, KeyError> {
-        self.conn.query_row("SELECT count(*) FROM quota_snapshots", [], |row| row.get::<_, i64>(0)).map(|n| n.max(0) as usize).map_err(sql)
+        self.conn
+            .query_row("SELECT count(*) FROM quota_snapshots", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map(|n| n.max(0) as usize)
+            .map_err(sql)
     }
 }
 
@@ -952,12 +1004,28 @@ struct Placement {
 /// A `u16` the schema cannot hold is a store error rather than a saturating cast:
 /// the column only ever received a `u16` through this API, so a wider value means
 /// the file was edited by something that is not this build.
-fn read_session(row: (String, String, Option<String>, Option<String>, Option<i64>, Option<String>)) -> Result<OAuthSession, KeyError> {
+fn read_session(
+    row: (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+    ),
+) -> Result<OAuthSession, KeyError> {
     let (provider, kind, access_key, refresh_key, terminal_status, terminal_reason) = row;
-    let kind = SessionKind::parse(&kind)
-        .ok_or_else(|| KeyError::Store(format!("oauth session {provider:?} has unknown kind {kind:?}")))?;
+    let kind = SessionKind::parse(&kind).ok_or_else(|| {
+        KeyError::Store(format!(
+            "oauth session {provider:?} has unknown kind {kind:?}"
+        ))
+    })?;
     let terminal_status = terminal_status
-        .map(|status| u16::try_from(status).map_err(|_| KeyError::Store(format!("oauth session {provider:?} has status {status}"))))
+        .map(|status| {
+            u16::try_from(status).map_err(|_| {
+                KeyError::Store(format!("oauth session {provider:?} has status {status}"))
+            })
+        })
         .transpose()?;
     Ok(OAuthSession {
         provider,
@@ -1000,7 +1068,12 @@ impl std::fmt::Debug for CredentialStore {
 /// written anyway, because a failed read is a store problem and refusing to
 /// persist would turn it into a session that dies on the next boot.
 impl RotationSink for CredentialStore {
-    fn persist_rotation(&self, provider: &str, presented: Option<&str>, renewed: &OAuthToken) -> bool {
+    fn persist_rotation(
+        &self,
+        provider: &str,
+        presented: Option<&str>,
+        renewed: &OAuthToken,
+    ) -> bool {
         match self.write_rotation(provider, presented, renewed) {
             Ok(written) => written,
             Err(e) => {
@@ -1034,7 +1107,10 @@ impl CredentialStore {
         // refresh half to exchange, in which case there is nothing to compare and
         // nothing a concurrent rotation could have invalidated.
         if let Some(presented) = presented
-            && placement.stored_refresh.as_ref().is_some_and(|stored| stored.as_bytes() != presented.as_bytes())
+            && placement
+                .stored_refresh
+                .as_ref()
+                .is_some_and(|stored| stored.as_bytes() != presented.as_bytes())
         {
             return Ok(false);
         }
@@ -1064,7 +1140,10 @@ fn row(bytes: &[u8]) -> Secret {
 
 /// The persisted argon2id metadata, or `None` for a store this build is creating.
 fn read_meta(conn: &Connection) -> Result<Option<KeyMeta>, KeyError> {
-    let json = conn.query_row(SELECT_META, [], |row| row.get::<_, String>(0)).optional().map_err(sql)?;
+    let json = conn
+        .query_row(SELECT_META, [], |row| row.get::<_, String>(0))
+        .optional()
+        .map_err(sql)?;
     json.map(|raw| KeyMeta::from_json(&raw)).transpose()
 }
 
@@ -1094,7 +1173,8 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::{
-        CredentialStore, MASTER_KEY_VAR, MAX_QUOTA_SNAPSHOT_AGE_SECS, OAuthSession, QuotaSnapshot, SessionKind, sql,
+        CredentialStore, MASTER_KEY_VAR, MAX_QUOTA_SNAPSHOT_AGE_SECS, OAuthSession, QuotaSnapshot,
+        SessionKind, sql,
     };
     use crate::codec::hex;
     use crate::error::KeyError;
@@ -1108,8 +1188,12 @@ mod tests {
     #[test]
     fn round_trips_a_credential() {
         let s = store();
-        s.insert("openai", "openai", &Secret::new(b"sk-provider".to_vec())).expect("insert");
-        assert_eq!(s.get("openai").expect("get").expect("a row").as_bytes(), b"sk-provider");
+        s.insert("openai", "openai", &Secret::new(b"sk-provider".to_vec()))
+            .expect("insert");
+        assert_eq!(
+            s.get("openai").expect("get").expect("a row").as_bytes(),
+            b"sk-provider"
+        );
     }
 
     #[test]
@@ -1120,25 +1204,39 @@ mod tests {
     #[test]
     fn lists_every_name_when_queried() {
         let s = store();
-        s.insert("openai", "b", &Secret::generate()).expect("insert");
-        s.insert("anthropic", "a", &Secret::generate()).expect("insert");
+        s.insert("openai", "b", &Secret::generate())
+            .expect("insert");
+        s.insert("anthropic", "a", &Secret::generate())
+            .expect("insert");
         assert_eq!(s.list_names().expect("names"), ["a", "b"]);
     }
 
     #[test]
     fn replaces_a_credential_when_inserted_again() {
         let s = store();
-        s.insert("openai", "k", &Secret::new(b"first".to_vec())).expect("insert");
-        s.insert("openai", "k", &Secret::new(b"second".to_vec())).expect("insert");
-        assert_eq!(s.get("k").expect("get").expect("a row").as_bytes(), b"second");
+        s.insert("openai", "k", &Secret::new(b"first".to_vec()))
+            .expect("insert");
+        s.insert("openai", "k", &Secret::new(b"second".to_vec()))
+            .expect("insert");
+        assert_eq!(
+            s.get("k").expect("get").expect("a row").as_bytes(),
+            b"second"
+        );
     }
 
     #[test]
     fn stores_the_envelope_and_never_the_plaintext() {
         let s = store();
-        s.insert("openai", "k", &Secret::new(b"sk-plaintext".to_vec())).expect("insert");
-        let row: String =
-            s.conn.query_row("SELECT envelope FROM credentials WHERE name = 'k'", [], |r| r.get(0)).expect("row");
+        s.insert("openai", "k", &Secret::new(b"sk-plaintext".to_vec()))
+            .expect("insert");
+        let row: String = s
+            .conn
+            .query_row(
+                "SELECT envelope FROM credentials WHERE name = 'k'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("row");
         assert!(row.starts_with("enc:v2:"), "{row}");
         assert!(!row.contains("sk-plaintext"), "{row}");
     }
@@ -1146,8 +1244,14 @@ mod tests {
     #[test]
     fn refuses_a_credential_when_the_provider_does_not_match_the_aad() {
         let s = store();
-        s.insert("openai", "k", &Secret::new(b"sk-x".to_vec())).expect("insert");
-        s.conn.execute("UPDATE credentials SET provider = 'groq' WHERE name = 'k'", []).expect("tamper");
+        s.insert("openai", "k", &Secret::new(b"sk-x".to_vec()))
+            .expect("insert");
+        s.conn
+            .execute(
+                "UPDATE credentials SET provider = 'groq' WHERE name = 'k'",
+                [],
+            )
+            .expect("tamper");
         assert!(matches!(s.get("k"), Err(KeyError::TagMismatch)));
     }
 
@@ -1160,12 +1264,18 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let material = Secret::generate();
         let first = CredentialStore::open_with_material(&path, &material).expect("first open");
-        first.insert("openai", "openai", &Secret::new(b"sk-persisted".to_vec())).expect("insert");
+        first
+            .insert("openai", "openai", &Secret::new(b"sk-persisted".to_vec()))
+            .expect("insert");
         drop(first);
 
         let second = CredentialStore::open_with_material(&path, &material).expect("reopen");
         assert_eq!(
-            second.get("openai").expect("get").expect("a row").as_bytes(),
+            second
+                .get("openai")
+                .expect("get")
+                .expect("a row")
+                .as_bytes(),
             b"sk-persisted"
         );
         let _ = std::fs::remove_file(&path);
@@ -1177,10 +1287,13 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let mine = Secret::generate();
         let store = CredentialStore::open_with_material(&path, &mine).expect("open");
-        store.insert("openai", "openai", &Secret::new(b"sk-x".to_vec())).expect("insert");
+        store
+            .insert("openai", "openai", &Secret::new(b"sk-x".to_vec()))
+            .expect("insert");
         drop(store);
 
-        let theirs = CredentialStore::open_with_material(&path, &Secret::generate()).expect("reopen");
+        let theirs =
+            CredentialStore::open_with_material(&path, &Secret::generate()).expect("reopen");
         assert!(matches!(theirs.get("openai"), Err(KeyError::TagMismatch)));
         let _ = std::fs::remove_file(&path);
     }
@@ -1189,7 +1302,8 @@ mod tests {
     fn refuses_to_open_when_the_file_is_not_a_database() {
         let path = std::env::temp_dir().join(format!("ar-keys-garbage-{}.db", std::process::id()));
         std::fs::write(&path, b"not a sqlite file at all").expect("write");
-        let e = CredentialStore::open_with_material(&path, &Secret::generate()).expect_err("garbage");
+        let e =
+            CredentialStore::open_with_material(&path, &Secret::generate()).expect_err("garbage");
         assert!(matches!(e, KeyError::Store(_)), "{e}");
         let _ = std::fs::remove_file(&path);
     }
@@ -1206,15 +1320,23 @@ mod tests {
         // SAFETY: the only writer and reader of this name in this test binary.
         unsafe { std::env::set_var(MASTER_KEY_VAR, hex::encode(material.as_bytes())) };
         let store = CredentialStore::open_with_env_key(&path).expect("open from $VAR");
-        store.insert("openai", "openai", &Secret::new(b"sk-env".to_vec())).expect("insert");
-        assert_eq!(store.get("openai").expect("get").expect("a row").as_bytes(), b"sk-env");
+        store
+            .insert("openai", "openai", &Secret::new(b"sk-env".to_vec()))
+            .expect("insert");
+        assert_eq!(
+            store.get("openai").expect("get").expect("a row").as_bytes(),
+            b"sk-env"
+        );
         drop(store);
 
         // SAFETY: as above, and this thread is the only one that can observe it.
         unsafe { std::env::remove_var(MASTER_KEY_VAR) };
         let e = CredentialStore::open_with_env_key(&path).expect_err("unset now");
         assert!(matches!(e, KeyError::MasterKey(_)), "{e}");
-        assert!(e.to_string().contains(MASTER_KEY_VAR), "the reason names the variable: {e}");
+        assert!(
+            e.to_string().contains(MASTER_KEY_VAR),
+            "the reason names the variable: {e}"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -1222,7 +1344,8 @@ mod tests {
     #[test]
     fn reports_a_sqlite_failure_as_a_store_error_carrying_no_value() {
         let s = store();
-        s.insert("openai", "k", &Secret::new(b"sk-value".to_vec())).expect("insert");
+        s.insert("openai", "k", &Secret::new(b"sk-value".to_vec()))
+            .expect("insert");
         let e = s.get("k' OR 1=1 --").expect("parameterised, so a miss");
         assert!(e.is_none(), "{e:?}");
         let rendered = sql(rusqlite::Error::InvalidQuery).to_string();
@@ -1231,8 +1354,13 @@ mod tests {
 
     /// One session's rows written to a store on disk: the access row, the refresh
     /// row, and the placement that names both.
-    fn seeded_store(tag: &str, access: &str, refresh: &str) -> (std::path::PathBuf, Secret, CredentialStore) {
-        let path = std::env::temp_dir().join(format!("ar-keys-rotate-{tag}-{}.db", std::process::id()));
+    fn seeded_store(
+        tag: &str,
+        access: &str,
+        refresh: &str,
+    ) -> (std::path::PathBuf, Secret, CredentialStore) {
+        let path =
+            std::env::temp_dir().join(format!("ar-keys-rotate-{tag}-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let material = Secret::generate();
         let store = CredentialStore::open_with_material(&path, &material).expect("on-disk store");
@@ -1243,9 +1371,15 @@ mod tests {
                     .with_refresh_key("codex_refresh"),
             )
             .expect("session row");
-        store.insert("codex", "codex", &Secret::new(access.as_bytes().to_vec())).expect("access row");
         store
-            .insert("codex", "codex_refresh", &Secret::new(refresh.as_bytes().to_vec()))
+            .insert("codex", "codex", &Secret::new(access.as_bytes().to_vec()))
+            .expect("access row");
+        store
+            .insert(
+                "codex",
+                "codex_refresh",
+                &Secret::new(refresh.as_bytes().to_vec()),
+            )
             .expect("refresh row");
         (path, material, store)
     }
@@ -1273,7 +1407,11 @@ mod tests {
         assert!(written, "an unchanged row takes the write");
         let later = reopened(&path, &material);
         assert_eq!(
-            later.get("codex_refresh").expect("refresh row").expect("a row").as_bytes(),
+            later
+                .get("codex_refresh")
+                .expect("refresh row")
+                .expect("a row")
+                .as_bytes(),
             b"rt-renewed",
             "a fresh process must not load the refresh token this one spent"
         );
@@ -1287,15 +1425,19 @@ mod tests {
         // would revert their rotation and cost them the live token.
         let (path, material, store) = seeded_store("cas", "at-theirs", "rt-theirs");
 
-        let renewed =
-            OAuthToken::new(ProviderSecret::new("at-ours")).with_refresh(ProviderSecret::new("rt-ours"));
+        let renewed = OAuthToken::new(ProviderSecret::new("at-ours"))
+            .with_refresh(ProviderSecret::new("rt-ours"));
         let written = store.persist_rotation("codex", Some("rt-spent"), &renewed);
         drop(store);
 
         assert!(!written, "the guard reports a skip rather than clobbering");
         let later = reopened(&path, &material);
         assert_eq!(
-            later.get("codex_refresh").expect("refresh row").expect("a row").as_bytes(),
+            later
+                .get("codex_refresh")
+                .expect("refresh row")
+                .expect("a row")
+                .as_bytes(),
             b"rt-theirs",
             "the fresher rotation survives"
         );
@@ -1324,7 +1466,10 @@ mod tests {
         s.insert_session(&session).expect("insert");
 
         assert_eq!(
-            s.get_session("codex").expect("get").expect("a row").refresh_key(),
+            s.get_session("codex")
+                .expect("get")
+                .expect("a row")
+                .refresh_key(),
             Some("codex_refresh")
         );
     }
@@ -1334,20 +1479,30 @@ mod tests {
         // `CREATE TABLE IF NOT EXISTS` does nothing for a column added to a table
         // that is already there, so the shape is asserted at open time. A file
         // from before the column has to gain it or every rotation query fails.
-        let path = std::env::temp_dir().join(format!("ar-keys-pre-refresh-key-{}.db", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("ar-keys-pre-refresh-key-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let material = Secret::generate();
         let first = CredentialStore::open_with_material(&path, &material).expect("open");
-        first.conn.execute("ALTER TABLE oauth_sessions DROP COLUMN refresh_key", []).expect("simulate the old file");
+        first
+            .conn
+            .execute("ALTER TABLE oauth_sessions DROP COLUMN refresh_key", [])
+            .expect("simulate the old file");
         drop(first);
 
         let second = CredentialStore::open_with_material(&path, &material).expect("reopen");
         second
-            .insert_session(&OAuthSession::new("codex", SessionKind::Refresh).with_refresh_key("codex_refresh"))
+            .insert_session(
+                &OAuthSession::new("codex", SessionKind::Refresh).with_refresh_key("codex_refresh"),
+            )
             .expect("the row the old file could not hold");
 
         assert_eq!(
-            second.get_session("codex").expect("get").expect("a row").refresh_key(),
+            second
+                .get_session("codex")
+                .expect("get")
+                .expect("a row")
+                .refresh_key(),
             Some("codex_refresh")
         );
         let _ = std::fs::remove_file(&path);
@@ -1374,7 +1529,10 @@ mod tests {
         let s = store();
         let e = s.get("openai").expect("get");
         assert!(e.is_none());
-        assert!(!format!("{e:?}").contains("sk"), "a miss must not render key material");
+        assert!(
+            !format!("{e:?}").contains("sk"),
+            "a miss must not render key material"
+        );
     }
 
     // `oauth_sessions` — the table F-MED-2's generated CHECK was waiting for.
@@ -1416,7 +1574,10 @@ mod tests {
         let s = store();
         let e = s
             .conn
-            .execute("INSERT INTO oauth_sessions (provider, kind) VALUES ('codex', 'device_code')", [])
+            .execute(
+                "INSERT INTO oauth_sessions (provider, kind) VALUES ('codex', 'device_code')",
+                [],
+            )
             .expect_err("not one of the three kinds");
         assert!(matches!(e, rusqlite::Error::SqliteFailure(..)), "{e}");
     }
@@ -1424,15 +1585,21 @@ mod tests {
     #[test]
     fn stores_an_anonymous_session_when_it_carries_no_credential() {
         let s = store();
-        s.insert_session(&OAuthSession::new("cursor", SessionKind::Anonymous)).expect("insert");
-        assert_eq!(s.get_session("cursor").expect("get").expect("a row").kind(), SessionKind::Anonymous);
+        s.insert_session(&OAuthSession::new("cursor", SessionKind::Anonymous))
+            .expect("insert");
+        assert_eq!(
+            s.get_session("cursor").expect("get").expect("a row").kind(),
+            SessionKind::Anonymous
+        );
     }
 
     #[test]
     fn refuses_an_anonymous_session_when_it_carries_a_credential() {
         let s = store();
         let e = s
-            .insert_session(&OAuthSession::new("cursor", SessionKind::Anonymous).with_access_key("cursor"))
+            .insert_session(
+                &OAuthSession::new("cursor", SessionKind::Anonymous).with_access_key("cursor"),
+            )
             .expect_err("an anonymous session has no secret to point at");
         assert!(
             matches!(&e, KeyError::AnonymousCredential { placement } if placement == "cursor"),
@@ -1455,26 +1622,39 @@ mod tests {
     #[test]
     fn round_trips_a_refresh_session_when_the_row_is_written() {
         let s = store();
-        let session = OAuthSession::new("codex", SessionKind::Refresh).with_access_key("codex_refresh");
+        let session =
+            OAuthSession::new("codex", SessionKind::Refresh).with_access_key("codex_refresh");
         s.insert_session(&session).expect("insert");
-        assert_eq!(s.get_session("codex").expect("get").expect("a row"), session);
+        assert_eq!(
+            s.get_session("codex").expect("get").expect("a row"),
+            session
+        );
     }
 
     #[test]
     fn round_trips_a_device_session_when_the_row_is_written() {
         let s = store();
-        let session = OAuthSession::new("gemini-cli", SessionKind::Device).with_access_key("gemini_cli");
+        let session =
+            OAuthSession::new("gemini-cli", SessionKind::Device).with_access_key("gemini_cli");
         s.insert_session(&session).expect("insert");
-        assert_eq!(s.get_session("gemini-cli").expect("get").expect("a row"), session);
+        assert_eq!(
+            s.get_session("gemini-cli").expect("get").expect("a row"),
+            session
+        );
     }
 
     #[test]
     fn round_trips_a_terminal_status_when_the_pair_matches_the_generated_list() {
         let s = store();
-        let session = OAuthSession::new("claude", SessionKind::Refresh).with_access_key("claude_refresh").terminal(400, "invalid_grant");
+        let session = OAuthSession::new("claude", SessionKind::Refresh)
+            .with_access_key("claude_refresh")
+            .terminal(400, "invalid_grant");
         s.insert_session(&session).expect("insert");
         assert_eq!(
-            s.get_session("claude").expect("get").expect("a row").terminal_status(),
+            s.get_session("claude")
+                .expect("get")
+                .expect("a row")
+                .terminal_status(),
             Some(400)
         );
     }
@@ -1485,7 +1665,10 @@ mod tests {
         // 503 is what a transient refresh failure reports; recording it would
         // retire a session the classifier explicitly called retryable.
         let e = s
-            .insert_session(&OAuthSession::new("codex", SessionKind::Refresh).terminal(503, "refresh-endpoint-unavailable"))
+            .insert_session(
+                &OAuthSession::new("codex", SessionKind::Refresh)
+                    .terminal(503, "refresh-endpoint-unavailable"),
+            )
             .expect_err("transient is not terminal");
         assert!(matches!(e, KeyError::Store(_)), "{e}");
     }
@@ -1498,7 +1681,8 @@ mod tests {
     #[test]
     fn forgets_a_session_when_the_provider_is_removed() {
         let s = store();
-        s.insert_session(&OAuthSession::new("codex", SessionKind::Refresh)).expect("insert");
+        s.insert_session(&OAuthSession::new("codex", SessionKind::Refresh))
+            .expect("insert");
         assert!(s.remove_session("codex").expect("remove"));
     }
 
@@ -1510,25 +1694,34 @@ mod tests {
     #[test]
     fn counts_every_session_row_for_doctor() {
         let s = store();
-        s.insert_session(&OAuthSession::new("codex", SessionKind::Refresh)).expect("insert");
-        s.insert_session(&OAuthSession::new("cursor", SessionKind::Anonymous)).expect("insert");
+        s.insert_session(&OAuthSession::new("codex", SessionKind::Refresh))
+            .expect("insert");
+        s.insert_session(&OAuthSession::new("cursor", SessionKind::Anonymous))
+            .expect("insert");
         assert_eq!(s.session_count().expect("count"), 2);
     }
 
     #[test]
     fn replaces_a_session_when_the_same_provider_is_written_again() {
         let s = store();
-        s.insert_session(&OAuthSession::new("codex", SessionKind::Refresh)).expect("insert");
-        s.insert_session(&OAuthSession::new("codex", SessionKind::Refresh).terminal(401, "token_revoked"))
+        s.insert_session(&OAuthSession::new("codex", SessionKind::Refresh))
             .expect("insert");
+        s.insert_session(
+            &OAuthSession::new("codex", SessionKind::Refresh).terminal(401, "token_revoked"),
+        )
+        .expect("insert");
         assert_eq!(s.session_count().expect("count"), 1);
     }
 
     #[test]
     fn keeps_session_rows_beside_credential_rows() {
         let s = store();
-        s.insert("codex", "codex", &Secret::generate()).expect("credential");
-        s.insert_session(&OAuthSession::new("codex", SessionKind::Refresh).with_access_key("codex")).expect("session");
+        s.insert("codex", "codex", &Secret::generate())
+            .expect("credential");
+        s.insert_session(
+            &OAuthSession::new("codex", SessionKind::Refresh).with_access_key("codex"),
+        )
+        .expect("session");
         assert_eq!(s.list_names().expect("names"), ["codex"]);
         assert_eq!(s.session_count().expect("count"), 1);
     }
@@ -1537,36 +1730,78 @@ mod tests {
     fn opens_a_store_written_before_the_sessions_table_existed() {
         // The upgrade path is `CREATE TABLE IF NOT EXISTS` and nothing else, so a
         // file carrying only the two original tables must gain the third.
-        let path = std::env::temp_dir().join(format!("ar-keys-pre-sessions-{}.db", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("ar-keys-pre-sessions-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let material = Secret::generate();
         let first = CredentialStore::open_with_material(&path, &material).expect("open");
-        first.insert("codex", "codex", &Secret::new(b"sk-old".to_vec())).expect("insert");
-        first.conn.execute("DROP TABLE oauth_sessions", []).expect("simulate the pre-table file");
+        first
+            .insert("codex", "codex", &Secret::new(b"sk-old".to_vec()))
+            .expect("insert");
+        first
+            .conn
+            .execute("DROP TABLE oauth_sessions", [])
+            .expect("simulate the pre-table file");
         drop(first);
 
         let second = CredentialStore::open_with_material(&path, &material).expect("reopen");
-        assert_eq!(second.get("codex").expect("get").expect("a row").as_bytes(), b"sk-old");
+        assert_eq!(
+            second.get("codex").expect("get").expect("a row").as_bytes(),
+            b"sk-old"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn renders_no_secret_when_a_session_row_is_printed() {
         let s = store();
-        s.insert_session(&OAuthSession::new("codex", SessionKind::Refresh).with_access_key("codex_refresh")).expect("insert");
+        s.insert_session(
+            &OAuthSession::new("codex", SessionKind::Refresh).with_access_key("codex_refresh"),
+        )
+        .expect("insert");
         let rendered = format!("{:?}", s.get_session("codex").expect("get").expect("a row"));
         assert!(!rendered.contains("sk-"), "{rendered}");
     }
 
-    fn snapshot(provider: &str, window: &str, remaining: Option<f64>, exhausted: bool, recorded_at: u64) -> QuotaSnapshot {
-        QuotaSnapshot::new(provider, window, remaining, exhausted, Some(1_800_000_000), recorded_at)
+    fn snapshot(
+        provider: &str,
+        window: &str,
+        remaining: Option<f64>,
+        exhausted: bool,
+        recorded_at: u64,
+    ) -> QuotaSnapshot {
+        QuotaSnapshot::new(
+            provider,
+            window,
+            remaining,
+            exhausted,
+            Some(1_800_000_000),
+            recorded_at,
+        )
     }
 
     #[test]
     fn round_trips_a_quota_snapshot() {
         let s = store();
-        s.insert_quota_snapshot(&snapshot("openai", "session-a", Some(0.25), false, 1_700_000_000)).expect("insert");
-        assert_eq!(s.latest_quota_snapshot("openai", "session-a").expect("read"), Some(snapshot("openai", "session-a", Some(0.25), false, 1_700_000_000)));
+        s.insert_quota_snapshot(&snapshot(
+            "openai",
+            "session-a",
+            Some(0.25),
+            false,
+            1_700_000_000,
+        ))
+        .expect("insert");
+        assert_eq!(
+            s.latest_quota_snapshot("openai", "session-a")
+                .expect("read"),
+            Some(snapshot(
+                "openai",
+                "session-a",
+                Some(0.25),
+                false,
+                1_700_000_000
+            ))
+        );
     }
 
     #[test]
@@ -1574,9 +1809,26 @@ mod tests {
         // Latest-wins is the whole point of the time series: a stale reading
         // answering "what is it now" is worse than no reading at all.
         let s = store();
-        s.insert_quota_snapshot(&snapshot("openai", "session-a", Some(0.9), false, 1_700_000_000)).expect("insert");
-        s.insert_quota_snapshot(&snapshot("openai", "session-a", Some(0.4), false, 1_700_000_600)).expect("insert");
-        let latest = s.latest_quota_snapshot("openai", "session-a").expect("read").expect("a row");
+        s.insert_quota_snapshot(&snapshot(
+            "openai",
+            "session-a",
+            Some(0.9),
+            false,
+            1_700_000_000,
+        ))
+        .expect("insert");
+        s.insert_quota_snapshot(&snapshot(
+            "openai",
+            "session-a",
+            Some(0.4),
+            false,
+            1_700_000_600,
+        ))
+        .expect("insert");
+        let latest = s
+            .latest_quota_snapshot("openai", "session-a")
+            .expect("read")
+            .expect("a row");
         assert_eq!(latest.remaining_percentage, Some(0.4));
     }
 
@@ -1585,9 +1837,26 @@ mod tests {
         // Two readings in the same second: the one inserted last is the one
         // observed last, so it has to win.
         let s = store();
-        s.insert_quota_snapshot(&snapshot("openai", "session-a", Some(0.9), false, 1_700_000_000)).expect("insert");
-        s.insert_quota_snapshot(&snapshot("openai", "session-a", Some(0.1), false, 1_700_000_000)).expect("insert");
-        let latest = s.latest_quota_snapshot("openai", "session-a").expect("read").expect("a row");
+        s.insert_quota_snapshot(&snapshot(
+            "openai",
+            "session-a",
+            Some(0.9),
+            false,
+            1_700_000_000,
+        ))
+        .expect("insert");
+        s.insert_quota_snapshot(&snapshot(
+            "openai",
+            "session-a",
+            Some(0.1),
+            false,
+            1_700_000_000,
+        ))
+        .expect("insert");
+        let latest = s
+            .latest_quota_snapshot("openai", "session-a")
+            .expect("read")
+            .expect("a row");
         assert_eq!(latest.remaining_percentage, Some(0.1));
     }
 
@@ -1595,38 +1864,99 @@ mod tests {
     fn reads_the_exhausted_flag_back() {
         // The flag a routing decision turns on, readable without parsing prose.
         let s = store();
-        s.insert_quota_snapshot(&snapshot("claude", "weekly", None, true, 1_700_000_000)).expect("insert");
-        let latest = s.latest_quota_snapshot("claude", "weekly").expect("read").expect("a row");
+        s.insert_quota_snapshot(&snapshot("claude", "weekly", None, true, 1_700_000_000))
+            .expect("insert");
+        let latest = s
+            .latest_quota_snapshot("claude", "weekly")
+            .expect("read")
+            .expect("a row");
         assert!(latest.exhausted);
     }
 
     #[test]
     fn keeps_an_unexhausted_window_distinguishable_from_an_exhausted_one() {
         let s = store();
-        s.insert_quota_snapshot(&snapshot("openai", "session-a", Some(0.0), false, 1_700_000_000)).expect("insert");
-        s.insert_quota_snapshot(&snapshot("openai", "session-b", None, false, 1_700_000_000)).expect("insert");
-        assert!(!s.latest_quota_snapshot("openai", "session-a").expect("read").expect("a row").exhausted);
-        assert!(!s.latest_quota_snapshot("openai", "session-b").expect("read").expect("a row").exhausted);
+        s.insert_quota_snapshot(&snapshot(
+            "openai",
+            "session-a",
+            Some(0.0),
+            false,
+            1_700_000_000,
+        ))
+        .expect("insert");
+        s.insert_quota_snapshot(&snapshot("openai", "session-b", None, false, 1_700_000_000))
+            .expect("insert");
+        assert!(
+            !s.latest_quota_snapshot("openai", "session-a")
+                .expect("read")
+                .expect("a row")
+                .exhausted
+        );
+        assert!(
+            !s.latest_quota_snapshot("openai", "session-b")
+                .expect("read")
+                .expect("a row")
+                .exhausted
+        );
     }
 
     #[test]
     fn separates_windows_of_the_same_provider() {
         let s = store();
-        s.insert_quota_snapshot(&snapshot("openai", "session-a", Some(0.5), false, 1_700_000_000)).expect("insert");
-        s.insert_quota_snapshot(&snapshot("openai", "session-b", Some(0.1), false, 1_700_000_900)).expect("insert");
-        assert_eq!(s.latest_quota_snapshot("openai", "session-a").expect("read").expect("a row").remaining_percentage, Some(0.5));
+        s.insert_quota_snapshot(&snapshot(
+            "openai",
+            "session-a",
+            Some(0.5),
+            false,
+            1_700_000_000,
+        ))
+        .expect("insert");
+        s.insert_quota_snapshot(&snapshot(
+            "openai",
+            "session-b",
+            Some(0.1),
+            false,
+            1_700_000_900,
+        ))
+        .expect("insert");
+        assert_eq!(
+            s.latest_quota_snapshot("openai", "session-a")
+                .expect("read")
+                .expect("a row")
+                .remaining_percentage,
+            Some(0.5)
+        );
     }
 
     #[test]
     fn returns_none_when_no_snapshot_was_recorded() {
-        assert_eq!(store().latest_quota_snapshot("openai", "session-a").expect("read"), None);
+        assert_eq!(
+            store()
+                .latest_quota_snapshot("openai", "session-a")
+                .expect("read"),
+            None
+        );
     }
 
     #[test]
     fn counts_the_rows_it_holds() {
         let s = store();
-        s.insert_quota_snapshot(&snapshot("openai", "session-a", Some(0.5), false, 1_700_000_000)).expect("insert");
-        s.insert_quota_snapshot(&snapshot("openai", "session-a", Some(0.4), false, 1_700_000_600)).expect("insert");
+        s.insert_quota_snapshot(&snapshot(
+            "openai",
+            "session-a",
+            Some(0.5),
+            false,
+            1_700_000_000,
+        ))
+        .expect("insert");
+        s.insert_quota_snapshot(&snapshot(
+            "openai",
+            "session-a",
+            Some(0.4),
+            false,
+            1_700_000_600,
+        ))
+        .expect("insert");
         assert_eq!(s.quota_snapshot_count().expect("count"), 2);
     }
 
@@ -1635,13 +1965,23 @@ mod tests {
         // `QuotaWindow` reads a zero limit as unlimited headroom; storing `0.0`
         // here would report it as drained.
         let s = store();
-        s.insert_quota_snapshot(&snapshot("openai", "session-a", None, false, 1_700_000_000)).expect("insert");
-        assert_eq!(s.latest_quota_snapshot("openai", "session-a").expect("read").expect("a row").remaining_percentage, None);
+        s.insert_quota_snapshot(&snapshot("openai", "session-a", None, false, 1_700_000_000))
+            .expect("insert");
+        assert_eq!(
+            s.latest_quota_snapshot("openai", "session-a")
+                .expect("read")
+                .expect("a row")
+                .remaining_percentage,
+            None
+        );
     }
 
     #[test]
     fn ages_a_snapshot_by_its_recorded_time() {
-        assert_eq!(snapshot("openai", "w", Some(1.0), false, 1_700_000_000).age_secs(1_700_000_300), 300);
+        assert_eq!(
+            snapshot("openai", "w", Some(1.0), false, 1_700_000_000).age_secs(1_700_000_300),
+            300
+        );
     }
 
     #[test]
@@ -1660,25 +2000,50 @@ mod tests {
     fn reads_a_future_timestamp_as_brand_new_rather_than_ancient() {
         // A wrapped `u64` would make a clock-skewed reading look centuries old and
         // drop the connection for a reason that does not exist.
-        assert_eq!(snapshot("openai", "w", Some(1.0), false, 1_700_000_600).age_secs(1_700_000_000), 0);
+        assert_eq!(
+            snapshot("openai", "w", Some(1.0), false, 1_700_000_600).age_secs(1_700_000_000),
+            0
+        );
     }
 
     #[test]
     fn opens_a_store_written_before_the_quota_snapshots_table_existed() {
         // `CREATE TABLE IF NOT EXISTS` again: a file carrying only the two
         // original tables must gain the third and keep its credentials.
-        let path = std::env::temp_dir().join(format!("ar-keys-pre-quota-{}.db", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("ar-keys-pre-quota-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let material = Secret::generate();
         let first = CredentialStore::open_with_material(&path, &material).expect("open");
-        first.insert("codex", "codex", &Secret::new(b"sk-old".to_vec())).expect("insert");
-        first.conn.execute("DROP TABLE quota_snapshots", []).expect("simulate the pre-table file");
+        first
+            .insert("codex", "codex", &Secret::new(b"sk-old".to_vec()))
+            .expect("insert");
+        first
+            .conn
+            .execute("DROP TABLE quota_snapshots", [])
+            .expect("simulate the pre-table file");
         drop(first);
 
         let second = CredentialStore::open_with_material(&path, &material).expect("reopen");
-        assert_eq!(second.get("codex").expect("get").expect("a row").as_bytes(), b"sk-old");
-        second.insert_quota_snapshot(&snapshot("codex", "weekly", Some(0.5), false, 1_700_000_000)).expect("insert");
-        assert!(second.latest_quota_snapshot("codex", "weekly").expect("read").is_some());
+        assert_eq!(
+            second.get("codex").expect("get").expect("a row").as_bytes(),
+            b"sk-old"
+        );
+        second
+            .insert_quota_snapshot(&snapshot(
+                "codex",
+                "weekly",
+                Some(0.5),
+                false,
+                1_700_000_000,
+            ))
+            .expect("insert");
+        assert!(
+            second
+                .latest_quota_snapshot("codex", "weekly")
+                .expect("read")
+                .is_some()
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

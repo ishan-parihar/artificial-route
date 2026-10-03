@@ -10,15 +10,15 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use ar_route::{ProviderId, Strategy};
+use ar_server::{
+    Components, HttpExec, ModelCard, ProviderConfig, ServerConfig, TRACE_HEADER, server,
+};
 use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::response::Response;
 use axum::routing::post;
-use ar_route::{ProviderId, Strategy};
-use ar_server::{
-    Components, HttpExec, ModelCard, ProviderConfig, ServerConfig, TRACE_HEADER, server,
-};
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
@@ -41,7 +41,9 @@ async fn mock_upstream() -> String {
     let app = Router::new().route(
         "/v1/chat/completions",
         post(|headers: HeaderMap, body: Body| async move {
-            let bytes = axum::body::to_bytes(body, 64 * 1024).await.unwrap_or_default();
+            let bytes = axum::body::to_bytes(body, 64 * 1024)
+                .await
+                .unwrap_or_default();
             let auth = headers
                 .get(header::AUTHORIZATION)
                 .and_then(|v| v.to_str().ok())
@@ -63,7 +65,9 @@ async fn mock_upstream() -> String {
                 .header(header::CONTENT_TYPE, "text/event-stream")
                 .body(Body::from_stream(futures::stream::iter([
                     Ok::<Bytes, std::io::Error>(Bytes::from(format!("data: {echo}\n\n"))),
-                    Ok(Bytes::from_static(b"data: {\"delta\":{\"content\":\"Hel\"}}\n\n")),
+                    Ok(Bytes::from_static(
+                        b"data: {\"delta\":{\"content\":\"Hel\"}}\n\n",
+                    )),
                     Ok(Bytes::from_static(b"data: [DONE]\n\n")),
                 ])))
                 .unwrap_or_else(|_| fallback(StatusCode::INTERNAL_SERVER_ERROR))
@@ -113,7 +117,12 @@ async fn call(app: &Router, req: Request<Body>) -> (StatusCode, HeaderMap, Strin
     let resp = app.clone().oneshot(req).await.expect("router responds");
     let status = resp.status();
     let headers = resp.headers().clone();
-    let body = resp.into_body().collect().await.expect("body collects").to_bytes();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .expect("body collects")
+        .to_bytes();
     (status, headers, String::from_utf8_lossy(&body).into_owned())
 }
 
@@ -135,11 +144,17 @@ fn post_chat(body: &str, extra: &[(&str, &str)]) -> Request<Body> {
 }
 
 fn get(path: &str) -> Request<Body> {
-    Request::builder().uri(path).body(Body::empty()).expect("request builds")
+    Request::builder()
+        .uri(path)
+        .body(Body::empty())
+        .expect("request builds")
 }
 
 fn header_of(map: &HeaderMap, name: &str) -> String {
-    map.get(name).and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned()
+    map.get(name)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned()
 }
 
 #[tokio::test]
@@ -158,8 +173,14 @@ async fn e2e_single_provider_when_key_set() {
     assert!(text.contains("[DONE]"), "stream not terminated: {text}");
     // The upstream's echo proves the body and the bearer token crossed the
     // proxy, and that the model was rewritten to the provider's spelling.
-    assert!(text.contains("sk-test-key"), "upstream never saw the key: {text}");
-    assert!(text.contains("mock-model"), "model was not rewritten: {text}");
+    assert!(
+        text.contains("sk-test-key"),
+        "upstream never saw the key: {text}"
+    );
+    assert!(
+        text.contains("mock-model"),
+        "model was not rewritten: {text}"
+    );
     assert_eq!(header_of(&headers, "content-type"), "text/event-stream");
 
     // --- decision headers ----------------------------------------------
@@ -172,7 +193,10 @@ async fn e2e_single_provider_when_key_set() {
     );
     assert!(header_of(&headers, "x-ar-usage").contains("attempts=1"));
     assert_eq!(header_of(&headers, "x-ar-cache"), "bypass");
-    assert!(!header_of(&headers, TRACE_HEADER).is_empty(), "no trace id echoed");
+    assert!(
+        !header_of(&headers, TRACE_HEADER).is_empty(),
+        "no trace id echoed"
+    );
 
     // --- GET /v1/models ------------------------------------------------
     let (status, headers, text) = call(&router, get("/v1/models")).await;
@@ -190,9 +214,15 @@ async fn e2e_single_provider_when_key_set() {
     let (status, headers, text) = call(&router, get("/metrics")).await;
     assert_eq!(status, 200);
     assert!(header_of(&headers, "content-type").starts_with("text/plain"));
-    assert!(text.contains("ar_http_requests_total"), "metrics missing: {text}");
+    assert!(
+        text.contains("ar_http_requests_total"),
+        "metrics missing: {text}"
+    );
     // P0 gate from docs/04-obs: no request content may reach /metrics.
-    assert!(!text.contains("hi\""), "metrics leaked request content: {text}");
+    assert!(
+        !text.contains("hi\""),
+        "metrics leaked request content: {text}"
+    );
 
     // The lkgp pin from the streaming request must have landed.
     assert!(
@@ -200,7 +230,10 @@ async fn e2e_single_provider_when_key_set() {
         "successful request did not record an lkgp pin"
     );
     assert!(
-        state.metrics.render().contains("ar_upstream_attempts_total 1"),
+        state
+            .metrics
+            .render()
+            .contains("ar_upstream_attempts_total 1"),
         "attempt was not counted"
     );
 }
@@ -222,7 +255,10 @@ async fn e2e_fails_over_when_first_provider_429s() {
         "no Retry-After advertised to the client"
     );
     let decision = header_of(&headers, "x-ar-decision");
-    assert!(decision.contains("outcome=retry"), "decision was: {decision}");
+    assert!(
+        decision.contains("outcome=retry"),
+        "decision was: {decision}"
+    );
     assert!(decision.contains("provider=p1"), "decision was: {decision}");
 }
 
@@ -238,7 +274,10 @@ async fn e2e_returns_503_when_no_provider_configured() {
     let (status, _, text) = call(&s.router, post_chat(r#"{"model":"m"}"#, &[])).await;
     assert_eq!(status, 503);
     // The message says what to configure rather than leaking internals.
-    assert!(text.contains("no provider is configured"), "unhelpful error: {text}");
+    assert!(
+        text.contains("no provider is configured"),
+        "unhelpful error: {text}"
+    );
 }
 
 #[tokio::test]
@@ -274,7 +313,9 @@ async fn always_429() -> String {
                 .unwrap_or_else(|_| fallback(StatusCode::INTERNAL_SERVER_ERROR))
         }),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let addr: SocketAddr = listener.local_addr().expect("addr");
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;

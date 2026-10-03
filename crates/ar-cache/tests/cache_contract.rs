@@ -10,10 +10,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ar_cache::entry::now_ms;
-use bytes::Bytes;
 use ar_cache::idempotency::{DEFAULT_IDEMPOTENCY_BYTES, DEFAULT_IDEMPOTENCY_TTL, Replay};
 use ar_cache::tier::{DEFAULT_MEM_BYTES, DiskTier};
 use ar_cache::{Cache, CacheConfig, CacheState, Entry, TtlPolicy};
+use bytes::Bytes;
 use serde_json::json;
 
 /// A unique scratch path per call, so `cargo test`'s thread pool cannot have two
@@ -22,10 +22,7 @@ use serde_json::json;
 fn scratch(name: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "ar-cache-{name}-{}-{n}.redb",
-        std::process::id()
-    ))
+    std::env::temp_dir().join(format!("ar-cache-{name}-{}-{n}.redb", std::process::id()))
 }
 
 fn body() -> &'static str {
@@ -60,8 +57,15 @@ fn hits_when_same_body() {
     let cache = keyed_cache();
     let key = ar_cache::key::request_key("acme", "gpt-4o-mini", &request_body());
 
-    assert_eq!(cache.get(&key).state, CacheState::Miss, "cold key must miss");
-    assert!(cache.store(&key, 200, "application/json", body()), "first POST is stored");
+    assert_eq!(
+        cache.get(&key).state,
+        CacheState::Miss,
+        "cold key must miss"
+    );
+    assert!(
+        cache.store(&key, 200, "application/json", body()),
+        "first POST is stored"
+    );
 
     let second = cache.get(&key);
     assert_eq!(second.state, CacheState::Hit, "identical POST must hit");
@@ -75,7 +79,13 @@ fn hits_when_same_body() {
 fn replays_safe_when_idempotency_key() {
     let cache = keyed_cache();
     let store = cache.idempotency();
-    let first = Entry::new(200, "application/json", body(), now_ms(), std::time::Duration::from_secs(60));
+    let first = Entry::new(
+        200,
+        "application/json",
+        body(),
+        now_ms(),
+        std::time::Duration::from_secs(60),
+    );
 
     // First attempt claims the key and publishes the answer.
     assert_eq!(store.begin("acme", "retry-1"), Replay::Proceed);
@@ -83,11 +93,18 @@ fn replays_safe_when_idempotency_key() {
 
     // A client retry -- same key, same body, minutes later -- replays verbatim.
     let replay = store.begin("acme", "retry-1");
-    assert_eq!(replay, Replay::Cached(first), "retry must replay, not re-execute");
+    assert_eq!(
+        replay,
+        Replay::Cached(first),
+        "retry must replay, not re-execute"
+    );
 
     // A concurrent retry, before the first answer exists, is told to wait.
     let other = Cache::memory_only();
-    assert_eq!(other.idempotency().begin("acme", "retry-2"), Replay::Proceed);
+    assert_eq!(
+        other.idempotency().begin("acme", "retry-2"),
+        Replay::Proceed
+    );
     assert_eq!(
         other.idempotency().begin("acme", "retry-2"),
         Replay::InFlight,
@@ -102,15 +119,18 @@ fn evicts_when_full() {
     // evict rather than grow.
     const CAP: u64 = 256 * 1024;
     const BODY_BYTES: usize = 32 * 1024;
-    let cache = Cache::with_config(
-        CacheConfig::memory_only().with_mem_bytes(CAP),
-    )
-    .expect("memory-only cache");
+    let cache = Cache::with_config(CacheConfig::memory_only().with_mem_bytes(CAP))
+        .expect("memory-only cache");
     let payload = "x".repeat(BODY_BYTES);
 
     for i in 0..500 {
         let key = ar_cache::key::request_key("acme", "gpt-4o-mini", &json!({ "n": i }));
-        cache.store(&key, 200, "application/json", Bytes::copy_from_slice(payload.as_bytes()));
+        cache.store(
+            &key,
+            200,
+            "application/json",
+            Bytes::copy_from_slice(payload.as_bytes()),
+        );
     }
 
     let weight = cache.mem().weight();
@@ -203,13 +223,11 @@ fn stores_a_4xx_for_thirty_seconds() {
 #[test]
 fn a_2xx_expires_after_its_ttl() {
     // A 1 ms success TTL, so the test does not sleep for five minutes.
-    let cache = Cache::with_config(
-        CacheConfig::memory_only().with_ttl(TtlPolicy {
-            success: std::time::Duration::from_millis(5),
-            client_error: std::time::Duration::from_millis(5),
-            other: ar_cache::NO_STORE,
-        }),
-    )
+    let cache = Cache::with_config(CacheConfig::memory_only().with_ttl(TtlPolicy {
+        success: std::time::Duration::from_millis(5),
+        client_error: std::time::Duration::from_millis(5),
+        other: ar_cache::NO_STORE,
+    }))
     .expect("memory-only cache");
     let key = ar_cache::key::request_key("acme", "gpt-4o-mini", &json!({"n": 3}));
     assert!(cache.store(&key, 200, "application/json", body()));
@@ -236,7 +254,13 @@ fn does_not_store_a_truncated_completion() {
 fn disk_tier_serves_an_entry_after_the_process_restarts() {
     let path = scratch("persist");
     let key = ar_cache::key::request_key("acme", "gpt-4o-mini", &request_body());
-    let entry = Entry::new(200, "application/json", body(), now_ms(), std::time::Duration::from_secs(300));
+    let entry = Entry::new(
+        200,
+        "application/json",
+        body(),
+        now_ms(),
+        std::time::Duration::from_secs(300),
+    );
 
     {
         let disk = DiskTier::open(&path, 1 << 20).expect("open");
@@ -244,7 +268,10 @@ fn disk_tier_serves_an_entry_after_the_process_restarts() {
     }
     // Reopened as a *different* `DiskTier`, which is what a restart is.
     let reopened = DiskTier::open(&path, 1 << 20).expect("reopen");
-    assert_eq!(reopened.get(&key, now_ms()).expect("get").map(|e| e.body), Some(entry.body));
+    assert_eq!(
+        reopened.get(&key, now_ms()).expect("get").map(|e| e.body),
+        Some(entry.body)
+    );
     drop(reopened);
     let _ = std::fs::remove_file(&path);
 }
@@ -273,7 +300,10 @@ fn disk_tier_refuses_to_exceed_its_byte_cap() {
     }
 
     assert!(stored > 0, "the cap must still allow some writes");
-    assert!(stored < 64, "the cap must refuse eventually: stored {stored}/64");
+    assert!(
+        stored < 64,
+        "the cap must refuse eventually: stored {stored}/64"
+    );
     assert!(
         disk.used_bytes() <= disk.cap_bytes(),
         "logical bytes {} exceeded cap {}",
@@ -293,19 +323,29 @@ fn cache_falls_back_to_the_disk_tier_on_a_memory_miss() {
     // memory tier has never seen the key -- a restart, using only the public
     // API. (`forget` would clear the disk row too, so it cannot stand in for
     // a cold memory tier.)
-    let writer = Cache::with_config(CacheConfig::memory_only().with_disk(&path)).expect("with disk");
+    let writer =
+        Cache::with_config(CacheConfig::memory_only().with_disk(&path)).expect("with disk");
     assert!(writer.store(&key, 200, "application/json", body()));
     drop(writer);
 
-    let reader = Cache::with_config(CacheConfig::memory_only().with_disk(&path)).expect("with disk");
-    assert_eq!(reader.get(&key).state, CacheState::Miss, "memory tier starts cold");
+    let reader =
+        Cache::with_config(CacheConfig::memory_only().with_disk(&path)).expect("with disk");
+    assert_eq!(
+        reader.get(&key).state,
+        CacheState::Miss,
+        "memory tier starts cold"
+    );
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("runtime");
     let lookup = rt.block_on(reader.get_with_disk(key));
-    assert_eq!(lookup.state, CacheState::Hit, "disk tier must serve the miss");
+    assert_eq!(
+        lookup.state,
+        CacheState::Hit,
+        "disk tier must serve the miss"
+    );
     assert_eq!(lookup.body().map(Bytes::as_ref), Some(body().as_bytes()));
     drop(rt);
     drop(reader);
@@ -339,7 +379,13 @@ fn an_idempotency_store_at_capacity_never_exceeds_it() {
         store.complete(
             "acme",
             &format!("k{i}"),
-            Entry::new(200, "application/json", body(), now_ms(), std::time::Duration::from_secs(86_400)),
+            Entry::new(
+                200,
+                "application/json",
+                body(),
+                now_ms(),
+                std::time::Duration::from_secs(86_400),
+            ),
         );
     }
     assert!(

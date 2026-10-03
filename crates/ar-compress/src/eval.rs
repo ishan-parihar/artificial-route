@@ -155,7 +155,9 @@ pub const SEED_CORPUS: &[EvalCase<'static>] = &[
                   2026-06-22T10:00:03Z ERROR upstream timeout after=30000ms\n\
                   2026-06-22T10:00:04Z INFO  fell back to secondary provider",
         question: "What error occurred and what happened after it?",
-        gold: Some("An upstream timeout after 30000ms; the worker then fell back to the secondary provider."),
+        gold: Some(
+            "An upstream timeout after 30000ms; the worker then fell back to the secondary provider.",
+        ),
         captured: false,
     },
     EvalCase {
@@ -406,11 +408,7 @@ pub fn report_table(report: &Report<'_>) -> String {
         let mark = if case.truncated { " (truncated)" } else { "" };
         out.push_str(&format!(
             "| {}{mark} | {} | {:.4} | {} | {:.4} |\n",
-            case.id,
-            case.kind,
-            case.fidelity,
-            case.savings.saved,
-            case.savings.ratio
+            case.id, case.kind, case.fidelity, case.savings.saved, case.savings.ratio
         ));
     }
     out.push_str(&format!(
@@ -458,20 +456,19 @@ fn looks_like_pii(text: &str) -> bool {
 }
 
 fn has_email(text: &str) -> bool {
-    let Some(at) = text.find('@') else { return false };
+    let Some(at) = text.find('@') else {
+        return false;
+    };
     let local = &text[..at];
     // The domain ends at the first whitespace, not at the end of the text:
     // "ops@example.com for access" has a valid domain followed by prose, and
     // reading the prose as part of the domain rejects nothing at all.
-    let domain = text[at + 1..]
-        .split_whitespace()
-        .next()
-        .unwrap_or_default();
+    let domain = text[at + 1..].split_whitespace().next().unwrap_or_default();
     local.chars().any(|c| c.is_alphanumeric())
         && domain.contains('.')
-        && domain
-            .split('.')
-            .all(|label| !label.is_empty() && label.chars().all(|c| c.is_alphanumeric() || c == '-'))
+        && domain.split('.').all(|label| {
+            !label.is_empty() && label.chars().all(|c| c.is_alphanumeric() || c == '-')
+        })
 }
 
 /// A `NNN-NN-NNNN` run anywhere in the text.
@@ -577,7 +574,13 @@ mod tests {
 
     #[test]
     fn reports_fidelity_when_eval() {
-        let report = run(SEED_CORPUS, &plan(vec![Engine::Caveman]), registered(), None).unwrap();
+        let report = run(
+            SEED_CORPUS,
+            &plan(vec![Engine::Caveman]),
+            registered(),
+            None,
+        )
+        .unwrap();
         assert_eq!(report.cases.len(), SEED_CORPUS.len());
     }
 
@@ -633,7 +636,9 @@ mod tests {
     #[test]
     fn table_carries_all_three_columns() {
         let report = run(SEED_CORPUS, &plan(vec![Engine::Rtk]), registered(), None).unwrap();
-        assert!(report_table(&report).contains("| case | kind | fidelity | saved_tokens | ratio |"));
+        assert!(
+            report_table(&report).contains("| case | kind | fidelity | saved_tokens | ratio |")
+        );
     }
 
     #[test]
@@ -691,7 +696,9 @@ mod tests {
 
     #[test]
     fn clears_ordinary_prose() {
-        assert!(!looks_like_pii("the deploy waits for a human to approve it"));
+        assert!(!looks_like_pii(
+            "the deploy waits for a human to approve it"
+        ));
     }
 
     #[test]

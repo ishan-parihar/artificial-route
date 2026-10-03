@@ -53,7 +53,7 @@ pub mod trace;
 
 pub use audit::{AuditLedger, RAW_TTL_SECS};
 pub use error::ObsError;
-pub use metrics::{Cache, Decision, Family, Metrics, Queue, Request, MAX_SERIES};
+pub use metrics::{Cache, Decision, Family, MAX_SERIES, Metrics, Queue, Request};
 pub use trace::{CHANNEL_CAP, RETENTION_DAYS, TraceWriter};
 
 #[cfg(test)]

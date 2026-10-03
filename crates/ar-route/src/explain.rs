@@ -107,8 +107,8 @@ mod tests {
     #[test]
     fn traces_factors_when_explain() {
         let combo = virtual_combo("auto/cheap").expect("known alias");
-        let trace = explain_route(&combo, &pool(), &AutoSelector::new(), |_| 0.5)
-            .expect("pool present");
+        let trace =
+            explain_route(&combo, &pool(), &AutoSelector::new(), |_| 0.5).expect("pool present");
         // The cheapest candidate scores cost_inv 1 - 0.20/2.50 = 0.92 under the
         // cost-saver pack, which is what made it win.
         assert!(
@@ -121,16 +121,16 @@ mod tests {
     #[test]
     fn names_the_cheapest_provider_when_auto_cheap() {
         let combo = virtual_combo("auto/cheap").expect("known alias");
-        let trace = explain_route(&combo, &pool(), &AutoSelector::new(), |_| 0.5)
-            .expect("pool present");
+        let trace =
+            explain_route(&combo, &pool(), &AutoSelector::new(), |_| 0.5).expect("pool present");
         assert_eq!(trace.provider.as_str(), "together");
     }
 
     #[test]
     fn reports_every_falling_provider_in_order() {
         let combo = virtual_combo("auto/cheap").expect("known alias");
-        let trace = explain_route(&combo, &pool(), &AutoSelector::new(), |_| 0.5)
-            .expect("pool present");
+        let trace =
+            explain_route(&combo, &pool(), &AutoSelector::new(), |_| 0.5).expect("pool present");
         assert_eq!(trace.fallbacks.len(), crate::MAX_ATTEMPTS - 1);
         assert_eq!(trace.fallbacks[0].as_str(), "groq");
     }
@@ -138,16 +138,16 @@ mod tests {
     #[test]
     fn reports_the_variant_that_produced_the_decision() {
         let combo = virtual_combo("auto/fast").expect("known alias");
-        let trace = explain_route(&combo, &pool(), &AutoSelector::new(), |_| 0.5)
-            .expect("pool present");
+        let trace =
+            explain_route(&combo, &pool(), &AutoSelector::new(), |_| 0.5).expect("pool present");
         assert_eq!(trace.variant, "auto/fast");
     }
 
     #[test]
     fn emits_all_sixteen_factors_in_order() {
         let combo = virtual_combo("auto").expect("known alias");
-        let trace = explain_route(&combo, &pool(), &AutoSelector::new(), |_| 0.5)
-            .expect("pool present");
+        let trace =
+            explain_route(&combo, &pool(), &AutoSelector::new(), |_| 0.5).expect("pool present");
         let pairs = trace.factor_pairs();
         assert_eq!(pairs.len(), 16);
         assert_eq!(pairs[0].0, "quota");
@@ -161,8 +161,8 @@ mod tests {
         noisy[0].quota_remaining_pct = -50.0;
         noisy[1].p95_latency_ms = f64::NAN;
         noisy[2].quality = Some(4.0);
-        let trace = explain_route(&combo, &noisy, &AutoSelector::new(), |_| 0.5)
-            .expect("pool present");
+        let trace =
+            explain_route(&combo, &noisy, &AutoSelector::new(), |_| 0.5).expect("pool present");
         for (name, v) in trace.factor_pairs() {
             assert!((0.0..=1.0).contains(&v), "{name} was {v}");
         }
@@ -172,8 +172,8 @@ mod tests {
     fn reports_clear_score_when_pool_has_one() {
         let combo = virtual_combo("auto").expect("known alias");
         let one = [AutoCandidate::new(ProviderId::new("solo"), "m").with_price(1.0)];
-        let trace = explain_route(&combo, &one, &AutoSelector::new(), |_| 0.5)
-            .expect("pool present");
+        let trace =
+            explain_route(&combo, &one, &AutoSelector::new(), |_| 0.5).expect("pool present");
         assert_eq!(trace.reason, WinnerReason::ClearScore);
     }
 
@@ -181,8 +181,8 @@ mod tests {
     fn reports_clear_score_when_one_candidate_leads_by_a_lot() {
         let combo = virtual_combo("auto/cheap").expect("known alias");
         // `pool()` spans 0.20..2.50 USD/Mtok, which is far past CLEAR_WINNER.
-        let trace = explain_route(&combo, &pool(), &AutoSelector::new(), |_| 0.5)
-            .expect("pool present");
+        let trace =
+            explain_route(&combo, &pool(), &AutoSelector::new(), |_| 0.5).expect("pool present");
         assert_eq!(trace.reason, WinnerReason::ClearScore);
     }
 
@@ -197,8 +197,8 @@ mod tests {
             AutoCandidate::new(ProviderId::new("b"), "m").with_price(1.01),
             AutoCandidate::new(ProviderId::new("c"), "m").with_price(1.02),
         ];
-        let trace = explain_route(&combo, &close, &AutoSelector::new(), |_| 0.5)
-            .expect("pool present");
+        let trace =
+            explain_route(&combo, &close, &AutoSelector::new(), |_| 0.5).expect("pool present");
         assert_eq!(trace.reason, WinnerReason::Rotation);
     }
 
@@ -214,9 +214,14 @@ mod tests {
         // The safety contract, as a test: the trace is built only from provider
         // ids, model names and f64, so there is no field a prompt could reach.
         let combo = virtual_combo("auto/cheap").expect("known alias");
-        let trace = explain_route(&combo, &pool(), &AutoSelector::new(), |_| 0.5)
-            .expect("pool present");
-        let RouteTrace { provider, model, fallbacks, .. } = trace;
+        let trace =
+            explain_route(&combo, &pool(), &AutoSelector::new(), |_| 0.5).expect("pool present");
+        let RouteTrace {
+            provider,
+            model,
+            fallbacks,
+            ..
+        } = trace;
         assert!(!provider.as_str().is_empty() && !model.is_empty() && !fallbacks.is_empty());
     }
 }

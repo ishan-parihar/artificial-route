@@ -32,7 +32,9 @@ impl Usd {
     /// Builds an amount from a per-million-token dollar price.
     #[must_use]
     pub fn per_mtok(dollars: f64) -> Self {
-        Self { micros: (dollars * 1e6).max(0.0) as u64 }
+        Self {
+            micros: (dollars * 1e6).max(0.0) as u64,
+        }
     }
 
     /// The amount as a float, for display and reporting only.
@@ -87,7 +89,10 @@ pub struct Cost {
 
 impl Cost {
     /// $0 with no pricing row behind it.
-    pub const UNPRICED: Self = Self { usd: Usd::ZERO, priced: false };
+    pub const UNPRICED: Self = Self {
+        usd: Usd::ZERO,
+        priced: false,
+    };
 }
 
 /// Provider → model → prices, plus the flat-rate provider set.
@@ -104,7 +109,11 @@ pub struct PricingTable {
 
 /// NUL-separated so a provider name can never collide with a model name.
 fn row_key(provider: &str, model: &str) -> String {
-    format!("{}\0{}", provider.trim().to_ascii_lowercase(), model.trim().to_ascii_lowercase())
+    format!(
+        "{}\0{}",
+        provider.trim().to_ascii_lowercase(),
+        model.trim().to_ascii_lowercase()
+    )
 }
 
 impl PricingTable {
@@ -177,14 +186,20 @@ impl PricingTable {
     #[must_use]
     pub fn cost(&self, provider: &str, model: &str, usage: NormalizedUsage) -> Cost {
         if self.is_flat_rate(provider) {
-            return Cost { usd: Usd::ZERO, priced: true };
+            return Cost {
+                usd: Usd::ZERO,
+                priced: true,
+            };
         }
         let Some(prices) = self.prices(provider, model) else {
             return Cost::UNPRICED;
         };
         let micros = cost_micros(usage.prompt, prices.input_micros_per_mtok)
             .saturating_add(cost_micros(usage.completion, prices.output_micros_per_mtok));
-        Cost { usd: Usd { micros }, priced: true }
+        Cost {
+            usd: Usd { micros },
+            priced: true,
+        }
     }
 
     fn prices(&self, provider: &str, model: &str) -> Option<Prices> {
@@ -192,7 +207,9 @@ impl PricingTable {
             return Some(*prices);
         }
         // "accounts/fireworks/models/x" and "fireworks/x" both mean "x".
-        self.rows.get(&row_key(provider, strip_provider_path(model))).copied()
+        self.rows
+            .get(&row_key(provider, strip_provider_path(model)))
+            .copied()
     }
 }
 
@@ -207,24 +224,42 @@ mod tests {
 
     fn table() -> PricingTable {
         let mut t = PricingTable::default();
-        t.set("openai", "gpt-4o", Prices { input_micros_per_mtok: 2_500_000, output_micros_per_mtok: 10_000_000 });
+        t.set(
+            "openai",
+            "gpt-4o",
+            Prices {
+                input_micros_per_mtok: 2_500_000,
+                output_micros_per_mtok: 10_000_000,
+            },
+        );
         t
     }
 
     #[test]
     fn prices_known_model_when_row_present() {
-        let cost = table().cost("openai", "gpt-4o", NormalizedUsage::new(1_000_000, 1_000_000));
+        let cost = table().cost(
+            "openai",
+            "gpt-4o",
+            NormalizedUsage::new(1_000_000, 1_000_000),
+        );
         assert_eq!(cost.usd.micros, 12_500_000);
     }
 
     #[test]
     fn reports_unpriced_when_no_row_found() {
-        assert_eq!(table().cost("openai", "unknown", NormalizedUsage::new(1, 1)), Cost::UNPRICED);
+        assert_eq!(
+            table().cost("openai", "unknown", NormalizedUsage::new(1, 1)),
+            Cost::UNPRICED
+        );
     }
 
     #[test]
     fn resolves_row_through_provider_path_prefix() {
-        let cost = table().cost("openai", "accounts/fireworks/models/gpt-4o", NormalizedUsage::new(1_000_000, 0));
+        let cost = table().cost(
+            "openai",
+            "accounts/fireworks/models/gpt-4o",
+            NormalizedUsage::new(1_000_000, 0),
+        );
         assert_eq!(cost.usd.micros, 2_500_000);
     }
 
@@ -238,8 +273,18 @@ mod tests {
     fn costs_zero_but_priced_when_flat_rate_provider() {
         let mut t = table();
         t.set_flat_rate("anthropic");
-        let cost = t.cost("anthropic", "claude-sonnet-4", NormalizedUsage::new(1_000_000, 1_000_000));
-        assert_eq!(cost, Cost { usd: Usd::ZERO, priced: true });
+        let cost = t.cost(
+            "anthropic",
+            "claude-sonnet-4",
+            NormalizedUsage::new(1_000_000, 1_000_000),
+        );
+        assert_eq!(
+            cost,
+            Cost {
+                usd: Usd::ZERO,
+                priced: true
+            }
+        );
     }
 
     #[test]
@@ -249,22 +294,40 @@ mod tests {
 
     #[test]
     fn prices_known_model_when_loaded_from_registry() {
-        let cost = PricingTable::global().cost("openai", "gpt-5.4", NormalizedUsage::new(1_000_000, 0));
-        assert!(cost.priced, "the generated catalog carries an openai/gpt-5.4 row");
+        let cost =
+            PricingTable::global().cost("openai", "gpt-5.4", NormalizedUsage::new(1_000_000, 0));
+        assert!(
+            cost.priced,
+            "the generated catalog carries an openai/gpt-5.4 row"
+        );
         assert!(cost.usd.micros > 0, "{cost:?}");
     }
 
     #[test]
     fn reports_unpriced_when_registry_has_no_row() {
-        let cost = PricingTable::global().cost("openai", "definitely-not-a-model", NormalizedUsage::new(1, 1));
+        let cost = PricingTable::global().cost(
+            "openai",
+            "definitely-not-a-model",
+            NormalizedUsage::new(1, 1),
+        );
         assert_eq!(cost, Cost::UNPRICED);
     }
 
     #[test]
     fn marks_flat_rate_providers_from_registry() {
         // `claude` is the Claude Code plan: a subscription, so $0 but priced.
-        let cost = PricingTable::global().cost("claude", "claude-sonnet-5", NormalizedUsage::new(1_000_000, 1_000_000));
-        assert_eq!(cost, Cost { usd: Usd::ZERO, priced: true });
+        let cost = PricingTable::global().cost(
+            "claude",
+            "claude-sonnet-5",
+            NormalizedUsage::new(1_000_000, 1_000_000),
+        );
+        assert_eq!(
+            cost,
+            Cost {
+                usd: Usd::ZERO,
+                priced: true
+            }
+        );
     }
 
     #[test]
@@ -275,6 +338,9 @@ mod tests {
         let cheap = t.cost("openai", "gpt-5.4-nano", NormalizedUsage::new(1_000_000, 0));
         let pricey = t.cost("openai", "gpt-5.4", NormalizedUsage::new(1_000_000, 0));
         assert!(cheap.priced && pricey.priced);
-        assert!(cheap.usd.micros < pricey.usd.micros, "cheap {cheap:?} vs pricey {pricey:?}");
+        assert!(
+            cheap.usd.micros < pricey.usd.micros,
+            "cheap {cheap:?} vs pricey {pricey:?}"
+        );
     }
 }

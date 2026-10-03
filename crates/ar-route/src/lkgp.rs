@@ -80,9 +80,7 @@ impl LkgpPins {
     pub fn get(&self, session: &str) -> Option<ProviderId> {
         let mut pins = self.pins.lock().ok()?;
         sweep(&mut pins, self.ttl);
-        pins
-            .get(session)
-            .map(|p| p.provider.clone())
+        pins.get(session).map(|p| p.provider.clone())
     }
 
     /// Drops the pin for `session`. Called when the pinned provider fails, so a
@@ -136,7 +134,10 @@ mod tests {
     fn returns_pinned_provider_after_record() {
         let pins = LkgpPins::new();
         pins.record("s1", &ProviderId::new("groq"));
-        assert_eq!(pins.get("s1").map(|p| p.as_str().to_owned()), Some("groq".to_owned()));
+        assert_eq!(
+            pins.get("s1").map(|p| p.as_str().to_owned()),
+            Some("groq".to_owned())
+        );
     }
 
     #[test]

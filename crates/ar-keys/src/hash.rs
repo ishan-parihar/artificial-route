@@ -21,9 +21,9 @@
 //! `enc:v1:<iv>:<ct>:<tag>`. What changed is what those fields mean and what
 //! the KDF behind them is, not the grammar.
 
+use aes_gcm::AeadInPlace as _;
 use aes_gcm::aead::AeadCore;
 use aes_gcm::aead::rand_core::OsRng;
-use aes_gcm::AeadInPlace as _;
 
 use crate::codec;
 use crate::error::KeyError;
@@ -77,7 +77,11 @@ impl HashParams {
     /// then falls. It runs once per key load, never per request. If the <35 MB
     /// idle budget in `docs/00-overview.md` ever has to absorb it, `HashParams`
     //  is the knob and the value is a per-install decision, not a constant.
-    pub const RECOMMENDED: Self = Self { m_cost: 19 * 1024, t_cost: 2, p_cost: 1 };
+    pub const RECOMMENDED: Self = Self {
+        m_cost: 19 * 1024,
+        t_cost: 2,
+        p_cost: 1,
+    };
 
     /// Test fixture only: 64 KiB, one pass.
     ///
@@ -85,7 +89,11 @@ impl HashParams {
     /// `RECOMMENDED` costs seconds of CPU for no extra coverage, and the
     /// property under test is "the same key re-derives", not "argon2id is
     /// slow". One test derives at `RECOMMENDED` to keep the defaults honest.
-    pub const FAST: Self = Self { m_cost: 64, t_cost: 1, p_cost: 1 };
+    pub const FAST: Self = Self {
+        m_cost: 64,
+        t_cost: 1,
+        p_cost: 1,
+    };
 }
 
 /// Derives the AEAD key: `argon2id(master, salt, params) → 32 bytes`.
@@ -97,14 +105,23 @@ impl HashParams {
 ///
 /// # Errors
 /// [`KeyError::BadParams`] if argon2id rejects the cost.
-pub fn derive_aead_key(master: &Secret, salt: &Salt, params: HashParams) -> Result<Secret, KeyError> {
+pub fn derive_aead_key(
+    master: &Secret,
+    salt: &Salt,
+    params: HashParams,
+) -> Result<Secret, KeyError> {
     use argon2::{Algorithm, Argon2, Params, Version};
 
     let hash = Argon2::new(
         Algorithm::Argon2id,
         Version::V0x13,
-        Params::new(params.m_cost, params.t_cost, params.p_cost, Some(crate::KEY_LEN))
-            .map_err(|e| KeyError::BadParams(e.to_string()))?,
+        Params::new(
+            params.m_cost,
+            params.t_cost,
+            params.p_cost,
+            Some(crate::KEY_LEN),
+        )
+        .map_err(|e| KeyError::BadParams(e.to_string()))?,
     );
     let mut out = vec![0_u8; crate::KEY_LEN];
     hash.hash_password_into(master.as_bytes(), salt.as_bytes(), &mut out)
@@ -122,7 +139,9 @@ pub fn derive_aead_key(master: &Secret, salt: &Salt, params: HashParams) -> Resu
 /// characters that would make a collision ambiguous.
 fn aad(provider: &str, key_id: &str) -> Result<String, KeyError> {
     if provider.contains('|') || key_id.contains('|') {
-        return Err(KeyError::Malformed("provider and key-id must not contain `|`"));
+        return Err(KeyError::Malformed(
+            "provider and key-id must not contain `|`",
+        ));
     }
     Ok(format!("{provider}|{key_id}|v{VERSION}"))
 }
@@ -173,12 +192,19 @@ pub fn decrypt(
     envelope: &str,
 ) -> Result<Secret, KeyError> {
     let aad = aad(provider, key_id)?;
-    let body = envelope.strip_prefix(PREFIX).ok_or_else(|| classify(envelope))?;
+    let body = envelope
+        .strip_prefix(PREFIX)
+        .ok_or_else(|| classify(envelope))?;
     let mut fields = body.split(':');
-    let (nonce_b64, ct_b64, tag_b64) = match (fields.next(), fields.next(), fields.next(), fields.next()) {
-        (Some(n), Some(c), Some(t), None) => (n, c, t),
-        _ => return Err(KeyError::Malformed("expected exactly 3 `:`-separated fields")),
-    };
+    let (nonce_b64, ct_b64, tag_b64) =
+        match (fields.next(), fields.next(), fields.next(), fields.next()) {
+            (Some(n), Some(c), Some(t), None) => (n, c, t),
+            _ => {
+                return Err(KeyError::Malformed(
+                    "expected exactly 3 `:`-separated fields",
+                ));
+            }
+        };
     // Length checks before any decode, so a wrong key reports `TagMismatch` and
     // a wrong *shape* reports `Malformed` rather than both.
     if nonce_b64.len() != codec::b64::encoded_len(NONCE_LEN) {
@@ -202,9 +228,12 @@ pub fn decrypt(
     // panic on a short field. Both lengths are already implied by the base64
     // width checks above; these conversions restate it defensively rather than
     // trusting it.
-    let nonce: [u8; NONCE_LEN] =
-        nonce.try_into().map_err(|_| KeyError::Malformed("nonce field is not 12 bytes"))?;
-    let tag: [u8; TAG_LEN] = tag.try_into().map_err(|_| KeyError::Malformed("tag field is not 16 bytes"))?;
+    let nonce: [u8; NONCE_LEN] = nonce
+        .try_into()
+        .map_err(|_| KeyError::Malformed("nonce field is not 12 bytes"))?;
+    let tag: [u8; TAG_LEN] = tag
+        .try_into()
+        .map_err(|_| KeyError::Malformed("tag field is not 16 bytes"))?;
     cipher
         .decrypt_in_place_detached(
             aes_gcm::Nonce::from_slice(&nonce),
@@ -257,7 +286,12 @@ mod tests {
         let mk = test_master();
         let secret = Secret::new(b"sk-provider-key".to_vec());
         let env = encrypt(&mk, "openai", "k1", &secret).expect("encrypt");
-        assert_eq!(decrypt(&mk, "openai", "k1", &env).expect("decrypt").as_bytes(), b"sk-provider-key");
+        assert_eq!(
+            decrypt(&mk, "openai", "k1", &env)
+                .expect("decrypt")
+                .as_bytes(),
+            b"sk-provider-key"
+        );
     }
 
     #[test]
@@ -272,7 +306,10 @@ mod tests {
         let mk = test_master();
         let a = encrypt(&mk, "openai", "k1", &Secret::new(b"x".to_vec())).expect("encrypt");
         let b = encrypt(&mk, "openai", "k1", &Secret::new(b"x".to_vec())).expect("encrypt");
-        assert_ne!(a, b, "a fresh nonce per encryption is the whole point of GCM");
+        assert_ne!(
+            a, b,
+            "a fresh nonce per encryption is the whole point of GCM"
+        );
     }
 
     #[test]
@@ -299,7 +336,13 @@ mod tests {
 
     #[test]
     fn refuses_a_foreign_master_key() {
-        let env = encrypt(&test_master(), "openai", "k1", &Secret::new(b"sk-x".to_vec())).expect("encrypt");
+        let env = encrypt(
+            &test_master(),
+            "openai",
+            "k1",
+            &Secret::new(b"sk-x".to_vec()),
+        )
+        .expect("encrypt");
         assert!(decrypt(&test_master(), "openai", "k1", &env).is_err());
     }
 
@@ -316,19 +359,30 @@ mod tests {
     #[test]
     fn names_a_v1_envelope_instead_of_a_tag_mismatch() {
         let mk = test_master();
-        assert!(matches!(decrypt(&mk, "openai", "k1", "enc:v1:aabb:ccdd:eeff"), Err(crate::KeyError::LegacyV1)));
+        assert!(matches!(
+            decrypt(&mk, "openai", "k1", "enc:v1:aabb:ccdd:eeff"),
+            Err(crate::KeyError::LegacyV1)
+        ));
     }
 
     #[test]
     fn names_an_unprefixed_string() {
         let mk = test_master();
-        assert!(matches!(decrypt(&mk, "openai", "k1", "sk-plain"), Err(crate::KeyError::NotEncrypted)));
+        assert!(matches!(
+            decrypt(&mk, "openai", "k1", "sk-plain"),
+            Err(crate::KeyError::NotEncrypted)
+        ));
     }
 
     #[test]
     fn rejects_a_short_tag_field() {
         let mk = test_master();
-        let env = format!("enc:v2:{}:{}:{}", "A".repeat(16), "A".repeat(8), "A".repeat(4));
+        let env = format!(
+            "enc:v2:{}:{}:{}",
+            "A".repeat(16),
+            "A".repeat(8),
+            "A".repeat(4)
+        );
         assert!(decrypt(&mk, "openai", "k1", &env).is_err());
     }
 
@@ -338,25 +392,48 @@ mod tests {
         let secret = Secret::new(b"sk-right".to_vec());
         let env = encrypt(&mk, "openai", "k1", &secret).expect("encrypt");
         assert!(verify(&mk, "openai", "k1", &env, &secret).expect("verify"));
-        assert!(!verify(&mk, "openai", "k1", &env, &Secret::new(b"sk-wrong".to_vec())).expect("verify"));
+        assert!(
+            !verify(
+                &mk,
+                "openai",
+                "k1",
+                &env,
+                &Secret::new(b"sk-wrong".to_vec())
+            )
+            .expect("verify")
+        );
     }
 
     #[test]
     fn the_same_master_and_salt_re_derive_the_same_key() {
         let master = Secret::generate();
         let salt = Salt::generate();
-        let a = MasterKey::new(master.to_owned_secret(), KeyMeta::with_params(HashParams::FAST, salt)).expect("a");
-        let b = MasterKey::new(master.to_owned_secret(), KeyMeta::with_params(HashParams::FAST, salt)).expect("b");
+        let a = MasterKey::new(
+            master.to_owned_secret(),
+            KeyMeta::with_params(HashParams::FAST, salt),
+        )
+        .expect("a");
+        let b = MasterKey::new(
+            master.to_owned_secret(),
+            KeyMeta::with_params(HashParams::FAST, salt),
+        )
+        .expect("b");
         assert!(a.aead_key().ct_eq(b.aead_key()));
     }
 
     #[test]
     fn a_different_salt_derives_a_different_key() {
         let master = Secret::generate();
-        let a = MasterKey::new(master.to_owned_secret(), KeyMeta::with_params(HashParams::FAST, Salt::generate()))
-            .expect("a");
-        let b = MasterKey::new(master.to_owned_secret(), KeyMeta::with_params(HashParams::FAST, Salt::generate()))
-            .expect("b");
+        let a = MasterKey::new(
+            master.to_owned_secret(),
+            KeyMeta::with_params(HashParams::FAST, Salt::generate()),
+        )
+        .expect("a");
+        let b = MasterKey::new(
+            master.to_owned_secret(),
+            KeyMeta::with_params(HashParams::FAST, Salt::generate()),
+        )
+        .expect("b");
         assert!(!a.aead_key().ct_eq(b.aead_key()));
     }
 
@@ -364,11 +441,19 @@ mod tests {
     fn recommended_params_derive_a_key_that_round_trips() {
         // Keeps the shipped defaults honest: RECOMMENDED must be accepted by
         // argon2id, not just FAST.
-        let mk = MasterKey::new(Secret::generate(), KeyMeta::with_params(HashParams::RECOMMENDED, Salt::generate()))
-            .expect("derive at RECOMMENDED");
+        let mk = MasterKey::new(
+            Secret::generate(),
+            KeyMeta::with_params(HashParams::RECOMMENDED, Salt::generate()),
+        )
+        .expect("derive at RECOMMENDED");
         let secret = Secret::new(b"sk-x".to_vec());
         let env = encrypt(&mk, "openai", "k1", &secret).expect("encrypt");
-        assert_eq!(decrypt(&mk, "openai", "k1", &env).expect("decrypt").as_bytes(), b"sk-x");
+        assert_eq!(
+            decrypt(&mk, "openai", "k1", &env)
+                .expect("decrypt")
+                .as_bytes(),
+            b"sk-x"
+        );
     }
 
     #[test]

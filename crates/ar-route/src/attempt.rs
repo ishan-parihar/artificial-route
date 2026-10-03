@@ -23,7 +23,7 @@ use http::StatusCode;
 use crate::contract::{CanonicalRequest, ExecError, Executor, ProviderId, Upstream};
 use crate::error::RouteError;
 use crate::resilience::{
-    BreakerClass, LockReason, LOCKOUT_BASE_COOLDOWN, Resilience, quota_cooldown,
+    BreakerClass, LOCKOUT_BASE_COOLDOWN, LockReason, Resilience, quota_cooldown,
 };
 
 /// Upper bound on providers tried for one request.
@@ -160,8 +160,13 @@ enum Step {
 /// the list is this narrow: a blanket `contains("invalid")` rule turns every
 /// model-scoped rejection into a hard stop and a one-line provider-side fix
 /// into a 400 at the edge.
-const STOP_400_ROWS: &[&str] =
-    &["invalid message format", "malformed", "context", "prompt", "token"];
+const STOP_400_ROWS: &[&str] = &[
+    "invalid message format",
+    "malformed",
+    "context",
+    "prompt",
+    "token",
+];
 
 /// 400 bodies that are a *provider capability* limit, which another provider
 /// may well not share. `comboPredicates.ts` advances on these before the stop
@@ -278,7 +283,9 @@ fn classify_status(status: u16, body: &str) -> Step {
         return Step::Success;
     }
     if status == 400 && is_stop_400(body) {
-        return Step::Abort { status: StatusCode::BAD_REQUEST };
+        return Step::Abort {
+            status: StatusCode::BAD_REQUEST,
+        };
     }
     Step::Failover { status }
 }
@@ -314,7 +321,10 @@ fn classify_fault(status: u16, body: &str) -> Fault {
 /// takes its models with it, so retiring one model would leave the rest
 /// dispatching into the same wall.
 fn classify_terminal(lower: &str) -> Option<Terminal> {
-    if ACCOUNT_DEACTIVATED_SIGNALS.iter().any(|s| lower.contains(s)) {
+    if ACCOUNT_DEACTIVATED_SIGNALS
+        .iter()
+        .any(|s| lower.contains(s))
+    {
         return Some(Terminal::Provider);
     }
     MODEL_RETIRED_SIGNALS
@@ -351,7 +361,12 @@ fn charge_failure(
         // client told to come back then. Note the provider breaker is *not*
         // charged — an empty account says nothing about the endpoint's health.
         Fault::QuotaExhausted => (
-            resilience.lock_model(provider, model, LockReason::QuotaExhausted, quota_cooldown()),
+            resilience.lock_model(
+                provider,
+                model,
+                LockReason::QuotaExhausted,
+                quota_cooldown(),
+            ),
             true,
         ),
         // A throttle answers to both scopes at their own widths: the key takes
@@ -465,65 +480,61 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
 
         tried += 1;
         let verdict = match exec.call(provider, canonical).await {
-            Ok(upstream) => match classify_status(upstream.status.as_u16(), &body_text(&upstream)) {
-                Step::Success => {
-                    // Success clears all error state for this key
-                    // (`connectionCooldown.ts`), so the next failure of an
-                    // otherwise-healthy provider starts from `base` again — and
-                    // closes the breaker, since a working call is proof the
-                    // provider is back.
-                    resilience.record_success(provider.as_str());
-                    resilience.record_provider_success(provider.as_str());
-                    return Ok(AttemptOutcome::Succeeded {
-                        provider: provider.clone(),
-                        attempts: tried,
-                        upstream,
-                    });
+            Ok(upstream) => {
+                match classify_status(upstream.status.as_u16(), &body_text(&upstream)) {
+                    Step::Success => {
+                        // Success clears all error state for this key
+                        // (`connectionCooldown.ts`), so the next failure of an
+                        // otherwise-healthy provider starts from `base` again — and
+                        // closes the breaker, since a working call is proof the
+                        // provider is back.
+                        resilience.record_success(provider.as_str());
+                        resilience.record_provider_success(provider.as_str());
+                        return Ok(AttemptOutcome::Succeeded {
+                            provider: provider.clone(),
+                            attempts: tried,
+                            upstream,
+                        });
+                    }
+                    Step::Abort { status } => {
+                        return Ok(AttemptOutcome::Abort(AbortReport {
+                            status,
+                            reason: abort_reason(status),
+                            tried,
+                        }));
+                    }
+                    Step::Failover { status } => {
+                        let (cooldown, throttled) = charge_failure(
+                            resilience,
+                            provider,
+                            &canonical.model,
+                            status,
+                            &body_text(&upstream),
+                            upstream.retry_after,
+                        );
+                        tracing::warn!(
+                            provider = %provider,
+                            status,
+                            cooldown_ms = cooldown.as_millis() as u64,
+                            "attempt failed over"
+                        );
+                        (
+                            status,
+                            provider.clone(),
+                            cooldown,
+                            throttled,
+                            upstream.error_body.clone(),
+                            upstream.retry_after,
+                        )
+                    }
                 }
-                Step::Abort { status } => {
-                    return Ok(AttemptOutcome::Abort(AbortReport {
-                        status,
-                        reason: abort_reason(status),
-                        tried,
-                    }));
-                }
-                Step::Failover { status } => {
-                    let (cooldown, throttled) = charge_failure(
-                        resilience,
-                        provider,
-                        &canonical.model,
-                        status,
-                        &body_text(&upstream),
-                        upstream.retry_after,
-                    );
-                    tracing::warn!(
-                        provider = %provider,
-                        status,
-                        cooldown_ms = cooldown.as_millis() as u64,
-                        "attempt failed over"
-                    );
-                    (
-                        status,
-                        provider.clone(),
-                        cooldown,
-                        throttled,
-                        upstream.error_body.clone(),
-                        upstream.retry_after,
-                    )
-                }
-            },
+            }
             Err(ExecError(msg)) => {
                 // No verdict from the provider at all: charge a cooldown so the
                 // next request does not walk into the same dead socket, and a
                 // breaker tick so enough dead sockets take the provider out.
-                let (cooldown, _) = charge_failure(
-                    resilience,
-                    provider,
-                    &canonical.model,
-                    502,
-                    "",
-                    None,
-                );
+                let (cooldown, _) =
+                    charge_failure(resilience, provider, &canonical.model, 502, "", None);
                 tracing::warn!(provider = %provider, error = %msg, "transport failure, failing over");
                 (502, provider.clone(), cooldown, false, Bytes::new(), None)
             }
@@ -568,7 +579,11 @@ fn terminate(
             .or(Some(cooldown))
             .unwrap_or(Duration::from_secs(1))
             .max(Duration::from_millis(1));
-        return AttemptOutcome::Retry { after, provider: throttled, tried };
+        return AttemptOutcome::Retry {
+            after,
+            provider: throttled,
+            tried,
+        };
     }
     AttemptOutcome::Failover {
         status,
@@ -609,11 +624,13 @@ mod tests {
     use bytes::Bytes;
     use http::StatusCode;
 
-    use super::{Fault, MAX_ATTEMPTS, Terminal, attempt_loop, classify_fault, classify_status, Step};
+    use super::{
+        Fault, MAX_ATTEMPTS, Step, Terminal, attempt_loop, classify_fault, classify_status,
+    };
+    use crate::AttemptOutcome;
     use crate::contract::{CanonicalRequest, ExecError, Executor, ProviderId, Upstream};
     use crate::resilience::BreakerClass;
-use crate::resilience::Resilience;
-    use crate::AttemptOutcome;
+    use crate::resilience::Resilience;
 
     /// A cloneable verdict description; `Upstream` is not `Clone` because it
     /// owns a boxed stream, so the script stores this instead and builds a
@@ -698,12 +715,20 @@ use crate::resilience::Resilience;
         // error body and relays the window the provider asked for — both die
         // at the loop's outcome if the loop never carried them. (Wave J1.)
         let r = Resilience::new();
-        let exec = Scripted::new(vec![Verdict::Status(
-            503,
-            r#"{"error":{"code":"insufficient_quota","message":"over"}}"#,
-        ), Verdict::Status(503, r#"{"code":"upstream_died"}"#)]);
+        let exec = Scripted::new(vec![
+            Verdict::Status(
+                503,
+                r#"{"error":{"code":"insufficient_quota","message":"over"}}"#,
+            ),
+            Verdict::Status(503, r#"{"code":"upstream_died"}"#),
+        ]);
         let got = block(attempt_loop(&req(), &chain(&["p1", "p2"]), &exec, &r));
-        let Ok(AttemptOutcome::Failover { error_body, retry_after, .. }) = got else {
+        let Ok(AttemptOutcome::Failover {
+            error_body,
+            retry_after,
+            ..
+        }) = got
+        else {
             panic!("expected failover, got {got:?}");
         };
         assert_eq!(retry_after, None, "the 503 verdict asked for no window");
@@ -735,7 +760,10 @@ use crate::resilience::Resilience;
     #[test]
     fn fails_over_when_provider_429() {
         // p1 is rate-limited, p2 answers 200: the loop must report p2 served it.
-        let exec = Scripted::new(vec![Verdict::RateLimited(Some(Duration::from_secs(2))), Verdict::Ok]);
+        let exec = Scripted::new(vec![
+            Verdict::RateLimited(Some(Duration::from_secs(2))),
+            Verdict::Ok,
+        ]);
         let r = Resilience::new();
         let got = block(attempt_loop(&req(), &chain(&["p1", "p2"]), &exec, &r));
         let Ok(AttemptOutcome::Succeeded { provider, .. }) = got else {
@@ -746,7 +774,10 @@ use crate::resilience::Resilience;
 
     #[test]
     fn puts_rate_limited_provider_in_cooldown() {
-        let exec = Scripted::new(vec![Verdict::RateLimited(Some(Duration::from_secs(30))), Verdict::Ok]);
+        let exec = Scripted::new(vec![
+            Verdict::RateLimited(Some(Duration::from_secs(30))),
+            Verdict::Ok,
+        ]);
         let r = Resilience::new();
         let _ = block(attempt_loop(&req(), &chain(&["p1", "p2"]), &exec, &r));
         assert!(r.is_cooling("p1"));
@@ -760,13 +791,21 @@ use crate::resilience::Resilience;
         ]);
         let r = Resilience::new();
         let got = block(attempt_loop(&req(), &chain(&["p1", "p2"]), &exec, &r));
-        let Ok(AttemptOutcome::Retry { after, provider, tried }) = got else {
+        let Ok(AttemptOutcome::Retry {
+            after,
+            provider,
+            tried,
+        }) = got
+        else {
             panic!("expected retry, got {got:?}");
         };
         // Backoff is per key and p2 has no prior failure, so p1 cools for
         // max(base=3s, 9s)=9s and p2 for max(3s, 4s)=4s. The client is told
         // the soonest, not the latest — and both were tried, so `tried` is 2.
-        assert_eq!((after, provider.as_str(), tried), (Duration::from_secs(4), "p2", 2));
+        assert_eq!(
+            (after, provider.as_str(), tried),
+            (Duration::from_secs(4), "p2", 2)
+        );
     }
 
     #[test]
@@ -779,11 +818,19 @@ use crate::resilience::Resilience;
         ]);
         let r = Resilience::new();
         let got = block(attempt_loop(&req(), &chain(&["p1", "p2"]), &exec, &r));
-        let Ok(AttemptOutcome::Retry { after, provider, tried }) = got else {
+        let Ok(AttemptOutcome::Retry {
+            after,
+            provider,
+            tried,
+        }) = got
+        else {
             panic!("expected retry, got {got:?}");
         };
         // p1 said 30s; p2 only got our own 3s guess, which must not shorten it.
-        assert_eq!((after, provider.as_str(), tried), (Duration::from_secs(30), "p1", 2));
+        assert_eq!(
+            (after, provider.as_str(), tried),
+            (Duration::from_secs(30), "p1", 2)
+        );
     }
 
     #[test]
@@ -800,14 +847,24 @@ use crate::resilience::Resilience;
     #[test]
     fn never_dispatches_second_provider_after_client_fault() {
         let exec = Scripted::new(vec![PROMPT_SHAPE]);
-        let _ = block(attempt_loop(&req(), &chain(&["p1", "p2"]), &exec, &Resilience::new()));
+        let _ = block(attempt_loop(
+            &req(),
+            &chain(&["p1", "p2"]),
+            &exec,
+            &Resilience::new(),
+        ));
         assert_eq!(exec.seen(), ["p1"]);
     }
 
     #[test]
     fn fails_over_on_context_overflow_400() {
         let exec = Scripted::new(vec![OVERFLOW, Verdict::Transport("also down")]);
-        let got = block(attempt_loop(&req(), &chain(&["p1", "p2"]), &exec, &Resilience::new()));
+        let got = block(attempt_loop(
+            &req(),
+            &chain(&["p1", "p2"]),
+            &exec,
+            &Resilience::new(),
+        ));
         assert!(matches!(got, Ok(AttemptOutcome::Failover { .. })));
     }
 
@@ -825,7 +882,12 @@ use crate::resilience::Resilience;
     #[test]
     fn reports_502_when_only_transport_errors() {
         let exec = Scripted::new(vec![Verdict::Transport("dns"), Verdict::Transport("reset")]);
-        let got = block(attempt_loop(&req(), &chain(&["p1", "p2"]), &exec, &Resilience::new()));
+        let got = block(attempt_loop(
+            &req(),
+            &chain(&["p1", "p2"]),
+            &exec,
+            &Resilience::new(),
+        ));
         let Ok(AttemptOutcome::Failover { status, tried, .. }) = got else {
             panic!("expected failover, got {got:?}");
         };
@@ -866,7 +928,9 @@ use crate::resilience::Resilience;
         let chain: Vec<ProviderId> = names.iter().map(ProviderId::new).collect();
         let got = block(attempt_loop(&req(), &chain, &exec, &Resilience::new()));
         assert_eq!(exec.seen().len(), MAX_ATTEMPTS);
-        assert!(matches!(got, Ok(AttemptOutcome::Failover { tried, .. }) if tried as usize == MAX_ATTEMPTS));
+        assert!(
+            matches!(got, Ok(AttemptOutcome::Failover { tried, .. }) if tried as usize == MAX_ATTEMPTS)
+        );
     }
 
     #[test]
@@ -885,7 +949,10 @@ use crate::resilience::Resilience;
 
     #[test]
     fn classifies_429_as_failover() {
-        assert_eq!(classify_status(429, "slow down"), Step::Failover { status: 429 });
+        assert_eq!(
+            classify_status(429, "slow down"),
+            Step::Failover { status: 429 }
+        );
     }
 
     #[test]
@@ -895,14 +962,19 @@ use crate::resilience::Resilience;
 
     #[test]
     fn classifies_auth_refusal_as_failover() {
-        assert_eq!(classify_status(401, "bad key"), Step::Failover { status: 401 });
+        assert_eq!(
+            classify_status(401, "bad key"),
+            Step::Failover { status: 401 }
+        );
     }
 
     #[test]
     fn classifies_400_prompt_shape_as_abort() {
         assert_eq!(
             classify_status(400, "prompt is malformed"),
-            Step::Abort { status: StatusCode::BAD_REQUEST }
+            Step::Abort {
+                status: StatusCode::BAD_REQUEST
+            }
         );
     }
 
@@ -911,7 +983,10 @@ use crate::resilience::Resilience;
         // Same status, different meaning: one waits for a day, the other for
         // a backoff step. Reading both as the same is what makes an exhausted
         // account get re-selected every few seconds until it is topped up.
-        assert_eq!(classify_fault(429, "insufficient_quota"), Fault::QuotaExhausted);
+        assert_eq!(
+            classify_fault(429, "insufficient_quota"),
+            Fault::QuotaExhausted
+        );
         assert_eq!(classify_fault(429, "slow down"), Fault::Throttled);
         // The anchored "tier has been exhausted" signal exists so Gemini's
         // transient RPM phrasing below stays a throttle: a bare "has been
@@ -933,8 +1008,14 @@ use crate::resilience::Resilience;
 
     #[test]
     fn terminal_bodies_split_between_account_and_model() {
-        assert_eq!(classify_fault(401, "your account has been deactivated"), Fault::Terminal(Terminal::Provider));
-        assert_eq!(classify_fault(404, "this model is no longer available"), Fault::Terminal(Terminal::Model));
+        assert_eq!(
+            classify_fault(401, "your account has been deactivated"),
+            Fault::Terminal(Terminal::Provider)
+        );
+        assert_eq!(
+            classify_fault(404, "this model is no longer available"),
+            Fault::Terminal(Terminal::Model)
+        );
         // The account wins when a body could read as either: a dead account
         // takes its models with it.
         assert_eq!(
@@ -953,21 +1034,39 @@ use crate::resilience::Resilience;
     fn quota_429_and_transient_429_diverge_end_to_end() {
         let quota_r = Resilience::new();
         let quota_exec = Scripted::new(vec![QUOTA_429, QUOTA_429]);
-        let Ok(AttemptOutcome::Retry { after: quota_after, .. }) =
-            block(attempt_loop(&req(), &chain(&["p1", "p2"]), &quota_exec, &quota_r))
+        let Ok(AttemptOutcome::Retry {
+            after: quota_after, ..
+        }) = block(attempt_loop(
+            &req(),
+            &chain(&["p1", "p2"]),
+            &quota_exec,
+            &quota_r,
+        ))
         else {
             panic!("expected retry");
         };
-        assert!(quota_after > Duration::from_secs(3600), "a spent allowance waits for the day");
+        assert!(
+            quota_after > Duration::from_secs(3600),
+            "a spent allowance waits for the day"
+        );
 
         let plain_r = Resilience::new();
         let plain_exec = Scripted::new(vec![PLAIN_429, PLAIN_429]);
-        let Ok(AttemptOutcome::Retry { after: plain_after, .. }) =
-            block(attempt_loop(&req(), &chain(&["p1", "p2"]), &plain_exec, &plain_r))
+        let Ok(AttemptOutcome::Retry {
+            after: plain_after, ..
+        }) = block(attempt_loop(
+            &req(),
+            &chain(&["p1", "p2"]),
+            &plain_exec,
+            &plain_r,
+        ))
         else {
             panic!("expected retry");
         };
-        assert!(plain_after <= Duration::from_secs(300), "a plain 429 takes the backoff");
+        assert!(
+            plain_after <= Duration::from_secs(300),
+            "a plain 429 takes the backoff"
+        );
     }
 
     #[test]
@@ -1001,7 +1100,11 @@ use crate::resilience::Resilience;
         else {
             panic!("expected success");
         };
-        assert_eq!(provider.as_str(), "p2", "the quota-locked provider was walked");
+        assert_eq!(
+            provider.as_str(),
+            "p2",
+            "the quota-locked provider was walked"
+        );
     }
 
     #[test]
@@ -1020,7 +1123,10 @@ use crate::resilience::Resilience;
         let r = Resilience::new();
         let exec = Scripted::new(vec![ACCOUNT_DEAD, Verdict::Ok]);
         let got = block(attempt_loop(&req(), &chain(&["p1", "p2"]), &exec, &r));
-        assert!(!r.is_usable("p1"), "the credential is gone, not merely slow");
+        assert!(
+            !r.is_usable("p1"),
+            "the credential is gone, not merely slow"
+        );
         // The chain still fails over to p2 rather than aborting on the spot:
         // another provider can serve the request.
         assert!(matches!(got, Ok(AttemptOutcome::Succeeded { .. })));

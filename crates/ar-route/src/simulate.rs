@@ -144,13 +144,8 @@ mod tests {
     #[test]
     fn dry_runs_without_dispatch_when_simulate() {
         let tripwire = Arc::new(Tripwire::default());
-        let _ = simulate_route(
-            &combo("auto/cheap"),
-            &pool(),
-            &AutoSelector::new(),
-            |_| 0.5,
-        )
-        .expect("pool present");
+        let _ = simulate_route(&combo("auto/cheap"), &pool(), &AutoSelector::new(), |_| 0.5)
+            .expect("pool present");
         // `simulate_route` has no `Executor` parameter, so the only way it
         // could reach an upstream is by acquiring one some other way. It does
         // not; the counter proves the dry run is a pure function of its inputs.
@@ -159,13 +154,8 @@ mod tests {
 
     #[test]
     fn scores_cheapest_when_auto_cheap() {
-        let plan = simulate_route(
-            &combo("auto/cheap"),
-            &pool(),
-            &AutoSelector::new(),
-            |_| 0.5,
-        )
-        .expect("pool present");
+        let plan = simulate_route(&combo("auto/cheap"), &pool(), &AutoSelector::new(), |_| 0.5)
+            .expect("pool present");
         assert_eq!(plan.winner().map_or("", ProviderId::as_str), "together");
     }
 
@@ -173,17 +163,11 @@ mod tests {
     fn caps_the_chain_at_max_attempts() {
         let wide: Vec<AutoCandidate> = (0..9)
             .map(|i| {
-                AutoCandidate::new(ProviderId::new(format!("p{i}")), "m")
-                    .with_price(1.0 + i as f64)
+                AutoCandidate::new(ProviderId::new(format!("p{i}")), "m").with_price(1.0 + i as f64)
             })
             .collect();
-        let plan = simulate_route(
-            &combo("auto/cheap"),
-            &wide,
-            &AutoSelector::new(),
-            |_| 0.5,
-        )
-        .expect("pool present");
+        let plan = simulate_route(&combo("auto/cheap"), &wide, &AutoSelector::new(), |_| 0.5)
+            .expect("pool present");
         assert_eq!(plan.chain().len(), crate::MAX_ATTEMPTS);
     }
 
@@ -219,13 +203,8 @@ mod tests {
     #[test]
     fn resolves_every_variant_without_dispatch() {
         for v in AutoVariant::ALL {
-            let plan = simulate_route(
-                &combo(v.as_str()),
-                &pool(),
-                &AutoSelector::new(),
-                |_| 0.5,
-            )
-            .expect("pool present");
+            let plan = simulate_route(&combo(v.as_str()), &pool(), &AutoSelector::new(), |_| 0.5)
+                .expect("pool present");
             assert_eq!(plan.chain().len(), crate::MAX_ATTEMPTS, "{v:?}");
         }
     }
@@ -233,13 +212,8 @@ mod tests {
     #[test]
     fn plan_drives_the_attempt_loop_from_its_first_entry() {
         let tripwire = Arc::new(Tripwire::default());
-        let plan = simulate_route(
-            &combo("auto/cheap"),
-            &pool(),
-            &AutoSelector::new(),
-            |_| 0.5,
-        )
-        .expect("pool present");
+        let plan = simulate_route(&combo("auto/cheap"), &pool(), &AutoSelector::new(), |_| 0.5)
+            .expect("pool present");
         let _ = futures::executor::block_on(crate::attempt_loop(
             &CanonicalRequest::new("m", bytes::Bytes::from_static(b"{}")),
             plan.chain(),

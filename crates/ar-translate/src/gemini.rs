@@ -198,7 +198,12 @@ pub struct GeminiGenerationConfig {
     )]
     pub max_output_tokens: Option<u32>,
     /// Nucleus sampling. No canonical field; read for completeness, dropped.
-    #[serde(default, rename = "topP", alias = "top_p", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "topP",
+        alias = "top_p",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub top_p: Option<f32>,
     /// Vendor and future config keys, preserved verbatim.
     #[serde(flatten, default)]

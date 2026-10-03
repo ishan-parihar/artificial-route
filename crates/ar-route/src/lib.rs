@@ -90,7 +90,7 @@ pub use auto::{
     factors, pool_maxima, score, score_pool, virtual_combo,
 };
 pub use contract::{
-    ArExec, ArTranslate, CanonicalRequest, Candidate, ChunkStream, ExecError, Executor, MediaReply,
+    ArExec, ArTranslate, Candidate, CanonicalRequest, ChunkStream, ExecError, Executor, MediaReply,
     ProviderId, QuotaWindow, Strng, Upstream,
 };
 pub use error::RouteError;

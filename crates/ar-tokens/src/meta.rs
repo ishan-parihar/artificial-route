@@ -70,10 +70,20 @@ impl ResponseMeta {
     /// [`PricingTable::cost`] over the resolved row. Cost travels with usage so a
     /// caller cannot pair one request's tokens with another's price.
     #[must_use]
-    pub fn from_upstream(prices: &PricingTable, provider: &str, model: &str, usage: &Value) -> Self {
+    pub fn from_upstream(
+        prices: &PricingTable,
+        provider: &str,
+        model: &str,
+        usage: &Value,
+    ) -> Self {
         let usage = NormalizedUsage::from_usage(usage);
         let cost = prices.cost(provider, model, usage);
-        Self { usage, cost, latency: Duration::ZERO, savings_tokens: 0 }
+        Self {
+            usage,
+            cost,
+            latency: Duration::ZERO,
+            savings_tokens: 0,
+        }
     }
 
     /// The same meta, stamped with how long the request took.
@@ -89,7 +99,10 @@ impl ResponseMeta {
     /// saved.
     #[must_use]
     pub fn with_savings_tokens(self, saved: u32) -> Self {
-        Self { savings_tokens: saved, ..self }
+        Self {
+            savings_tokens: saved,
+            ..self
+        }
     }
 
     /// What the request reported, in `{prompt, completion, total}`.
@@ -157,14 +170,24 @@ mod tests {
 
     fn table() -> PricingTable {
         let mut t = PricingTable::default();
-        t.set("openai", "gpt-4o", Prices { input_micros_per_mtok: 2_500_000, output_micros_per_mtok: 10_000_000 });
+        t.set(
+            "openai",
+            "gpt-4o",
+            Prices {
+                input_micros_per_mtok: 2_500_000,
+                output_micros_per_mtok: 10_000_000,
+            },
+        );
         t
     }
 
     #[test]
     fn reads_usage_when_the_body_carries_one() {
         let usage = json!({ "prompt_tokens": 10, "completion_tokens": 5 });
-        assert_eq!(usage_from_body(br#"{"usage":{"prompt_tokens":10,"completion_tokens":5}}"#), Some(NormalizedUsage::from_usage(&usage)));
+        assert_eq!(
+            usage_from_body(br#"{"usage":{"prompt_tokens":10,"completion_tokens":5}}"#),
+            Some(NormalizedUsage::from_usage(&usage))
+        );
     }
 
     #[test]
@@ -179,19 +202,30 @@ mod tests {
 
     #[test]
     fn normalizes_an_anthropic_body_with_cache_counters() {
-        let body = br#"{"usage":{"input_tokens":10,"cache_read_input_tokens":4,"output_tokens":2}}"#;
+        let body =
+            br#"{"usage":{"input_tokens":10,"cache_read_input_tokens":4,"output_tokens":2}}"#;
         assert_eq!(usage_from_body(body).expect("usage").prompt, 14);
     }
 
     #[test]
     fn prices_the_usage_it_normalized() {
-        let meta = ResponseMeta::from_upstream(&table(), "openai", "gpt-4o", &json!({ "prompt_tokens": 1_000_000, "completion_tokens": 1_000_000 }));
+        let meta = ResponseMeta::from_upstream(
+            &table(),
+            "openai",
+            "gpt-4o",
+            &json!({ "prompt_tokens": 1_000_000, "completion_tokens": 1_000_000 }),
+        );
         assert_eq!(meta.cost().usd.micros, 12_500_000);
     }
 
     #[test]
     fn reports_the_token_pair_the_headers_print() {
-        let meta = ResponseMeta::from_upstream(&table(), "openai", "gpt-4o", &json!({ "prompt_tokens": 10, "completion_tokens": 5 }));
+        let meta = ResponseMeta::from_upstream(
+            &table(),
+            "openai",
+            "gpt-4o",
+            &json!({ "prompt_tokens": 10, "completion_tokens": 5 }),
+        );
         assert_eq!((meta.tokens_in(), meta.tokens_out()), (10, 5));
     }
 
@@ -199,14 +233,24 @@ mod tests {
     fn marks_an_unknown_model_unpriced_rather_than_free() {
         // The distinction `Cost` exists for: `$0 unpriced` must not read as a
         // budget decision that the request was cheap.
-        let meta = ResponseMeta::from_upstream(&table(), "openai", "nope", &json!({ "prompt_tokens": 10 }));
+        let meta = ResponseMeta::from_upstream(
+            &table(),
+            "openai",
+            "nope",
+            &json!({ "prompt_tokens": 10 }),
+        );
         assert_eq!(meta.cost(), Cost::UNPRICED);
     }
 
     #[test]
     fn computes_speed_from_completion_tokens_over_elapsed_time() {
-        let meta = ResponseMeta::from_upstream(&table(), "openai", "gpt-4o", &json!({ "completion_tokens": 500 }))
-            .with_latency(Duration::from_secs(2));
+        let meta = ResponseMeta::from_upstream(
+            &table(),
+            "openai",
+            "gpt-4o",
+            &json!({ "completion_tokens": 500 }),
+        )
+        .with_latency(Duration::from_secs(2));
         assert_eq!(meta.tokens_per_second(), Some(250.0));
     }
 
@@ -214,14 +258,24 @@ mod tests {
     fn omits_speed_when_the_elapsed_time_is_zero() {
         // A zero would read as "instant"; the reference omits the field so a
         // plugin cannot divide by it.
-        let meta = ResponseMeta::from_upstream(&table(), "openai", "gpt-4o", &json!({ "completion_tokens": 500 }));
+        let meta = ResponseMeta::from_upstream(
+            &table(),
+            "openai",
+            "gpt-4o",
+            &json!({ "completion_tokens": 500 }),
+        );
         assert_eq!(meta.tokens_per_second(), None);
     }
 
     #[test]
     fn reports_zero_speed_for_a_response_with_no_completion_tokens() {
-        let meta = ResponseMeta::from_upstream(&table(), "openai", "gpt-4o", &json!({ "prompt_tokens": 10 }))
-            .with_latency(Duration::from_millis(500));
+        let meta = ResponseMeta::from_upstream(
+            &table(),
+            "openai",
+            "gpt-4o",
+            &json!({ "prompt_tokens": 10 }),
+        )
+        .with_latency(Duration::from_millis(500));
         assert_eq!(meta.tokens_per_second(), Some(0.0));
     }
 
@@ -233,11 +287,24 @@ mod tests {
 
     #[test]
     fn carries_the_savings_a_compression_stage_reported() {
-        assert_eq!(ResponseMeta::default().with_savings_tokens(42).savings_tokens(), 42);
+        assert_eq!(
+            ResponseMeta::default()
+                .with_savings_tokens(42)
+                .savings_tokens(),
+            42
+        );
     }
 
     #[test]
     fn defaults_to_nothing_observed() {
-        assert_eq!(ResponseMeta::default(), ResponseMeta { usage: NormalizedUsage::new(0, 0), cost: Cost::UNPRICED, latency: Duration::ZERO, savings_tokens: 0 });
+        assert_eq!(
+            ResponseMeta::default(),
+            ResponseMeta {
+                usage: NormalizedUsage::new(0, 0),
+                cost: Cost::UNPRICED,
+                latency: Duration::ZERO,
+                savings_tokens: 0
+            }
+        );
     }
 }

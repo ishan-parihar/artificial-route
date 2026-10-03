@@ -25,7 +25,10 @@ fn temp_db(tag: &str) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!(
         "ar-keys-store-it-{tag}-{}-{n}-{}.db",
         std::process::id(),
-        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
     ));
     let _ = std::fs::remove_file(&path);
     path
@@ -34,8 +37,17 @@ fn temp_db(tag: &str) -> std::path::PathBuf {
 #[test]
 fn returns_a_credential_when_the_name_is_stored() {
     let store = CredentialStore::open_in_memory(&Secret::generate()).expect("open");
-    store.insert("openai", "openai", &Secret::new(b"sk-it-round-trip".to_vec())).expect("insert");
-    assert_eq!(store.get("openai").expect("get").expect("a row").as_bytes(), b"sk-it-round-trip");
+    store
+        .insert(
+            "openai",
+            "openai",
+            &Secret::new(b"sk-it-round-trip".to_vec()),
+        )
+        .expect("insert");
+    assert_eq!(
+        store.get("openai").expect("get").expect("a row").as_bytes(),
+        b"sk-it-round-trip"
+    );
 }
 
 #[test]
@@ -47,8 +59,12 @@ fn returns_nothing_when_the_name_is_absent() {
 #[test]
 fn lists_every_stored_name() {
     let store = CredentialStore::open_in_memory(&Secret::generate()).expect("open");
-    store.insert("openai", "openai", &Secret::generate()).expect("insert");
-    store.insert("anthropic", "anthropic", &Secret::generate()).expect("insert");
+    store
+        .insert("openai", "openai", &Secret::generate())
+        .expect("insert");
+    store
+        .insert("anthropic", "anthropic", &Secret::generate())
+        .expect("insert");
     assert_eq!(store.list_names().expect("names"), ["anthropic", "openai"]);
 }
 
@@ -62,10 +78,19 @@ fn reads_back_after_the_store_is_closed_and_reopened() {
     let material = Secret::generate();
     {
         let first = CredentialStore::open_with_material(&path, &material).expect("open");
-        first.insert("openai", "openai", &Secret::new(b"sk-it-reopen".to_vec())).expect("insert");
+        first
+            .insert("openai", "openai", &Secret::new(b"sk-it-reopen".to_vec()))
+            .expect("insert");
     }
     let second = CredentialStore::open_with_material(&path, &material).expect("reopen");
-    assert_eq!(second.get("openai").expect("get").expect("a row").as_bytes(), b"sk-it-reopen");
+    assert_eq!(
+        second
+            .get("openai")
+            .expect("get")
+            .expect("a row")
+            .as_bytes(),
+        b"sk-it-reopen"
+    );
     let _ = std::fs::remove_file(&path);
 }
 
@@ -74,7 +99,8 @@ fn refuses_a_row_when_the_master_key_is_another_installs() {
     let path = temp_db("foreign");
     {
         let mine = CredentialStore::open_with_material(&path, &Secret::generate()).expect("open");
-        mine.insert("openai", "openai", &Secret::new(b"sk-it-foreign".to_vec())).expect("insert");
+        mine.insert("openai", "openai", &Secret::new(b"sk-it-foreign".to_vec()))
+            .expect("insert");
     }
     let theirs = CredentialStore::open_with_material(&path, &Secret::generate()).expect("reopen");
     assert!(matches!(theirs.get("openai"), Err(KeyError::TagMismatch)));
@@ -84,17 +110,27 @@ fn refuses_a_row_when_the_master_key_is_another_installs() {
 #[test]
 fn renders_no_credential_in_debug() {
     let store = CredentialStore::open_in_memory(&Secret::generate()).expect("open");
-    store.insert("openai", "openai", &Secret::new(b"sk-it-debug".to_vec())).expect("insert");
+    store
+        .insert("openai", "openai", &Secret::new(b"sk-it-debug".to_vec()))
+        .expect("insert");
     let rendered = format!("{store:?}");
     assert!(rendered.starts_with("CredentialStore"), "{rendered}");
-    assert!(!rendered.contains("sk-it-debug"), "a credential reached Debug: {rendered}");
+    assert!(
+        !rendered.contains("sk-it-debug"),
+        "a credential reached Debug: {rendered}"
+    );
 }
 
 #[test]
 fn reads_the_credential_as_header_text() {
     let store = CredentialStore::open_in_memory(&Secret::generate()).expect("open");
-    store.insert("openai", "openai", &Secret::new(b"sk-it-text".to_vec())).expect("insert");
-    assert_eq!(store.get_text("openai").expect("text").as_deref(), Some("sk-it-text"));
+    store
+        .insert("openai", "openai", &Secret::new(b"sk-it-text".to_vec()))
+        .expect("insert");
+    assert_eq!(
+        store.get_text("openai").expect("text").as_deref(),
+        Some("sk-it-text")
+    );
 }
 
 #[test]
@@ -108,14 +144,19 @@ fn round_trips_a_session_through_the_public_re_exports() {
     let store = CredentialStore::open_in_memory(&Secret::generate()).expect("open");
     let session = OAuthSession::new("codex", SessionKind::Refresh).with_access_key("codex_refresh");
     store.insert_session(&session).expect("insert session");
-    assert_eq!(store.get_session("codex").expect("get").expect("a row"), session);
+    assert_eq!(
+        store.get_session("codex").expect("get").expect("a row"),
+        session
+    );
 }
 
 #[test]
 fn refuses_an_anonymous_credential_through_the_public_error() {
     let store = CredentialStore::open_in_memory(&Secret::generate()).expect("open");
     let e = store
-        .insert_session(&OAuthSession::new("cursor", SessionKind::Anonymous).with_access_key("cursor"))
+        .insert_session(
+            &OAuthSession::new("cursor", SessionKind::Anonymous).with_access_key("cursor"),
+        )
         .expect_err("anonymous holds no credential");
     assert!(matches!(e, KeyError::AnonymousCredential { .. }), "{e}");
 }
@@ -123,6 +164,8 @@ fn refuses_an_anonymous_credential_through_the_public_error() {
 #[test]
 fn counts_sessions_for_doctor_through_the_public_api() {
     let store = CredentialStore::open_in_memory(&Secret::generate()).expect("open");
-    store.insert_session(&OAuthSession::new("cursor", SessionKind::Anonymous)).expect("insert session");
+    store
+        .insert_session(&OAuthSession::new("cursor", SessionKind::Anonymous))
+        .expect("insert session");
     assert_eq!(store.session_count().expect("count"), 1);
 }

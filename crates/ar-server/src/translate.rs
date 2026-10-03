@@ -125,10 +125,11 @@ pub fn to_canonical_for_route(route: &str, inbound: &[u8]) -> Result<CanonicalRe
     }
 
     match route {
-        "/v1/chat/completions" => Ok(
-            CanonicalRequest::new(head.model, Bytes::copy_from_slice(inbound))
-                .with_stream(head.stream),
-        ),
+        "/v1/chat/completions" => Ok(CanonicalRequest::new(
+            head.model,
+            Bytes::copy_from_slice(inbound),
+        )
+        .with_stream(head.stream)),
         "/v1/messages" => typed(inbound, |raw| {
             let req: AnthropicMessages = serde_json::from_slice(raw)
                 .map_err(|e| format!("/v1/messages is not an Anthropic Messages body: {e}"))?;
@@ -227,7 +228,10 @@ mod tests {
         let raw = br#"{"model":"claude-sonnet-4-5","max_tokens":64,"system":"be terse",
             "messages":[{"role":"user","content":"hi"}]}"#;
         let got = to_canonical_for_route("/v1/messages", raw).expect("anthropic body");
-        assert_eq!((got.model.as_ref(), got.stream), ("claude-sonnet-4-5", false));
+        assert_eq!(
+            (got.model.as_ref(), got.stream),
+            ("claude-sonnet-4-5", false)
+        );
     }
 
     #[test]
@@ -276,8 +280,7 @@ mod tests {
         // `input` is the one field only Responses has, so this is the case where
         // the routes genuinely do not overlap.
         let raw = br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;
-        let err = to_canonical_for_route("/v1/responses", raw)
-            .expect_err("shape mismatch refused");
+        let err = to_canonical_for_route("/v1/responses", raw).expect_err("shape mismatch refused");
         assert!(err.contains("input"), "unhelpful error: {err}");
     }
 
@@ -307,7 +310,12 @@ mod tests {
 
     #[test]
     fn refuses_a_body_with_no_model_on_every_route() {
-        for route in ["/v1/chat/completions", "/v1/messages", "/v1/responses", "/api/chat"] {
+        for route in [
+            "/v1/chat/completions",
+            "/v1/messages",
+            "/v1/responses",
+            "/api/chat",
+        ] {
             let err = to_canonical_for_route(route, br#"{"messages":[]}"#)
                 .expect_err("missing model refused");
             assert!(err.contains("model"), "{route}: unhelpful error: {err}");
@@ -316,8 +324,7 @@ mod tests {
 
     #[test]
     fn names_the_route_it_refused() {
-        let err = to_canonical_for_route("/api/chat", b"{not json")
-            .expect_err("malformed refused");
+        let err = to_canonical_for_route("/api/chat", b"{not json").expect_err("malformed refused");
         assert!(err.contains("/api/chat"), "unhelpful error: {err}");
     }
 

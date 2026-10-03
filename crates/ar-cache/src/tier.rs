@@ -65,10 +65,7 @@ pub struct ByteWeighter;
 
 impl Weighter<CacheKey, Entry> for ByteWeighter {
     fn weight(&self, _key: &CacheKey, value: &Entry) -> u64 {
-        KEY_LEN as u64
-            + value.body.len() as u64
-            + value.content_type.len() as u64
-            + ENTRY_OVERHEAD
+        KEY_LEN as u64 + value.body.len() as u64 + value.content_type.len() as u64 + ENTRY_OVERHEAD
     }
 }
 
@@ -80,7 +77,8 @@ impl Weighter<CacheKey, Entry> for ByteWeighter {
 /// holding.
 #[derive(Debug)]
 pub struct MemTier {
-    cache: Lru<CacheKey, Entry, ByteWeighter, DefaultHashBuilder, DefaultLifecycle<CacheKey, Entry>>,
+    cache:
+        Lru<CacheKey, Entry, ByteWeighter, DefaultHashBuilder, DefaultLifecycle<CacheKey, Entry>>,
 }
 
 impl MemTier {
@@ -257,7 +255,10 @@ impl DiskTier {
         let outcome = {
             let mut table = write.open_table(ENTRIES)?;
             let ledger = write.open_table(LEDGER)?;
-            let used = ledger.get(USED_ROW)?.map_or(0, |g| g.value()).saturating_add(incoming);
+            let used = ledger
+                .get(USED_ROW)?
+                .map_or(0, |g| g.value())
+                .saturating_add(incoming);
 
             if used > self.cap_bytes {
                 let reclaimed = sweep_expired(&mut table, now)?;
@@ -303,7 +304,10 @@ impl DiskTier {
             let previous = table.remove(key.as_bytes().as_slice())?;
             let freed = previous.as_ref().map_or(0, |p| p.value().len() as u64);
             if freed > 0 {
-                let used = ledger.get(USED_ROW)?.map_or(0, |g| g.value()).saturating_sub(freed);
+                let used = ledger
+                    .get(USED_ROW)?
+                    .map_or(0, |g| g.value())
+                    .saturating_sub(freed);
                 ledger.insert(USED_ROW, used)?;
             }
             previous.map(|p| p.value().to_vec())
@@ -359,7 +363,6 @@ impl DiskTier {
     pub fn is_empty(&self) -> Result<bool, CacheError> {
         Ok(self.len()? == 0)
     }
-
 }
 
 /// Reads the logical byte total. One row, one read transaction.
@@ -395,8 +398,6 @@ fn sweep_expired(table: &mut redb::Table<'_, &[u8], &[u8]>, now: u64) -> Result<
     Ok(reclaimed)
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -412,7 +413,13 @@ mod tests {
         let key = CacheKey::hash(b"k");
         let small = Entry::new(200, "text/plain", "a", 0, Duration::from_secs(1));
         let fat = "a".repeat(1000);
-        let big = Entry::new(200, "text/plain", Bytes::copy_from_slice(fat.as_bytes()), 0, Duration::from_secs(1));
+        let big = Entry::new(
+            200,
+            "text/plain",
+            Bytes::copy_from_slice(fat.as_bytes()),
+            0,
+            Duration::from_secs(1),
+        );
         let w = ByteWeighter;
         assert!(
             quick_cache::Weighter::weight(&w, &key, &big)
@@ -424,7 +431,11 @@ mod tests {
     fn expired_entry_reads_as_absent() {
         let tier = MemTier::new(1 << 20);
         let key = CacheKey::hash(b"k");
-        tier.insert(&key, Entry::new(200, "text/plain", "x", 0, Duration::from_millis(5)), 0);
+        tier.insert(
+            &key,
+            Entry::new(200, "text/plain", "x", 0, Duration::from_millis(5)),
+            0,
+        );
         assert!(tier.get(&key, 6).is_none());
     }
 
@@ -436,7 +447,11 @@ mod tests {
         // the thing that grows RSS.
         let tier = MemTier::new(0);
         let key = CacheKey::hash(b"k");
-        tier.insert(&key, Entry::new(200, "text/plain", "x", 0, Duration::from_secs(9)), 0);
+        tier.insert(
+            &key,
+            Entry::new(200, "text/plain", "x", 0, Duration::from_secs(9)),
+            0,
+        );
         assert_eq!(tier.weight(), 0, "a zero-capacity tier must retain nothing");
     }
 
@@ -447,7 +462,11 @@ mod tests {
         // does not promise an entry fits.
         let tier = MemTier::new(1);
         let key = CacheKey::hash(b"k");
-        tier.insert(&key, Entry::new(200, "text/plain", "x", 0, Duration::from_secs(9)), 0);
+        tier.insert(
+            &key,
+            Entry::new(200, "text/plain", "x", 0, Duration::from_secs(9)),
+            0,
+        );
         assert!(tier.get(&key, 0).is_none() || tier.weight() <= tier.capacity());
     }
 }

@@ -59,7 +59,9 @@ fn main() -> ExitCode {
             },
         ),
         other => {
-            eprintln!("eval:compression: unknown plan {other:?}; expected off|lite|rtk|caveman|stacked");
+            eprintln!(
+                "eval:compression: unknown plan {other:?}; expected off|lite|rtk|caveman|stacked"
+            );
             return ExitCode::from(2);
         }
     };
@@ -67,10 +69,16 @@ fn main() -> ExitCode {
     println!("# eval:compression");
     println!();
     println!("- plan: {}", describe(&plan));
-    println!("- corpus: {} cases, synthetic seed corpus", SEED_CORPUS.len());
+    println!(
+        "- corpus: {} cases, synthetic seed corpus",
+        SEED_CORPUS.len()
+    );
     println!(
         "- hard budget: {}",
-        budget.map_or_else(|| "off (engines only)".to_owned(), |b| format!("{b} tokens"))
+        budget.map_or_else(
+            || "off (engines only)".to_owned(),
+            |b| format!("{b} tokens")
+        )
     );
     println!();
 

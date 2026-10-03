@@ -183,8 +183,15 @@ mod tests {
     #[test]
     fn collapses_a_quadruple_at_every_rung() {
         let quad = "warn\nwarn\nwarn\nwarn\n";
-        for level in [Intensity::Minimal, Intensity::Standard, Intensity::Aggressive] {
-            assert!(!rtk_at(quad, level).contains("warn\nwarn\nwarn\nwarn"), "{level}");
+        for level in [
+            Intensity::Minimal,
+            Intensity::Standard,
+            Intensity::Aggressive,
+        ] {
+            assert!(
+                !rtk_at(quad, level).contains("warn\nwarn\nwarn\nwarn"),
+                "{level}"
+            );
         }
     }
 

@@ -23,9 +23,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
 use ar_compress::{Engine, Intensity, Step};
 use ar_registry::CustomProvider;
+use arc_swap::ArcSwap;
 use notify_debouncer_full::notify::{self, RecommendedWatcher, RecursiveMode, Watcher};
 use notify_debouncer_full::{DebouncedEvent, Debouncer, FileIdMap, new_debouncer};
 use serde::{Deserialize, Serialize};
@@ -587,9 +587,10 @@ impl TryFrom<RawCompression> for Compression {
     type Error = CompressionError;
 
     fn try_from(raw: RawCompression) -> Result<Self, Self::Error> {
-        let engine = Engine::from_id(&raw.engine).ok_or_else(|| CompressionError::UnknownEngine {
-            id: raw.engine.clone(),
-        })?;
+        let engine =
+            Engine::from_id(&raw.engine).ok_or_else(|| CompressionError::UnknownEngine {
+                id: raw.engine.clone(),
+            })?;
         let level = match raw.intensity {
             None => None,
             // A no-dial engine with a level is rejected rather than ignored: the
@@ -602,13 +603,12 @@ impl TryFrom<RawCompression> for Compression {
                 });
             }
             Some(id) => {
-                let level = Intensity::from_id(&id).ok_or_else(|| {
-                    CompressionError::UnknownIntensity {
+                let level =
+                    Intensity::from_id(&id).ok_or_else(|| CompressionError::UnknownIntensity {
                         engine: engine.as_str(),
                         levels: ladder(engine),
                         id: id.clone(),
-                    }
-                })?;
+                    })?;
                 if !engine.levels().contains(&level) {
                     return Err(CompressionError::UnknownIntensity {
                         engine: engine.as_str(),
@@ -822,8 +822,11 @@ impl Config {
     where
         F: FnMut(&str) -> Result<Option<String>, String>,
     {
-        let expanded = shellexpand::env_with_context(yaml, |name| lookup(name))
-            .map_err(|e| ConfigError::Expand { cause: e.to_string() })?;
+        let expanded = shellexpand::env_with_context(yaml, |name| lookup(name)).map_err(|e| {
+            ConfigError::Expand {
+                cause: e.to_string(),
+            }
+        })?;
         let cfg: Self =
             serde_yaml::from_str(&expanded).map_err(|source| ConfigError::Yaml { source })?;
         cfg.validate()?;
@@ -832,7 +835,9 @@ impl Config {
 
     /// [`Config::parse`] with `$VAR` resolved from the process environment.
     pub fn from_env(yaml: &str) -> Result<Self, ConfigError> {
-        Self::parse(yaml, |name| std::env::var(name).map(Some).map_err(|e| e.to_string()))
+        Self::parse(yaml, |name| {
+            std::env::var(name).map(Some).map_err(|e| e.to_string())
+        })
     }
 
     /// Rejects dangling key references, which would otherwise surface as an
@@ -964,13 +969,19 @@ impl Config {
             .iter()
             .find(|p| p.id == id)
             .map(|p| p.key.as_str())
-            .or_else(|| self.custom_providers.iter().find(|c| c.id == id).map(|c| c.key_ref.as_str()))
+            .or_else(|| {
+                self.custom_providers
+                    .iter()
+                    .find(|c| c.id == id)
+                    .map(|c| c.key_ref.as_str())
+            })
     }
 
     /// Whether `id` names a provider this config declares, from either list.
     #[must_use]
     pub fn declares(&self, id: &str) -> bool {
-        self.providers.iter().any(|p| p.id == id) || self.custom_providers.iter().any(|c| c.id == id)
+        self.providers.iter().any(|p| p.id == id)
+            || self.custom_providers.iter().any(|c| c.id == id)
     }
 }
 
@@ -1099,7 +1110,11 @@ impl ConfigHandle {
     /// via rename, which silently invalidates an inode-bound watch. Returns a
     /// guard whose drop stops the watcher thread.
     pub fn watch(self: &Arc<Self>) -> Result<WatcherGuard, ConfigError> {
-        let dir = self.path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+        let dir = self
+            .path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
         let watched = self.path.clone();
 
         let handle = Arc::clone(self);
@@ -1136,7 +1151,9 @@ impl ConfigHandle {
                 cause: e.to_string(),
             })?;
 
-        Ok(WatcherGuard { _debouncer: debouncer })
+        Ok(WatcherGuard {
+            _debouncer: debouncer,
+        })
     }
 }
 
@@ -1253,7 +1270,11 @@ combos:
     #[test]
     fn defaults_pool_to_empty_when_absent() {
         // Every config written before the field existed must load unchanged.
-        assert!(Config::parse(SAMPLE, stub_lookup).unwrap().combos[0].pool.is_empty());
+        assert!(
+            Config::parse(SAMPLE, stub_lookup).unwrap().combos[0]
+                .pool
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1268,10 +1289,28 @@ combos:
     /// already in this list, and [`Strategy::parse`] pins each of them to its
     /// canonical spelling in `ar-route`'s own tests.
     const ROUTE_STRATEGIES: [&str; 22] = [
-        "priority", "round-robin", "cost-optimized", "lkgp", "weighted", "fill-first", "p2c",
-        "least-used", "random", "strict-random", "headroom", "reset-window", "reset-aware",
-        "quota-weighted", "quota-share", "quota-share-fair", "expiry-first", "context-relay",
-        "context-optimized", "cache-optimized", "fusion", "pipeline",
+        "priority",
+        "round-robin",
+        "cost-optimized",
+        "lkgp",
+        "weighted",
+        "fill-first",
+        "p2c",
+        "least-used",
+        "random",
+        "strict-random",
+        "headroom",
+        "reset-window",
+        "reset-aware",
+        "quota-weighted",
+        "quota-share",
+        "quota-share-fair",
+        "expiry-first",
+        "context-relay",
+        "context-optimized",
+        "cache-optimized",
+        "fusion",
+        "pipeline",
     ];
 
     #[test]
@@ -1305,12 +1344,18 @@ combos:
     #[test]
     fn parses_auto_family_as_auto() {
         assert_eq!(Strategy::parse("auto"), Strategy::Auto("auto".to_owned()));
-        assert_eq!(Strategy::parse("auto/quality"), Strategy::Auto("auto/quality".to_owned()));
+        assert_eq!(
+            Strategy::parse("auto/quality"),
+            Strategy::Auto("auto/quality".to_owned())
+        );
     }
 
     #[test]
     fn parses_unknown_name_as_deferred_rather_than_failing() {
-        assert_eq!(Strategy::parse("totally-new"), Strategy::Deferred("totally-new".to_owned()));
+        assert_eq!(
+            Strategy::parse("totally-new"),
+            Strategy::Deferred("totally-new".to_owned())
+        );
         assert!(!Strategy::parse("totally-new").is_routable());
     }
 
@@ -1352,7 +1397,8 @@ combos:
         // then answered every request with a 501 that said "deferred" — the
         // operator's own spelling treated as a typo.
         let yaml = "keys:\n  k: v\ncombos:\n  - id: c\n    strategy: quota-weighted\n    targets: [openai/gpt-5.4]\n";
-        let cfg = Config::parse(yaml, stub_lookup).expect("quota-weighted is a strategy this build has");
+        let cfg =
+            Config::parse(yaml, stub_lookup).expect("quota-weighted is a strategy this build has");
         assert_eq!(cfg.combos[0].strategy, Strategy::QuotaWeighted);
         assert!(cfg.combos[0].strategy.is_routable());
         assert_eq!(cfg.combos[0].strategy.as_str(), "quota-weighted");
@@ -1368,7 +1414,11 @@ combos:
         assert_eq!(combo.targets, ["openai/gpt-5.4", "groq/llama-3.3-70b"]);
         assert!(combo.weights.is_empty(), "a bare list declares no weights");
         for target in &combo.targets {
-            assert_eq!(combo.weight_of(target), 1, "{target} keeps the default share");
+            assert_eq!(
+                combo.weight_of(target),
+                1,
+                "{target} keeps the default share"
+            );
         }
     }
 
@@ -1382,7 +1432,11 @@ combos:
         let combo = &cfg.combos[0];
         assert_eq!(combo.targets, ["openai/gpt-5.4", "groq/llama-3.3-70b"]);
         assert_eq!(combo.weight_of("groq/llama-3.3-70b"), 7);
-        assert_eq!(combo.weight_of("openai/gpt-5.4"), 1, "the bare one declared nothing");
+        assert_eq!(
+            combo.weight_of("openai/gpt-5.4"),
+            1,
+            "the bare one declared nothing"
+        );
     }
 
     #[test]
@@ -1420,7 +1474,10 @@ combos:
     #[test]
     fn reads_an_oauth_session_by_provider_id() {
         let cfg = Config::parse(OAUTH_YAML, |name| Ok(Some(format!("synthetic-{name}")))).unwrap();
-        assert_eq!(cfg.oauth_for("codex").map(|s| s.provider.as_str()), Some("codex"));
+        assert_eq!(
+            cfg.oauth_for("codex").map(|s| s.provider.as_str()),
+            Some("codex")
+        );
     }
 
     #[test]
@@ -1433,7 +1490,10 @@ combos:
     fn reads_a_token_endpoint_and_an_expiry() {
         let cfg = Config::parse(OAUTH_YAML, |name| Ok(Some(format!("synthetic-{name}")))).unwrap();
         let session = cfg.oauth_for("codex").expect("the session");
-        assert_eq!(session.token_url.as_deref(), Some("https://auth.example.invalid/token"));
+        assert_eq!(
+            session.token_url.as_deref(),
+            Some("https://auth.example.invalid/token")
+        );
         assert_eq!(session.expires_at, Some(1_800_000_000));
     }
 
@@ -1459,13 +1519,18 @@ combos:
     );
 
     fn browser_login_cfg() -> Config {
-        Config::parse(BROWSER_LOGIN_YAML, |name| Ok(Some(format!("synthetic-{name}"))))
-            .expect("the browser-login block must load")
+        Config::parse(BROWSER_LOGIN_YAML, |name| {
+            Ok(Some(format!("synthetic-{name}")))
+        })
+        .expect("the browser-login block must load")
     }
 
     #[test]
     fn reads_the_browser_login_placement_keys_when_declared() {
-        let session = browser_login_cfg().oauth_for("codex").expect("the session").clone();
+        let session = browser_login_cfg()
+            .oauth_for("codex")
+            .expect("the session")
+            .clone();
         assert_eq!(
             session.authorization_url.as_deref(),
             Some("https://auth.example.invalid/authorize"),
@@ -1518,8 +1583,10 @@ combos:
 
     #[test]
     fn rejects_a_remote_redirect_uri_when_it_is_plain_http() {
-        let yaml = BROWSER_LOGIN_YAML
-            .replace("http://127.0.0.1:1455/callback", "http://callbacks.example/callback");
+        let yaml = BROWSER_LOGIN_YAML.replace(
+            "http://127.0.0.1:1455/callback",
+            "http://callbacks.example/callback",
+        );
         assert!(matches!(
             Config::parse(&yaml, |name| Ok(Some(format!("synthetic-{name}")))),
             Err(ConfigError::BadOAuthUrl { .. }),
@@ -1528,8 +1595,10 @@ combos:
 
     #[test]
     fn accepts_a_remote_redirect_uri_when_it_is_https() {
-        let yaml = BROWSER_LOGIN_YAML
-            .replace("http://127.0.0.1:1455/callback", "https://ar.example/callback");
+        let yaml = BROWSER_LOGIN_YAML.replace(
+            "http://127.0.0.1:1455/callback",
+            "https://ar.example/callback",
+        );
         assert!(
             Config::parse(&yaml, |name| Ok(Some(format!("synthetic-{name}")))).is_ok(),
             "https needs no loopback exemption"
@@ -1540,7 +1609,8 @@ combos:
     fn accepts_a_loopback_redirect_uri_when_it_is_plain_http() {
         let cfg = browser_login_cfg();
         assert_eq!(
-            cfg.oauth_for("codex").and_then(|s| s.redirect_uri.as_deref()),
+            cfg.oauth_for("codex")
+                .and_then(|s| s.redirect_uri.as_deref()),
             Some("http://127.0.0.1:1455/callback"),
         );
     }
@@ -1557,7 +1627,10 @@ combos:
     #[test]
     fn parses_a_config_with_no_oauth_block() {
         let cfg = Config::parse(SAMPLE, stub_lookup).unwrap();
-        assert!(cfg.oauth.is_empty(), "omission is not-oauth, exactly like compression");
+        assert!(
+            cfg.oauth.is_empty(),
+            "omission is not-oauth, exactly like compression"
+        );
     }
 
     #[test]
@@ -1580,7 +1653,8 @@ combos:
         let cfg = Config::parse(CUSTOM, stub_lookup).unwrap();
         assert_eq!(cfg.key_name("local-gateway"), Some("local"));
         assert_eq!(
-            cfg.key(cfg.key_name("local-gateway").unwrap_or_default()).map(Secret::expose),
+            cfg.key(cfg.key_name("local-gateway").unwrap_or_default())
+                .map(Secret::expose),
             Some("secret-for-AR_TEST_LOCAL_KEY")
         );
     }
@@ -1609,7 +1683,10 @@ combos:
         let yaml = "keys:\n  k: v\ncustom_providers:\n  - id: mine\n    protocol: openai-compatible\n    base_url: https://api.example.invalid\n    key_ref: k\n    headers:\n      x-api-key: v\n";
         let cfg = Config::parse(yaml, stub_lookup).unwrap();
         assert_eq!(
-            cfg.custom_providers[0].headers.get("x-api-key").map(String::as_str),
+            cfg.custom_providers[0]
+                .headers
+                .get("x-api-key")
+                .map(String::as_str),
             Some("v")
         );
     }
@@ -1633,7 +1710,10 @@ combos:
     #[test]
     fn defaults_the_level_to_the_engine_when_only_the_engine_is_named() {
         let cfg = Config::parse(&combo_yaml("compression: { engine: rtk }"), stub_lookup).unwrap();
-        assert_eq!(cfg.combos[0].compression.map(Compression::step), Some(Step::new(Engine::Rtk)));
+        assert_eq!(
+            cfg.combos[0].compression.map(Compression::step),
+            Some(Step::new(Engine::Rtk))
+        );
     }
 
     /// Every pair the catalog says is legal must load. This is the pin that keeps
@@ -1651,7 +1731,10 @@ combos:
                     .unwrap_or_else(|e| panic!("{engine}@{level} must load: {e}"));
                 assert_eq!(
                     cfg.combos[0].compression,
-                    Some(Compression { engine, level: Some(*level) }),
+                    Some(Compression {
+                        engine,
+                        level: Some(*level)
+                    }),
                     "{engine}@{level}"
                 );
             }
@@ -1660,8 +1743,11 @@ combos:
 
     #[test]
     fn refuses_a_combo_when_the_engine_is_not_in_the_catalog() {
-        let err = Config::parse(&combo_yaml("compression: { engine: omniglyph }"), stub_lookup)
-            .expect_err("an unwired engine id must not load");
+        let err = Config::parse(
+            &combo_yaml("compression: { engine: omniglyph }"),
+            stub_lookup,
+        )
+        .expect_err("an unwired engine id must not load");
         assert!(matches!(err, ConfigError::Yaml { .. }), "{err}");
     }
 
@@ -1707,8 +1793,11 @@ combos:
     /// stopped accepting. `include_str!` keeps the pin honest about the path.
     #[test]
     fn parses_the_omni_mirror_when_read_from_this_repo() {
-        let cfg = Config::parse(include_str!("../../../config.omni-mirror.yaml"), stub_lookup)
-            .expect("the mirror template must load");
+        let cfg = Config::parse(
+            include_str!("../../../config.omni-mirror.yaml"),
+            stub_lookup,
+        )
+        .expect("the mirror template must load");
         assert_eq!(cfg.combos.len(), 3);
     }
 
@@ -1716,9 +1805,16 @@ combos:
     /// has to say so, or "mirrors the live combos 1:1" is not true.
     #[test]
     fn gives_every_mirrored_combo_the_live_lite_engine() {
-        let cfg = Config::parse(include_str!("../../../config.omni-mirror.yaml"), stub_lookup)
-            .expect("the mirror template must load");
-        let engines: Vec<Option<Engine>> = cfg.combos.iter().map(|c| c.compression.map(|k| k.engine)).collect();
+        let cfg = Config::parse(
+            include_str!("../../../config.omni-mirror.yaml"),
+            stub_lookup,
+        )
+        .expect("the mirror template must load");
+        let engines: Vec<Option<Engine>> = cfg
+            .combos
+            .iter()
+            .map(|c| c.compression.map(|k| k.engine))
+            .collect();
         assert_eq!(engines, [Some(Engine::Lite); 3]);
     }
 
@@ -1754,7 +1850,10 @@ combos:
 
     #[test]
     fn refuses_an_anonymous_session_that_declares_a_refresh_row() {
-        let yaml = ANON.replace("    anonymous_editor: artificial-route", "    anonymous_editor: artificial-route\n    refresh_key: kilocode_refresh");
+        let yaml = ANON.replace(
+            "    anonymous_editor: artificial-route",
+            "    anonymous_editor: artificial-route\n    refresh_key: kilocode_refresh",
+        );
         let err = Config::parse(&yaml, stub_lookup).expect_err("no account to refresh");
         assert!(err.to_string().contains("holds no account"), "{err}");
     }
@@ -1785,7 +1884,11 @@ combos:
             "    device_auth_url: https://auth.example.invalid/device\n",
         );
         let err = Config::parse(yaml, stub_lookup).expect_err("nothing to poll");
-        assert!(err.to_string().contains("device_auth_url and device_poll_url"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("device_auth_url and device_poll_url"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1798,7 +1901,12 @@ combos:
             "    device_poll_url: https://auth.example.invalid/poll\n",
         );
         let cfg = Config::parse(yaml, stub_lookup).expect("both halves are declared");
-        assert!(cfg.oauth_for("grok-cli").expect("declared").device_poll_url.is_some());
+        assert!(
+            cfg.oauth_for("grok-cli")
+                .expect("declared")
+                .device_poll_url
+                .is_some()
+        );
     }
 
     #[test]
@@ -1834,10 +1942,16 @@ combos:
         // A provider that addresses the grant by path cannot be expressed by a flat
         // poll URL, so the placeholder has to be accepted rather than read as a
         // malformed URL — the request it builds is the operator's declaration.
-        let cfg = Config::parse(&device_yaml("https://auth.example.invalid/poll/{code}"), stub_lookup)
-            .expect("a templated poll URL is a declared endpoint");
+        let cfg = Config::parse(
+            &device_yaml("https://auth.example.invalid/poll/{code}"),
+            stub_lookup,
+        )
+        .expect("a templated poll URL is a declared endpoint");
         assert_eq!(
-            cfg.oauth_for("grok-cli").expect("declared").device_poll_url.as_deref(),
+            cfg.oauth_for("grok-cli")
+                .expect("declared")
+                .device_poll_url
+                .as_deref(),
             Some("https://auth.example.invalid/poll/{code}"),
             "the placeholder is carried through verbatim for the executor to substitute"
         );
@@ -1873,7 +1987,8 @@ combos:
             "    device_auth_url: https://auth.example.invalid/codes/{code}\n",
             "    device_poll_url: https://auth.example.invalid/poll\n",
         );
-        let err = Config::parse(yaml, stub_lookup).expect_err("there is no device code yet to place there");
+        let err = Config::parse(yaml, stub_lookup)
+            .expect_err("there is no device code yet to place there");
         assert!(err.to_string().contains("device_auth_url"), "{err}");
     }
 }

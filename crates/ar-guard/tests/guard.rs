@@ -12,7 +12,11 @@ use ar_guard::{Kind, Rule, Verdict, inspect, redact_bidi};
 #[test]
 fn redacts_when_secret_present() {
     let r = redact_bidi("Authorization: Bearer sk-proj-Ab3dEf9hK2mN7pQ1rS5tU8vW4xY6z").unwrap();
-    assert!(r.has(Kind::Bearer), "bearer credential survived: {}", r.text());
+    assert!(
+        r.has(Kind::Bearer),
+        "bearer credential survived: {}",
+        r.text()
+    );
     assert!(!r.text().contains("Ab3dEf9hK2mN7pQ1rS5tU8vW4xY6z"));
     assert!(r.text().contains("[REDACTED:bearer]"));
 }
@@ -48,7 +52,12 @@ fn allows_benign_that_looks_like_the_neighbors() {
     // as an SSN, and "risk-management" that reads as an `sk-` key.
     let r = redact_bidi("released 2024-01-1234, see risk-management-config.md").unwrap();
     assert!(r.is_clean());
-    assert_eq!(inspect("show the instructions for this file").unwrap().verdict(), Verdict::Allow);
+    assert_eq!(
+        inspect("show the instructions for this file")
+            .unwrap()
+            .verdict(),
+        Verdict::Allow
+    );
 }
 
 #[test]

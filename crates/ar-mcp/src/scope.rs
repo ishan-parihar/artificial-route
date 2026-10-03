@@ -105,8 +105,17 @@ impl Scope {
     /// Every name [`Scope::parse`] accepts, in the order a help line should list
     /// them: category wildcards first, then the per-domain bits, then `*`.
     pub const NAMES: [&'static str; 11] = [
-        "read:*", "write:*", "execute:*", "*:health", "*:combos", "*:quota", "*:usage", "*:models",
-        "*:completions", "*", "none",
+        "read:*",
+        "write:*",
+        "execute:*",
+        "*:health",
+        "*:combos",
+        "*:quota",
+        "*:usage",
+        "*:models",
+        "*:completions",
+        "*",
+        "none",
     ];
 
     fn one(name: &str) -> Option<Self> {
@@ -166,7 +175,10 @@ mod tests {
 
     #[test]
     fn parses_a_comma_separated_grant_list() {
-        assert_eq!(Scope::parse("read:*,*:combos").expect("known"), Scope::READ | Scope::COMBOS);
+        assert_eq!(
+            Scope::parse("read:*,*:combos").expect("known"),
+            Scope::READ | Scope::COMBOS
+        );
     }
 
     #[test]
@@ -178,20 +190,28 @@ mod tests {
     fn parse_rejects_an_unknown_name_rather_than_dropping_it() {
         // A typo that silently dropped its bit would leave a host believing it
         // granted a scope it did not.
-        let e = Scope::parse("read:*").and_then(|_| Scope::parse("read")).expect_err("typo");
+        let e = Scope::parse("read:*")
+            .and_then(|_| Scope::parse("read"))
+            .expect_err("typo");
         assert!(e.contains("\"read\""), "{e}");
         assert!(e.contains("read:*"), "the error lists the valid set: {e}");
     }
 
     #[test]
     fn parse_of_an_empty_grant_is_nothing_granted() {
-        assert_eq!(Scope::parse("").expect("empty is not an error"), Scope::NONE);
+        assert_eq!(
+            Scope::parse("").expect("empty is not an error"),
+            Scope::NONE
+        );
     }
 
     #[test]
     fn every_listed_name_parses() {
         for name in Scope::NAMES {
-            assert!(Scope::parse(name).is_ok(), "{name} is listed but does not parse");
+            assert!(
+                Scope::parse(name).is_ok(),
+                "{name} is listed but does not parse"
+            );
         }
     }
 
@@ -200,7 +220,8 @@ mod tests {
         // The grant grammar has no second spelling, so the ten names plus `*` must
         // be able to express the whole mask -- or a bit is unreachable and the
         // only way to grant it is `*`.
-        let all = "read:*,write:*,execute:*,*:health,*:combos,*:quota,*:usage,*:models,*:completions";
+        let all =
+            "read:*,write:*,execute:*,*:health,*:combos,*:quota,*:usage,*:models,*:completions";
         assert_eq!(Scope::parse(all).expect("known"), Scope::ALL);
     }
 }

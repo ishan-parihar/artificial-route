@@ -174,12 +174,7 @@ impl AuditLedger {
     /// classify it. Passing a prompt through is the caller's decision to make
     /// with the admin grant in hand, and `ar-guard` is what decides what may
     /// legitimately be raw.
-    pub fn append_raw(
-        &self,
-        line: &AuditLine,
-        excerpt: &str,
-        now: u64,
-    ) -> Result<u64, ObsError> {
+    pub fn append_raw(&self, line: &AuditLine, excerpt: &str, now: u64) -> Result<u64, ObsError> {
         if !self.raw {
             return Err(ObsError::AdminScope);
         }
@@ -192,7 +187,9 @@ impl AuditLedger {
         let write = self.db.begin_write().map_err(ObsError::store)?;
         {
             let mut table = write.open_table(ROWS).map_err(ObsError::store)?;
-            table.insert(key, value.as_slice()).map_err(ObsError::store)?;
+            table
+                .insert(key, value.as_slice())
+                .map_err(ObsError::store)?;
         }
         write.commit().map_err(ObsError::store)?;
         Ok(key)

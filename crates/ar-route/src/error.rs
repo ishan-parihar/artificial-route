@@ -27,7 +27,9 @@ pub enum RouteError {
     /// not exist, which is a client mistake, whereas a deferred *strategy* is
     /// a documented feature this binary does not have. The two are different
     /// bugs to chase and must not share a status.
-    #[error("unknown auto variant `{name}`; expected one of auto, auto/coding, auto/fast, auto/cheap, auto/smart, auto/chaos")]
+    #[error(
+        "unknown auto variant `{name}`; expected one of auto, auto/coding, auto/fast, auto/cheap, auto/smart, auto/chaos"
+    )]
     UnknownAutoVariant {
         /// The name as it arrived, echoed back so an operator can fix the
         /// config without reading the source.

@@ -42,7 +42,9 @@ pub mod meta;
 pub mod pricing;
 pub mod usage;
 
-pub use count::{DEFAULT_OUTPUT_ALLOWANCE, Estimate, MAX_EXACT_TOKEN_COUNT_CHARS, count_text, estimate_request};
+pub use count::{
+    DEFAULT_OUTPUT_ALLOWANCE, Estimate, MAX_EXACT_TOKEN_COUNT_CHARS, count_text, estimate_request,
+};
 pub use error::TokenError;
 pub use ledger::{Cap, CostReport, DenyReason, Entry, Ledger, LedgerRow, Spend, Verdict};
 pub use meta::{ResponseMeta, usage_from_body};

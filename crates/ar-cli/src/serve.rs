@@ -68,15 +68,14 @@ fn components(
     // `HttpExec::new` takes the list by value and `ServerConfig` needs its own
     // copy; one clone of a handful of four-field structs at boot is cheaper than
     // the seam it would take to share them.
-    let exec =
-        HttpExec::new(config.providers.clone())
-            .map_err(|e| {
-                commands::fail(
-                    e,
-                    "the HTTP client could not be built; check the TLS backend",
-                )
-            })
-            .map(|e| std::sync::Arc::new(e) as std::sync::Arc<dyn ArExec>)?;
+    let exec = HttpExec::new(config.providers.clone())
+        .map_err(|e| {
+            commands::fail(
+                e,
+                "the HTTP client could not be built; check the TLS backend",
+            )
+        })
+        .map(|e| std::sync::Arc::new(e) as std::sync::Arc<dyn ArExec>)?;
 
     // The usage ledger lives next to the credential store by construction, so
     // `serve` writing rows and `ar mcp`'s `cost_report`/`check_quota` reading
@@ -84,12 +83,10 @@ fn components(
     // An open failure demotes to header-only accounting: the response headers
     // are computed either way, and a proxy that refuses to boot because
     // bookkeeping could not open a file is a worse failure than a warned one.
-    let ledger_path = commands::store_path(&cli.config)
-        .parent()
-        .map_or_else(
-            || std::path::PathBuf::from("usage.sqlite"),
-            |dir| dir.join("usage.sqlite"),
-        );
+    let ledger_path = commands::store_path(&cli.config).parent().map_or_else(
+        || std::path::PathBuf::from("usage.sqlite"),
+        |dir| dir.join("usage.sqlite"),
+    );
     let ledger = match ar_tokens::Ledger::open(&ledger_path) {
         Ok(ledger) => Some(std::sync::Arc::new(std::sync::Mutex::new(ledger))),
         Err(e) => {

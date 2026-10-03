@@ -160,7 +160,9 @@ impl fmt::Debug for Salt {
     /// envelope is unreproducible without it — so unlike [`Secret`], hiding it
     /// would only make bug reports harder.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("Salt").field(&crate::hex::encode(&self.0)).finish()
+        f.debug_tuple("Salt")
+            .field(&crate::hex::encode(&self.0))
+            .finish()
     }
 }
 
@@ -191,13 +193,22 @@ impl KeyMeta {
     /// Fresh metadata: a new salt at the recommended cost.
     #[must_use]
     pub fn generate() -> Self {
-        Self { v: crate::hash::VERSION, ..Self::with_params(HashParams::RECOMMENDED, Salt::generate()) }
+        Self {
+            v: crate::hash::VERSION,
+            ..Self::with_params(HashParams::RECOMMENDED, Salt::generate())
+        }
     }
 
     /// Metadata with an explicit salt and cost.
     #[must_use]
     pub fn with_params(params: HashParams, salt: Salt) -> Self {
-        Self { v: crate::hash::VERSION, m_cost: params.m_cost, t_cost: params.t_cost, p_cost: params.p_cost, salt }
+        Self {
+            v: crate::hash::VERSION,
+            m_cost: params.m_cost,
+            t_cost: params.t_cost,
+            p_cost: params.p_cost,
+            salt,
+        }
     }
 
     /// The argon2id cost this metadata pins.
@@ -207,7 +218,11 @@ impl KeyMeta {
     /// that verifies nothing.
     #[must_use]
     pub fn params(&self) -> HashParams {
-        HashParams { m_cost: self.m_cost, t_cost: self.t_cost, p_cost: self.p_cost }
+        HashParams {
+            m_cost: self.m_cost,
+            t_cost: self.t_cost,
+            p_cost: self.p_cost,
+        }
     }
 
     /// JSON form, for the key metadata file.
@@ -306,7 +321,11 @@ impl MasterKey {
     /// or [`KeyError::BadParams`] if argon2id rejects the recorded cost.
     pub fn new(master: Secret, meta: KeyMeta) -> Result<Self, KeyError> {
         let aead_key = derive_aead_key(&master, &meta.salt, meta.params())?;
-        Ok(Self { master, aead_key, meta })
+        Ok(Self {
+            master,
+            aead_key,
+            meta,
+        })
     }
 
     /// Loads the master key from `source`.
@@ -331,7 +350,9 @@ impl MasterKey {
             MasterKeySource::Keyring { service, account } => {
                 let entry = keyring::Entry::new(service, account)
                     .map_err(|e| KeyError::MasterKey(e.to_string()))?;
-                let raw = entry.get_password().map_err(|e| KeyError::MasterKey(e.to_string()))?;
+                let raw = entry
+                    .get_password()
+                    .map_err(|e| KeyError::MasterKey(e.to_string()))?;
                 let bytes = decode_key_material(raw.trim())?;
                 Self::new(Secret::from_slice(&bytes)?, KeyMeta::generate())
             }
@@ -452,7 +473,7 @@ fn check_private(_path: &Path) -> Result<(), KeyError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{KeyMeta, MasterKey, MasterKeySource, Salt, Secret, KEY_LEN};
+    use super::{KEY_LEN, KeyMeta, MasterKey, MasterKeySource, Salt, Secret};
 
     #[test]
     fn debug_prints_length_and_never_content() {

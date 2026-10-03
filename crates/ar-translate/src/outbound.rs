@@ -79,8 +79,8 @@
 use serde_json::{Map, Value, json};
 
 use crate::canonical::{
-        CanonicalChat, CanonicalResponse, FinishReason, MediaPart, Msg, Role, render_openai_body,
-    };
+    CanonicalChat, CanonicalResponse, FinishReason, MediaPart, Msg, Role, render_openai_body,
+};
 
 /// Which provider wire a dispatch must render into.
 ///
@@ -281,7 +281,11 @@ pub fn render_claude_body(chat: &CanonicalChat) -> Vec<u8> {
         // `tool_result` block. Canonical keeps no `tool_use_id`, so the block
         // carries the result text alone — documented above as the missing tool
         // registry, which is the same gap.
-        let role = if msg.role == Role::Assistant { "assistant" } else { "user" };
+        let role = if msg.role == Role::Assistant {
+            "assistant"
+        } else {
+            "user"
+        };
         let mut content: Vec<Value> = Vec::with_capacity(msg.media.len() + 1);
         if !msg.content.is_empty() {
             if msg.role == Role::Tool {
@@ -342,7 +346,11 @@ pub fn render_openai_responses_body(chat: &CanonicalChat) -> Vec<u8> {
             }
             continue;
         }
-        let part_type = if msg.role == Role::Assistant { "output_text" } else { "input_text" };
+        let part_type = if msg.role == Role::Assistant {
+            "output_text"
+        } else {
+            "input_text"
+        };
         let mut parts: Vec<Value> = Vec::with_capacity(msg.media.len() + 1);
         if !msg.content.is_empty() {
             parts.push(json!({ "type": part_type, "text": msg.content }));
@@ -405,7 +413,11 @@ pub fn render_gemini_body(chat: &CanonicalChat) -> Vec<u8> {
             }
             continue;
         }
-        let role = if msg.role == Role::Assistant { "model" } else { "user" };
+        let role = if msg.role == Role::Assistant {
+            "model"
+        } else {
+            "user"
+        };
         let mut parts: Vec<Value> = Vec::with_capacity(msg.media.len() + 1);
         if !msg.content.is_empty() {
             parts.push(json!({ "text": msg.content }));
@@ -519,7 +531,8 @@ pub fn render_cursor_body(chat: &CanonicalChat) -> Vec<u8> {
             Role::User | Role::Assistant => {
                 if msg.media.is_empty() {
                     if !msg.content.is_empty() {
-                        messages.push(json!({ "role": msg.role.as_wire(), "content": msg.content }));
+                        messages
+                            .push(json!({ "role": msg.role.as_wire(), "content": msg.content }));
                     }
                     continue;
                 }
@@ -551,7 +564,11 @@ pub fn render_cursor_body(chat: &CanonicalChat) -> Vec<u8> {
 
 /// Builds Cursor's `<tool_result>` block, escaping the XML it contains.
 fn cursor_tool_result(text: &str) -> String {
-    let escape = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let escape = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
     // The reference strips C0 control characters here: Cursor's backend 400s a
     // request body containing one. `\t` and the line breaks are kept because a
     // tool result is multi-line by nature and dropping them would join the lines.
@@ -601,7 +618,10 @@ pub fn render_clova_body(chat: &CanonicalChat) -> Vec<u8> {
     let mut body = Map::with_capacity(4);
     body.insert("messages".to_owned(), Value::Array(messages));
     if let Some(max_tokens) = chat.max_tokens {
-        body.insert("maxTokens".to_owned(), max_tokens.min(CLOVA_MAX_OUTPUT_TOKENS).into());
+        body.insert(
+            "maxTokens".to_owned(),
+            max_tokens.min(CLOVA_MAX_OUTPUT_TOKENS).into(),
+        );
     }
     if let Some(temperature) = chat.temperature {
         body.insert("temperature".to_owned(), temperature.clamp(0.0, 1.0).into());
@@ -875,7 +895,7 @@ fn kiro_conversation_id(seed: &str) -> String {
 /// assert_eq!(value["usage"]["input_tokens"], 3);
 /// ```
 #[must_use]
-    pub fn to_anthropic_response(response: &CanonicalResponse) -> Value {
+pub fn to_anthropic_response(response: &CanonicalResponse) -> Value {
     json!({
         "id": response.id,
         "type": "message",
@@ -981,7 +1001,7 @@ mod tests {
         Msg::new(Role::User, text)
     }
 
-fn chat(messages: Vec<Msg>) -> CanonicalChat {
+    fn chat(messages: Vec<Msg>) -> CanonicalChat {
         CanonicalChat {
             model: "m-1".to_owned(),
             messages,
@@ -1011,7 +1031,7 @@ fn chat(messages: Vec<Msg>) -> CanonicalChat {
             .unwrap_or_else(|e| panic!("{wire} body is not json: {body}\n{e}"))
     }
 
-/// The shape every response test starts from, with self-consistent usage so a
+    /// The shape every response test starts from, with self-consistent usage so a
     /// usage assertion in one of them is about the mapper rather than the fixture.
     fn sample_response() -> CanonicalResponse {
         CanonicalResponse {
@@ -1020,7 +1040,11 @@ fn chat(messages: Vec<Msg>) -> CanonicalChat {
             created: 42,
             message: Msg::new(Role::Assistant, "hi"),
             finish_reason: FinishReason::Stop,
-            usage: Usage { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 },
+            usage: Usage {
+                prompt_tokens: 3,
+                completion_tokens: 1,
+                total_tokens: 4,
+            },
         }
     }
 
@@ -1042,7 +1066,11 @@ fn chat(messages: Vec<Msg>) -> CanonicalChat {
     fn hoists_a_system_turn_out_of_the_claude_message_array() {
         let value = rendered(&tri(), OutboundWire::Claude);
         assert_eq!(value["system"][0]["text"], "be terse", "{value}");
-        assert_eq!(value["messages"].as_array().expect("messages").len(), 2, "{value}");
+        assert_eq!(
+            value["messages"].as_array().expect("messages").len(),
+            2,
+            "{value}"
+        );
     }
 
     #[test]
@@ -1061,10 +1089,16 @@ fn chat(messages: Vec<Msg>) -> CanonicalChat {
         // Anthropic 400s a body with no `max_tokens`; the OpenAI wire omits the
         // field instead, so this cannot be the same renderer. The caller asked for
         // none, which is the case the default exists for.
-        let unnamed = CanonicalChat { max_tokens: None, ..chat(vec![user("hi")]) };
+        let unnamed = CanonicalChat {
+            max_tokens: None,
+            ..chat(vec![user("hi")])
+        };
         assert_eq!(rendered(&unnamed, OutboundWire::Claude)["max_tokens"], 4096);
         // A caller-supplied ceiling is still honoured rather than overwritten.
-        let named = CanonicalChat { max_tokens: Some(64), ..chat(vec![user("hi")]) };
+        let named = CanonicalChat {
+            max_tokens: Some(64),
+            ..chat(vec![user("hi")])
+        };
         assert_eq!(rendered(&named, OutboundWire::Claude)["max_tokens"], 64);
     }
 
@@ -1083,15 +1117,23 @@ fn chat(messages: Vec<Msg>) -> CanonicalChat {
     #[test]
     fn synthesises_a_claude_user_turn_when_every_turn_was_a_system_turn() {
         // The reference's #5245 guard: Anthropic rejects an empty `messages`.
-        let value = rendered(&chat(vec![Msg::new(Role::System, "only")]), OutboundWire::Claude);
+        let value = rendered(
+            &chat(vec![Msg::new(Role::System, "only")]),
+            OutboundWire::Claude,
+        );
         assert_eq!(value["messages"][0]["role"], "user", "{value}");
     }
 
     #[test]
     fn renders_a_tool_turn_as_a_claude_tool_result_block() {
-        let value =
-            rendered(&chat(vec![user("hi"), Msg::new(Role::Tool, "42")]), OutboundWire::Claude);
-        assert_eq!(value["messages"][1]["role"], "user", "claude has no tool role");
+        let value = rendered(
+            &chat(vec![user("hi"), Msg::new(Role::Tool, "42")]),
+            OutboundWire::Claude,
+        );
+        assert_eq!(
+            value["messages"][1]["role"], "user",
+            "claude has no tool role"
+        );
         assert_eq!(value["messages"][1]["content"][0]["type"], "tool_result");
     }
 
@@ -1121,7 +1163,10 @@ fn chat(messages: Vec<Msg>) -> CanonicalChat {
     fn renames_the_token_ceiling_for_the_responses_wire() {
         let value = rendered(&tri(), OutboundWire::Responses);
         assert_eq!(value["max_output_tokens"], 128);
-        assert!(value.get("max_tokens").is_none(), "the OpenAI spelling is not a Responses key");
+        assert!(
+            value.get("max_tokens").is_none(),
+            "the OpenAI spelling is not a Responses key"
+        );
     }
 
     #[test]
@@ -1133,8 +1178,7 @@ fn chat(messages: Vec<Msg>) -> CanonicalChat {
         ));
         let value = rendered(&chat(vec![turn]), OutboundWire::Responses);
         assert_eq!(
-            value["input"][0]["content"][1]["image_url"]["url"],
-            "data:image/png;base64,QUJD",
+            value["input"][0]["content"][1]["image_url"]["url"], "data:image/png;base64,QUJD",
             "{value}"
         );
     }
@@ -1159,9 +1203,15 @@ fn chat(messages: Vec<Msg>) -> CanonicalChat {
     #[test]
     fn renders_a_gemini_system_instruction_and_contents() {
         let value = rendered(&tri(), OutboundWire::Gemini);
-        assert_eq!(value["systemInstruction"]["parts"][0]["text"], "be terse", "{value}");
+        assert_eq!(
+            value["systemInstruction"]["parts"][0]["text"], "be terse",
+            "{value}"
+        );
         assert_eq!(value["contents"][0]["role"], "user");
-        assert_eq!(value["contents"][1]["role"], "model", "gemini spells assistant `model`");
+        assert_eq!(
+            value["contents"][1]["role"], "model",
+            "gemini spells assistant `model`"
+        );
     }
 
     #[test]
@@ -1216,22 +1266,37 @@ fn chat(messages: Vec<Msg>) -> CanonicalChat {
         // a user turn or it is lost.
         let value = rendered(&tri(), OutboundWire::Cursor);
         assert_eq!(value["messages"][0]["role"], "user");
-        assert_eq!(value["messages"][0]["content"], "[System Instructions]\nbe terse");
+        assert_eq!(
+            value["messages"][0]["content"],
+            "[System Instructions]\nbe terse"
+        );
     }
 
     #[test]
     fn respells_a_cursor_tool_turn_as_a_tool_result_block() {
-        let value =
-            rendered(&chat(vec![user("hi"), Msg::new(Role::Tool, "42")]), OutboundWire::Cursor);
-        assert_eq!(value["messages"][1]["role"], "user", "cursor has no tool role");
-        let content = value["messages"][1]["content"].as_str().expect("string content");
+        let value = rendered(
+            &chat(vec![user("hi"), Msg::new(Role::Tool, "42")]),
+            OutboundWire::Cursor,
+        );
+        assert_eq!(
+            value["messages"][1]["role"], "user",
+            "cursor has no tool role"
+        );
+        let content = value["messages"][1]["content"]
+            .as_str()
+            .expect("string content");
         assert!(content.contains("<result>42</result>"), "{content}");
     }
 
     #[test]
     fn escapes_xml_inside_a_cursor_tool_result() {
-        let value = rendered(&chat(vec![Msg::new(Role::Tool, "a < b & c")]), OutboundWire::Cursor);
-        let content = value["messages"][0]["content"].as_str().expect("string content");
+        let value = rendered(
+            &chat(vec![Msg::new(Role::Tool, "a < b & c")]),
+            OutboundWire::Cursor,
+        );
+        let content = value["messages"][0]["content"]
+            .as_str()
+            .expect("string content");
         assert!(content.contains("a &lt; b &amp; c"), "{content}");
     }
 
@@ -1246,8 +1311,7 @@ fn chat(messages: Vec<Msg>) -> CanonicalChat {
         ));
         let value = rendered(&chat(vec![turn]), OutboundWire::Cursor);
         assert_eq!(
-            value["messages"][0]["content"][1]["image_url"]["url"],
-            "data:image/png;base64,QUJD",
+            value["messages"][0]["content"][1]["image_url"]["url"], "data:image/png;base64,QUJD",
             "{value}"
         );
     }
@@ -1255,8 +1319,9 @@ fn chat(messages: Vec<Msg>) -> CanonicalChat {
     #[test]
     fn round_trips_canonical_through_the_cursor_wire_and_back() {
         let value = rendered(&tri(), OutboundWire::Cursor);
-        let back = to_canonical(serde_json::from_value::<OpenAIChat>(value).expect("a cursor body"))
-            .expect("canonicalises back");
+        let back =
+            to_canonical(serde_json::from_value::<OpenAIChat>(value).expect("a cursor body"))
+                .expect("canonicalises back");
         // The system turn returns as a user turn: that is the loss Cursor's ask
         // format forces, and the reason its mapper prefixes the text.
         assert_eq!(back.messages[0], user("[System Instructions]\nbe terse"));
@@ -1272,7 +1337,10 @@ fn chat(messages: Vec<Msg>) -> CanonicalChat {
         let value = rendered(&tri(), OutboundWire::Clova);
         assert_eq!(value["messages"][0]["content"][0]["type"], "text");
         assert_eq!(value["maxTokens"], 128);
-        assert!(value.get("max_tokens").is_none(), "the OpenAI spelling is not a CLOVA key");
+        assert!(
+            value.get("max_tokens").is_none(),
+            "the OpenAI spelling is not a CLOVA key"
+        );
     }
 
     #[test]
@@ -1297,8 +1365,7 @@ fn chat(messages: Vec<Msg>) -> CanonicalChat {
         ));
         let value = rendered(&chat(vec![inline]), OutboundWire::Clova);
         assert_eq!(
-            value["messages"][0]["content"][1]["dataUri"]["data"],
-            "data:image/png;base64,QUJD",
+            value["messages"][0]["content"][1]["dataUri"]["data"], "data:image/png;base64,QUJD",
             "{value}"
         );
     }
@@ -1307,21 +1374,32 @@ fn chat(messages: Vec<Msg>) -> CanonicalChat {
     fn clamps_clova_temperature_to_the_vendor_range() {
         // Live-verified rejection above 1, so this clamp is load-bearing rather
         // than cosmetic.
-        let hot = CanonicalChat { temperature: Some(1.9), ..chat(vec![user("hi")]) };
+        let hot = CanonicalChat {
+            temperature: Some(1.9),
+            ..chat(vec![user("hi")])
+        };
         assert_eq!(rendered(&hot, OutboundWire::Clova)["temperature"], 1.0);
     }
 
     #[test]
     fn caps_clova_output_tokens_at_the_vendor_ceiling() {
-        let loud = CanonicalChat { max_tokens: Some(999_999), ..chat(vec![user("hi")]) };
+        let loud = CanonicalChat {
+            max_tokens: Some(999_999),
+            ..chat(vec![user("hi")])
+        };
         assert_eq!(rendered(&loud, OutboundWire::Clova)["maxTokens"], 4096);
     }
 
     #[test]
     fn folds_a_clova_tool_turn_into_a_user_turn() {
-        let value =
-            rendered(&chat(vec![user("hi"), Msg::new(Role::Tool, "42")]), OutboundWire::Clova);
-        assert_eq!(value["messages"][1]["role"], "user", "clova has no tool role");
+        let value = rendered(
+            &chat(vec![user("hi"), Msg::new(Role::Tool, "42")]),
+            OutboundWire::Clova,
+        );
+        assert_eq!(
+            value["messages"][1]["role"], "user",
+            "clova has no tool role"
+        );
         assert_eq!(value["messages"][1]["content"][0]["text"], "42");
     }
 
@@ -1343,8 +1421,8 @@ fn chat(messages: Vec<Msg>) -> CanonicalChat {
         // rather than pretending the body is one.
         let mut body = value;
         body["model"] = serde_json::Value::String(canonical.model);
-        let back =
-            to_canonical(serde_json::from_value::<OpenAIChat>(body).expect("a clova body"))                .expect("canonicalises back");
+        let back = to_canonical(serde_json::from_value::<OpenAIChat>(body).expect("a clova body"))
+            .expect("canonicalises back");
         assert_eq!(back.messages[0], user("hi"));
         assert_eq!(back.messages[1], Msg::new(Role::Assistant, "hello"));
     }
@@ -1371,7 +1449,10 @@ fn chat(messages: Vec<Msg>) -> CanonicalChat {
             .as_str()
             .expect("string content");
         assert!(content.starts_with("be terse\n"), "{content}");
-        assert!(content.ends_with("hello"), "the current turn is the last one: {content}");
+        assert!(
+            content.ends_with("hello"),
+            "the current turn is the last one: {content}"
+        );
     }
 
     /// A cache hit needs the same conversation to produce the same id on every
@@ -1382,7 +1463,11 @@ fn chat(messages: Vec<Msg>) -> CanonicalChat {
         // render; a fresh one per request would defeat the upstream cache entirely.
         // The id is seeded from the *first* user turn, so adding a turn must not
         // move it — that is what a growing conversation looks like.
-        let growing = chat(vec![user("hi"), Msg::new(Role::Assistant, "hello"), user("and now?")]);
+        let growing = chat(vec![
+            user("hi"),
+            Msg::new(Role::Assistant, "hello"),
+            user("and now?"),
+        ]);
         let earlier = chat(vec![user("hi")]);
         assert_eq!(
             rendered(&growing, OutboundWire::Kiro)["conversationState"]["conversationId"],
@@ -1431,10 +1516,16 @@ fn chat(messages: Vec<Msg>) -> CanonicalChat {
             "image_url",
             serde_json::json!({ "image_url": { "url": "data:image/png;base64,QUJD" } }),
         ));
-        let canonical = CanonicalChat { model: "claude-sonnet-4-5".into(), ..chat(vec![turn]) };
+        let canonical = CanonicalChat {
+            model: "claude-sonnet-4-5".into(),
+            ..chat(vec![turn])
+        };
         for wire in OutboundWire::ALL {
             let body = String::from_utf8(render_for_wire(&canonical, *wire)).expect("utf-8");
-            assert!(body.contains("QUJD"), "{wire} dropped the image bytes: {body}");
+            assert!(
+                body.contains("QUJD"),
+                "{wire} dropped the image bytes: {body}"
+            );
         }
     }
 
@@ -1447,7 +1538,13 @@ fn chat(messages: Vec<Msg>) -> CanonicalChat {
             "image_url",
             serde_json::json!({ "image_url": { "url": "data:image/png;base64,QUJD" } }),
         ));
-        let value = rendered(&CanonicalChat { model: "claude-sonnet-4-5".into(), ..chat(vec![turn]) }, OutboundWire::Kiro);
+        let value = rendered(
+            &CanonicalChat {
+                model: "claude-sonnet-4-5".into(),
+                ..chat(vec![turn])
+            },
+            OutboundWire::Kiro,
+        );
         let images = &value["conversationState"]["currentMessage"]["userInputMessage"]["images"];
         assert_eq!(images[0]["format"], "png", "{value}");
         assert_eq!(images[0]["source"]["bytes"], "QUJD", "{value}");
@@ -1462,7 +1559,13 @@ fn chat(messages: Vec<Msg>) -> CanonicalChat {
             "image_url",
             serde_json::json!({ "image_url": { "url": "data:image/png;base64,QUJD" } }),
         ));
-        let value = rendered(&CanonicalChat { model: "deepseek-chat".into(), ..chat(vec![turn]) }, OutboundWire::Kiro);
+        let value = rendered(
+            &CanonicalChat {
+                model: "deepseek-chat".into(),
+                ..chat(vec![turn])
+            },
+            OutboundWire::Kiro,
+        );
         assert!(
             value["conversationState"]["currentMessage"]["userInputMessage"]
                 .get("images")
@@ -1485,7 +1588,10 @@ fn chat(messages: Vec<Msg>) -> CanonicalChat {
         assert_eq!(block["source"]["type"], "base64", "{value}");
         assert_eq!(block["source"]["media_type"], "image/png", "{value}");
         assert_eq!(block["source"]["data"], "QUJD", "{value}");
-        assert!(block.get("image_url").is_none(), "the openai spelling leaked: {value}");
+        assert!(
+            block.get("image_url").is_none(),
+            "the openai spelling leaked: {value}"
+        );
     }
 
     #[test]
@@ -1512,15 +1618,25 @@ fn chat(messages: Vec<Msg>) -> CanonicalChat {
             serde_json::json!({ "id": "t1", "name": "lookup", "input": { "q": "x" } }),
         ));
         let value = rendered(&chat(vec![turn]), OutboundWire::Claude);
-        assert_eq!(value["messages"][0]["content"][0]["type"], "tool_use", "{value}");
-        assert_eq!(value["messages"][0]["content"][0]["input"]["q"], "x", "{value}");
+        assert_eq!(
+            value["messages"][0]["content"][0]["type"], "tool_use",
+            "{value}"
+        );
+        assert_eq!(
+            value["messages"][0]["content"][0]["input"]["q"], "x",
+            "{value}"
+        );
     }
 
     #[test]
     fn drops_a_turn_with_neither_text_nor_media() {
         let empty = vec![user("hi"), Msg::new(Role::Assistant, "")];
         let value = rendered(&chat(empty), OutboundWire::Claude);
-        assert_eq!(value["messages"].as_array().expect("messages").len(), 1, "{value}");
+        assert_eq!(
+            value["messages"].as_array().expect("messages").len(),
+            1,
+            "{value}"
+        );
     }
 
     // ── response direction ─────────────────────────────────────────────
@@ -1529,7 +1645,10 @@ fn chat(messages: Vec<Msg>) -> CanonicalChat {
     fn renders_an_anthropic_response_envelope() {
         let value = to_anthropic_response(&sample_response());
         assert_eq!(value["type"], "message");
-        assert_eq!(value["stop_reason"], "end_turn", "anthropic does not spell it `stop`");
+        assert_eq!(
+            value["stop_reason"], "end_turn",
+            "anthropic does not spell it `stop`"
+        );
         assert_eq!(value["content"][0]["type"], "text");
         assert_eq!(value["usage"]["input_tokens"], 3);
     }
@@ -1544,7 +1663,11 @@ fn chat(messages: Vec<Msg>) -> CanonicalChat {
         ] {
             let mut response = sample_response();
             response.finish_reason = reason;
-            assert_eq!(to_anthropic_response(&response)["stop_reason"], wire, "{reason:?}");
+            assert_eq!(
+                to_anthropic_response(&response)["stop_reason"],
+                wire,
+                "{reason:?}"
+            );
         }
     }
 

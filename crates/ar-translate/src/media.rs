@@ -114,7 +114,9 @@ pub enum MediaError {
         model: String,
     },
     /// A `dimensions` override was sent to a fixed-width family.
-    #[error("model {model:?} has a fixed {fixed}-dimension output and does not accept `dimensions`")]
+    #[error(
+        "model {model:?} has a fixed {fixed}-dimension output and does not accept `dimensions`"
+    )]
     DimensionsUnsupported {
         /// The requested model id, verbatim.
         model: String,
@@ -257,7 +259,8 @@ pub fn family_guard(req: &EmbeddingRequest) -> Result<(), MediaError> {
     if req.model.trim().is_empty() {
         return Err(MediaError::EmptyModel);
     }
-    if req.encoding_format
+    if req
+        .encoding_format
         .as_deref()
         .is_some_and(|f| f != "float" && f != "base64")
     {
@@ -337,7 +340,6 @@ mod tests {
         ));
     }
 
-
     #[test]
     fn rejects_input_when_empty() {
         let body = req(r#"{"model":"text-embedding-3-small","input":[]}"#)
@@ -345,10 +347,4 @@ mod tests {
 
         assert!(matches!(family_guard(&body), Err(MediaError::EmptyInput)));
     }
-
-
-
-
-
-
 }

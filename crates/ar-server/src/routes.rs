@@ -56,12 +56,12 @@ use std::time::{Duration, Instant};
 
 use ar_cache::{Cache, CacheKey, CacheState};
 use ar_compress::Step;
-use ar_tokens::ResponseMeta;
 use ar_route::{
-    AttemptOutcome, AutoCandidate, AutoSelector, CanonicalRequest, Candidate, JudgeOutcome,
-    JudgePanel, JudgeTarget, ProviderId, RouteError, Strng, Strategy, attempt_loop, pick,
+    AttemptOutcome, AutoCandidate, AutoSelector, Candidate, CanonicalRequest, JudgeOutcome,
+    JudgePanel, JudgeTarget, ProviderId, RouteError, Strategy, Strng, attempt_loop, pick,
     simulate_route, synthesize, virtual_combo,
 };
+use ar_tokens::ResponseMeta;
 use axum::body::Body;
 use axum::extract::{OriginalUri, Path, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
@@ -76,7 +76,7 @@ use crate::app::AppState;
 use crate::config::{DefaultChain, RouteCombo};
 use crate::text::{
     COMPRESSION_ECHO, COMPRESSION_HEADER, COMPRESSION_HEADER_ALIAS, GUARD_HEADER, GuardVerdict,
-    compression_echo, compression_plan_with_alias, compress_body, guard_body,
+    compress_body, compression_echo, compression_plan_with_alias, guard_body,
 };
 use crate::translate::to_canonical_for_route;
 
@@ -280,7 +280,8 @@ enum Dialect {
     Responses,
     /// `POST /api/chat`. NDJSON, not SSE: a keepalive would have to be a JSON
     /// line, and inventing one would be inventing a wire format.
-    Ollama,}
+    Ollama,
+}
 
 impl Dialect {
     /// The path this dialect is served at, which is also the dialect selector
@@ -418,7 +419,12 @@ async fn handle_chat(
     let mut canonical = match to_canonical_for_route(dialect.route(), &body) {
         Ok(c) => c,
         Err(e) => {
-            return error_because(StatusCode::BAD_REQUEST, "invalid_request", "unparsable_body", &e);
+            return error_because(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "unparsable_body",
+                &e,
+            );
         }
     };
     // `Accept: text/event-stream` is an opt-in for a client that sends no
@@ -477,8 +483,12 @@ async fn handle_chat(
     // native spelling wins, then the alias, then the combo, and the echo
     // still names the layer that chose, never the wire name that asked.
     let compression = compression_plan_with_alias(
-        headers.get(COMPRESSION_HEADER).and_then(|v| v.to_str().ok()),
-        headers.get(COMPRESSION_HEADER_ALIAS).and_then(|v| v.to_str().ok()),
+        headers
+            .get(COMPRESSION_HEADER)
+            .and_then(|v| v.to_str().ok()),
+        headers
+            .get(COMPRESSION_HEADER_ALIAS)
+            .and_then(|v| v.to_str().ok()),
         plan.compression.as_ref().map(std::slice::from_ref),
     );
     let mut savings_tokens = 0;
@@ -524,9 +534,16 @@ async fn handle_chat(
     // afterwards, which is a second dispatch over a composed prompt
     // (`fusion.ts::handleFusionChat`).
     if plan.strategy == Strategy::Fusion {
-        return fusion_response(state, &canonical, &plan, dialect, dispatched, savings_tokens)
-            .await
-            .with_guard(guard_verdict);
+        return fusion_response(
+            state,
+            &canonical,
+            &plan,
+            dialect,
+            dispatched,
+            savings_tokens,
+        )
+        .await
+        .with_guard(guard_verdict);
     }
     let mut outcome = match tokio::time::timeout(
         state.config.stream_deadline(canonical.model.as_ref()),
@@ -561,7 +578,9 @@ async fn handle_chat(
         Ok(Ok(o)) => o,
     };
 
-    state.metrics.observe_attempts(u64::from(outcome.attempts()));
+    state
+        .metrics
+        .observe_attempts(u64::from(outcome.attempts()));
     if matches!(outcome, AttemptOutcome::Failover { .. }) {
         state.metrics.observe_failover();
     }
@@ -595,7 +614,13 @@ async fn handle_chat(
     // whatever the dialect's final frames carried. See `docs/07` (wave D) for
     // the split this half closes.
     let meta = if canonical.stream {
-        account_stream(&mut outcome, state, dialect, key_id.as_deref(), &canonical.model);
+        account_stream(
+            &mut outcome,
+            state,
+            dialect,
+            key_id.as_deref(),
+            &canonical.model,
+        );
         ResponseMeta::default()
             .with_latency(dispatched.elapsed())
             .with_savings_tokens(savings_tokens)
@@ -663,7 +688,10 @@ async fn buffer_for_accounting(
     // Only a 2xx that completed is counted. A failover's last upstream failure
     // has nothing spent against it, and an abort has no body to read: zero is
     // the honest figure in both.
-    let AttemptOutcome::Succeeded { upstream, provider, .. } = outcome else {
+    let AttemptOutcome::Succeeded {
+        upstream, provider, ..
+    } = outcome
+    else {
         return defaults();
     };
 
@@ -678,13 +706,20 @@ async fn buffer_for_accounting(
         async move { body }
     }));
 
-    let Some(meta) = read_and_record(state, key_id, provider.as_str(), &canonical.model, dialect, &body)
-    else {
+    let Some(meta) = read_and_record(
+        state,
+        key_id,
+        provider.as_str(),
+        &canonical.model,
+        dialect,
+        &body,
+    ) else {
         // Unparseable replies (relay of a provider's HTML error page, say)
         // have no usage to count; the headers keep their zeros on purpose.
         return defaults();
     };
-    meta.with_latency(elapsed).with_savings_tokens(savings_tokens)
+    meta.with_latency(elapsed)
+        .with_savings_tokens(savings_tokens)
 }
 
 /// Unix seconds now, for the ledger row's `created_at`.
@@ -724,10 +759,14 @@ fn read_and_record(
     let pricing = &state.config.prices;
     let meta = ResponseMeta::from_upstream(pricing, provider, model, usage);
     if let Some(ledger) = state.ledger.as_ref()
-        && let Err(e) = ledger
-            .lock()
-            .expect("ledger lock")
-            .record_response(key_id.unwrap_or("anonymous"), provider, model, usage, epoch_now(), pricing)
+        && let Err(e) = ledger.lock().expect("ledger lock").record_response(
+            key_id.unwrap_or("anonymous"),
+            provider,
+            model,
+            usage,
+            epoch_now(),
+            pricing,
+        )
     {
         // The response headers already carry the computed figure, and a
         // ledger write failure must not fail a request that succeeded — the
@@ -836,11 +875,14 @@ impl UsageTee {
         let Some(ledger) = self.state.ledger.as_ref() else {
             return;
         };
-        if let Err(e) = ledger
-            .lock()
-            .expect("ledger lock")
-            .record_response(&self.key_id, &self.provider, &self.model, &usage, epoch_now(), &self.state.config.prices)
-        {
+        if let Err(e) = ledger.lock().expect("ledger lock").record_response(
+            &self.key_id,
+            &self.provider,
+            &self.model,
+            &usage,
+            epoch_now(),
+            &self.state.config.prices,
+        ) {
             // Same contract as the non-streaming arm: a ledger write failure is
             // an operator-visible gap, never the client's problem.
             tracing::warn!(error = %e, "usage ledger write failed for a streamed reply");
@@ -860,7 +902,10 @@ fn account_stream(
     key_id: Option<&str>,
     model: &str,
 ) {
-    let AttemptOutcome::Succeeded { provider, upstream, .. } = outcome else {
+    let AttemptOutcome::Succeeded {
+        provider, upstream, ..
+    } = outcome
+    else {
         return;
     };
     if state.ledger.is_none() {
@@ -898,10 +943,12 @@ fn usage_from_frames(
     };
     match dialect {
         Dialect::OpenAi => tail.iter().rev().find_map(|chunk| {
-            data_frames(chunk)
-                .into_iter()
-                .rev()
-                .find_map(|frame| frame.get("usage").filter(|usage| usage.is_object()).cloned())
+            data_frames(chunk).into_iter().rev().find_map(|frame| {
+                frame
+                    .get("usage")
+                    .filter(|usage| usage.is_object())
+                    .cloned()
+            })
         }),
         Dialect::Anthropic => {
             // Input rides in the very first frame (`message_start`), output in
@@ -909,16 +956,22 @@ fn usage_from_frames(
             // one lookup each.
             let input = head
                 .and_then(|chunk| {
-                    data_frames(chunk).into_iter().find(|frame| frame.get("type").and_then(serde_json::Value::as_str) == Some("message_start"))
+                    data_frames(chunk).into_iter().find(|frame| {
+                        frame.get("type").and_then(serde_json::Value::as_str)
+                            == Some("message_start")
+                    })
                 })
                 .and_then(|frame| frame.pointer("/message/usage").cloned());
-            let output = tail.iter().rev().find_map(|chunk| {
-                data_frames(chunk)
-                    .into_iter()
-                    .rev()
-                    .find(|frame| frame.get("type").and_then(serde_json::Value::as_str) == Some("message_delta"))
-            })
-            .and_then(|frame| frame.get("usage").cloned());
+            let output = tail
+                .iter()
+                .rev()
+                .find_map(|chunk| {
+                    data_frames(chunk).into_iter().rev().find(|frame| {
+                        frame.get("type").and_then(serde_json::Value::as_str)
+                            == Some("message_delta")
+                    })
+                })
+                .and_then(|frame| frame.get("usage").cloned());
             match (input, output) {
                 (Some(input), Some(output)) => Some(serde_json::json!({
                     "input_tokens": input.get("input_tokens").cloned().unwrap_or(serde_json::Value::Null),
@@ -934,7 +987,10 @@ fn usage_from_frames(
             data_frames(chunk)
                 .into_iter()
                 .rev()
-                .find(|frame| frame.get("type").and_then(serde_json::Value::as_str) == Some("response.completed"))
+                .find(|frame| {
+                    frame.get("type").and_then(serde_json::Value::as_str)
+                        == Some("response.completed")
+                })
                 .and_then(|frame| frame.pointer("/response/usage").cloned())
         }),
         Dialect::Ollama => tail.iter().rev().find_map(|chunk| {
@@ -1092,7 +1148,13 @@ async fn fusion_synthesis(
 ) -> JudgeOutcome {
     let panel = JudgePanel::new(answers);
     let task = request_text(canonical);
-    synthesize(&panel, &JudgeTarget::provider(judge.as_str()), &task, state.exec.as_ref()).await
+    synthesize(
+        &panel,
+        &JudgeTarget::provider(judge.as_str()),
+        &task,
+        state.exec.as_ref(),
+    )
+    .await
 }
 
 /// The user's request as the judge should see it: the original messages, or a
@@ -1175,7 +1237,12 @@ struct Stages {
 /// before this runs, so the arm is unreachable rather than a guess.
 fn request_key(canonical: &CanonicalRequest, caller_key: Option<&str>) -> Option<CacheKey> {
     let body = serde_json::from_slice::<serde_json::Value>(&canonical.body).ok()?;
-    Some(ar_cache::key::request_key_with("default", &canonical.model, &body, caller_key))
+    Some(ar_cache::key::request_key_with(
+        "default",
+        &canonical.model,
+        &body,
+        caller_key,
+    ))
 }
 
 /// The cache-control headers one request carried, as the dispatch needs them.
@@ -1406,7 +1473,10 @@ fn accept_forces_stream(headers: &HeaderMap) -> bool {
 /// Silently falling back to the default chain is the defect this fixes: a client
 /// asking for `gpt-4o` when the server serves `cheap` got `cheap`'s answer and
 /// no way to know.
-pub(crate) fn resolve(state: &AppState, canonical: &CanonicalRequest) -> Result<RoutePlan, RouteReject> {
+pub(crate) fn resolve(
+    state: &AppState,
+    canonical: &CanonicalRequest,
+) -> Result<RoutePlan, RouteReject> {
     let model = canonical.model.as_ref();
 
     if let Some(chain) = auto_chain(state, model) {
@@ -1428,7 +1498,10 @@ pub(crate) fn resolve(state: &AppState, canonical: &CanonicalRequest) -> Result<
                 compression: combo.compression,
                 judge: judge(state, combo),
             }),
-            None => Err(RouteReject::UnknownModel(unknown_model(model, &state.config.combo_ids()))),
+            None => Err(RouteReject::UnknownModel(unknown_model(
+                model,
+                &state.config.combo_ids(),
+            ))),
         },
         DefaultChain::Flat => Ok(RoutePlan {
             chain: order(state, state.config.candidates(None)),
@@ -1451,7 +1524,9 @@ fn judge(state: &AppState, combo: &RouteCombo) -> Option<ProviderId> {
         return None;
     }
     let judge = combo.judge_model.as_deref()?;
-    let provider = judge.split_once('/').map_or(judge, |(provider, _)| provider);
+    let provider = judge
+        .split_once('/')
+        .map_or(judge, |(provider, _)| provider);
     state
         .config
         .providers
@@ -1643,7 +1718,15 @@ fn decorate(
         outcome.attempts()
     );
 
-    let Stages { compression, cache_state, cache_key, cache, model, cache_control, meta } = stages;
+    let Stages {
+        compression,
+        cache_state,
+        cache_key,
+        cache,
+        model,
+        cache_control,
+        meta,
+    } = stages;
 
     // Every accounting number the response reports, from one [`ResponseMeta`].
     // Cost is priced in `ar-tokens` against the same row the ledger stores, so a
@@ -1709,9 +1792,14 @@ fn decorate(
                     let stream = upstream.stream;
                     let body = match keepalive.filter(|k| !k.is_noop()) {
                         Some(k) => Body::from_stream(k.relay(stream)),
-                        None => Body::from_stream(stream.map(Ok::<Bytes, std::convert::Infallible>)),
+                        None => {
+                            Body::from_stream(stream.map(Ok::<Bytes, std::convert::Infallible>))
+                        }
                     };
-                    builder.header(header::CONTENT_TYPE, ct).status(status).body(body)
+                    builder
+                        .header(header::CONTENT_TYPE, ct)
+                        .status(status)
+                        .body(body)
                 }
             }
         }
@@ -1731,7 +1819,13 @@ fn decorate(
                     .because("chain_throttled"),
                 ))
         }
-        AttemptOutcome::Failover { status, provider, error_body, retry_after, .. } => {
+        AttemptOutcome::Failover {
+            status,
+            provider,
+            error_body,
+            retry_after,
+            ..
+        } => {
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
             // The last provider's own identifier, when it is one this build
             // passes through. The reference projects upstream codes through
@@ -1747,18 +1841,18 @@ fn decorate(
                 // A window the provider stated is information the client can
                 // use; keeping it costs the same header the retry arm already
                 // stamps. Sub-second rounds up, as there.
-                builder = builder
-                    .header(header::RETRY_AFTER, retry_after.as_secs().max(1).to_string());
+                builder = builder.header(
+                    header::RETRY_AFTER,
+                    retry_after.as_secs().max(1).to_string(),
+                );
             }
-            builder.status(status).body(json_body(ErrorSpec::of(
-                status,
-                code,
-                &message,
-            )))
+            builder
+                .status(status)
+                .body(json_body(ErrorSpec::of(status, code, &message)))
         }
-        AttemptOutcome::Abort(report) => builder
-            .status(report.status)
-            .body(json_body(ErrorSpec::of(report.status, "aborted", &report.reason))),
+        AttemptOutcome::Abort(report) => builder.status(report.status).body(json_body(
+            ErrorSpec::of(report.status, "aborted", &report.reason),
+        )),
     };
 
     resp.unwrap_or_else(|_| {
@@ -2034,12 +2128,19 @@ struct ErrorSpec<'a> {
     /// Human-readable sentence. Always router-authored.
     message: &'a str,
     /// The path the request asked for, present only on the unknown-route 404.
-    path: Option<&'a str>,}
+    path: Option<&'a str>,
+}
 
 impl<'a> ErrorSpec<'a> {
     /// Builds a spec for a status and code, with no finer reason.
     fn of(status: StatusCode, code: &'a str, message: &'a str) -> Self {
-        Self { kind: kind_for(status), code, reason: None, message, path: None }
+        Self {
+            kind: kind_for(status),
+            code,
+            reason: None,
+            message,
+            path: None,
+        }
     }
 
     /// Adds a `reason`, which is the whole point of having one: a client
@@ -2243,12 +2344,10 @@ pub async fn healthz() -> Response {
 pub async fn metrics(State(state): State<AppState>) -> Response {
     (
         StatusCode::OK,
-        [
-            (
-                header::CONTENT_TYPE,
-                "text/plain; version=0.0.4; charset=utf-8",
-            ),
-        ],
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
         state.metrics.render(),
     )
         .into_response()
@@ -2302,15 +2401,11 @@ pub async fn models(State(state): State<AppState>) -> Response {
         .header(header::CONTENT_TYPE, "application/json")
         // `stale` is how an operator sees that a revalidation is pending without
         // reading the body.
-        .header(
-            CACHE_HEADER,
-            if cached.stale { "stale" } else { "fresh" },
-        )
+        .header(CACHE_HEADER, if cached.stale { "stale" } else { "fresh" })
         .header("x-ar-models-age-seconds", age.to_string())
-        .body(Body::from(
-            serde_json::to_vec(&payload)
-                .unwrap_or_else(|_| br#"{"object":"list","data":[]}"#.to_vec()),
-        ))
+        .body(Body::from(serde_json::to_vec(&payload).unwrap_or_else(
+            |_| br#"{"object":"list","data":[]}"#.to_vec(),
+        )))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
@@ -2322,7 +2417,8 @@ pub async fn models(State(state): State<AppState>) -> Response {
 /// [`models`] rather than sharing it so the probe never enumerates the catalog —
 /// a `HEAD` that built a card body to throw it away would be work per probe on
 /// the one route an SDK hits hardest.
-pub async fn models_head() -> Response {    Response::builder()
+pub async fn models_head() -> Response {
+    Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::empty())
@@ -2342,11 +2438,12 @@ pub async fn models_head() -> Response {    Response::builder()
 /// registry lacks it.
 pub async fn model(State(state): State<AppState>, Path(model): Path<String>) -> Response {
     let cached = cached_models(&state);
-    let found = cached
-        .cards
-        .iter()
-        .find(|c| c.id == model)
-        .or_else(|| cached.cards.iter().find(|c| c.id.eq_ignore_ascii_case(&model)));
+    let found = cached.cards.iter().find(|c| c.id == model).or_else(|| {
+        cached
+            .cards
+            .iter()
+            .find(|c| c.id.eq_ignore_ascii_case(&model))
+    });
 
     match found {
         Some(card) => json_response(&card_json(card), cached.stale),
@@ -2381,6 +2478,18 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    use super::{
+        CACHE_HEADER, COMPRESSION_ECHO, CacheControl, Dialect, FALLBACK_ATTEMPTS_HEADER, Keepalive,
+        LATENCY_MS_HEADER, MODEL_HEADER, PROVIDER_HEADER, RESPONSE_COST_HEADER,
+        SAVINGS_TOKENS_HEADER, Stages, TOKENS_IN_HEADER, TOKENS_OUT_HEADER,
+        TOKENS_PER_SECOND_HEADER, USAGE_FRAME_CAP, UsageTee, VERSION_HEADER, accept_forces_stream,
+        build_chain, card_json, declares_stream, decorate, error, error_because, kind_for, model,
+        models_head, not_found, outcome_label, require_json, terminator_seen, unknown_model,
+        usage_from_frames,
+    };
+    use crate::app::{AppState, Components};
+    use crate::config::{ComboTarget, ServerConfig};
+    use crate::models::ModelCard;
     use ar_route::{
         AbortReport, ArExec, AttemptOutcome, CanonicalRequest, ExecError, MediaReply, ProviderId,
         Strategy, Upstream,
@@ -2389,18 +2498,6 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
     use axum::response::Response;
     use bytes::Bytes;
-    use super::{
-        CACHE_HEADER, COMPRESSION_ECHO, CacheControl, Dialect, FALLBACK_ATTEMPTS_HEADER,
-        Keepalive, LATENCY_MS_HEADER, MODEL_HEADER, PROVIDER_HEADER, RESPONSE_COST_HEADER,
-        SAVINGS_TOKENS_HEADER, Stages, TOKENS_IN_HEADER, TOKENS_OUT_HEADER,
-        TOKENS_PER_SECOND_HEADER, USAGE_FRAME_CAP, VERSION_HEADER, UsageTee, accept_forces_stream,
-        build_chain, card_json, declares_stream, decorate, error, error_because, kind_for, model,
-        models_head, not_found, outcome_label, require_json, terminator_seen, unknown_model,
-        usage_from_frames,
-    };
-    use crate::app::{AppState, Components};
-    use crate::config::{ComboTarget, ServerConfig};
-    use crate::models::ModelCard;
 
     fn candidate(provider: &str) -> ar_route::Candidate {
         ar_route::Candidate::new(ProviderId::new(provider), "m")
@@ -2442,7 +2539,10 @@ mod tests {
 
     /// [`routed_under`], plus the in-memory usage ledger an accounting test
     /// needs to observe the write rather than only the headers.
-    fn routed_with_ledger(exec: Arc<dyn ArExec>, ledger: Arc<Mutex<ar_tokens::Ledger>>) -> AppState {
+    fn routed_with_ledger(
+        exec: Arc<dyn ArExec>,
+        ledger: Arc<Mutex<ar_tokens::Ledger>>,
+    ) -> AppState {
         Components {
             exec,
             ledger: Some(ledger),
@@ -2452,9 +2552,7 @@ mod tests {
     }
 
     /// Answers every chat dispatch with the canned chunks as a stream.
-    struct CannedExec(
-        Vec<&'static str>,
-    );
+    struct CannedExec(Vec<&'static str>);
 
     impl ArExec for CannedExec {
         fn post_chat<'a>(
@@ -2483,12 +2581,14 @@ mod tests {
         let mut config = ServerConfig::single(
             0,
             Strategy::Priority,
-            vec![crate::exec::ProviderConfig::new(
-                ProviderId::new("p"),
-                "http://127.0.0.1:1/v1",
-                "k",
-            )
-            .with_model("m")],
+            vec![
+                crate::exec::ProviderConfig::new(
+                    ProviderId::new("p"),
+                    "http://127.0.0.1:1/v1",
+                    "k",
+                )
+                .with_model("m"),
+            ],
         );
         config.combos = vec![crate::config::RouteCombo::new(
             "m",
@@ -2505,10 +2605,18 @@ mod tests {
             0,
             Strategy::Fusion,
             vec![
-                crate::exec::ProviderConfig::new(ProviderId::new("a"), "http://127.0.0.1:1/v1", "k")
-                    .with_model("m"),
-                crate::exec::ProviderConfig::new(ProviderId::new("b"), "http://127.0.0.1:1/v1", "k")
-                    .with_model("m"),
+                crate::exec::ProviderConfig::new(
+                    ProviderId::new("a"),
+                    "http://127.0.0.1:1/v1",
+                    "k",
+                )
+                .with_model("m"),
+                crate::exec::ProviderConfig::new(
+                    ProviderId::new("b"),
+                    "http://127.0.0.1:1/v1",
+                    "k",
+                )
+                .with_model("m"),
             ],
         );
         let mut combo = crate::config::RouteCombo::new(
@@ -2592,7 +2700,9 @@ mod tests {
             // The chat recorder is only pointed at chat paths; a media dispatch
             // reaching it means a test wired the wrong route.
             Box::pin(async move {
-                Err(ExecError("the recording exec serves no media path".to_owned()))
+                Err(ExecError(
+                    "the recording exec serves no media path".to_owned(),
+                ))
             })
         }
     }
@@ -2702,7 +2812,11 @@ mod tests {
     }
 
     fn header_of(map: &HeaderMap, name: &str) -> String {
-        map.get(name).unwrap_or_else(|| panic!("missing {name}")).to_str().expect("header text").to_owned()
+        map.get(name)
+            .unwrap_or_else(|| panic!("missing {name}"))
+            .to_str()
+            .expect("header text")
+            .to_owned()
     }
 
     #[test]
@@ -2715,7 +2829,13 @@ mod tests {
         )
         .with_latency(Duration::from_secs(2));
         let headers = headers_for(meta, 1);
-        assert_eq!((header_of(&headers, TOKENS_IN_HEADER).as_str(), header_of(&headers, TOKENS_OUT_HEADER).as_str()), ("120", "34"));
+        assert_eq!(
+            (
+                header_of(&headers, TOKENS_IN_HEADER).as_str(),
+                header_of(&headers, TOKENS_OUT_HEADER).as_str()
+            ),
+            ("120", "34")
+        );
     }
 
     #[test]
@@ -2728,13 +2848,19 @@ mod tests {
 
     #[test]
     fn stamps_the_savings_a_compression_stage_reported() {
-        let headers = headers_for(ar_tokens::ResponseMeta::default().with_savings_tokens(128), 1);
+        let headers = headers_for(
+            ar_tokens::ResponseMeta::default().with_savings_tokens(128),
+            1,
+        );
         assert_eq!(header_of(&headers, SAVINGS_TOKENS_HEADER), "128");
     }
 
     #[test]
     fn stamps_the_latency_in_whole_milliseconds() {
-        let headers = headers_for(ar_tokens::ResponseMeta::default().with_latency(Duration::from_millis(42)), 1);
+        let headers = headers_for(
+            ar_tokens::ResponseMeta::default().with_latency(Duration::from_millis(42)),
+            1,
+        );
         assert_eq!(header_of(&headers, LATENCY_MS_HEADER), "42");
     }
 
@@ -2785,7 +2911,10 @@ mod tests {
         let meta = record_million_token_completion(&ledger);
         let mut report = ledger.report(1).expect("report");
         let row = report.rows.remove(0);
-        assert_eq!(header_of(&headers_for(meta, 1), RESPONSE_COST_HEADER), row.cost_usd.as_decimal_string());
+        assert_eq!(
+            header_of(&headers_for(meta, 1), RESPONSE_COST_HEADER),
+            row.cost_usd.as_decimal_string()
+        );
     }
 
     #[test]
@@ -2794,16 +2923,33 @@ mod tests {
         // count and the two can be compared without widening `LedgerRow`.
         let ledger = ar_tokens::Ledger::open_in_memory().expect("ledger");
         let meta = ledger
-            .record_response("k1", "openai", "gpt-4o", &serde_json::json!({ "prompt_tokens": 1_000_000 }), 1_700_000_000, &priced_table())
+            .record_response(
+                "k1",
+                "openai",
+                "gpt-4o",
+                &serde_json::json!({ "prompt_tokens": 1_000_000 }),
+                1_700_000_000,
+                &priced_table(),
+            )
             .expect("record");
         let mut report = ledger.report(1).expect("report");
         let row = report.rows.remove(0);
-        assert_eq!(header_of(&headers_for(meta, 1), TOKENS_IN_HEADER), row.total_tokens.to_string());
+        assert_eq!(
+            header_of(&headers_for(meta, 1), TOKENS_IN_HEADER),
+            row.total_tokens.to_string()
+        );
     }
 
     fn priced_table() -> ar_tokens::PricingTable {
         let mut t = ar_tokens::PricingTable::default();
-        t.set("openai", "gpt-4o", ar_tokens::Prices { input_micros_per_mtok: 2_500_000, output_micros_per_mtok: 10_000_000 });
+        t.set(
+            "openai",
+            "gpt-4o",
+            ar_tokens::Prices {
+                input_micros_per_mtok: 2_500_000,
+                output_micros_per_mtok: 10_000_000,
+            },
+        );
         t
     }
 
@@ -2898,7 +3044,10 @@ mod tests {
         let body = body_of(resp).await;
         assert_eq!(body["error"]["code"], "model_not_found");
         assert!(
-            body["error"]["message"].as_str().unwrap_or_default().contains("gpt-4o"),
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("gpt-4o"),
             "the miss must name what was asked for: {body}"
         );
     }
@@ -2951,7 +3100,10 @@ mod tests {
         assert_eq!(kind_for(StatusCode::BAD_REQUEST), "invalid_request_error");
         assert_eq!(kind_for(StatusCode::UNAUTHORIZED), "authentication_error");
         assert_eq!(kind_for(StatusCode::NOT_FOUND), "not_found");
-        assert_eq!(kind_for(StatusCode::UNSUPPORTED_MEDIA_TYPE), "invalid_request_error");
+        assert_eq!(
+            kind_for(StatusCode::UNSUPPORTED_MEDIA_TYPE),
+            "invalid_request_error"
+        );
         assert_eq!(kind_for(StatusCode::TOO_MANY_REQUESTS), "rate_limit_error");
         assert_eq!(kind_for(StatusCode::BAD_GATEWAY), "server_error");
     }
@@ -2980,7 +3132,10 @@ mod tests {
     fn post_with_content_type(value: Option<&str>) -> HeaderMap {
         let mut headers = HeaderMap::new();
         if let Some(value) = value {
-            headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(value).expect("header value"));
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_str(value).expect("header value"),
+            );
         }
         headers
     }
@@ -3003,7 +3158,12 @@ mod tests {
     fn admits_json_with_a_charset_parameter() {
         // The parameter is not a different media type; refusing it would break
         // every client that sets a charset, which is most of them.
-        assert!(require_json(&post_with_content_type(Some("application/json; charset=utf-8"))).is_none());
+        assert!(
+            require_json(&post_with_content_type(Some(
+                "application/json; charset=utf-8"
+            )))
+            .is_none()
+        );
     }
 
     #[test]
@@ -3015,7 +3175,10 @@ mod tests {
 
     fn accept(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        headers.insert(header::ACCEPT, HeaderValue::from_str(value).expect("header value"));
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_str(value).expect("header value"),
+        );
         headers
     }
 
@@ -3028,7 +3191,9 @@ mod tests {
     fn an_accept_header_naming_both_json_and_sse_stays_json() {
         // The OpenAI and Vercel AI SDK non-stream signature. Streaming this one
         // hands the client a body it cannot parse.
-        assert!(!accept_forces_stream(&accept("application/json, text/event-stream")));
+        assert!(!accept_forces_stream(&accept(
+            "application/json, text/event-stream"
+        )));
     }
 
     #[test]
@@ -3041,7 +3206,9 @@ mod tests {
         // The body is the client's own statement; `Accept` is only a fallback for
         // a body that said nothing, so the two signals have to be distinguishable
         // and this is the pair that decides it.
-        assert!(declares_stream(&Bytes::from_static(br#"{"model":"m","stream":false}"#)));
+        assert!(declares_stream(&Bytes::from_static(
+            br#"{"model":"m","stream":false}"#
+        )));
     }
 
     #[test]
@@ -3054,12 +3221,16 @@ mod tests {
         // What a client that builds its body programmatically sends for "unset".
         // Reading it as a declaration would refuse the `Accept` opt-in to a client
         // that never opted out of it.
-        assert!(!declares_stream(&Bytes::from_static(br#"{"model":"m","stream":null}"#)));
+        assert!(!declares_stream(&Bytes::from_static(
+            br#"{"model":"m","stream":null}"#
+        )));
     }
 
     #[test]
     fn an_explicit_stream_true_is_a_declaration() {
-        assert!(declares_stream(&Bytes::from_static(br#"{"model":"m","stream":true}"#)));
+        assert!(declares_stream(&Bytes::from_static(
+            br#"{"model":"m","stream":true}"#
+        )));
     }
 
     // --- keepalive frames ----------------------------------------------
@@ -3069,7 +3240,10 @@ mod tests {
         // Responses discriminates on a `type` inside the payload, so the
         // terminator is the completed event rather than a terminator line.
         let terminator = Dialect::Responses.terminator().expect("responses has one");
-        assert!(!terminator_seen(&Bytes::from_static(b"data: [DONE]\n\n"), Some(terminator)));
+        assert!(!terminator_seen(
+            &Bytes::from_static(b"data: [DONE]\n\n"),
+            Some(terminator)
+        ));
         assert!(terminator_seen(
             &Bytes::from_static(b"data: {\"type\":\"response.completed\"}\n\n"),
             Some(terminator)
@@ -3081,25 +3255,44 @@ mod tests {
         // Not `data: [DONE]`, which is the OpenAI spelling: an Anthropic stream
         // that ends on the wrong terminator is a stream that ended wrong.
         let terminator = Dialect::Anthropic.terminator().expect("anthropic has one");
-        assert!(terminator_seen(&Bytes::from_static(b"event: message_stop\ndata: {}\n\n"), Some(terminator)));
-        assert!(!terminator_seen(&Bytes::from_static(b"data: [DONE]\n\n"), Some(terminator)));
+        assert!(terminator_seen(
+            &Bytes::from_static(b"event: message_stop\ndata: {}\n\n"),
+            Some(terminator)
+        ));
+        assert!(!terminator_seen(
+            &Bytes::from_static(b"data: [DONE]\n\n"),
+            Some(terminator)
+        ));
     }
 
     #[test]
     fn the_anthropic_keepalive_is_a_real_ping_event() {
         // The load-bearing assertion in the whole keepalive design: an SSE
         // comment is invisible to the client whose watchdog this exists for.
-        let frame = Dialect::Anthropic.keepalive().expect("anthropic has a keepalive");
-        assert!(frame.starts_with("event: ping"), "not a real event: {frame}");
-        assert!(!frame.contains(": keepalive"), "a comment is not a ping: {frame}");
+        let frame = Dialect::Anthropic
+            .keepalive()
+            .expect("anthropic has a keepalive");
+        assert!(
+            frame.starts_with("event: ping"),
+            "not a real event: {frame}"
+        );
+        assert!(
+            !frame.contains(": keepalive"),
+            "a comment is not a ping: {frame}"
+        );
     }
 
     #[test]
     fn the_anthropic_truncation_error_is_a_real_error_event() {
         // The same reasoning as the ping: the Anthropic spec defines
         // `event: error`, and a comment carrying an error reaches no client.
-        let frame = Dialect::Anthropic.stream_error().expect("anthropic names truncation");
-        assert!(frame.starts_with("event: error"), "not a real event: {frame}");
+        let frame = Dialect::Anthropic
+            .stream_error()
+            .expect("anthropic names truncation");
+        assert!(
+            frame.starts_with("event: error"),
+            "not a real event: {frame}"
+        );
     }
 
     #[test]
@@ -3109,9 +3302,14 @@ mod tests {
         // frames, not just the keepalive.
         for frame in [
             Dialect::OpenAi.keepalive().expect("openai has a keepalive"),
-            Dialect::OpenAi.stream_error().expect("openai names truncation"),
+            Dialect::OpenAi
+                .stream_error()
+                .expect("openai names truncation"),
         ] {
-            assert!(!frame.contains("event:"), "an OpenAI frame emitted an event: {frame}");
+            assert!(
+                !frame.contains("event:"),
+                "an OpenAI frame emitted an event: {frame}"
+            );
         }
     }
 
@@ -3120,12 +3318,17 @@ mod tests {
         // A Responses client discriminates on `type` inside the payload, so
         // "still working" has to be spelled `response.in_progress` rather than a
         // comment the parser skips.
-        let frame = Dialect::Responses.keepalive().expect("responses has a keepalive");
+        let frame = Dialect::Responses
+            .keepalive()
+            .expect("responses has a keepalive");
         assert!(
             frame.contains("\"type\":\"response.in_progress\""),
             "not an in-progress event: {frame}"
         );
-        assert!(!frame.contains(": keepalive"), "a comment is not an event: {frame}");
+        assert!(
+            !frame.contains(": keepalive"),
+            "a comment is not an event: {frame}"
+        );
         // The payload must not look like a finished answer, or a client renders
         // content this server invented.
         assert!(frame.contains("\"status\":\"in_progress\""), "{frame}");
@@ -3137,7 +3340,10 @@ mod tests {
         // Every SSE parser skips a comment by definition, so this is the one frame
         // shape that is safe for a client with no event names.
         let frame = Dialect::OpenAi.keepalive().expect("openai has a keepalive");
-        assert!(frame.starts_with(':'), "an OpenAI keepalive must be a comment: {frame}");
+        assert!(
+            frame.starts_with(':'),
+            "an OpenAI keepalive must be a comment: {frame}"
+        );
     }
 
     #[test]
@@ -3165,7 +3371,9 @@ mod tests {
             let probe: &[u8] = match dialect {
                 Dialect::Responses => br#"{"model":"m","input":"hi"}"#,
                 Dialect::Ollama => br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
-                Dialect::Anthropic => br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+                Dialect::Anthropic => {
+                    br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#
+                }
                 Dialect::OpenAi => br#"{"model":"m","messages":[]}"#,
             };
             assert!(
@@ -3181,7 +3389,9 @@ mod tests {
         // contain what is written above — asserted so a future frame that quotes
         // an upstream body cannot slip a credential in.
         for dialect in [Dialect::OpenAi, Dialect::Anthropic, Dialect::Responses] {
-            let frame = dialect.stream_error().expect("sse dialects name truncation");
+            let frame = dialect
+                .stream_error()
+                .expect("sse dialects name truncation");
             assert!(frame.contains("stream_error"), "{dialect:?}: {frame}");
             assert!(!frame.contains("Bearer"), "{dialect:?}: {frame}");
         }
@@ -3189,11 +3399,20 @@ mod tests {
 
     #[test]
     fn a_terminator_is_recognised_inside_a_frame() {
-        assert!(terminator_seen(&Bytes::from_static(b"data: [DONE]\n\n"), Dialect::OpenAi.terminator()));
-        assert!(!terminator_seen(&Bytes::from_static(b"data: {}\n\n"), Dialect::OpenAi.terminator()));
+        assert!(terminator_seen(
+            &Bytes::from_static(b"data: [DONE]\n\n"),
+            Dialect::OpenAi.terminator()
+        ));
+        assert!(!terminator_seen(
+            &Bytes::from_static(b"data: {}\n\n"),
+            Dialect::OpenAi.terminator()
+        ));
         // Split across chunks is not claimed either way: the relay checks the
         // last frame, so a partial frame is a frame without a terminator.
-        assert!(!terminator_seen(&Bytes::from_static(b"data: [DO"), Dialect::OpenAi.terminator()));
+        assert!(!terminator_seen(
+            &Bytes::from_static(b"data: [DO"),
+            Dialect::OpenAi.terminator()
+        ));
     }
 
     /// Drains a relay to a `Vec<String>`, one entry per frame.
@@ -3223,19 +3442,36 @@ mod tests {
             vec![Bytes::from_static(b"data: {\"delta\":{}}\n\n")],
         )
         .await;
-        assert_eq!(frames.len(), 2, "one relayed frame plus the error: {frames:?}");
-        assert!(frames[1].contains("stream_error"), "no in-band error: {frames:?}");
+        assert_eq!(
+            frames.len(),
+            2,
+            "one relayed frame plus the error: {frames:?}"
+        );
+        assert!(
+            frames[1].contains("stream_error"),
+            "no in-band error: {frames:?}"
+        );
     }
 
     #[tokio::test]
     async fn a_stream_that_ends_with_its_terminator_gets_no_error_frame() {
         let frames = drain(
             Keepalive::new(Dialect::OpenAi, NOWAIT),
-            vec![Bytes::from_static(b"data: {\"delta\":{}}\n\n"), Bytes::from_static(b"data: [DONE]\n\n")],
+            vec![
+                Bytes::from_static(b"data: {\"delta\":{}}\n\n"),
+                Bytes::from_static(b"data: [DONE]\n\n"),
+            ],
         )
         .await;
-        assert_eq!(frames.len(), 2, "a terminated stream gained a frame: {frames:?}");
-        assert!(frames[1].contains("[DONE]"), "the terminator was not relayed: {frames:?}");
+        assert_eq!(
+            frames.len(),
+            2,
+            "a terminated stream gained a frame: {frames:?}"
+        );
+        assert!(
+            frames[1].contains("[DONE]"),
+            "the terminator was not relayed: {frames:?}"
+        );
     }
 
     /// A chat POST to any dialect's own path — the same shape as [`chat`] with
@@ -3254,7 +3490,11 @@ mod tests {
     /// Every stream test here records at most one reply, so "the report" is the
     /// clearest way to say "exactly the row this test claims and no more".
     fn only_row(ledger: &Mutex<ar_tokens::Ledger>) -> Option<ar_tokens::LedgerRow> {
-        let report = ledger.lock().expect("ledger lock").report(10).expect("report");
+        let report = ledger
+            .lock()
+            .expect("ledger lock")
+            .report(10)
+            .expect("report");
         let mut rows = report.rows;
         (rows.len() == 1).then(|| rows.remove(0))
     }
@@ -3321,8 +3561,15 @@ mod tests {
         )
         .await;
         drain_body(resp).await;
-        let report = ledger.lock().expect("ledger lock").report(10).expect("report");
-        assert!(report.rows.is_empty(), "a usage-free stream recorded {report:?}");
+        let report = ledger
+            .lock()
+            .expect("ledger lock")
+            .report(10)
+            .expect("report");
+        assert!(
+            report.rows.is_empty(),
+            "a usage-free stream recorded {report:?}"
+        );
     }
 
     #[tokio::test]
@@ -3367,7 +3614,10 @@ mod tests {
         let router = crate::app::app(routed_with_ledger(exec, Arc::clone(&ledger)));
         let resp = drive(
             &router,
-            post_to("/v1/responses", "{\"model\":\"m\",\"input\":\"hi\",\"stream\":true}"),
+            post_to(
+                "/v1/responses",
+                "{\"model\":\"m\",\"input\":\"hi\",\"stream\":true}",
+            ),
         )
         .await;
         drain_body(resp).await;
@@ -3421,12 +3671,16 @@ mod tests {
         )
         .await;
         assert_eq!(
-            resp.headers().get(TOKENS_IN_HEADER).and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get(TOKENS_IN_HEADER)
+                .and_then(|v| v.to_str().ok()),
             Some("9"),
             "the prompt count rides the header"
         );
         assert_eq!(
-            resp.headers().get(TOKENS_OUT_HEADER).and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get(TOKENS_OUT_HEADER)
+                .and_then(|v| v.to_str().ok()),
             Some("4"),
         );
         drain_body(resp).await;
@@ -3438,9 +3692,7 @@ mod tests {
     fn the_frame_parser_reads_each_dialects_usage_shape() {
         // The ledger row stores only the sum, so the split is pinned here, at
         // the parser, where prompt and completion are still separate numbers.
-        let usage = |value: serde_json::Value| {
-            ar_tokens::NormalizedUsage::from_usage(&value)
-        };
+        let usage = |value: serde_json::Value| ar_tokens::NormalizedUsage::from_usage(&value);
 
         // OpenAI: usage rides in the last data frame that carries one.
         let tail = [
@@ -3462,7 +3714,8 @@ mod tests {
             ),
             Bytes::from_static(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
         ];
-        let got = usage_from_frames(Dialect::Anthropic, Some(&head), &tail).expect("anthropic compose");
+        let got =
+            usage_from_frames(Dialect::Anthropic, Some(&head), &tail).expect("anthropic compose");
         assert_eq!(usage(got), ar_tokens::NormalizedUsage::new(21, 5));
 
         // Responses: the completed event carries the response object with
@@ -3477,11 +3730,9 @@ mod tests {
 
         // Ollama: the final `done:true` NDJSON line carries both counts at
         // its root.
-        let tail = [
-            Bytes::from_static(
-                b"{\"model\":\"m\",\"done\":true,\"prompt_eval_count\":9,\"eval_count\":4}\n",
-            ),
-        ];
+        let tail = [Bytes::from_static(
+            b"{\"model\":\"m\",\"done\":true,\"prompt_eval_count\":9,\"eval_count\":4}\n",
+        )];
         let got = usage_from_frames(Dialect::Ollama, None, &tail).expect("ollama final line");
         assert_eq!(usage(got), ar_tokens::NormalizedUsage::new(9, 4));
     }
@@ -3512,7 +3763,9 @@ mod tests {
             )),
         );
         let mut tee = UsageTee {
-            inner: Box::pin(futures::stream::iter([Bytes::from_static(b"data: [DONE]\n\n")])),
+            inner: Box::pin(futures::stream::iter([Bytes::from_static(
+                b"data: [DONE]\n\n",
+            )])),
             head: None,
             tail: Vec::new(),
             state,
@@ -3583,9 +3836,9 @@ mod tests {
                         None,
                     ))
                 } else {
-                    Ok(Upstream::success(Box::pin(futures::stream::iter([Bytes::from(
-                        payload,
-                    )]))))
+                    Ok(Upstream::success(Box::pin(futures::stream::iter([
+                        Bytes::from(payload),
+                    ]))))
                 }
             })
         }
@@ -3609,11 +3862,19 @@ mod tests {
         let router = crate::app::app(routed_fusion(exec, None));
         let resp = drive(
             &router,
-            chat(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#, &[]),
+            chat(
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.headers().get(PROVIDER_HEADER).and_then(|v| v.to_str().ok()), Some("a"));
+        assert_eq!(
+            resp.headers()
+                .get(PROVIDER_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("a")
+        );
         let body = body_of(resp).await;
         assert_eq!(body["choices"][0]["message"]["content"], "from a");
     }
@@ -3627,13 +3888,24 @@ mod tests {
         let router = crate::app::app(routed_fusion(exec, Some("b/m")));
         let resp = drive(
             &router,
-            chat(r#"{"model":"m","messages":[{"role":"user","content":"which?"}]}"#, &[]),
+            chat(
+                r#"{"model":"m","messages":[{"role":"user","content":"which?"}]}"#,
+                &[],
+            ),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.headers().get(PROVIDER_HEADER).and_then(|v| v.to_str().ok()), Some("b"));
+        assert_eq!(
+            resp.headers()
+                .get(PROVIDER_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("b")
+        );
         let body = body_of(resp).await;
-        assert_eq!(body["choices"][0]["message"]["content"], "synthesized answer");
+        assert_eq!(
+            body["choices"][0]["message"]["content"],
+            "synthesized answer"
+        );
     }
 
     #[tokio::test]
@@ -3644,11 +3916,19 @@ mod tests {
         let router = crate::app::app(routed_fusion(exec, Some("b/m")));
         let resp = drive(
             &router,
-            chat(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#, &[]),
+            chat(
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.headers().get(PROVIDER_HEADER).and_then(|v| v.to_str().ok()), Some("a"));
+        assert_eq!(
+            resp.headers()
+                .get(PROVIDER_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("a")
+        );
         let body = body_of(resp).await;
         assert_eq!(body["choices"][0]["message"]["content"], "from a");
     }
@@ -3676,7 +3956,10 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let requests = seen.lock().expect("recorder").clone();
-        let panel_calls = requests.iter().filter(|b| !b.contains("model-fusion panel")).count();
+        let panel_calls = requests
+            .iter()
+            .filter(|b| !b.contains("model-fusion panel"))
+            .count();
         assert_eq!(panel_calls, 2, "both members were asked");
         assert!(
             requests
@@ -3689,8 +3972,10 @@ mod tests {
         // asserted rather than left incidental: a fusion answer is one complete
         // answer, and relaying the judge's token stream would hand the client a
         // stream in place of the fusion it requested.
-        let judge_bodies: Vec<&String> =
-            requests.iter().filter(|b| b.contains("model-fusion panel")).collect();
+        let judge_bodies: Vec<&String> = requests
+            .iter()
+            .filter(|b| b.contains("model-fusion panel"))
+            .collect();
         assert_eq!(judge_bodies.len(), 1, "one judge dispatch");
         assert!(
             judge_bodies[0].contains("\"stream\":false"),
@@ -3725,16 +4010,20 @@ mod tests {
                         "data: {\"choices\":[{\"delta\":{\"content\":\"text\"}}]}\n\n",
                         "data: [DONE]\n\n"
                     );
-                    Ok(Upstream::success(Box::pin(futures::stream::iter([Bytes::from(
-                        frame,
-                    )]))))
+                    Ok(Upstream::success(Box::pin(futures::stream::iter([
+                        Bytes::from(frame),
+                    ]))))
                 } else {
-                    let text = if is_judge { "synthesized answer" } else { "a complete answer" };
+                    let text = if is_judge {
+                        "synthesized answer"
+                    } else {
+                        "a complete answer"
+                    };
                     let payload =
                         format!("{{\"choices\":[{{\"message\":{{\"content\":\"{text}\"}}}}]}}");
-                    Ok(Upstream::success(Box::pin(futures::stream::iter([Bytes::from(
-                        payload,
-                    )]))))
+                    Ok(Upstream::success(Box::pin(futures::stream::iter([
+                        Bytes::from(payload),
+                    ]))))
                 }
             })
         }
@@ -3756,7 +4045,10 @@ mod tests {
         let router = crate::app::app(routed_fusion(exec, None));
         let resp = drive(
             &router,
-            chat(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#, &[]),
+            chat(
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
@@ -3792,18 +4084,36 @@ mod tests {
         let keepalive = Keepalive::new(Dialect::Anthropic, Duration::from_millis(20));
         assert!(!keepalive.is_noop());
         let frames = idle_frames(keepalive).await;
-        assert_eq!(frames.len(), 2, "an idle stream was not kept alive: {frames:?}");
+        assert_eq!(
+            frames.len(),
+            2,
+            "an idle stream was not kept alive: {frames:?}"
+        );
         for frame in &frames {
-            assert!(frame.contains("event: ping"), "not an Anthropic ping: {frame}");
+            assert!(
+                frame.contains("event: ping"),
+                "not an Anthropic ping: {frame}"
+            );
         }
     }
 
     #[tokio::test]
     async fn an_idle_responses_stream_emits_in_progress_frames() {
-        let frames = idle_frames(Keepalive::new(Dialect::Responses, Duration::from_millis(20))).await;
-        assert_eq!(frames.len(), 2, "an idle stream was not kept alive: {frames:?}");
+        let frames = idle_frames(Keepalive::new(
+            Dialect::Responses,
+            Duration::from_millis(20),
+        ))
+        .await;
+        assert_eq!(
+            frames.len(),
+            2,
+            "an idle stream was not kept alive: {frames:?}"
+        );
         for frame in &frames {
-            assert!(frame.contains("response.in_progress"), "not an in-progress frame: {frame}");
+            assert!(
+                frame.contains("response.in_progress"),
+                "not an in-progress frame: {frame}"
+            );
         }
     }
 
@@ -3822,7 +4132,10 @@ mod tests {
         )
         .await;
         assert_eq!(frames.len(), 3, "a fast stream gained a frame: {frames:?}");
-        assert!(!frames.iter().any(|f| f.contains("keepalive")), "keepalive on a fast stream: {frames:?}");
+        assert!(
+            !frames.iter().any(|f| f.contains("keepalive")),
+            "keepalive on a fast stream: {frames:?}"
+        );
     }
 
     #[tokio::test]
@@ -3844,11 +4157,16 @@ mod tests {
         // keepalive exists for.
         let frames = drain(
             Keepalive::new(Dialect::Anthropic, NOWAIT),
-            vec![Bytes::from_static(b"event: content_block_delta\ndata: {}\n\n")],
+            vec![Bytes::from_static(
+                b"event: content_block_delta\ndata: {}\n\n",
+            )],
         )
         .await;
         assert_eq!(frames.len(), 2, "{frames:?}");
-        assert!(frames[1].starts_with("event: error"), "not an Anthropic error event: {frames:?}");
+        assert!(
+            frames[1].starts_with("event: error"),
+            "not an Anthropic error event: {frames:?}"
+        );
     }
 
     #[tokio::test]
@@ -3861,7 +4179,11 @@ mod tests {
             ],
         )
         .await;
-        assert_eq!(frames.len(), 2, "a terminated Responses stream gained a frame: {frames:?}");
+        assert_eq!(
+            frames.len(),
+            2,
+            "a terminated Responses stream gained a frame: {frames:?}"
+        );
     }
 
     #[tokio::test]
@@ -3870,7 +4192,10 @@ mod tests {
         // so there is no half-finished answer to describe and a client that got
         // zero bytes is not waiting on a frame.
         let frames = drain(Keepalive::new(Dialect::OpenAi, NOWAIT), vec![]).await;
-        assert!(frames.is_empty(), "an empty stream was described: {frames:?}");
+        assert!(
+            frames.is_empty(),
+            "an empty stream was described: {frames:?}"
+        );
     }
 
     // --- the 415 guard, through the router ----------------------------
@@ -3881,7 +4206,8 @@ mod tests {
         // operator to the wrong place entirely.
         let router = crate::app::app(routed());
         let mut req = chat("hello", &[]);
-        req.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+        req.headers_mut()
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
         let resp = drive(&router, req).await;
         assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
         let body = body_of(resp).await;
@@ -3976,8 +4302,16 @@ mod tests {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .expect("body reads");
-        assert_eq!(bytes.as_ref(), reply.as_bytes(), "the buffered relay is the upstream's own bytes");
-        let report = ledger.lock().expect("ledger lock").report(10).expect("report");
+        assert_eq!(
+            bytes.as_ref(),
+            reply.as_bytes(),
+            "the buffered relay is the upstream's own bytes"
+        );
+        let report = ledger
+            .lock()
+            .expect("ledger lock")
+            .report(10)
+            .expect("report");
         assert_eq!(
             report.rows.len(),
             1,
@@ -3994,10 +4328,7 @@ mod tests {
         // and the headers say so with zeros rather than with invented counts.
         // Two chunks because a one-chunk stream would not distinguish
         // "streamed" from "buffered then relayed as a single chunk".
-        let exec = Arc::new(CannedExec(vec![
-            "data: {\"a\":1}\n\n",
-            "data: [DONE]\n\n",
-        ]));
+        let exec = Arc::new(CannedExec(vec!["data: {\"a\":1}\n\n", "data: [DONE]\n\n"]));
         let router = crate::app::app(routed_under(exec));
         let resp = drive(
             &router,
@@ -4046,8 +4377,7 @@ mod tests {
 
     /// The canned completion every cache test replays: non-stream, JSON, a
     /// usage block the accounting path can read.
-    const CANNED: &str =
-        r#"{"id":"r1","choices":[{"message":{"role":"assistant","content":"hi"}}],"usage":{"prompt_tokens":3,"completion_tokens":2}}"#;
+    const CANNED: &str = r#"{"id":"r1","choices":[{"message":{"role":"assistant","content":"hi"}}],"usage":{"prompt_tokens":3,"completion_tokens":2}}"#;
 
     #[tokio::test]
     async fn a_failover_the_client_sees_names_the_upstreams_code() {
@@ -4065,7 +4395,10 @@ mod tests {
         let router = crate::app::app(routed_under(exec));
         let resp = drive(
             &router,
-            chat(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#, &[]),
+            chat(
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -4083,7 +4416,10 @@ mod tests {
         let router = crate::app::app(routed_under(exec));
         let resp = drive(
             &router,
-            chat(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#, &[]),
+            chat(
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ),
         )
         .await;
         let body = body_of(resp).await;
@@ -4130,11 +4466,10 @@ mod tests {
                 &'a self,
                 _provider: &'a ProviderId,
                 _canonical: &'a CanonicalRequest,
-            ) -> Pin<Box<dyn Future<Output = Result<Upstream, ExecError>> + Send + 'a>> {
+            ) -> Pin<Box<dyn Future<Output = Result<Upstream, ExecError>> + Send + 'a>>
+            {
                 let guarded = GuardedStream(Arc::clone(&self.0));
-                Box::pin(async move {
-                    Ok(Upstream::success(Box::pin(guarded)))
-                })
+                Box::pin(async move { Ok(Upstream::success(Box::pin(guarded))) })
             }
 
             fn post_media<'a>(
@@ -4143,7 +4478,8 @@ mod tests {
                 _endpoint: &'a str,
                 _content_type: &'a str,
                 _body: &'a [u8],
-            ) -> Pin<Box<dyn Future<Output = Result<MediaReply, ExecError>> + Send + 'a>> {
+            ) -> Pin<Box<dyn Future<Output = Result<MediaReply, ExecError>> + Send + 'a>>
+            {
                 Box::pin(async move { Err(ExecError("no media in this fixture".to_owned())) })
             }
         }
@@ -4209,14 +4545,19 @@ mod tests {
         let body = r#"{"model":"m","messages":[{"role":"user","content":"once"}]}"#;
 
         let first = drive(&router, chat(body, &[("x-ar-no-cache", "true")])).await;
-        let second =
-            drive(&router, chat(body, &[("x-omniroute-no-cache", "true")])).await;
+        let second = drive(&router, chat(body, &[("x-omniroute-no-cache", "true")])).await;
         assert_eq!(
-            first.headers().get(CACHE_HEADER).and_then(|v| v.to_str().ok()),
+            first
+                .headers()
+                .get(CACHE_HEADER)
+                .and_then(|v| v.to_str().ok()),
             Some("bypass")
         );
         assert_eq!(
-            second.headers().get(CACHE_HEADER).and_then(|v| v.to_str().ok()),
+            second
+                .headers()
+                .get(CACHE_HEADER)
+                .and_then(|v| v.to_str().ok()),
             Some("bypass")
         );
         assert_eq!(
@@ -4237,8 +4578,7 @@ mod tests {
         let router = crate::app::app(routed_with_cache(exec));
         let body = r#"{"model":"m","messages":[{"role":"user","content":"once"}]}"#;
 
-        let first =
-            drive(&router, chat(body, &[("x-ar-cache-no-store", "true")])).await;
+        let first = drive(&router, chat(body, &[("x-ar-cache-no-store", "true")])).await;
         let first_verdict = first
             .headers()
             .get(CACHE_HEADER)
@@ -4254,7 +4594,10 @@ mod tests {
             "no-store must not kill the lookup"
         );
         assert_eq!(
-            second.headers().get(CACHE_HEADER).and_then(|v| v.to_str().ok()),
+            second
+                .headers()
+                .get(CACHE_HEADER)
+                .and_then(|v| v.to_str().ok()),
             Some("miss"),
             "the no-store request left an entry behind"
         );
@@ -4263,7 +4606,9 @@ mod tests {
         drain_body(drive(&router, chat(other, &[])).await).await;
         let hit = drive(&router, chat(other, &[])).await;
         assert_eq!(
-            hit.headers().get(CACHE_HEADER).and_then(|v| v.to_str().ok()),
+            hit.headers()
+                .get(CACHE_HEADER)
+                .and_then(|v| v.to_str().ok()),
             Some("hit"),
             "the fixture cache never hits, so this test proves nothing"
         );
@@ -4280,8 +4625,11 @@ mod tests {
         let body = r#"{"model":"m","messages":[{"role":"user","content":"once"}]}"#;
 
         drain_body(drive(&router, chat(body, &[])).await).await;
-        let namespaced =
-            drive(&router, chat(body, &[("x-omniroute-cache-key", "tenant-b")])).await;
+        let namespaced = drive(
+            &router,
+            chat(body, &[("x-omniroute-cache-key", "tenant-b")]),
+        )
+        .await;
         let namespaced_verdict = namespaced
             .headers()
             .get(CACHE_HEADER)
@@ -4293,10 +4641,12 @@ mod tests {
             Some("miss"),
             "the caller-key segment did not enter the digest"
         );
-        let same_segment =
-            drive(&router, chat(body, &[("x-ar-cache-key", "tenant-b")])).await;
+        let same_segment = drive(&router, chat(body, &[("x-ar-cache-key", "tenant-b")])).await;
         assert_eq!(
-            same_segment.headers().get(CACHE_HEADER).and_then(|v| v.to_str().ok()),
+            same_segment
+                .headers()
+                .get(CACHE_HEADER)
+                .and_then(|v| v.to_str().ok()),
             Some("hit"),
             "the two spellings of one segment must fold identically"
         );
@@ -4321,7 +4671,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1_100)).await;
         let expired = drive(&router, chat(short, &[])).await;
         assert_eq!(
-            expired.headers().get(CACHE_HEADER).and_then(|v| v.to_str().ok()),
+            expired
+                .headers()
+                .get(CACHE_HEADER)
+                .and_then(|v| v.to_str().ok()),
             Some("miss"),
             "the caller TTL did not shorten the entry"
         );
@@ -4330,7 +4683,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1_100)).await;
         let clamped = drive(&router, chat(long, &[])).await;
         assert_eq!(
-            clamped.headers().get(CACHE_HEADER).and_then(|v| v.to_str().ok()),
+            clamped
+                .headers()
+                .get(CACHE_HEADER)
+                .and_then(|v| v.to_str().ok()),
             Some("hit"),
             "the clamp must hold: a century-long request still answers within the policy lifetime"
         );
@@ -4419,10 +4775,10 @@ mod tests {
             &router,
             chat(
                 r#"{"model":"m","messages":[{"role":"user","content":"hey there partner"}]}"#,
-                &[(
-                    "x-ar-compression",
-                    "engine:caveman",
-                ), ("x-omniroute-compression", "off")],
+                &[
+                    ("x-ar-compression", "engine:caveman"),
+                    ("x-omniroute-compression", "off"),
+                ],
             ),
         )
         .await;
@@ -4480,7 +4836,11 @@ mod tests {
             ),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "the body was refused at the edge");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_GATEWAY,
+            "the body was refused at the edge"
+        );
     }
 
     // --- Accept forces streaming, through the router -------------------
@@ -4499,7 +4859,9 @@ mod tests {
         )
         .await;
         assert_eq!(
-            resp.headers().get(crate::routes::CACHE_HEADER).and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get(crate::routes::CACHE_HEADER)
+                .and_then(|v| v.to_str().ok()),
             Some("bypass"),
             "the request was not treated as a stream"
         );
@@ -4517,7 +4879,9 @@ mod tests {
         )
         .await;
         assert_eq!(
-            resp.headers().get(crate::routes::CACHE_HEADER).and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get(crate::routes::CACHE_HEADER)
+                .and_then(|v| v.to_str().ok()),
             Some("miss"),
             "the body said JSON and Accept was only a fallback"
         );
