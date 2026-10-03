@@ -8,11 +8,11 @@
 //! media went somewhere else, and a 2xx from the wrong place would still pass a
 //! status-only assertion.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use ar_config::Secret;
-use ar_exec::{ArExec, MediaBody, MediaEndpoint};
-use ar_registry::{AuthClass, ProviderDef, WireFormat};
+use ar_exec::{ArExec, Dispatch, MediaBody, MediaEndpoint};
+use ar_registry::WireFormat;
 use ar_translate::{EmbeddingRequest, Modality, OpenAIChat, chat_modality, to_canonical};
 use axum::Router;
 use axum::body::Body;
@@ -57,18 +57,17 @@ async fn spawn_upstream(body: &'static str) -> (String, Arc<Mutex<Vec<String>>>)
 /// Built field-by-field rather than spread over a `Default`, because
 /// `ar-registry` is extending `ProviderDef` in parallel and a `Default` spread
 /// would silently inherit a *default* price or executor instead of "none".
-fn provider(base_url: &str) -> ProviderDef {
-    ProviderDef {
-        base_url: base_url.to_owned(),
+/// The per-provider dispatch shape every test sends: one base URL, one
+/// bearer, the OpenAI wire, no model rewrite.
+fn dispatch(base_url: &str) -> Dispatch<'_> {
+    static NO_HEADERS: BTreeMap<String, String> = BTreeMap::new();
+    Dispatch {
+        base_url,
         wire_format: WireFormat::Openai,
-        auth: AuthClass::ApiKey,
-        env_hint: "TEST_API_KEY".to_owned(),
-        models: vec![],
-        prices: Default::default(),
-        executor: ar_core::Strng::from("default"),
-        auth_kind: ar_core::Strng::from("api_key"),
-        flat_rate: false,
-        headers: Default::default(),
+        api_key: "sk-test",
+        upstream_model: "",
+        stream: false,
+        headers: &NO_HEADERS,
     }
 }
 
@@ -93,8 +92,7 @@ async fn embeds_when_valid() {
     let rendered = exec
         .post_embeddings(
             &body,
-            &provider(&base_url),
-            &Secret::new("sk-test"),
+            &dispatch(&base_url),
             &CancellationToken::new(),
         )
         .await
@@ -116,8 +114,7 @@ async fn rejects_embeddings_when_model_outside_registry() {
     let err = exec
         .post_embeddings(
             &body,
-            &provider(&base_url),
-            &Secret::new("sk-test"),
+            &dispatch(&base_url),
             &CancellationToken::new(),
         )
         .await
@@ -150,9 +147,8 @@ async fn routes_vision_when_image_part() {
     let response = exec
         .post_media(
             endpoint,
+            &dispatch(&base_url),
             &MediaBody { content_type: "application/json", bytes: b"{}" },
-            &provider(&base_url),
-            &Secret::new("sk-test"),
             &CancellationToken::new(),
         )
         .await
@@ -170,10 +166,9 @@ async fn transcribes_when_audio() {
     let response = exec
         .post_media(
             MediaEndpoint::Transcriptions,
+            &dispatch(&base_url),
             // The audio endpoints are multipart; the bytes are the caller's.
             &MediaBody { content_type: "multipart/form-data", bytes: b"--b\r\n\r\n" },
-            &provider(&base_url),
-            &Secret::new("sk-test"),
             &CancellationToken::new(),
         )
         .await
@@ -190,9 +185,8 @@ async fn forwards_translations_when_audio_targeted_english() {
 
     exec.post_media(
         MediaEndpoint::Translations,
+        &dispatch(&base_url),
         &MediaBody { content_type: "multipart/form-data", bytes: b"--b\r\n\r\n" },
-        &provider(&base_url),
-        &Secret::new("sk-test"),
         &CancellationToken::new(),
     )
     .await
@@ -208,9 +202,8 @@ async fn forwards_ocr_when_document_route_requested() {
 
     exec.post_media(
         MediaEndpoint::Ocr,
+        &dispatch(&base_url),
         &MediaBody { content_type: "application/json", bytes: br#"{"model":"ocr-1"}"# },
-        &provider(&base_url),
-        &Secret::new("sk-test"),
         &CancellationToken::new(),
     )
     .await
@@ -239,9 +232,8 @@ async fn surfaces_message_when_media_upstream_errors() {
     let err = exec
         .post_media(
             MediaEndpoint::Ocr,
+            &dispatch(&format!("http://{addr}")),
             &MediaBody { content_type: "application/json", bytes: b"{}" },
-            &provider(&format!("http://{addr}")),
-            &Secret::new("sk-test"),
             &CancellationToken::new(),
         )
         .await

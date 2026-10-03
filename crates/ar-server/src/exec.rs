@@ -42,7 +42,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use ar_registry::WireFormat;
-use ar_route::{ArExec as ArRouteExec, CanonicalRequest, ExecError, ProviderId, Upstream};
+use ar_route::{
+    ArExec as ArRouteExec, CanonicalRequest, ExecError, MediaReply, ProviderId, Upstream,
+};
 use axum::http::StatusCode;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -602,6 +604,86 @@ impl ArRouteExec for HttpExec {
             })
         })
     }
+
+    /// POSTs a media body and reads the whole reply.
+    ///
+    /// The one per-provider rewrite chat gets for free from `render_request`
+    /// is done here by hand: a routed media request names a combo or
+    /// `provider/model`, and the upstream wants its own spelling. JSON bodies
+    /// get the `model` field replaced; multipart bodies cannot be rewritten
+    /// without re-encoding them, so they forward verbatim and the caller's form
+    /// data must already spell the upstream's model.
+    fn post_media<'a>(
+        &'a self,
+        provider: &'a ProviderId,
+        endpoint: &'a str,
+        content_type: &'a str,
+        body: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<MediaReply, ExecError>> + Send + 'a>> {
+        Box::pin(async move {
+            let cfg = self
+                .by_id
+                .get(provider)
+                .ok_or_else(|| ExecError(format!("no such provider: {provider}")))?;
+
+            // No media executor exists behind an OAuth session in this build,
+            // and the failure has to say so: a session that fell through to the
+            // API-key branch would send an empty bearer and report the
+            // provider's own 401 as if it were a media verdict.
+            if self.oauth.contains_key(provider) {
+                return Err(ExecError(
+                    "oauth sessions do not serve media endpoints in this build; configure an api-key provider for media"
+                        .to_owned(),
+                ));
+            }
+
+            let endpoint = ar_exec::MediaEndpoint::from_path(endpoint).ok_or_else(|| {
+                ExecError(format!("unknown media endpoint path: {endpoint}"))
+            })?;
+
+            let shape = cfg.dispatch(false);
+            let bytes = rewrite_json_model(body, content_type, shape.upstream_model);
+
+            let abort = CancellationToken::new();
+            let reply = self
+                .core
+                .post_media(
+                    endpoint,
+                    &shape,
+                    &ar_exec::MediaBody {
+                        content_type,
+                        bytes: bytes.as_deref().unwrap_or(body),
+                    },
+                    &abort,
+                )
+                .await
+                .map_err(flatten)?;
+
+            Ok(MediaReply {
+                status: reply.status,
+                body: reply.bytes,
+                content_type: reply.content_type,
+                retry_after: reply.retry_after,
+            })
+        })
+    }
+}
+
+/// Replaces the `model` field of a JSON body with `upstream_model`.
+///
+/// `None` means "forward as-is": a non-JSON body, an unparseable one, or an
+/// empty `upstream_model` (the config spells the upstream name as its own
+/// routing id) all forward verbatim. Rewriting a body that failed to parse
+/// would mean inventing a wire, and a multipart body re-encoded here would be
+/// a shape no provider documents — `AGENTS.md`'s one hard prohibition.
+fn rewrite_json_model(body: &[u8], content_type: &str, upstream_model: &str) -> Option<Vec<u8>> {
+    if upstream_model.is_empty() || !content_type.starts_with("application/json") {
+        return None;
+    }
+    let mut value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let model = value.get_mut("model")?;
+    *model = serde_json::Value::String(upstream_model.to_owned());
+    serde_json::to_vec(&value).ok()
 }
 
 /// Flattens `ar_exec::ExecError` into the router's string-carrying error.

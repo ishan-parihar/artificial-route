@@ -64,6 +64,7 @@ pub mod app;
 pub mod config;
 pub mod exec;
 pub mod keys;
+pub mod media;
 pub mod metrics;
 pub mod models;
 pub mod routes;

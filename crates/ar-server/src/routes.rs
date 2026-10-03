@@ -574,7 +574,7 @@ fn request_key(canonical: &CanonicalRequest) -> Option<CacheKey> {
 /// cannot be written by accident as a bare sentence — and there is exactly one
 /// today, which is the point.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum RouteReject {
+pub(crate) enum RouteReject {
     /// The request `model` names no configured combo. Carries the 400 text, which
     /// lists the ids that do exist.
     UnknownModel(String),
@@ -594,9 +594,9 @@ enum RouteReject {
 /// it was resolved from is also on the stack; the struct is three fields, one of
 /// them a `Vec` of small `ProviderId`s.
 #[derive(Clone, Debug, PartialEq)]
-struct RoutePlan {
-    chain: Vec<ProviderId>,
-    strategy: Strategy,
+pub(crate) struct RoutePlan {
+    pub(crate) chain: Vec<ProviderId>,
+    pub(crate) strategy: Strategy,
     /// The resolved combo's compression setting, if it declared one.
     compression: Option<Step>,
 }
@@ -619,7 +619,7 @@ struct RoutePlan {
 ///
 /// The reason is never the token, for the reason in [`crate::keys`]: this
 /// response is a cacheable 401 a browser may keep.
-fn authorize(state: &AppState, headers: &HeaderMap, path: &str) -> Option<Response> {
+pub(crate) fn authorize(state: &AppState, headers: &HeaderMap, path: &str) -> Option<Response> {
     // `path` is only read when a gate exists, which is the only case where a
     // tokenized-alias URL can carry a credential at all.
     let gate = state.auth.as_deref()?;
@@ -646,7 +646,7 @@ fn authorize(state: &AppState, headers: &HeaderMap, path: &str) -> Option<Respon
 /// Ponytail: no `Content-Encoding` check. A gzipped body is one this server cannot
 /// translate either way, and it arrives as the translator's 400 rather than a 415
 /// dressed up as a different error.
-fn require_json(headers: &HeaderMap) -> Option<Response> {
+pub(crate) fn require_json(headers: &HeaderMap) -> Option<Response> {
     let ok = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -718,7 +718,7 @@ fn accept_forces_stream(headers: &HeaderMap) -> bool {
 /// Silently falling back to the default chain is the defect this fixes: a client
 /// asking for `gpt-4o` when the server serves `cheap` got `cheap`'s answer and
 /// no way to know.
-fn resolve(state: &AppState, canonical: &CanonicalRequest) -> Result<RoutePlan, RouteReject> {
+pub(crate) fn resolve(state: &AppState, canonical: &CanonicalRequest) -> Result<RoutePlan, RouteReject> {
     let model = canonical.model.as_ref();
 
     if let Some(chain) = auto_chain(state, model) {
@@ -1337,7 +1337,7 @@ fn error_code(status: StatusCode, code: &'static str, message: &str) -> Response
 
 /// [`error_code`] with a `reason` as well, for a client that has to act on which
 /// of several causes fired.
-fn error_because(
+pub(crate) fn error_because(
     status: StatusCode,
     code: &'static str,
     reason: &'static str,
@@ -1586,8 +1586,8 @@ mod tests {
     use std::time::Duration;
 
     use ar_route::{
-        AbortReport, ArExec, AttemptOutcome, CanonicalRequest, ExecError, ProviderId, Strategy,
-        Upstream,
+        AbortReport, ArExec, AttemptOutcome, CanonicalRequest, ExecError, MediaReply, ProviderId,
+        Strategy, Upstream,
     };
     use axum::extract::{Path, State};
     use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -1679,6 +1679,20 @@ mod tests {
                 .expect("recorder lock")
                 .push(canonical.body.clone());
             Box::pin(async move { Ok(Upstream::success(Box::pin(futures::stream::empty()))) })
+        }
+
+        fn post_media<'a>(
+            &'a self,
+            _provider: &'a ProviderId,
+            _endpoint: &'a str,
+            _content_type: &'a str,
+            _body: &'a [u8],
+        ) -> Pin<Box<dyn Future<Output = Result<MediaReply, ExecError>> + Send + 'a>> {
+            // The chat recorder is only pointed at chat paths; a media dispatch
+            // reaching it means a test wired the wrong route.
+            Box::pin(async move {
+                Err(ExecError("the recording exec serves no media path".to_owned()))
+            })
         }
     }
 

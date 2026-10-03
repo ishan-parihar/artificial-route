@@ -6,6 +6,12 @@
 //! the abort race and the upstream-error decoding, so a second pool is never
 //! needed and a media failure is reported in the same terms as a chat one.
 //!
+//! Both entry points take a [`crate::Dispatch`] rather than a registry
+//! [`ProviderDef`] + credential pair: a dispatch is the per-provider shape a
+//! routed request already carries (base URL, bearer, extra headers), so a
+//! caller with a routing table builds nothing it did not already have, and the
+//! credential stays a borrowed `&str` instead of a per-request secret copy.
+//!
 //! # Why the bodies are forwarded verbatim
 //!
 //! These endpoints do not share one wire shape. `/v1/embeddings` is JSON and is
@@ -21,8 +27,6 @@
 
 use std::time::Duration;
 
-use ar_config::Secret;
-use ar_registry::ProviderDef;
 use ar_translate::{
     EmbeddingRequest, EmbeddingUpstream, MediaError, Modality, create_embedding_response,
     family_guard,
@@ -30,7 +34,7 @@ use ar_translate::{
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
-use crate::ExecError;
+use crate::{Dispatch, ExecError};
 
 /// Which upstream endpoint a request is dispatched to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +70,27 @@ impl MediaEndpoint {
         }
     }
 
+    /// The endpoint a wire path names, or `None` for a path this family does
+    /// not serve.
+    ///
+    /// The inverse of [`Self::path`], so the server can dispatch by the path a
+    /// route is mounted on without importing this crate's enum through the
+    /// routing contract: the contract speaks paths, the executor owns the
+    /// vocabulary. Not `const` only because matching on `str` is not stable
+    /// in constant functions; a match on six literals is as cheap either way.
+    #[must_use]
+    pub fn from_path(path: &str) -> Option<Self> {
+        match path {
+            "/chat/completions" => Some(Self::ChatCompletions),
+            "/embeddings" => Some(Self::Embeddings),
+            "/audio/transcriptions" => Some(Self::Transcriptions),
+            "/audio/translations" => Some(Self::Translations),
+            "/images/generations" => Some(Self::ImageGenerations),
+            "/ocr" => Some(Self::Ocr),
+            _ => None,
+        }
+    }
+
     /// The endpoint a modality dispatches to.
     ///
     /// Vision lands on chat completions rather than a route of its own: every
@@ -87,13 +112,15 @@ impl MediaEndpoint {
 
 /// A media request body, forwarded byte-for-byte.
 ///
-/// The content type is `&'static str` rather than an owned header because every
-/// value is a constant at the call site — a `String` here would allocate once per
-/// request to hold a literal.
+/// The content type is borrowed rather than owned because two of the callers
+/// differ in kind: a JSON endpoint passes a constant (`"application/json"`),
+/// while multipart audio passes the request's own `Content-Type` verbatim —
+/// the boundary directive inside it is per-request and must survive, so the
+/// field cannot be `&'static str`.
 #[derive(Debug, Clone, Copy)]
 pub struct MediaBody<'a> {
     /// Value of the outbound `Content-Type`.
-    pub content_type: &'static str,
+    pub content_type: &'a str,
     /// The exact bytes to POST.
     pub bytes: &'a [u8],
 }
@@ -110,6 +137,12 @@ pub struct MediaResponse {
     pub status: reqwest::StatusCode,
     /// Decoded response body.
     pub bytes: Bytes,
+    /// The upstream's own `Content-Type`, verbatim.
+    ///
+    /// A verbatim relay needs it: an image generation answering with binary
+    /// bytes must not arrive at the client labelled `application/json`, and
+    /// the boundary in a multipart reply belongs to the upstream, not to us.
+    pub content_type: String,
     /// `Retry-After` the upstream sent, when present and valid.
     pub retry_after: Option<Duration>,
 }
@@ -130,15 +163,19 @@ impl crate::ArExec {
     pub async fn post_media(
         &self,
         endpoint: MediaEndpoint,
+        shape: &Dispatch<'_>,
         body: &MediaBody<'_>,
-        provider: &ProviderDef,
-        api_key: &Secret,
         abort: &CancellationToken,
     ) -> Result<MediaResponse, ExecError> {
-        let headers = crate::headers_for(api_key.expose(), body.content_type, "application/json", &provider.headers);
+        let headers = crate::headers_for(
+            shape.api_key,
+            body.content_type,
+            "application/json",
+            shape.headers,
+        );
         let response = crate::await_start(
             self.client
-                .post(crate::url::endpoint_url(&provider.base_url, endpoint.path()))
+                .post(crate::url::endpoint_url(shape.base_url, endpoint.path()))
                 .headers(headers)
                 .body(body.bytes.to_vec()),
             abort,
@@ -147,8 +184,15 @@ impl crate::ArExec {
         .await?;
 
         // Read before taking the headers off: `bytes()` consumes the response,
-        // so status and `Retry-After` are captured first rather than cloned.
+        // so status, `Content-Type` and `Retry-After` are captured first rather
+        // than cloned.
         let status = response.status();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_owned();
         let retry_after = crate::retry_after_of(response.headers());
 
         if !response.status().is_success() {
@@ -163,6 +207,7 @@ impl crate::ArExec {
         Ok(MediaResponse {
             status,
             bytes,
+            content_type,
             retry_after,
         })
     }
@@ -182,8 +227,7 @@ impl crate::ArExec {
     pub async fn post_embeddings(
         &self,
         req: &EmbeddingRequest,
-        provider: &ProviderDef,
-        api_key: &Secret,
+        shape: &Dispatch<'_>,
         abort: &CancellationToken,
     ) -> Result<serde_json::Value, ExecError> {
         family_guard(req).map_err(media_to_exec)?;
@@ -192,12 +236,11 @@ impl crate::ArExec {
         let response = self
             .post_media(
                 MediaEndpoint::Embeddings,
+                shape,
                 &MediaBody {
                     content_type: "application/json",
                     bytes: &body,
                 },
-                provider,
-                api_key,
                 abort,
             )
             .await?;

@@ -303,6 +303,24 @@ impl CanonicalRequest {
 /// `ar-llm` passthrough path is that framing survives untouched.
 pub type ChunkStream = Pin<Box<dyn Stream<Item = Bytes> + Send>>;
 
+/// A completed media exchange: the whole reply, read eagerly.
+///
+/// The non-streaming sibling of [`Upstream`]. None of the media endpoints
+/// stream, so there is no [`ChunkStream`] to hand over — the executor reads the
+/// full body before returning, and `status` + `error-shaped or not` are the
+/// same verdict the chat loop gets from an [`Upstream`].
+pub struct MediaReply {
+    /// HTTP status the provider returned, 2xx on success.
+    pub status: StatusCode,
+    /// The reply body, verbatim, successful or not.
+    pub body: Bytes,
+    /// The upstream's own `Content-Type`, so a verbatim relay does not have to
+    /// guess the label for bytes it did not produce.
+    pub content_type: String,
+    /// Parsed `Retry-After` on a 429/503, if the provider sent a usable one.
+    pub retry_after: Option<Duration>,
+}
+
 /// A completed upstream exchange, successful or not.
 pub struct Upstream {
     /// HTTP status the provider returned.
@@ -388,6 +406,32 @@ pub trait ArExec: Send + Sync {
         provider: &'a ProviderId,
         canonical: &'a CanonicalRequest,
     ) -> Pin<Box<dyn Future<Output = Result<Upstream, ExecError>> + Send + 'a>>;
+
+    /// POSTs a non-chat media `body` to the wire path `endpoint` names and
+    /// returns the whole reply.
+    ///
+    /// `endpoint` is a path, not an enum, because the media vocabulary belongs
+    /// to the executor crate; this contract only needs to name a place to POST
+    /// to, which a route's own path already spells (`"/embeddings"`, …). An
+    /// unknown path is an [`ExecError`], not a fall-through to chat.
+    ///
+    /// A media exchange is eager where a chat one streams: [`MediaReply`]
+    /// carries the decoded body because none of these endpoints frame their
+    /// replies incrementally.
+    ///
+    /// # Errors
+    /// Returns [`ExecError`] for transport-level failures, an unknown provider,
+    /// an unknown endpoint path, and — in this build — a provider whose
+    /// credentials are an OAuth session, which no media executor transcribes.
+    /// A non-2xx HTTP status is **not** an error here, for the same reason it
+    /// is not one on [`Self::post_chat`]: the caller must see the verdict.
+    fn post_media<'a>(
+        &'a self,
+        provider: &'a ProviderId,
+        endpoint: &'a str,
+        content_type: &'a str,
+        body: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<MediaReply, ExecError>> + Send + 'a>>;
 }
 
 /// What [`Router::attempt_loop`](crate::Router::attempt_loop) executes against.

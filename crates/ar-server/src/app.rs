@@ -20,6 +20,7 @@
 //! order — and one narrower than the layer would make the per-model value
 //! unreachable, so the layer is never narrower than [`REQUEST_TIMEOUT`] either.
 
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
@@ -36,6 +37,7 @@ use ar_route::{ArExec, LkgpPins, Resilience};
 
 use crate::config::ServerConfig;
 use crate::keys::AuthGate;
+use crate::media;
 use crate::metrics::{Metrics, Outcome};
 use crate::models::{ModelsCache, StaticCatalog};
 use crate::routes;
@@ -44,6 +46,14 @@ use crate::routes;
 /// loop, and refusing it at the edge is cheaper than buffering it. Checked here
 /// rather than by the handler because a handler has already paid the allocation.
 pub const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+/// Request body ceiling on the media routes. Audio uploads are the whole point
+/// of `/v1/audio/transcriptions` and run megabytes by nature, so the chat cap
+/// cannot govern them; 25MB is the reference platform's own documented upload
+/// limit for the same endpoint, which is the one number a client can already
+/// be relying on. Applied on a sub-router merged before the shared layers, so
+/// chat keeps its own tighter ceiling.
+pub const MEDIA_BODY_BYTES: usize = 25 * 1024 * 1024;
 
 /// Ceiling on time-to-response-headers. Deliberately generous: it is a
 /// backstop against a dead upstream, not a latency budget.
@@ -342,6 +352,26 @@ impl ArExec for NullExec {
             )))
         })
     }
+
+    fn post_media<'a>(
+        &'a self,
+        provider: &'a ar_route::ProviderId,
+        _endpoint: &'a str,
+        _content_type: &'a str,
+        _body: &'a [u8],
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<ar_route::MediaReply, ar_route::ExecError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            Err(ar_route::ExecError(format!(
+                "no provider is configured; refusing media dispatch to {provider}"
+            )))
+        })
+    }
 }
 
 /// Builds the router with every route and the tower layers.
@@ -360,11 +390,33 @@ impl ArExec for NullExec {
 /// reaches a browser as an opaque failure and the JSON body never gets read.
 pub fn app(state: AppState) -> Router {
     let timeout = state.config.max_deadline();
+    // The media family carries bodies the chat ceiling would refuse (audio),
+    // so its routes are built on their own sub-router with their own body
+    // limit and merged in — `route_layer` would have applied to the chat routes
+    // registered before it, and a second global layer would loosen nothing.
+    let media = Router::new()
+        .route("/v1/embeddings", axum::routing::post(media::embeddings))
+        .route(
+            "/v1/audio/transcriptions",
+            axum::routing::post(media::transcriptions),
+        )
+        .route(
+            "/v1/images/generations",
+            axum::routing::post(media::image_generations),
+        )
+        .route("/v1/ocr", axum::routing::post(media::ocr))
+        .layer(RequestBodyLimitLayer::new(MEDIA_BODY_BYTES));
     Router::new()
         .route("/v1/chat/completions", axum::routing::post(routes::chat_completions))
         .route("/v1/messages", axum::routing::post(routes::messages))
         .route("/v1/responses", axum::routing::post(routes::responses))
         .route("/api/chat", axum::routing::post(routes::ollama_chat))
+        // The legacy OpenAI alias the reference gateway still serves: a client
+        // configured against `/v1/completions` is a client this server would
+        // otherwise 404 for no reason. Same handler, so the two routes cannot
+        // drift.
+        .route("/v1/completions", axum::routing::post(routes::chat_completions))
+        .merge(media)
         // `.head()` is spelled out: axum answers an unregistered method with
         // 405, so a `.get()`-only route turns an SDK's HEAD availability probe
         // into a refusal instead of a 200.
@@ -1073,6 +1125,23 @@ mod tests {
             Box<
                 dyn std::future::Future<
                         Output = Result<ar_route::Upstream, ar_route::ExecError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(std::future::pending())
+        }
+
+        fn post_media<'a>(
+            &'a self,
+            _provider: &'a ar_route::ProviderId,
+            _endpoint: &'a str,
+            _content_type: &'a str,
+            _body: &'a [u8],
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<ar_route::MediaReply, ar_route::ExecError>,
                     > + Send
                     + 'a,
             >,

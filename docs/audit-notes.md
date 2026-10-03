@@ -238,3 +238,14 @@ config knob plus a request header, both default-off) and a new row here. Pinned 
 `forwards_an_over_budget_body_to_the_executor_unclamped`
 (`crates/ar-server/src/routes.rs` tests): it fails the moment any default-on
 truncation enters the dispatch path.
+
+**(e) Transcriptions route by `?model=`, not by the multipart form's model
+field.** The reference's `audioTranscription.ts` parses the multipart form to
+find the model (`parseTranscriptionModel`); this build has no multipart parser
+by design (`AGENTS.md` forbids re-encoding a body into a shape no provider
+documents), so `/v1/audio/transcriptions` routes by the query parameter — the
+same convention the reference's own Deepgram path uses — and forwards the form
+verbatim, meaning the form must already spell the upstream's model. Port the
+form-field scanner only when a real client needs OpenAI-style model routing;
+it is one commit, and until then the 400 a missing parameter produces says
+exactly what to send.
