@@ -85,6 +85,44 @@ pub const DECISION_HEADER: &str = "x-ar-decision";
 pub const USAGE_HEADER: &str = "x-ar-usage";
 /// Cache verdict: `hit`, `miss` or `bypass`.
 pub const CACHE_HEADER: &str = "x-ar-cache";
+/// Kill the cache on both sides for this request: no lookup, no store.
+///
+/// Value grammar is the reference's strict one — exactly `true`, after ASCII
+/// case folding; `1`/`yes`/`on` do not count (the reference matches on the
+/// string, not on truthiness, and so does this). The `x-omniroute-*` spelling
+/// is the alias a client configured against the reference gateway sends.
+pub const NO_CACHE_HEADER: &str = "x-ar-no-cache";
+/// [`NO_CACHE_HEADER`], as a client configured against the reference gateway
+/// spells it.
+pub const NO_CACHE_HEADER_ALIAS: &str = "x-omniroute-no-cache";
+/// Kill the cache *write* only: the lookup still happens and can still hit.
+///
+/// Distinct from [`NO_CACHE_HEADER`] in the reference too — there
+/// `no-cache` is the both-sides bypass and `cache-no-store` is the
+/// store-side guard, read on the store path only (`semanticCacheManager.ts`,
+/// the `store()` refusal ahead of the shared bypass check).
+pub const NO_STORE_HEADER: &str = "x-ar-cache-no-store";
+/// [`NO_STORE_HEADER`], as a client configured against the reference gateway
+/// spells it.
+pub const NO_STORE_HEADER_ALIAS: &str = "x-omniroute-cache-no-store";
+/// A caller-supplied segment folded into the cache key, on both sides.
+///
+/// Namespaces entries: two clients naming different segments never see each
+/// other's answers, and an absent segment is the shared default. See
+/// [`request_key_with`] for what lands in the digest.
+pub const CACHE_KEY_HEADER: &str = "x-ar-cache-key";
+/// [`CACHE_KEY_HEADER`], as a client configured against the reference gateway
+/// spells it.
+pub const CACHE_KEY_HEADER_ALIAS: &str = "x-omniroute-cache-key";
+/// A caller-requested TTL for the entry this request's answer is stored under.
+///
+/// The reference's units and heuristic are kept: a value over `100_000` is
+/// milliseconds as written, anything else is seconds (`#14484`, which also
+/// clamped it — mirrored on the store side, where the policy ceiling wins).
+pub const CACHE_TTL_HEADER: &str = "x-ar-cache-ttl";
+/// [`CACHE_TTL_HEADER`], as a client configured against the reference gateway
+/// spells it.
+pub const CACHE_TTL_HEADER_ALIAS: &str = "x-omniroute-cache-ttl";
 /// Prompt tokens the upstream reported.
 ///
 /// Counted on non-streaming replies since wave D: the completed body is
@@ -456,12 +494,15 @@ async fn handle_chat(
 
     // A streaming request cannot be replayed from cache — frames arrive
     // incrementally and the client is already consuming them — so it reports
-    // `bypass`. Anything else gets a real lookup.
+    // `bypass`, as does a request that said `no-cache`: both are requests the
+    // lookup genuinely never happened for. A `cache-no-store` request still
+    // looks, and its verdict is whatever the lookup said.
+    let cache_control = CacheControl::read(headers);
     let cache = state.cache.clone();
-    let cache_key = if canonical.stream {
+    let cache_key = if canonical.stream || cache_control.no_cache {
         None
     } else {
-        request_key(&canonical)
+        request_key(&canonical, cache_control.key.as_deref())
     };
 
     if let (Some(key), Some(cache)) = (cache_key.as_ref(), cache.as_ref())
@@ -526,7 +567,7 @@ async fn handle_chat(
     // non-stream request that got this far genuinely missed. The old code wrote
     // `bypass` unconditionally, which reads on the client as "the cache is off"
     // on a server that had no cache at all.
-    let cache_state = if canonical.stream {
+    let cache_state = if canonical.stream || cache_control.no_cache {
         CacheState::Bypass
     } else {
         CacheState::Miss
@@ -567,6 +608,7 @@ async fn handle_chat(
             cache_key,
             cache,
             model: canonical.model.clone(),
+            cache_control,
             meta,
         },
     )
@@ -701,6 +743,10 @@ struct Stages {
     /// request's own spelling is the one a client comparing headers to its
     /// request can recognize.
     model: Strng,
+    /// What the cache-control headers asked for, for the one store the relay
+    /// makes. Rides here for the same reason the model does: the tee is
+    /// `decorate`'s to call and the parsing is the handler's to do once.
+    cache_control: CacheControl,
     /// What the request spent and how long it took, for the `x-ar-*` accounting
     /// headers.
     ///
@@ -717,9 +763,66 @@ struct Stages {
 /// and inventing a second one would only change the digest.
 /// `None` for a body that is not JSON, which the translator has already refused
 /// before this runs, so the arm is unreachable rather than a guess.
-fn request_key(canonical: &CanonicalRequest) -> Option<CacheKey> {
+fn request_key(canonical: &CanonicalRequest, caller_key: Option<&str>) -> Option<CacheKey> {
     let body = serde_json::from_slice::<serde_json::Value>(&canonical.body).ok()?;
-    Some(ar_cache::key::request_key("default", &canonical.model, &body))
+    Some(ar_cache::key::request_key_with("default", &canonical.model, &body, caller_key))
+}
+
+/// The cache-control headers one request carried, as the dispatch needs them.
+///
+/// Both spellings are read on every field, native first then the reference's
+/// alias — the same precedence the compression header established in wave A: a
+/// client configured against either gateway sends something this server
+/// answers, and a client sending both gets its native word.
+#[derive(Clone, Debug, Default)]
+struct CacheControl {
+    /// `no-cache: true` — the both-sides kill. No lookup, no store, and the
+    /// verdict reads `bypass` because that is what happened.
+    no_cache: bool,
+    /// `cache-no-store: true` — the write-side kill. The lookup still runs.
+    no_store: bool,
+    /// The caller's key segment, folded into the digest on both sides.
+    key: Option<Strng>,
+    /// The caller-requested TTL, already normalized to a `Duration`. The
+    /// policy's ceiling still wins at store time.
+    ttl: Option<Duration>,
+}
+
+impl CacheControl {
+    /// Reads the four fields off the request headers.
+    ///
+    /// Grammar decisions are the reference's, not ours: the two boolean
+    /// fields match the exact string `true` after ASCII case folding, and an
+    /// unparseable or non-positive TTL is "no opinion" rather than a 400 — a
+    /// cache hint is advisory, and refusing a request over one would make a
+    /// misconfigured client's cache control into an availability problem.
+    fn read(headers: &HeaderMap) -> Self {
+        fn pair<'a>(headers: &'a HeaderMap, native: &str, alias: &str) -> Option<&'a str> {
+            [native, alias]
+                .into_iter()
+                .find_map(|name| headers.get(name).and_then(|v| v.to_str().ok()))
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+        }
+        let is_true = |native: &str, alias: &str| {
+            pair(headers, native, alias).is_some_and(|v| v.eq_ignore_ascii_case("true"))
+        };
+        let ttl = pair(headers, CACHE_TTL_HEADER, CACHE_TTL_HEADER_ALIAS)
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .map(|v| {
+                // The reference's heuristic: over 100_000 is milliseconds as
+                // written, anything else is seconds.
+                let millis = if v > 100_000 { v } else { v * 1_000 };
+                Duration::from_millis(millis)
+            });
+        Self {
+            no_cache: is_true(NO_CACHE_HEADER, NO_CACHE_HEADER_ALIAS),
+            no_store: is_true(NO_STORE_HEADER, NO_STORE_HEADER_ALIAS),
+            key: pair(headers, CACHE_KEY_HEADER, CACHE_KEY_HEADER_ALIAS).map(Strng::from),
+            ttl,
+        }
+    }
 }
 
 /// Why a request could not be routed.
@@ -1103,7 +1206,7 @@ fn decorate(
         outcome.attempts()
     );
 
-    let Stages { compression, cache_state, cache_key, cache, model, meta } = stages;
+    let Stages { compression, cache_state, cache_key, cache, model, cache_control, meta } = stages;
 
     // Every accounting number the response reports, from one [`ResponseMeta`].
     // Cost is priced in `ar-tokens` against the same row the ledger stores, so a
@@ -1162,6 +1265,8 @@ fn decorate(
                         cache,
                         key,
                         status.as_u16(),
+                        cache_control.no_store,
+                        cache_control.ttl,
                     ))),
                 _ => {
                     let stream = upstream.stream;
@@ -1224,6 +1329,8 @@ fn tee_and_store(
     cache: Arc<Cache>,
     key: CacheKey,
     status: u16,
+    no_store: bool,
+    ttl: Option<Duration>,
 ) -> impl futures::Stream<Item = Result<Bytes, std::convert::Infallible>> + Send + use<> {
     async_stream::stream! {
         let mut buf: Vec<u8> = Vec::new();
@@ -1239,8 +1346,25 @@ fn tee_and_store(
             }
             yield Ok(chunk);
         }
-        if keep && status < 300 {
-            cache.store(&key, status, "application/json", Bytes::from(buf));
+        // `no-store` is the write-side kill: the lookup already happened, and
+        // this tee's whole job was the write. A caller TTL, when present,
+        // shortens the entry — the policy ceiling still wins on the store side
+        // ([`ar_cache::Cache::store_with_ttl`]).
+        if keep && status < 300 && !no_store {
+            match ttl {
+                Some(ttl) => {
+                    cache.store_with_ttl(
+                        &key,
+                        status,
+                        "application/json",
+                        Bytes::from(buf),
+                        ttl,
+                    );
+                }
+                None => {
+                    cache.store(&key, status, "application/json", Bytes::from(buf));
+                }
+            }
         }
     }
 }
@@ -1775,12 +1899,12 @@ mod tests {
     use axum::response::Response;
     use bytes::Bytes;
     use super::{
-        COMPRESSION_ECHO, Dialect, FALLBACK_ATTEMPTS_HEADER, Keepalive, LATENCY_MS_HEADER,
-        MODEL_HEADER, PROVIDER_HEADER, RESPONSE_COST_HEADER, SAVINGS_TOKENS_HEADER, Stages,
-        TOKENS_IN_HEADER, TOKENS_OUT_HEADER, TOKENS_PER_SECOND_HEADER, VERSION_HEADER,
-        accept_forces_stream, build_chain, card_json, declares_stream, decorate, error,
-        error_because, kind_for, model, models_head, not_found, outcome_label, require_json,
-        terminator_seen, unknown_model,
+        CACHE_HEADER, COMPRESSION_ECHO, CacheControl, Dialect, FALLBACK_ATTEMPTS_HEADER,
+        Keepalive, LATENCY_MS_HEADER, MODEL_HEADER, PROVIDER_HEADER, RESPONSE_COST_HEADER,
+        SAVINGS_TOKENS_HEADER, Stages, TOKENS_IN_HEADER, TOKENS_OUT_HEADER,
+        TOKENS_PER_SECOND_HEADER, VERSION_HEADER, accept_forces_stream, build_chain, card_json,
+        declares_stream, decorate, error, error_because, kind_for, model, models_head, not_found,
+        outcome_label, require_json, terminator_seen, unknown_model,
     };
     use crate::app::{AppState, Components};
     use crate::config::{ComboTarget, ServerConfig};
@@ -2012,6 +2136,7 @@ mod tests {
                 cache_key: None,
                 cache: None,
                 model: ar_route::Strng::from("m"),
+                cache_control: CacheControl::default(),
                 meta,
             },
         );
@@ -2814,6 +2939,167 @@ mod tests {
             bytes.as_ref(),
             b"data: {\"a\":1}\n\ndata: [DONE]\n\n".as_ref(),
             "stream bytes must be identical to the upstream's"
+        );
+    }
+
+    /// [`routed_under`], plus a live 1MB memory cache — the cache tests need a
+    /// tier that actually stores, not a bigger fixture.
+    fn routed_with_cache(exec: Arc<dyn ArExec>) -> AppState {
+        Components {
+            exec,
+            cache_bytes: Some(Some(1 << 20)),
+            ..Components::unconfigured(one_provider_config())
+        }
+        .into_state()
+    }
+
+    /// Consumes a response body so the cache tee's final poll — the one that
+    /// stores the entry — actually runs. `drive` returns the response without
+    /// polling the body, and an unpollled relay stores nothing.
+    async fn drain_body(resp: Response) {
+        let _ = axum::body::to_bytes(resp.into_body(), usize::MAX).await;
+    }
+
+    /// The canned completion every cache test replays: non-stream, JSON, a
+    /// usage block the accounting path can read.
+    const CANNED: &str =
+        r#"{"id":"r1","choices":[{"message":{"role":"assistant","content":"hi"}}],"usage":{"prompt_tokens":3,"completion_tokens":2}}"#;
+
+    #[tokio::test]
+    async fn a_no_cache_header_kills_both_cache_sides() {
+        // The reference's both-sides bypass, strict-"true" grammar: both
+        // spellings must answer `bypass` and neither may leave an entry —
+        // two dispatches for two requests is the proof nothing was served.
+        let recorder = Arc::new(Mutex::new(Vec::new()));
+        let exec = Arc::new(RecordingExec(Arc::clone(&recorder)));
+        let router = crate::app::app(routed_with_cache(exec));
+        let body = r#"{"model":"m","messages":[{"role":"user","content":"once"}]}"#;
+
+        let first = drive(&router, chat(body, &[("x-ar-no-cache", "true")])).await;
+        let second =
+            drive(&router, chat(body, &[("x-omniroute-no-cache", "true")])).await;
+        assert_eq!(
+            first.headers().get(CACHE_HEADER).and_then(|v| v.to_str().ok()),
+            Some("bypass")
+        );
+        assert_eq!(
+            second.headers().get(CACHE_HEADER).and_then(|v| v.to_str().ok()),
+            Some("bypass")
+        );
+        assert_eq!(
+            recorder.lock().expect("recorder lock").len(),
+            2,
+            "a no-cache request stored or served an entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_no_store_header_reads_but_writes_nothing() {
+        // The write-side kill: the first request's lookup answers `miss`, the
+        // second (same body, no header) must also answer `miss` — the entry the
+        // first would have written is the one `no-store` refused — and the
+        // third+fourth pair prove the cache in this fixture does hit when a
+        // store was allowed, so the second `miss` is the header's doing.
+        let exec = Arc::new(CannedExec(vec![CANNED]));
+        let router = crate::app::app(routed_with_cache(exec));
+        let body = r#"{"model":"m","messages":[{"role":"user","content":"once"}]}"#;
+
+        let first =
+            drive(&router, chat(body, &[("x-ar-cache-no-store", "true")])).await;
+        let first_verdict = first
+            .headers()
+            .get(CACHE_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        // The tee's final poll is where the no-store refusal lives, so the body
+        // must actually be read for the request to have *attempted* a store.
+        drain_body(first).await;
+        let second = drive(&router, chat(body, &[])).await;
+        assert_eq!(
+            first_verdict.as_deref(),
+            Some("miss"),
+            "no-store must not kill the lookup"
+        );
+        assert_eq!(
+            second.headers().get(CACHE_HEADER).and_then(|v| v.to_str().ok()),
+            Some("miss"),
+            "the no-store request left an entry behind"
+        );
+
+        let other = r#"{"model":"m","messages":[{"role":"user","content":"twice"}]}"#;
+        drain_body(drive(&router, chat(other, &[])).await).await;
+        let hit = drive(&router, chat(other, &[])).await;
+        assert_eq!(
+            hit.headers().get(CACHE_HEADER).and_then(|v| v.to_str().ok()),
+            Some("hit"),
+            "the fixture cache never hits, so this test proves nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cache_key_header_namespaces_entries() {
+        // The same body under different caller-key segments is two entries;
+        // the same segment under either spelling is one. The alias spelling on
+        // the second request and the native on the third is the probe that both
+        // fold into the digest identically.
+        let exec = Arc::new(CannedExec(vec![CANNED]));
+        let router = crate::app::app(routed_with_cache(exec));
+        let body = r#"{"model":"m","messages":[{"role":"user","content":"once"}]}"#;
+
+        drain_body(drive(&router, chat(body, &[])).await).await;
+        let namespaced =
+            drive(&router, chat(body, &[("x-omniroute-cache-key", "tenant-b")])).await;
+        let namespaced_verdict = namespaced
+            .headers()
+            .get(CACHE_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        drain_body(namespaced).await;
+        assert_eq!(
+            namespaced_verdict.as_deref(),
+            Some("miss"),
+            "the caller-key segment did not enter the digest"
+        );
+        let same_segment =
+            drive(&router, chat(body, &[("x-ar-cache-key", "tenant-b")])).await;
+        assert_eq!(
+            same_segment.headers().get(CACHE_HEADER).and_then(|v| v.to_str().ok()),
+            Some("hit"),
+            "the two spellings of one segment must fold identically"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cache_ttl_header_shortens_but_never_extends_an_entry() {
+        // The ms form (`150000`) asks for 150ms: after it lapses the entry is
+        // gone. The seconds form asking for centuries must be clamped to the
+        // policy's own lifetime — the entry it writes still answers `hit` here
+        // because the clamp is what kept it from being the asked-for one.
+        let exec = Arc::new(CannedExec(vec![CANNED]));
+        let router = crate::app::app(routed_with_cache(exec));
+        let short = r#"{"model":"m","messages":[{"role":"user","content":"short"}]}"#;
+        let long = r#"{"model":"m","messages":[{"role":"user","content":"long"}]}"#;
+
+        // The seconds form (`1`) is the only way to ask for a short entry: the
+        // reference's heuristic reads anything at or under `100_000` as
+        // seconds, so a sub-second TTL is not expressible — the ms form starts
+        // at ~100s. After the 1s entry lapses the lookup must miss.
+        drain_body(drive(&router, chat(short, &[("x-ar-cache-ttl", "1")])).await).await;
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        let expired = drive(&router, chat(short, &[])).await;
+        assert_eq!(
+            expired.headers().get(CACHE_HEADER).and_then(|v| v.to_str().ok()),
+            Some("miss"),
+            "the caller TTL did not shorten the entry"
+        );
+
+        drain_body(drive(&router, chat(long, &[("x-ar-cache-ttl", "999999999")])).await).await;
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        let clamped = drive(&router, chat(long, &[])).await;
+        assert_eq!(
+            clamped.headers().get(CACHE_HEADER).and_then(|v| v.to_str().ok()),
+            Some("hit"),
+            "the clamp must hold: a century-long request still answers within the policy lifetime"
         );
     }
 

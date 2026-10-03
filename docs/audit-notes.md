@@ -249,3 +249,13 @@ verbatim, meaning the form must already spell the upstream's model. Port the
 form-field scanner only when a real client needs OpenAI-style model routing;
 it is one commit, and until then the 400 a missing parameter produces says
 exactly what to send.
+
+**(f) The semantic cache's tuning headers are known and ignored.** The reference
+reads `x-omniroute-cache-threshold` (a 0–1 similarity bound) and
+`x-omniroute-cache-type` on its semantic cache
+(`semanticCacheManager.ts:249-256`); this build's cache is exact — hash hit or
+miss, no similarity score to bound and no layer type to choose — so both
+headers are ignored rather than approximated. A client sending them loses
+nothing it was promised: the two knobs tune a subsystem that does not exist
+here, and pretending to honor them (say, by treating a threshold as a
+bypass trigger) would make the header lie about what it moved.

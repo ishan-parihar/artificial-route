@@ -396,7 +396,28 @@ impl Cache {
         content_type: &str,
         body: impl Into<Bytes>,
     ) -> bool {
-        self.store_inner(key, status, content_type, body, false)
+        self.store_inner(key, status, content_type, body, None, false)
+    }
+
+    /// [`store`](Self::store) with a caller-requested TTL, clamped to the
+    /// policy's.
+    ///
+    /// A request's cache-control headers may shorten an entry's life but never
+    /// extend it past the operator's configured ceiling — the same clamp the
+    /// reference added when its unbounded header let a client pin an entry far
+    /// past the configured cache lifetime (`semanticCacheManager.ts`, #14484).
+    /// `Duration::ZERO` here is a request asking to store nothing, and answers
+    /// `false` without writing for exactly the reason [`Self::store_truncated`]
+    /// does.
+    pub fn store_with_ttl(
+        &self,
+        key: &CacheKey,
+        status: u16,
+        content_type: &str,
+        body: impl Into<Bytes>,
+        ttl: Duration,
+    ) -> bool {
+        self.store_inner(key, status, content_type, body, Some(ttl), false)
     }
 
     /// Declines to store a completion that was cut off at the token ceiling.
@@ -468,10 +489,15 @@ impl Cache {
         status: u16,
         content_type: &str,
         body: impl Into<Bytes>,
+        ttl_override: Option<Duration>,
         truncated: bool,
     ) -> bool {
         let now = now_ms();
-        let ttl = self.ttl.for_status(status);
+        let policy_ttl = self.ttl.for_status(status);
+        // The caller's request can only shorten: `min` against the policy
+        // ceiling, so a poisoned entry cannot be pinned past the configured
+        // lifetime by a header that asked for more.
+        let ttl = ttl_override.map_or(policy_ttl, |requested| requested.min(policy_ttl));
         if truncated || ttl == NO_STORE {
             return false;
         }

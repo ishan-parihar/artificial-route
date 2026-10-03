@@ -109,13 +109,41 @@ pub fn key_of(fields: &[(&str, &Value)]) -> CacheKey {
 /// cache that serves a 0.7 answer to a 0.0 request.
 #[must_use]
 pub fn request_key(tenant: &str, model: &str, body: &Value) -> CacheKey {
+    request_key_with(tenant, model, body, None)
+}
+
+/// [`request_key`], plus the caller-supplied key segment a request may carry in
+/// its cache-control headers.
+///
+/// The reference folds its `x-omniroute-cache-key` into the same digest
+/// (`semanticCacheManager.ts` reads it on both the lookup and the store side),
+/// which makes it a *namespace* — two clients naming different segments never
+/// see each other's entries, and an absent segment is the shared default. It is
+/// sorted into the hashed fields (`"body" < "caller_key" < "model" <
+/// "tenant"`) so the digest format stays one canonical string, and it is
+/// hashed rather than concatenated so a segment cannot be crafted to collide
+/// with another client's `(model, body)` pair.
+#[must_use]
+pub fn request_key_with(
+    tenant: &str,
+    model: &str,
+    body: &Value,
+    caller_key: Option<&str>,
+) -> CacheKey {
     let mut buf = String::with_capacity(256);
     buf.push('{');
-    // Sorted by name, matching `key_of`: "body" < "model" < "tenant".
+    // Sorted by name, matching `key_of`: "body" < "caller_key" < "model" <
+    // "tenant".
     push_string(&mut buf, "body");
     buf.push(':');
     write_value(body, &mut buf);
     buf.push(',');
+    if let Some(caller_key) = caller_key {
+        push_string(&mut buf, "caller_key");
+        buf.push(':');
+        push_string(&mut buf, caller_key);
+        buf.push(',');
+    }
     push_string(&mut buf, "model");
     buf.push(':');
     push_string(&mut buf, model);
