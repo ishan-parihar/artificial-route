@@ -298,3 +298,43 @@ decode/re-encode, no config knob, no `Accept-Encoding` negotiation) and
 **does** rich auth (9 upstream strategies incl. RFC 8693/7523 exchange,
 OIDC browser login, MCP OAuth server). Earlier "0/passthrough" cells were
 wrong and are corrected in the README table.
+
+## Parity closeout — waves A–O (2026-10-03)
+
+Closed per `docs/07-parity-closeout.md`, one commit per wave, all gates green
+before each. Where a wave's plan said "build" and the tree already had the
+mechanism, the commit records the verification and adds the missing pin
+instead of rebuilding.
+
+- **A** — `x-omniroute-compression` honored on the live path (the resolver
+  existed test-only), CORS admits the spelling. Echo stays `x-ar-compression`.
+- **B** — `x-ar-model` / `x-ar-provider` / `x-ar-version` stamped at
+  `decorate` on both arms; the trace id was already middleware-stamped.
+- **C** — media surface: `ArExec::post_media` on the routing contract,
+  Dispatch-shaped exec with per-provider model rewrite, four handlers on their
+  own 25MB sub-router, `/v1/completions` legacy alias, typed envelopes.
+- **D** — real usage accounting: key id threaded out of the gate (anonymous
+  sentinel), the non-stream arm buffers and records against the ledger `serve`
+  opens beside the config; headers match ledger math by construction; streams
+  stay zeroed — the documented split.
+- **E** — `x-ar-savings-tokens` counted, not estimated, on the rewrite branch.
+- **F1** — cache-control headers: `no-cache` (both sides), `cache-no-store`
+  (write only), `cache-key` (namespaces the digest, both sides),
+  `cache-ttl` (reference's seconds/ms heuristic, clamped to the policy
+  ceiling, #14484's fix mirrored). Both spellings honored.
+- **G** — budget clamp stays eval-only; accepted divergence, pinned by an
+  unclamped-forwarding test (row d).
+- **H1** — quota marking + preflight cutoff verified present and pinned
+  across requests: the terminal-code gate, the timestamped
+  `QuotaExhausted` lock and the loop's preflight skip all predate the wave.
+- **J1** — upstream error identity: `Failover` carries the last upstream's
+  body and window; the envelope's code is the provider's own when it is one of
+  six pass-through identifiers, else it collapses to the router default — the
+  same projection-vs-allowlist behaviour as the reference's ~310-entry list.
+- **I1** — stream resilience pinned: client-hangup aborts the upstream read
+  by construction (guard on the stream itself), truncation is described
+  in-band per dialect.
+
+Divergences are rows (a)–(f) in `docs/audit-notes.md`. Deferred with owners:
+per-provider quota fetchers, stream resume, identifier growth, compression
+depth, the auth lifecycle.

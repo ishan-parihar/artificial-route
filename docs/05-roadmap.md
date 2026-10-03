@@ -1,13 +1,12 @@
 # 05 — Roadmap P0-P6
 
 **Status (2026-10-03):** P0–P4 shipped in v0.1.0/v0.1.1; P5's guard/obs
-shipped with the `ar-guard`/`ar-obs` crates. P6 is split: the media family
-(embeddings, transcriptions, image-generations, OCR — declared scope at
-`docs/02` modality row) lands under the parity-closeout wave C; live
-discovery, vector search and the 12h soak remain deferred. The active plan is
-`docs/07-parity-closeout.md` — its wave→commit map supersedes the P-phases
-below for everything still open. The phase gates still apply unchanged to
-any work a P-phase takes on.
+shipped with the `ar-guard`/`ar-obs` crates. P6's media family landed under
+the parity closeout (`docs/07-parity-closeout.md`, wave C: embeddings,
+transcriptions, image-generations, OCR — the declared `docs/02` modality
+scope); live discovery, vector search and the 12h soak remain deferred. The
+parity-closeout waves A–O are the live plan; the phase gates below still apply
+to anything a P-phase takes on.
 
 Gate every phase: `cargo test --release` + `cargo clippy --all-targets --all-features --locked -- -D warnings` + RAM check.
 AXI gates in `06-axi-mcp.md` apply from P0 (`TOON`, `--fields`, `--version` fast path, no prompts).
