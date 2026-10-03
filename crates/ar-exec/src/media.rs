@@ -125,7 +125,6 @@ pub struct MediaBody<'a> {
     pub bytes: &'a [u8],
 }
 
-
 /// A completed, non-streaming media response.
 ///
 /// Holds the decoded body rather than the `reqwest::Response`: none of these

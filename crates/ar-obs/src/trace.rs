@@ -70,7 +70,9 @@ fn open_day(dir: &Path, day: u64) -> io::Result<File> {
 /// janitor that deletes what it cannot parse is how a rotation eats something it
 /// should not.
 fn prune(dir: &Path, today: u64) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
     let cutoff = today.saturating_sub(RETENTION_DAYS);
     for entry in entries.flatten() {
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {

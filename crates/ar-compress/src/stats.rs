@@ -50,9 +50,11 @@ impl Stats {
         } else {
             saved_tokens as f64 / original as f64
         };
-        Self { saved_tokens, ratio }
+        Self {
+            saved_tokens,
+            ratio,
+        }
     }
-
 }
 
 #[cfg(test)]

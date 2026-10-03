@@ -12,16 +12,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ar_keys::{
-    ACCESS_TTL, Action, Audit, HashParams, Issue, KeyError, KeyMeta, MasterKey, Outcome, REFRESH_TTL, Revocation, Salt,
-    Scope, ScopeSet, Secret, Tokens, decrypt, encrypt, verify,
+    ACCESS_TTL, Action, Audit, HashParams, Issue, KeyError, KeyMeta, MasterKey, Outcome,
+    REFRESH_TTL, Revocation, Salt, Scope, ScopeSet, Secret, Tokens, decrypt, encrypt, verify,
 };
 
 /// A fast-params master key. `HashParams::RECOMMENDED` costs 19 MiB and ~40 ms
 /// per derivation; a suite of this size would spend seconds of CPU proving
 /// nothing extra.
 fn master() -> MasterKey {
-    MasterKey::new(Secret::generate(), KeyMeta::with_params(HashParams::FAST, Salt::generate()))
-        .expect("derive a test master key")
+    MasterKey::new(
+        Secret::generate(),
+        KeyMeta::with_params(HashParams::FAST, Salt::generate()),
+    )
+    .expect("derive a test master key")
 }
 
 /// A unique redb path. redb takes an exclusive lock, so parallel tests must not
@@ -29,17 +32,34 @@ fn master() -> MasterKey {
 fn temp_store(tag: &str) -> (Revocation, std::path::PathBuf) {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("ar-keys-it-{tag}-{}-{n}.redb", std::process::id()));
+    let path =
+        std::env::temp_dir().join(format!("ar-keys-it-{tag}-{}-{n}.redb", std::process::id()));
     let _ = std::fs::remove_file(&path);
-    (Revocation::open(&path, 256).expect("open the revocation store"), path)
+    (
+        Revocation::open(&path, 256).expect("open the revocation store"),
+        path,
+    )
 }
 
 fn issue(tokens: &Tokens, scopes: ScopeSet) -> ar_keys::Issued {
-    tokens.issue(Issue { key_id: "key-1", scopes, device_id: Some("test-device"), ttl: None }).expect("issue")
+    tokens
+        .issue(Issue {
+            key_id: "key-1",
+            scopes,
+            device_id: Some("test-device"),
+            ttl: None,
+        })
+        .expect("issue")
 }
 
 fn now() -> i64 {
-    i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_secs()).expect("fits i64")
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_secs(),
+    )
+    .expect("fits i64")
 }
 
 #[test]
@@ -51,7 +71,9 @@ fn rejects_when_revoked() {
     // Live and correct before the revoke: this test is about the revocation, not
     // about a token that was never valid.
     assert!(
-        tokens.verify(&issued.access, Scope::ReadAll, &revocations).is_ok(),
+        tokens
+            .verify(&issued.access, Scope::ReadAll, &revocations)
+            .is_ok(),
         "precondition: the token must verify before it is revoked"
     );
 
@@ -59,7 +81,9 @@ fn rejects_when_revoked() {
 
     // The signature is still valid and `exp` is 15 minutes out, so the revoke
     // list is the only thing that can be refusing this.
-    let err = tokens.verify(&issued.access, Scope::ReadAll, &revocations).expect_err("a revoked token must be refused");
+    let err = tokens
+        .verify(&issued.access, Scope::ReadAll, &revocations)
+        .expect_err("a revoked token must be refused");
     assert!(matches!(err, KeyError::Revoked { .. }), "{err}");
     let _ = std::fs::remove_file(path);
 }
@@ -72,7 +96,12 @@ fn expires_when_stolen() {
     // separately in `token::tests::the_default_leeway_extends_the_effective_lifetime`.
     let tokens = Tokens::new(&master()).with_leeway(Duration::ZERO);
     let issued = tokens
-        .issue(Issue { key_id: "key-1", scopes: ScopeSet::all(), device_id: None, ttl: Some(Duration::from_secs(1)) })
+        .issue(Issue {
+            key_id: "key-1",
+            scopes: ScopeSet::all(),
+            device_id: None,
+            ttl: Some(Duration::from_secs(1)),
+        })
         .expect("issue");
 
     // The attacker's copy: taken while the token is still live, so it is a
@@ -91,7 +120,9 @@ fn expires_when_stolen() {
     // for the rest; 2100ms is deterministic for every one of them.
     std::thread::sleep(Duration::from_millis(2_100));
 
-    let err = tokens.verify(&stolen, Scope::ReadAll, &revocations).expect_err("an expired token must be refused");
+    let err = tokens
+        .verify(&stolen, Scope::ReadAll, &revocations)
+        .expect_err("an expired token must be refused");
     assert!(matches!(err, KeyError::Expired), "{err}");
     let _ = std::fs::remove_file(path);
 }
@@ -101,7 +132,10 @@ fn the_default_leeway_is_part_of_the_effective_lifetime() {
     // Worth stating explicitly: the skew allowance extends every token's life, so
     // it is a security parameter and not a rounding convenience.
     assert_eq!(Tokens::new(&master()).leeway(), ar_keys::DEFAULT_LEEWAY);
-    assert!(ar_keys::DEFAULT_LEEWAY.as_secs() > 0, "a zero default would break clock-skew tolerance");
+    assert!(
+        ar_keys::DEFAULT_LEEWAY.as_secs() > 0,
+        "a zero default would break clock-skew tolerance"
+    );
 }
 
 #[test]
@@ -121,8 +155,15 @@ fn revoking_one_half_does_not_revoke_the_other() {
     let (revocations, path) = temp_store("half");
     let tokens = Tokens::new(&master());
     let issued = issue(&tokens, ScopeSet::all());
-    tokens.revoke(&issued.access, &revocations).expect("revoke access");
-    assert!(tokens.verify(&issued.refresh, Scope::ReadAll, &revocations).is_ok(), "the refresh token must survive");
+    tokens
+        .revoke(&issued.access, &revocations)
+        .expect("revoke access");
+    assert!(
+        tokens
+            .verify(&issued.refresh, Scope::ReadAll, &revocations)
+            .is_ok(),
+        "the refresh token must survive"
+    );
     let _ = std::fs::remove_file(path);
 }
 
@@ -131,8 +172,11 @@ fn revoking_survives_a_restart() {
     // The property that matters for a reported leak: a restart must not
     // un-revoke anything.
     static N: AtomicU64 = AtomicU64::new(0);
-    let path = std::env::temp_dir()
-        .join(format!("ar-keys-it-restart-{}-{}.redb", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+    let path = std::env::temp_dir().join(format!(
+        "ar-keys-it-restart-{}-{}.redb",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
     let _ = std::fs::remove_file(&path);
     let tokens = Tokens::new(&master());
     let issued = issue(&tokens, ScopeSet::all());
@@ -155,8 +199,19 @@ fn refuses_a_scope_the_token_does_not_carry() {
     let (revocations, path) = temp_store("scope");
     let tokens = Tokens::new(&master());
     let read_only = issue(&tokens, ScopeSet::of([Scope::ReadAll]));
-    let err = tokens.verify(&read_only.access, Scope::WriteAll, &revocations).expect_err("a read-only token must not write");
-    assert!(matches!(err, KeyError::ScopeDenied { needed: "write:*", .. }), "{err}");
+    let err = tokens
+        .verify(&read_only.access, Scope::WriteAll, &revocations)
+        .expect_err("a read-only token must not write");
+    assert!(
+        matches!(
+            err,
+            KeyError::ScopeDenied {
+                needed: "write:*",
+                ..
+            }
+        ),
+        "{err}"
+    );
     let _ = std::fs::remove_file(path);
 }
 
@@ -165,7 +220,11 @@ fn an_unscoped_token_does_nothing() {
     let (revocations, path) = temp_store("unscoped");
     let tokens = Tokens::new(&master());
     let unscoped = issue(&tokens, ScopeSet::EMPTY);
-    assert!(tokens.verify(&unscoped.access, Scope::ReadAll, &revocations).is_err());
+    assert!(
+        tokens
+            .verify(&unscoped.access, Scope::ReadAll, &revocations)
+            .is_err()
+    );
     let _ = std::fs::remove_file(path);
 }
 
@@ -177,8 +236,16 @@ fn execute_completions_is_a_separate_grant_from_write() {
     let (revocations, path) = temp_store("execute-vs-write");
     let tokens = Tokens::new(&master());
     let issued = issue(&tokens, ScopeSet::of([Scope::ExecuteCompletions]));
-    assert!(tokens.verify(&issued.access, Scope::ExecuteCompletions, &revocations).is_ok());
-    assert!(tokens.verify(&issued.access, Scope::WriteAll, &revocations).is_err());
+    assert!(
+        tokens
+            .verify(&issued.access, Scope::ExecuteCompletions, &revocations)
+            .is_ok()
+    );
+    assert!(
+        tokens
+            .verify(&issued.access, Scope::WriteAll, &revocations)
+            .is_err()
+    );
     let _ = std::fs::remove_file(path);
 }
 
@@ -187,21 +254,40 @@ fn a_credential_cannot_be_moved_to_another_key_id() {
     // The splice v1 could not detect: the OmniRoute tree has zero `setAAD`
     // calls, so an envelope copied between rows authenticated fine.
     let m = master();
-    let envelope = encrypt(&m, "openai", "key-1", &Secret::new(b"sk-live-credential".to_vec())).expect("encrypt");
-    assert!(matches!(decrypt(&m, "openai", "key-2", &envelope), Err(KeyError::TagMismatch)));
+    let envelope = encrypt(
+        &m,
+        "openai",
+        "key-1",
+        &Secret::new(b"sk-live-credential".to_vec()),
+    )
+    .expect("encrypt");
+    assert!(matches!(
+        decrypt(&m, "openai", "key-2", &envelope),
+        Err(KeyError::TagMismatch)
+    ));
 }
 
 #[test]
 fn a_credential_cannot_be_read_by_another_provider() {
     let m = master();
-    let envelope = encrypt(&m, "openai", "key-1", &Secret::new(b"sk-live-credential".to_vec())).expect("encrypt");
+    let envelope = encrypt(
+        &m,
+        "openai",
+        "key-1",
+        &Secret::new(b"sk-live-credential".to_vec()),
+    )
+    .expect("encrypt");
     assert!(decrypt(&m, "groq", "key-1", &envelope).is_err());
 }
 
 #[test]
 fn a_credential_cannot_be_read_without_the_master_key() {
-    let envelope = encrypt(&master(), "openai", "key-1", &Secret::new(b"sk-x".to_vec())).expect("encrypt");
-    assert!(matches!(decrypt(&master(), "openai", "key-1", &envelope), Err(KeyError::TagMismatch)));
+    let envelope =
+        encrypt(&master(), "openai", "key-1", &Secret::new(b"sk-x".to_vec())).expect("encrypt");
+    assert!(matches!(
+        decrypt(&master(), "openai", "key-1", &envelope),
+        Err(KeyError::TagMismatch)
+    ));
 }
 
 #[test]
@@ -212,7 +298,10 @@ fn every_encryption_uses_a_fresh_nonce() {
     let secret = Secret::new(b"sk-x".to_vec());
     let mut seen = std::collections::HashSet::new();
     for _ in 0..16 {
-        assert!(seen.insert(encrypt(&m, "openai", "key-1", &secret).expect("encrypt")), "nonce reuse across encryptions");
+        assert!(
+            seen.insert(encrypt(&m, "openai", "key-1", &secret).expect("encrypt")),
+            "nonce reuse across encryptions"
+        );
     }
 }
 
@@ -225,14 +314,31 @@ fn the_audit_log_holds_the_key_id_and_never_the_key() {
 
     // The audit API takes a `Strng` the caller chooses and three closed enums,
     // so there is no field a secret could arrive in.
-    audit.record("openai/key-1".into(), Action::Decrypt, Outcome::Ok, "tag-verified");
+    audit.record(
+        "openai/key-1".into(),
+        Action::Decrypt,
+        Outcome::Ok,
+        "tag-verified",
+    );
     audit.record("key-1".into(), Action::Revoke, Outcome::Ok, "jti=abc123");
 
     let rendered = audit.to_text();
-    assert!(rendered.contains("key-1"), "the key id must be there: {rendered}");
-    assert!(!rendered.contains("sk-must-never-appear"), "the key leaked into the audit log: {rendered}");
-    assert!(!rendered.contains(&envelope), "the envelope leaked into the audit log: {rendered}");
-    assert!(!rendered.contains(&format!("{secret:?}")), "a Debug of the secret leaked: {rendered}");
+    assert!(
+        rendered.contains("key-1"),
+        "the key id must be there: {rendered}"
+    );
+    assert!(
+        !rendered.contains("sk-must-never-appear"),
+        "the key leaked into the audit log: {rendered}"
+    );
+    assert!(
+        !rendered.contains(&envelope),
+        "the envelope leaked into the audit log: {rendered}"
+    );
+    assert!(
+        !rendered.contains(&format!("{secret:?}")),
+        "a Debug of the secret leaked: {rendered}"
+    );
 }
 
 #[test]

@@ -213,7 +213,10 @@ pub fn score(key: &AffinityKey, target: &AffinityTarget) -> f64 {
 /// candidate. The reference bails out on `targets.length <= 1` for the same
 /// reason.
 #[must_use]
-pub fn order<'a>(key: Option<&AffinityKey>, targets: &'a [AffinityTarget]) -> Vec<&'a AffinityTarget> {
+pub fn order<'a>(
+    key: Option<&AffinityKey>,
+    targets: &'a [AffinityTarget],
+) -> Vec<&'a AffinityTarget> {
     let Some(key) = key else {
         return targets.iter().collect();
     };
@@ -352,7 +355,10 @@ mod tests {
     fn an_all_user_conversation_yields_no_prefix_key() {
         // The empty-prefix guard. Without it every first-turn conversation
         // hashes to the same digest and pins to one upstream.
-        assert_eq!(prefix_key("t", "m", &[TurnPrefix::User, TurnPrefix::User]), None);
+        assert_eq!(
+            prefix_key("t", "m", &[TurnPrefix::User, TurnPrefix::User]),
+            None
+        );
     }
 
     #[test]
@@ -365,7 +371,12 @@ mod tests {
         // A growing conversation must not change the key, or every turn is a
         // new key and nothing is ever pinned.
         let one = [TurnPrefix::System, TurnPrefix::User];
-        let two = [TurnPrefix::System, TurnPrefix::User, TurnPrefix::Assistant, TurnPrefix::User];
+        let two = [
+            TurnPrefix::System,
+            TurnPrefix::User,
+            TurnPrefix::Assistant,
+            TurnPrefix::User,
+        ];
         assert_eq!(prefix_key("t", "m", &one), prefix_key("t", "m", &two));
     }
 
@@ -386,9 +397,13 @@ mod tests {
 
     #[test]
     fn an_explicit_key_wins_over_the_derived_prefix() {
-        let resolved = resolve_key("t", "m", &system_then_user(), Some("  my-key  ")).expect("explicit");
+        let resolved =
+            resolve_key("t", "m", &system_then_user(), Some("  my-key  ")).expect("explicit");
         assert_eq!(resolved.source, AffinitySource::Explicit);
-        assert_ne!(resolved.key, prefix_key("t", "m", &system_then_user()).expect("prefix"));
+        assert_ne!(
+            resolved.key,
+            prefix_key("t", "m", &system_then_user()).expect("prefix")
+        );
     }
 
     #[test]
@@ -425,7 +440,10 @@ mod tests {
         // If this fails, every target ties and "affinity" is a no-op that
         // silently degrades routing to first-in-list.
         let key = resolve_key("t", "m", &system_then_user(), None).expect("key");
-        assert_ne!(score(&key, &target("groq")).to_bits(), score(&key, &target("openai")).to_bits());
+        assert_ne!(
+            score(&key, &target("groq")).to_bits(),
+            score(&key, &target("openai")).to_bits()
+        );
     }
 
     #[test]
@@ -516,8 +534,14 @@ mod tests {
     fn ordering_is_stable_across_calls() {
         let targets = [target("a"), target("b"), target("c")];
         let key = resolve_key("t", "m", &system_then_user(), None).expect("key");
-        let first: Vec<String> = order(Some(&key), &targets).iter().map(|t| t.identity()).collect();
-        let second: Vec<String> = order(Some(&key), &targets).iter().map(|t| t.identity()).collect();
+        let first: Vec<String> = order(Some(&key), &targets)
+            .iter()
+            .map(|t| t.identity())
+            .collect();
+        let second: Vec<String> = order(Some(&key), &targets)
+            .iter()
+            .map(|t| t.identity())
+            .collect();
         assert_eq!(first, second);
     }
 
@@ -525,7 +549,10 @@ mod tests {
     fn best_agrees_with_the_first_element_of_order() {
         let targets = [target("a"), target("b"), target("c")];
         let key = resolve_key("t", "m", &system_then_user(), None).expect("key");
-        assert_eq!(best(&key, &targets), order(Some(&key), &targets).first().copied());
+        assert_eq!(
+            best(&key, &targets),
+            order(Some(&key), &targets).first().copied()
+        );
     }
 
     #[test]
@@ -546,7 +573,10 @@ mod tests {
         let key = resolve_key("t", "m", &system_then_user(), None).expect("key");
         let fp = fingerprint(&key);
         assert_eq!(fp.len(), 12);
-        assert!(fp.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            fp.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
     }
 
     #[test]

@@ -268,7 +268,11 @@ async fn carries_the_callers_bearer_on_an_oauth_dispatch() {
     };
 
     let stream = exec
-        .post(&shape, br#"{"model":"test-model"}"#, &CancellationToken::new())
+        .post(
+            &shape,
+            br#"{"model":"test-model"}"#,
+            &CancellationToken::new(),
+        )
         .await
         .expect("mock upstream answers 200");
     server.abort();

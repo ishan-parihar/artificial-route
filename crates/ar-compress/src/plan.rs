@@ -177,7 +177,11 @@ impl Engine {
     pub const fn levels(self) -> &'static [Intensity] {
         match self {
             Self::Lite => &[],
-            Self::Rtk => &[Intensity::Minimal, Intensity::Standard, Intensity::Aggressive],
+            Self::Rtk => &[
+                Intensity::Minimal,
+                Intensity::Standard,
+                Intensity::Aggressive,
+            ],
             Self::Caveman => &[Intensity::Lite, Intensity::Full, Intensity::Ultra],
         }
     }
@@ -287,7 +291,9 @@ impl Intensity {
     #[must_use]
     pub fn from_id(id: &str) -> Option<Self> {
         let id = id.trim();
-        Self::ALL.into_iter().find(|l| l.as_str().eq_ignore_ascii_case(id))
+        Self::ALL
+            .into_iter()
+            .find(|l| l.as_str().eq_ignore_ascii_case(id))
     }
 }
 
@@ -507,8 +513,9 @@ fn plan_from_header(combos: &[Combo<'_>], layers: &Layers<'_>, header: &str) -> 
     combos
         .iter()
         .find(|c| {
-            c.name.is_some_and(|name| !name.trim().is_empty() && name.trim().eq_ignore_ascii_case(header))
-                || c.id.eq_ignore_ascii_case(header)
+            c.name.is_some_and(|name| {
+                !name.trim().is_empty() && name.trim().eq_ignore_ascii_case(header)
+            }) || c.id.eq_ignore_ascii_case(header)
         })
         .map(|combo| Plan {
             steps: combo.steps.to_vec(),
@@ -627,8 +634,8 @@ mod tests {
     use std::borrow::Cow;
 
     use super::{
-        Combo, Engine, Intensity, Layers, Plan, Source, Step, Transform, apply_plan, plan_resolution,
-        registered,
+        Combo, Engine, Intensity, Layers, Plan, Source, Step, Transform, apply_plan,
+        plan_resolution, registered,
     };
 
     const BALANCED: &[Step] = &[Step::new(Engine::Lite), Step::new(Engine::Caveman)];
@@ -720,13 +727,25 @@ mod tests {
 
     #[test]
     fn resolves_off_for_the_off_header() {
-        let plan = plan_resolution(&combos(), &Layers { header: Some("off"), ..all_layers_set() });
+        let plan = plan_resolution(
+            &combos(),
+            &Layers {
+                header: Some("off"),
+                ..all_layers_set()
+            },
+        );
         assert!(plan.is_off());
     }
 
     #[test]
     fn treats_blank_header_as_unset() {
-        let plan = plan_resolution(&combos(), &Layers { header: Some("   "), ..all_layers_set() });
+        let plan = plan_resolution(
+            &combos(),
+            &Layers {
+                header: Some("   "),
+                ..all_layers_set()
+            },
+        );
         assert_eq!(plan.source, Source::Combo);
     }
 
@@ -752,14 +771,20 @@ mod tests {
                 ..all_layers_set()
             },
         );
-        assert_eq!(plan.steps, [Step::new(Engine::Rtk), Step::new(Engine::Lite)]);
+        assert_eq!(
+            plan.steps,
+            [Step::new(Engine::Rtk), Step::new(Engine::Lite)]
+        );
     }
 
     #[test]
     fn resolves_engine_header_to_one_step() {
         let plan = plan_resolution(
             &combos(),
-            &Layers { header: Some("engine:caveman"), ..all_layers_set() },
+            &Layers {
+                header: Some("engine:caveman"),
+                ..all_layers_set()
+            },
         );
         assert_eq!(plan.steps, [Step::new(Engine::Caveman)]);
     }
@@ -768,7 +793,10 @@ mod tests {
     fn resolves_uppercase_header_the_same_way() {
         let plan = plan_resolution(
             &combos(),
-            &Layers { header: Some("BALANCED"), ..all_layers_set() },
+            &Layers {
+                header: Some("BALANCED"),
+                ..all_layers_set()
+            },
         );
         assert_eq!(plan.steps, BALANCED);
     }
@@ -777,7 +805,10 @@ mod tests {
     fn falls_through_for_an_unknown_engine_id() {
         let plan = plan_resolution(
             &combos(),
-            &Layers { header: Some("engine:llmlingua"), ..all_layers_set() },
+            &Layers {
+                header: Some("engine:llmlingua"),
+                ..all_layers_set()
+            },
         );
         assert_eq!(plan.source, Source::Combo);
     }
@@ -793,7 +824,10 @@ mod tests {
         ] {
             let plan = plan_resolution(
                 &combos(),
-                &Layers { header: Some(mode), ..all_layers_set() },
+                &Layers {
+                    header: Some(mode),
+                    ..all_layers_set()
+                },
             );
             assert_eq!(plan.steps, [step], "{mode}");
             assert_eq!(plan.source, Source::Header, "{mode}");
@@ -804,7 +838,10 @@ mod tests {
     fn resolves_a_reference_mode_case_insensitively() {
         let plan = plan_resolution(
             &combos(),
-            &Layers { header: Some(" ULTRA "), ..all_layers_set() },
+            &Layers {
+                header: Some(" ULTRA "),
+                ..all_layers_set()
+            },
         );
         assert_eq!(plan.steps, [Step::at(Engine::Caveman, Intensity::Ultra)]);
     }
@@ -813,8 +850,18 @@ mod tests {
     /// pipeline outranks a built-in approximation of the same word.
     #[test]
     fn prefers_a_named_combo_over_a_reference_mode_of_the_same_name() {
-        let named = [Combo { id: "ultra", name: None, steps: LITE_ONLY }];
-        let plan = plan_resolution(&named, &Layers { header: Some("ultra"), ..all_layers_set() });
+        let named = [Combo {
+            id: "ultra",
+            name: None,
+            steps: LITE_ONLY,
+        }];
+        let plan = plan_resolution(
+            &named,
+            &Layers {
+                header: Some("ultra"),
+                ..all_layers_set()
+            },
+        );
         assert_eq!(plan.steps, LITE_ONLY);
     }
 
@@ -825,7 +872,10 @@ mod tests {
         for mode in ["extreme", "summarizing", "ultra-ish"] {
             let plan = plan_resolution(
                 &combos(),
-                &Layers { header: Some(mode), ..all_layers_set() },
+                &Layers {
+                    header: Some(mode),
+                    ..all_layers_set()
+                },
             );
             assert_eq!(plan.source, Source::Combo, "{mode}");
         }
@@ -835,17 +885,27 @@ mod tests {
     fn matches_combo_by_id_when_name_does_not() {
         let plan = plan_resolution(
             &combos(),
-            &Layers { header: Some("c1"), ..all_layers_set() },
+            &Layers {
+                header: Some("c1"),
+                ..all_layers_set()
+            },
         );
         assert_eq!(plan.steps, BALANCED);
     }
 
     #[test]
     fn ignores_a_blank_combo_name() {
-        let blank = [Combo { id: "c9", name: Some("  "), steps: BALANCED }];
+        let blank = [Combo {
+            id: "c9",
+            name: Some("  "),
+            steps: BALANCED,
+        }];
         let plan = plan_resolution(
             &blank,
-            &Layers { header: Some("c9"), ..all_layers_set() },
+            &Layers {
+                header: Some("c9"),
+                ..all_layers_set()
+            },
         );
         assert_eq!(plan.steps, BALANCED);
     }
@@ -865,7 +925,10 @@ mod tests {
 
         let plan = plan_resolution(
             &combos,
-            &Layers { header: Some("Balanced-Combo"), ..all_layers_set() },
+            &Layers {
+                header: Some("Balanced-Combo"),
+                ..all_layers_set()
+            },
         );
 
         assert_eq!(plan.steps, BALANCED, "the id branch must ignore casing");
@@ -878,7 +941,10 @@ mod tests {
     fn falls_through_when_only_the_id_differs() {
         let plan = plan_resolution(
             &combos(),
-            &Layers { header: Some("c2"), ..all_layers_set() },
+            &Layers {
+                header: Some("c2"),
+                ..all_layers_set()
+            },
         );
 
         assert_eq!(plan.source, Source::Combo);
@@ -892,14 +958,16 @@ mod tests {
     fn distinguishes_an_explicit_off_from_a_silent_one() {
         let explicit = plan_resolution(
             &combos(),
-            &Layers { header: Some("off"), ..all_layers_set() },
+            &Layers {
+                header: Some("off"),
+                ..all_layers_set()
+            },
         );
         let silent = plan_resolution(&combos(), &Layers::default());
 
         assert!(explicit.is_off() && silent.is_off());
         assert_ne!(
-            explicit.source,
-            silent.source,
+            explicit.source, silent.source,
             "an explicit `off` and a silent one must not share a source",
         );
         assert_eq!(explicit.source, Source::Header);
@@ -929,25 +997,44 @@ mod tests {
     #[test]
     fn borrows_input_when_plan_is_off() {
         let plan = Plan::off(Source::Default);
-        assert!(matches!(apply_plan(&plan, "x", registered()), Cow::Borrowed(_)));
+        assert!(matches!(
+            apply_plan(&plan, "x", registered()),
+            Cow::Borrowed(_)
+        ));
     }
 
     #[test]
     fn borrows_input_when_single_engine_declines() {
-        let plan = Plan { steps: vec![Step::new(Engine::Lite)], source: Source::Default };
-        assert!(matches!(apply_plan(&plan, "let x = 1;", registered()), Cow::Borrowed(_)));
+        let plan = Plan {
+            steps: vec![Step::new(Engine::Lite)],
+            source: Source::Default,
+        };
+        assert!(matches!(
+            apply_plan(&plan, "let x = 1;", registered()),
+            Cow::Borrowed(_)
+        ));
     }
 
     #[test]
     fn rewrites_when_single_engine_acts() {
-        let plan = Plan { steps: vec![Step::new(Engine::Caveman)], source: Source::Default };
-        let out = apply_plan(&plan, "It seems like the cache is basically re-validating.", registered());
+        let plan = Plan {
+            steps: vec![Step::new(Engine::Caveman)],
+            source: Source::Default,
+        };
+        let out = apply_plan(
+            &plan,
+            "It seems like the cache is basically re-validating.",
+            registered(),
+        );
         assert!(out.len() < 56, "caveman did not shrink: {out}");
     }
 
     #[test]
     fn collapses_repeated_lines_when_rtk_runs() {
-        let plan = Plan { steps: vec![Step::new(Engine::Rtk)], source: Source::Default };
+        let plan = Plan {
+            steps: vec![Step::new(Engine::Rtk)],
+            source: Source::Default,
+        };
         let out = apply_plan(&plan, "same\nsame\nsame\nsame\n", registered());
         assert!(out.contains("same"), "{out}");
     }
@@ -988,7 +1075,11 @@ mod tests {
     #[test]
     fn defaults_a_bare_engine_to_the_middle_of_its_own_ladder() {
         for engine in [Engine::Lite, Engine::Rtk, Engine::Caveman] {
-            let expected = engine.levels().get(1).copied().unwrap_or(Intensity::Standard);
+            let expected = engine
+                .levels()
+                .get(1)
+                .copied()
+                .unwrap_or(Intensity::Standard);
             assert_eq!(Step::new(engine).level, expected, "{engine}");
         }
     }
@@ -996,8 +1087,14 @@ mod tests {
     #[test]
     fn labels_a_non_default_level_so_an_echo_can_show_the_dial() {
         assert_eq!(Step::new(Engine::Rtk).label(), "rtk");
-        assert_eq!(Step::at(Engine::Rtk, Intensity::Aggressive).label(), "rtk@aggressive");
-        assert_eq!(Step::at(Engine::Caveman, Intensity::Lite).label(), "caveman@lite");
+        assert_eq!(
+            Step::at(Engine::Rtk, Intensity::Aggressive).label(),
+            "rtk@aggressive"
+        );
+        assert_eq!(
+            Step::at(Engine::Caveman, Intensity::Lite).label(),
+            "caveman@lite"
+        );
     }
 
     #[test]

@@ -50,10 +50,10 @@ use bytes::Bytes;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
+use ar_exec::Dispatch;
 use ar_exec::oauth::{
     Connected, Connection, HttpRefresher, OAuthKind, OAuthToken, Refresher, RotationPool, Session,
 };
-use ar_exec::Dispatch;
 
 /// One configured upstream provider's OAuth credentials, resolved and ready.
 ///
@@ -85,7 +85,12 @@ impl OAuthAuth {
         refresh: impl Into<String>,
         expires_at: Option<u64>,
     ) -> Self {
-        Self { session, access: access.into(), refresh: refresh.into(), expires_at }
+        Self {
+            session,
+            access: access.into(),
+            refresh: refresh.into(),
+            expires_at,
+        }
     }
 
     /// Whether this session can renew: a refresh token *and* an endpoint.
@@ -333,7 +338,9 @@ impl ProviderConfig {
         match &self.oauth {
             Some(auth) => {
                 auth.is_usable()
-                    && self.oauth_executor().is_some_and(|kind| auth.session.kind() == kind)
+                    && self
+                        .oauth_executor()
+                        .is_some_and(|kind| auth.session.kind() == kind)
             }
             // No session declared. A pasted access token in `keys:` still works
             // and simply cannot renew — unless the catalog says this provider needs
@@ -424,7 +431,11 @@ impl HttpExec {
     /// When the `reqwest` client cannot be constructed (TLS backend missing).
     pub fn new(providers: Vec<ProviderConfig>) -> Result<Self, String> {
         let core = ar_exec::ArExec::new().map_err(|e| format!("reqwest client: {e}"))?;
-        let by_id = providers.iter().cloned().map(|p| (p.id.clone(), p)).collect();
+        let by_id = providers
+            .iter()
+            .cloned()
+            .map(|p| (p.id.clone(), p))
+            .collect();
 
         // One pool for the whole process: connections share it because they are
         // keyed by token hash, and two connections sharing a *pool* is fine
@@ -450,8 +461,12 @@ impl HttpExec {
                 );
                 continue;
             }
-            match Connection::pending(auth.session.clone(), Arc::clone(&pool), Arc::clone(&refresher))
-                .connect(auth.token())
+            match Connection::pending(
+                auth.session.clone(),
+                Arc::clone(&pool),
+                Arc::clone(&refresher),
+            )
+            .connect(auth.token())
             {
                 Ok(conn) => {
                     oauth.insert(p.id.clone(), Arc::new(conn));
@@ -463,7 +478,12 @@ impl HttpExec {
             }
         }
 
-        Ok(Self { core: Arc::new(core), providers, by_id, oauth })
+        Ok(Self {
+            core: Arc::new(core),
+            providers,
+            by_id,
+            oauth,
+        })
     }
 
     /// Configured providers, in fallback order.
@@ -537,7 +557,10 @@ impl ArRouteExec for HttpExec {
             // rendering once outside it would mean either a second render or a body
             // it would render again.
             let stream = match self.oauth.get(provider) {
-                Some(conn) => conn.dispatch(&self.core, &shape, &canonical.body, &abort).await,
+                Some(conn) => {
+                    conn.dispatch(&self.core, &shape, &canonical.body, &abort)
+                        .await
+                }
                 None => {
                     // Rendered here, once, so the API-key path posts a body already
                     // in the provider's wire.
@@ -637,9 +660,8 @@ impl ArRouteExec for HttpExec {
                 ));
             }
 
-            let endpoint = ar_exec::MediaEndpoint::from_path(endpoint).ok_or_else(|| {
-                ExecError(format!("unknown media endpoint path: {endpoint}"))
-            })?;
+            let endpoint = ar_exec::MediaEndpoint::from_path(endpoint)
+                .ok_or_else(|| ExecError(format!("unknown media endpoint path: {endpoint}")))?;
 
             let shape = cfg.dispatch(false);
             let bytes = rewrite_json_model(body, content_type, shape.upstream_model);
@@ -747,7 +769,11 @@ mod tests {
     fn an_anthropic_wire_is_dispatchable() {
         // The unblock: a Claude-dialect provider used to be refused here, so it
         // never entered a candidate list and could not dispatch at all.
-        assert!(cfg("p").with_wire_format(WireFormat::Anthropic).is_dispatchable());
+        assert!(
+            cfg("p")
+                .with_wire_format(WireFormat::Anthropic)
+                .is_dispatchable()
+        );
     }
 
     #[test]
@@ -758,7 +784,12 @@ mod tests {
             .with_weight(2)
             .with_quota(QuotaWindow::new(100, 10, 0));
         assert_eq!(
-            (p.input_usd_per_mtok, p.rank, p.weight, p.quota.map(|q| q.remaining())),
+            (
+                p.input_usd_per_mtok,
+                p.rank,
+                p.weight,
+                p.quota.map(|q| q.remaining())
+            ),
             (Some(0.15), 3, 2, Some(90))
         );
     }
@@ -776,7 +807,13 @@ mod tests {
     #[test]
     fn carries_provider_headers_into_the_dispatch_bundle() {
         let p = cfg("p").with_headers([("x-api-key".to_owned(), "v".to_owned())].into());
-        assert_eq!(p.dispatch(false).headers.get("x-api-key").map(String::as_str), Some("v"));
+        assert_eq!(
+            p.dispatch(false)
+                .headers
+                .get("x-api-key")
+                .map(String::as_str),
+            Some("v")
+        );
     }
 
     #[test]
@@ -818,28 +855,49 @@ mod tests {
 
     #[test]
     fn connects_an_oauth_session_from_resolved_credentials() {
-        let exec = HttpExec::new(vec![ProviderConfig::new(ProviderId::new("codex"), "https://x/v1", "")
-            .with_oauth(auth(OAuthKind::Codex, "synthetic-access", "synthetic-refresh", Some("https://a/t")))])
-            .expect("executor builds");
-        assert!(exec.oauth(&ProviderId::new("codex")).is_some(), "a connected session");
+        let exec = HttpExec::new(vec![
+            ProviderConfig::new(ProviderId::new("codex"), "https://x/v1", "").with_oauth(auth(
+                OAuthKind::Codex,
+                "synthetic-access",
+                "synthetic-refresh",
+                Some("https://a/t"),
+            )),
+        ])
+        .expect("executor builds");
+        assert!(
+            exec.oauth(&ProviderId::new("codex")).is_some(),
+            "a connected session"
+        );
     }
 
     #[test]
     fn omits_an_oauth_session_whose_access_token_is_empty() {
         // One dead account must not take a proxy with nine live ones down, and it
         // must not become an unauthenticated upstream call either.
-        let exec = HttpExec::new(vec![ProviderConfig::new(ProviderId::new("codex"), "https://x/v1", "")
-            .with_oauth(auth(OAuthKind::Codex, "  ", "", Some("https://a/t")))])
-            .expect("executor builds");
+        let exec = HttpExec::new(vec![
+            ProviderConfig::new(ProviderId::new("codex"), "https://x/v1", "").with_oauth(auth(
+                OAuthKind::Codex,
+                "  ",
+                "",
+                Some("https://a/t"),
+            )),
+        ])
+        .expect("executor builds");
         assert!(exec.oauth(&ProviderId::new("codex")).is_none());
     }
 
     #[test]
     fn omits_an_oauth_session_for_a_provider_this_build_cannot_authenticate() {
         // R1: kilocode keeps no connection rather than a guessed one.
-        let exec = HttpExec::new(vec![ProviderConfig::new(ProviderId::new("kilocode"), "https://x/v1", "")
-            .with_oauth(auth(OAuthKind::Cline, "synthetic-access", "", Some("https://a/t")))])
-            .expect("executor builds");
+        let exec = HttpExec::new(vec![
+            ProviderConfig::new(ProviderId::new("kilocode"), "https://x/v1", "").with_oauth(auth(
+                OAuthKind::Cline,
+                "synthetic-access",
+                "",
+                Some("https://a/t"),
+            )),
+        ])
+        .expect("executor builds");
         assert!(exec.oauth(&ProviderId::new("kilocode")).is_none());
     }
 
@@ -847,38 +905,63 @@ mod tests {
     fn reports_a_keyless_provider_without_an_executor_as_dispatchable() {
         // The other half of the same flag: a provider the catalog does *not* label
         // `oauth` is unaffected, or every keyless provider would be dropped.
-        assert!(ProviderConfig::new(ProviderId::new("ollama"), "https://x/v1", "").is_dispatchable());
+        assert!(
+            ProviderConfig::new(ProviderId::new("ollama"), "https://x/v1", "").is_dispatchable()
+        );
     }
 
     #[test]
     fn reports_a_provider_with_a_matching_executor_and_session_as_dispatchable() {
         let p = ProviderConfig::new(ProviderId::new("codex"), "https://x/v1", "")
             .with_needs_oauth_executor(true)
-            .with_oauth(auth(OAuthKind::Codex, "synthetic-access", "synthetic-refresh", Some("https://a/t")));
+            .with_oauth(auth(
+                OAuthKind::Codex,
+                "synthetic-access",
+                "synthetic-refresh",
+                Some("https://a/t"),
+            ));
         assert!(p.is_dispatchable());
     }
 
     #[test]
     fn reports_an_armed_oauth_session_as_dispatchable() {
-        let p = ProviderConfig::new(ProviderId::new("codex"), "https://x/v1", "")
-            .with_oauth(auth(OAuthKind::Codex, "synthetic-access", "synthetic-refresh", Some("https://a/t")));
+        let p = ProviderConfig::new(ProviderId::new("codex"), "https://x/v1", "").with_oauth(auth(
+            OAuthKind::Codex,
+            "synthetic-access",
+            "synthetic-refresh",
+            Some("https://a/t"),
+        ));
         assert!(p.is_dispatchable());
     }
 
     #[test]
     fn reports_an_oauth_session_with_no_access_token_as_undispatchable() {
-        let p = ProviderConfig::new(ProviderId::new("codex"), "https://x/v1", "")
-            .with_oauth(auth(OAuthKind::Codex, "", "synthetic-refresh", Some("https://a/t")));
-        assert!(!p.is_dispatchable(), "an empty bearer must not enter the candidate list");
+        let p = ProviderConfig::new(ProviderId::new("codex"), "https://x/v1", "").with_oauth(auth(
+            OAuthKind::Codex,
+            "",
+            "synthetic-refresh",
+            Some("https://a/t"),
+        ));
+        assert!(
+            !p.is_dispatchable(),
+            "an empty bearer must not enter the candidate list"
+        );
     }
 
     #[test]
     fn reports_an_oauth_provider_with_no_known_executor_as_undispatchable() {
         // The F-CRIT-1 gate: an `oauthType` provider this build cannot
         // authenticate is not dispatchable, so it never burns an attempt slot.
-        let p = ProviderConfig::new(ProviderId::new("kimi-coding"), "https://x/v1", "synthetic-access")
-            .with_needs_oauth_executor(true);
-        assert!(!p.is_dispatchable(), "no executor, so no way to authenticate");
+        let p = ProviderConfig::new(
+            ProviderId::new("kimi-coding"),
+            "https://x/v1",
+            "synthetic-access",
+        )
+        .with_needs_oauth_executor(true);
+        assert!(
+            !p.is_dispatchable(),
+            "no executor, so no way to authenticate"
+        );
     }
 
     #[test]
@@ -906,29 +989,49 @@ mod tests {
     fn reports_a_session_without_a_refresh_path_as_usable_but_not_renewable() {
         let a = auth(OAuthKind::Cline, "synthetic-access", "", None);
         assert!(a.is_usable());
-        assert!(!a.can_refresh(), "a token with no refresh and no endpoint cannot renew");
+        assert!(
+            !a.can_refresh(),
+            "a token with no refresh and no endpoint cannot renew"
+        );
     }
 
     #[test]
     fn keeps_the_access_token_out_of_the_oauth_debug_output() {
         let rendered = format!(
             "{:?}",
-            auth(OAuthKind::Codex, "synthetic-access", "synthetic-refresh", Some("https://a/t"))
+            auth(
+                OAuthKind::Codex,
+                "synthetic-access",
+                "synthetic-refresh",
+                Some("https://a/t")
+            )
         );
         assert!(!rendered.contains("synthetic-access"), "{rendered}");
     }
 
     #[test]
     fn carries_an_expiry_onto_the_token_it_hands_over() {
-        let token = auth(OAuthKind::Codex, "synthetic-access", "synthetic-refresh", Some("https://a/t")).token();
+        let token = auth(
+            OAuthKind::Codex,
+            "synthetic-access",
+            "synthetic-refresh",
+            Some("https://a/t"),
+        )
+        .token();
         assert!(token.can_refresh());
         assert_eq!(token.access().expose(), "synthetic-access");
-        assert!(!token.is_expiring(0), "an expiry in the future is not stale");
+        assert!(
+            !token.is_expiring(0),
+            "an expiry in the future is not stale"
+        );
     }
     #[test]
     fn hands_over_a_token_with_no_refresh_row_as_unrenewable() {
         let token = auth(OAuthKind::Cline, "synthetic-access", "", None).token();
-        assert!(!token.can_refresh(), "an empty refresh row is no refresh row");
+        assert!(
+            !token.can_refresh(),
+            "an empty refresh row is no refresh row"
+        );
     }
 
     #[tokio::test]
@@ -937,11 +1040,20 @@ mod tests {
         // 401 whose body names the dead account. Asserted here because the
         // conversion lives at the boundary where the typed error becomes an
         // `Upstream`, and nowhere else.
-        let exec = HttpExec::new(vec![ProviderConfig::new(ProviderId::new("cline"), "https://x/v1", "")
-            .with_needs_oauth_executor(true)
-            .with_oauth(auth(OAuthKind::Cline, "synthetic-access", "synthetic-refresh", Some("https://a/t")))])
-            .expect("executor builds");
-        let conn = exec.oauth(&ProviderId::new("cline")).expect("a live connection");
+        let exec = HttpExec::new(vec![
+            ProviderConfig::new(ProviderId::new("cline"), "https://x/v1", "")
+                .with_needs_oauth_executor(true)
+                .with_oauth(auth(
+                    OAuthKind::Cline,
+                    "synthetic-access",
+                    "synthetic-refresh",
+                    Some("https://a/t"),
+                )),
+        ])
+        .expect("executor builds");
+        let conn = exec
+            .oauth(&ProviderId::new("cline"))
+            .expect("a live connection");
         conn.quarantine(ar_exec::oauth::TerminalReport {
             provider: "cline".to_owned(),
             refresh_status: 400,
@@ -957,7 +1069,11 @@ mod tests {
             .await
             .expect("a verdict, not an error");
 
-        assert_eq!(outcome.status, StatusCode::UNAUTHORIZED, "a terminal session is a 401, not a 502");
+        assert_eq!(
+            outcome.status,
+            StatusCode::UNAUTHORIZED,
+            "a terminal session is a 401, not a 502"
+        );
         let text = String::from_utf8(outcome.error_body.to_vec()).expect("utf-8 json");
         assert!(text.contains("oauth_terminal"), "{text}");
         assert!(text.contains("cline"), "{text}");
@@ -1023,7 +1139,10 @@ mod tests {
     #[test]
     fn renders_a_gemini_family_dispatch_in_the_gemini_dialect() {
         let (body, value) = renders_for(WireFormat::Gemini, "gemini-3-pro");
-        assert_eq!(value["systemInstruction"]["parts"][0]["text"], "be terse", "{body}");
+        assert_eq!(
+            value["systemInstruction"]["parts"][0]["text"], "be terse",
+            "{body}"
+        );
         assert_eq!(value["generationConfig"]["maxOutputTokens"], 64, "{body}");
     }
 
@@ -1036,15 +1155,24 @@ mod tests {
     #[test]
     fn renders_a_cursor_family_dispatch_in_the_cursor_dialect() {
         let (body, value) = renders_for(WireFormat::Cursor, "cursor-small");
-        assert_eq!(value["messages"][0]["content"], "[System Instructions]\nbe terse", "{body}");
-        assert!(value.get("system").is_none(), "cursor has no system field: {body}");
+        assert_eq!(
+            value["messages"][0]["content"], "[System Instructions]\nbe terse",
+            "{body}"
+        );
+        assert!(
+            value.get("system").is_none(),
+            "cursor has no system field: {body}"
+        );
     }
 
     #[test]
     fn renders_a_clova_family_dispatch_in_the_clova_dialect() {
         let (body, value) = renders_for(WireFormat::Clova, "HCX-005");
         assert_eq!(value["maxTokens"], 64, "{body}");
-        assert!(value.get("max_tokens").is_none(), "the openai spelling is not a clova key: {body}");
+        assert!(
+            value.get("max_tokens").is_none(),
+            "the openai spelling is not a clova key: {body}"
+        );
     }
 
     #[test]
@@ -1071,7 +1199,10 @@ mod tests {
             WireFormat::Clova,
             WireFormat::Kiro,
         ] {
-            assert!(cfg("p").with_wire_format(dialect).is_dispatchable(), "{dialect:?}");
+            assert!(
+                cfg("p").with_wire_format(dialect).is_dispatchable(),
+                "{dialect:?}"
+            );
         }
     }
 
@@ -1083,6 +1214,9 @@ mod tests {
         // The chat-completions system role stays a role rather than being hoisted
         // onto a top-level `system` block the way the claude arm does.
         assert_eq!(value["messages"][0]["role"], "system", "{body}");
-        assert!(value.get("system").is_none(), "a claude body leaked onto the openai wire: {body}");
+        assert!(
+            value.get("system").is_none(),
+            "a claude body leaked onto the openai wire: {body}"
+        );
     }
 }

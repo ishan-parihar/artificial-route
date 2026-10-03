@@ -114,7 +114,11 @@ pub(crate) mod b64 {
         #[test]
         fn encoded_len_matches_the_encoder_for_the_envelope_field_sizes() {
             for n in [0_usize, 1, 3, 12, 16, 17, 32, 64] {
-                assert_eq!(URL_SAFE_NO_PAD.encode(vec![0_u8; n]).len(), encoded_len(n), "n={n}");
+                assert_eq!(
+                    URL_SAFE_NO_PAD.encode(vec![0_u8; n]).len(),
+                    encoded_len(n),
+                    "n={n}"
+                );
             }
         }
     }
@@ -135,7 +139,8 @@ pub(crate) mod b64_salt {
     /// Deserializes a base64 salt of exactly the right length.
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; SALT_LEN], D::Error> {
         let raw = String::deserialize(d)?;
-        let bytes = super::b64::decode(&raw).ok_or_else(|| serde::de::Error::custom("salt is not base64"))?;
+        let bytes = super::b64::decode(&raw)
+            .ok_or_else(|| serde::de::Error::custom("salt is not base64"))?;
         bytes.try_into().map_err(|v: Vec<u8>| {
             let n = v.len();
             serde::de::Error::custom(format!("salt must be {SALT_LEN} bytes, got {n}"))

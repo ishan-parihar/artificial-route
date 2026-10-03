@@ -163,7 +163,9 @@ impl std::fmt::Debug for PendingLogins {
     /// `Debug` that printed one would be a way to read another caller's login out
     /// of a log.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PendingLogins").field("pending", &self.len()).finish_non_exhaustive()
+        f.debug_struct("PendingLogins")
+            .field("pending", &self.len())
+            .finish_non_exhaustive()
     }
 }
 
@@ -220,7 +222,11 @@ impl PendingLogins {
         let mut entries = self.lock();
         prune(&mut entries);
         let mut rows: Vec<PendingRow> = entries.values().map(PendingLogin::row).collect();
-        rows.sort_by(|a, b| a.provider.cmp(&b.provider).then(a.session_id.cmp(&b.session_id)));
+        rows.sort_by(|a, b| {
+            a.provider
+                .cmp(&b.provider)
+                .then(a.session_id.cmp(&b.session_id))
+        });
         rows
     }
 
@@ -281,7 +287,11 @@ mod tests {
     fn start(table: &PendingLogins) -> String {
         let t = target();
         let request = new_authorize_request(&t.session, &t.redirect_uri);
-        table.start(t.session.provider(), request, "https://auth.example/authorize?x=1".to_owned())
+        table.start(
+            t.session.provider(),
+            request,
+            "https://auth.example/authorize?x=1".to_owned(),
+        )
     }
 
     #[test]
@@ -316,8 +326,15 @@ mod tests {
         let t = target();
         let request = new_authorize_request(&t.session, &t.redirect_uri);
         let verifier = request.verifier.clone();
-        let id = table.start(t.session.provider(), request, "https://auth.example/authorize".to_owned());
-        assert_eq!(table.take(&id).expect("pending").request().verifier, verifier);
+        let id = table.start(
+            t.session.provider(),
+            request,
+            "https://auth.example/authorize".to_owned(),
+        );
+        assert_eq!(
+            table.take(&id).expect("pending").request().verifier,
+            verifier
+        );
     }
 
     #[test]
@@ -326,7 +343,11 @@ mod tests {
         // zero seconds left, and `prune` drops it. Five minutes is not something a
         // test should wait for, so the rule is asserted on the helper.
         let stale = Instant::now() - LOGIN_TTL;
-        assert_eq!(remaining(stale, LOGIN_TTL), Duration::ZERO, "a stale entry has no budget left");
+        assert_eq!(
+            remaining(stale, LOGIN_TTL),
+            Duration::ZERO,
+            "a stale entry has no budget left"
+        );
     }
 
     #[test]
@@ -355,8 +376,16 @@ mod tests {
         let id = start(&table);
         let row = table.take(&id).expect("pending").row();
         let json = serde_json::to_string(&row).expect("serialises");
-        for banned in ["verifier", "code_challenge", "access_token", "refresh_token"] {
-            assert!(!json.contains(banned), "{banned} leaked into a status row: {json}");
+        for banned in [
+            "verifier",
+            "code_challenge",
+            "access_token",
+            "refresh_token",
+        ] {
+            assert!(
+                !json.contains(banned),
+                "{banned} leaked into a status row: {json}"
+            );
         }
     }
 
@@ -375,7 +404,10 @@ mod tests {
         let id = start(&table);
         let pending = table.take(&id).expect("pending");
         let text = format!("{pending:?}");
-        assert!(!text.contains(&pending.request().verifier), "the verifier reached a Debug: {text}");
+        assert!(
+            !text.contains(&pending.request().verifier),
+            "the verifier reached a Debug: {text}"
+        );
     }
 
     #[test]
@@ -383,7 +415,10 @@ mod tests {
         let table = PendingLogins::default();
         let id = start(&table);
         let text = format!("{table:?}");
-        assert!(!text.contains(&id), "a pending session id is a redeemable handle: {text}");
+        assert!(
+            !text.contains(&id),
+            "a pending session id is a redeemable handle: {text}"
+        );
     }
 
     #[test]
@@ -391,7 +426,10 @@ mod tests {
         let table = PendingLogins::default();
         let id = start(&table);
         table.discard("codex");
-        assert!(table.take(&id).is_none(), "a forgotten login cannot be redeemed");
+        assert!(
+            table.take(&id).is_none(),
+            "a forgotten login cannot be redeemed"
+        );
     }
 
     #[test]

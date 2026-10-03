@@ -39,7 +39,11 @@ impl ModelCard {
         } else {
             format!("{provider}/{upstream_model}")
         };
-        Self { id, provider, upstream_model }
+        Self {
+            id,
+            provider,
+            upstream_model,
+        }
     }
 }
 
@@ -129,13 +133,21 @@ impl<'a> ModelsCache<'a> {
     /// Builds an empty cache over `catalog` with [`MODELS_TTL`].
     #[must_use]
     pub fn new(catalog: &'a dyn ModelCatalog) -> Self {
-        Self { catalog, entry: Mutex::new(None), ttl: MODELS_TTL }
+        Self {
+            catalog,
+            entry: Mutex::new(None),
+            ttl: MODELS_TTL,
+        }
     }
 
     /// Builds an empty cache with an explicit TTL.
     #[must_use]
     pub fn with_ttl(catalog: &'a dyn ModelCatalog, ttl: Duration) -> Self {
-        Self { catalog, entry: Mutex::new(None), ttl }
+        Self {
+            catalog,
+            entry: Mutex::new(None),
+            ttl,
+        }
     }
 
     /// Returns the catalog, refreshing when stale or empty.
@@ -145,18 +157,24 @@ impl<'a> ModelsCache<'a> {
     pub fn get(&self) -> Cached {
         // A poisoned lock reads as "not fresh", so a failed refresh path
         // re-runs `load()` rather than trusting an unknown value.
-        let (fresh, had_entry) = self.entry.lock().ok().map_or((false, false), |e| {
-            match e.as_ref() {
-                None => (false, false),
-                Some(e) => (
-                    Instant::now().saturating_duration_since(e.stored_at) < self.ttl,
-                    true,
-                ),
-            }
-        });
+        let (fresh, had_entry) =
+            self.entry
+                .lock()
+                .ok()
+                .map_or((false, false), |e| match e.as_ref() {
+                    None => (false, false),
+                    Some(e) => (
+                        Instant::now().saturating_duration_since(e.stored_at) < self.ttl,
+                        true,
+                    ),
+                });
 
         if fresh {
-            return Cached { cards: self.snapshot_cards(), stale: false, revalidated: false };
+            return Cached {
+                cards: self.snapshot_cards(),
+                stale: false,
+                revalidated: false,
+            };
         }
 
         // Empty or past TTL: revalidate now, keeping the old value on failure.
@@ -166,7 +184,10 @@ impl<'a> ModelsCache<'a> {
                 // replaced" is the value just stored and the staleness is a lie.
                 let replaced = self.snapshot_cards();
                 if let Ok(mut e) = self.entry.lock() {
-                    *e = Some(Entry { cards, stored_at: Instant::now() });
+                    *e = Some(Entry {
+                        cards,
+                        stored_at: Instant::now(),
+                    });
                 }
                 // A caller that triggered a revalidation is answered with the
                 // value it replaced, marked stale: the refresh cost is paid here
@@ -176,7 +197,11 @@ impl<'a> ModelsCache<'a> {
                 // serves what it just loaded — an empty first `/v1/models` would
                 // be worse than a redundant one.
                 Cached {
-                    cards: if had_entry { replaced } else { self.snapshot_cards() },
+                    cards: if had_entry {
+                        replaced
+                    } else {
+                        self.snapshot_cards()
+                    },
                     stale: had_entry,
                     revalidated: true,
                 }
@@ -184,7 +209,11 @@ impl<'a> ModelsCache<'a> {
             Err(err) => {
                 // No secret, no request content: the catalog's own message only.
                 tracing::warn!(error = %err, "models catalog refresh failed, serving stale");
-                Cached { cards: self.snapshot_cards(), stale: true, revalidated: true }
+                Cached {
+                    cards: self.snapshot_cards(),
+                    stale: true,
+                    revalidated: true,
+                }
             }
         }
     }
@@ -193,7 +222,8 @@ impl<'a> ModelsCache<'a> {
     #[must_use]
     pub fn age(&self) -> Option<Duration> {
         let e = self.entry.lock().ok()?;
-        e.as_ref().map(|e| Instant::now().saturating_duration_since(e.stored_at))
+        e.as_ref()
+            .map(|e| Instant::now().saturating_duration_since(e.stored_at))
     }
 
     /// Whether the held value is past its TTL.
@@ -253,7 +283,10 @@ mod tests {
         let cache = ModelsCache::new(&cat);
         let first = cache.get();
         let second = cache.get();
-        assert_eq!((first.stale, second.stale, cat.calls.load(Ordering::Relaxed)), (false, false, 1));
+        assert_eq!(
+            (first.stale, second.stale, cat.calls.load(Ordering::Relaxed)),
+            (false, false, 1)
+        );
     }
 
     #[test]
@@ -281,7 +314,10 @@ mod tests {
         let cache = ModelsCache::with_ttl(&cat, Duration::from_nanos(1));
         let _ = cache.get();
         std::thread::sleep(Duration::from_millis(2));
-        assert!(cache.get().stale, "the read that revalidates is stale by definition");
+        assert!(
+            cache.get().stale,
+            "the read that revalidates is stale by definition"
+        );
     }
 
     #[test]
@@ -295,13 +331,27 @@ mod tests {
                 Ok(vec![ModelCard::new("p", format!("m{n}"))])
             }
         }
-        let cat = Rotating { calls: AtomicU64::new(0) };
+        let cat = Rotating {
+            calls: AtomicU64::new(0),
+        };
         let cache = ModelsCache::with_ttl(&cat, Duration::from_nanos(1));
-        assert_eq!(cache.get().cards[0].id, "p/m0", "a cold cache serves what it loaded");
+        assert_eq!(
+            cache.get().cards[0].id,
+            "p/m0",
+            "a cold cache serves what it loaded"
+        );
         std::thread::sleep(Duration::from_millis(2));
-        assert_eq!(cache.get().cards[0].id, "p/m0", "the revalidating read keeps the old value");
+        assert_eq!(
+            cache.get().cards[0].id,
+            "p/m0",
+            "the revalidating read keeps the old value"
+        );
         std::thread::sleep(Duration::from_millis(2));
-        assert_eq!(cache.get().cards[0].id, "p/m1", "the next read sees the new value");
+        assert_eq!(
+            cache.get().cards[0].id,
+            "p/m1",
+            "the next read sees the new value"
+        );
     }
 
     #[test]
@@ -327,7 +377,9 @@ mod tests {
                 }
             }
         }
-        let cat = Flaky { calls: AtomicU64::new(0) };
+        let cat = Flaky {
+            calls: AtomicU64::new(0),
+        };
         let cache = ModelsCache::with_ttl(&cat, Duration::from_nanos(1));
         let first = cache.get();
         std::thread::sleep(Duration::from_millis(2));
@@ -358,7 +410,9 @@ mod tests {
                 Ok(vec![card()])
             }
         }
-        let cat = Counting { calls: AtomicU64::new(0) };
+        let cat = Counting {
+            calls: AtomicU64::new(0),
+        };
         let m = Metrics::new();
         // A TTL long enough that the second read is fresh, so exactly one
         // revalidation happens.

@@ -172,7 +172,10 @@ impl AutoSelector {
             return Some((ranked[0].clone(), WinnerReason::ClearScore));
         }
         let reason = WinnerReason::Rotation;
-        Some((Self::take(ranked, reachable[n % reachable.len()], n), reason))
+        Some((
+            Self::take(ranked, reachable[n % reachable.len()], n),
+            reason,
+        ))
     }
 
     /// One index from `band`, rotating.
@@ -218,7 +221,6 @@ mod tests {
             model: crate::contract::Strng::from("m"),
             score,
             factors: crate::auto::scoring::healthy_factors(),
-
         }
     }
 
@@ -233,7 +235,12 @@ mod tests {
     fn promotes_half_of_rest_when_mid_is_empty() {
         // A 0.4 spread with one leader: everyone else is >30% below, so `mid`
         // would be empty and the pool would collapse to two bands.
-        let ranked = [scored("a", 1.0), scored("b", 0.4), scored("c", 0.4), scored("d", 0.4)];
+        let ranked = [
+            scored("a", 1.0),
+            scored("b", 0.4),
+            scored("c", 0.4),
+            scored("d", 0.4),
+        ];
         let (top, mid, rest) = group_into_tiers(&ranked);
         assert_eq!((top.len(), mid.len(), rest.len()), (1, 2, 1));
     }
@@ -259,7 +266,8 @@ mod tests {
         // in `rest` while keeping the spread under CLEAR_WINNER.
         let ranked = [scored("a", 0.8), scored("b", 0.8), scored("c", 0.72)];
         let cursor = AtomicU64::new(0);
-        let (got, _) = AutoSelector::select_ranked(&combo, &ranked, &cursor).expect("pool non-empty");
+        let (got, _) =
+            AutoSelector::select_ranked(&combo, &ranked, &cursor).expect("pool non-empty");
         assert_eq!(got.provider.as_str(), "a");
     }
 

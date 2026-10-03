@@ -348,7 +348,7 @@ impl RouteCombo {
 pub struct ServerConfig {
     /// Listen port.
     pub port: u16,
-/// Strategy for the *default* chain, used when `combos` is empty.
+    /// Strategy for the *default* chain, used when `combos` is empty.
     ///
     /// Per-combo strategy wins whenever `combos` is non-empty; this field is the
     /// environment path's strategy and the fallback for a combo with none.
@@ -360,7 +360,8 @@ pub struct ServerConfig {
     pub providers: Vec<ProviderConfig>,
     /// Routable combos. Empty means the flat provider list is the whole config,
     /// which is the environment path.
-    pub combos: Vec<RouteCombo>,    /// Prices for candidates that did not declare one.
+    pub combos: Vec<RouteCombo>,
+    /// Prices for candidates that did not declare one.
     ///
     /// Defaults to [`ar_tokens::PricingTable::global`] — `ar-registry`'s own
     /// compiled-in rows. A caller with richer data (a live `models.dev` sync, a
@@ -588,7 +589,9 @@ impl ServerConfig {
 
         for combo in &cfg.combos {
             if combo.targets.is_empty() {
-                return Err(ComboError::EmptyCombo { id: combo.id.clone() });
+                return Err(ComboError::EmptyCombo {
+                    id: combo.id.clone(),
+                });
             }
             let mut targets = Vec::with_capacity(combo.targets.len());
             for (rank, target) in combo.targets.iter().enumerate() {
@@ -655,9 +658,7 @@ impl ServerConfig {
 
         Ok(Self {
             port: port.unwrap_or(cfg.server.port),
-            strategy: combos
-                .first()
-                .map_or(Strategy::Priority, |c| c.strategy),
+            strategy: combos.first().map_or(Strategy::Priority, |c| c.strategy),
             providers,
             combos,
             prices: table,
@@ -841,11 +842,9 @@ impl ServerConfig {
     /// reaching into the table's private rows. An absent row is
     /// [`ar_tokens::Cost::UNPRICED`], which becomes `None` — not zero.
     fn price_of(&self, provider: &ProviderId, model: &str) -> Option<f64> {
-        let cost = self.prices.cost(
-            provider.as_str(),
-            model,
-            NormalizedUsage::new(1_000_000, 0),
-        );
+        let cost = self
+            .prices
+            .cost(provider.as_str(), model, NormalizedUsage::new(1_000_000, 0));
         cost.priced.then(|| cost.usd.as_f64())
     }
 
@@ -885,7 +884,10 @@ impl ServerConfig {
     /// because these seven are one flat env reader and a struct here would be a
     /// second source of truth for the same seven names.
     #[must_use]
-    #[allow(clippy::too_many_arguments, reason = "one field per env var; a config struct here would be a second source of truth")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one field per env var; a config struct here would be a second source of truth"
+    )]
     pub fn from_provider(
         port: Option<String>,
         base_url: Option<String>,
@@ -1051,7 +1053,9 @@ pub enum ComboError {
     /// "keyless provider", and a provider that *has* an entry resolving to
     /// nothing is that — but a name with no entry at all is a hole in the
     /// config, and it used to become an unauthenticated upstream call.
-    #[error("provider {provider:?} references key {key:?}, which is in neither the credential store nor `keys:`")]
+    #[error(
+        "provider {provider:?} references key {key:?}, which is in neither the credential store nor `keys:`"
+    )]
     UnresolvedKey {
         /// The provider that holds the dangling reference.
         provider: String,
@@ -1193,7 +1197,11 @@ fn anonymous_entry(
         return None;
     }
     let mut headers = def.headers.clone();
-    if let Some(editor) = declared.anonymous_editor.as_deref().filter(|e| !e.is_empty()) {
+    if let Some(editor) = declared
+        .anonymous_editor
+        .as_deref()
+        .filter(|e| !e.is_empty())
+    {
         headers.insert(ANONYMOUS_EDITOR_HEADER.to_owned(), editor.to_owned());
     }
     Some(
@@ -1264,7 +1272,12 @@ fn resolve_oauth(
         session = session.with_scope(scope);
     }
 
-    Ok(Some(OAuthAuth::new(session, access, refresh, declared.expires_at)))
+    Ok(Some(OAuthAuth::new(
+        session,
+        access,
+        refresh,
+        declared.expires_at,
+    )))
 }
 
 /// Splits a `provider/model` target at the longest provider-looking prefix.
@@ -1347,7 +1360,10 @@ fn resolve_key(
     }
     cfg.key(name).map_or_else(
         || {
-            Err(ComboError::UnresolvedKey { provider: provider.to_owned(), key: name.to_owned() })
+            Err(ComboError::UnresolvedKey {
+                provider: provider.to_owned(),
+                key: name.to_owned(),
+            })
         },
         |secret| Ok(secret.expose().to_owned()),
     )
@@ -1363,8 +1379,8 @@ mod tests {
     use ar_config::Config;
 
     use super::{
-        AUTH_MODE_VAR, AuthMode, ComboError, ComboTarget, DefaultChain, HTTP_MASTER_KEY_VAR, RouteCombo,
-        STREAM_TIMEOUT_VAR, ServerConfig, split_target,
+        AUTH_MODE_VAR, AuthMode, ComboError, ComboTarget, DefaultChain, HTTP_MASTER_KEY_VAR,
+        RouteCombo, STREAM_TIMEOUT_VAR, ServerConfig, split_target,
     };
     use crate::exec::ProviderConfig;
 
@@ -1424,8 +1440,12 @@ oauth:
 
     #[test]
     fn refuses_a_session_that_declares_both_anonymous_and_a_refresh_row() {
-        let yaml = ANON_YAML.replace("    anonymous_editor: artificial-route", "    anonymous_editor: artificial-route\n    refresh_key: kilocode_refresh");
-        let err = ar_config::Config::parse(&yaml, |_| Ok(Some(String::new()))).expect_err("contradictory");
+        let yaml = ANON_YAML.replace(
+            "    anonymous_editor: artificial-route",
+            "    anonymous_editor: artificial-route\n    refresh_key: kilocode_refresh",
+        );
+        let err = ar_config::Config::parse(&yaml, |_| Ok(Some(String::new())))
+            .expect_err("contradictory");
         assert!(err.to_string().contains("holds no account"), "{err}");
     }
 
@@ -1530,21 +1550,24 @@ combos:
     #[test]
     fn builds_one_combo_per_configured_combo() {
         let cfg = parse(TWO_COMBO_YAML).expect("config parses");
-        let server = ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
+        let server =
+            ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
         assert_eq!(server.combo_ids(), ["default", "cheap"]);
     }
 
     #[test]
     fn reads_the_port_from_the_file_config() {
         let cfg = parse(TWO_COMBO_YAML).expect("config parses");
-        let server = ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
+        let server =
+            ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
         assert_eq!(server.port, 20128);
     }
 
     #[test]
     fn honours_a_port_override() {
         let cfg = parse(TWO_COMBO_YAML).expect("config parses");
-        let server = ServerConfig::from_ar_config(&cfg, Some(9999), None, false, None).expect("combos build");
+        let server = ServerConfig::from_ar_config(&cfg, Some(9999), None, false, None)
+            .expect("combos build");
         assert_eq!(server.port, 9999);
     }
 
@@ -1555,14 +1578,16 @@ combos:
         // defaults to closed whatever the YAML says — which is the direction
         // that fails safe.
         let cfg = parse(TWO_COMBO_YAML).expect("config parses");
-        let server = ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
+        let server =
+            ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
         assert!(!server.public);
     }
 
     #[test]
     fn carries_an_explicit_public_flag() {
         let cfg = parse(TWO_COMBO_YAML).expect("config parses");
-        let server = ServerConfig::from_ar_config(&cfg, None, None, true, None).expect("combos build");
+        let server =
+            ServerConfig::from_ar_config(&cfg, None, None, true, None).expect("combos build");
         assert!(server.public);
     }
 
@@ -1575,9 +1600,14 @@ combos:
         // `drops_an_undispatchable_target_from_the_candidate_list` and
         // `builds_a_multi_provider_chain_from_two_dispatchable_targets`.
         let cfg = parse(TWO_COMBO_YAML).expect("config parses");
-        let server = ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
+        let server =
+            ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
         let combo = server.combo("default").expect("default combo exists");
-        assert_eq!(combo.targets.len(), 2, "both targets are declared in the file");
+        assert_eq!(
+            combo.targets.len(),
+            2,
+            "both targets are declared in the file"
+        );
     }
 
     #[test]
@@ -1607,7 +1637,8 @@ combos:
     #[test]
     fn resolves_each_combo_to_its_own_targets() {
         let cfg = parse(TWO_COMBO_YAML).expect("config parses");
-        let server = ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
+        let server =
+            ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
         let cheap = server.combo("cheap").expect("cheap combo exists");
         assert_eq!(server.candidates(Some(cheap)).len(), 1);
     }
@@ -1615,14 +1646,19 @@ combos:
     #[test]
     fn carries_the_per_combo_strategy() {
         let cfg = parse(TWO_COMBO_YAML).expect("config parses");
-        let server = ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
-        assert_eq!(server.combo("cheap").map(|c| c.strategy), Some(Strategy::CostOptimized));
+        let server =
+            ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
+        assert_eq!(
+            server.combo("cheap").map(|c| c.strategy),
+            Some(Strategy::CostOptimized)
+        );
     }
 
     #[test]
     fn takes_the_first_combo_as_the_default_chain() {
         let cfg = parse(TWO_COMBO_YAML).expect("config parses");
-        let server = ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
+        let server =
+            ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
         assert!(matches!(
             server.default_combo(),
             DefaultChain::Combo(c) if c.id == "default"
@@ -1636,12 +1672,10 @@ combos:
     /// had an arm for it — so it is the one that pins the whole chain.
     #[test]
     fn carries_expiry_first_from_the_config_to_the_dispatcher() {
-        let yaml = TWO_COMBO_YAML.replace(
-            "strategy: cost-optimized",
-            "strategy: expiry-first",
-        );
+        let yaml = TWO_COMBO_YAML.replace("strategy: cost-optimized", "strategy: expiry-first");
         let cfg = parse(&yaml).expect("config parses");
-        let server = ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
+        let server =
+            ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
         assert_eq!(
             server.combo("cheap").map(|c| c.strategy),
             Some(Strategy::ExpiryFirst),
@@ -1654,7 +1688,8 @@ combos:
         // `openai` appears in both combos; two dispatch rows would make the
         // executor's `by_id` keep whichever came last.
         let cfg = parse(TWO_COMBO_YAML).expect("config parses");
-        let server = ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
+        let server =
+            ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
         let openai = server
             .providers
             .iter()
@@ -1714,7 +1749,10 @@ combos:
             .collect();
         assert_eq!(
             got,
-            [("aihorde".to_owned(), "aphrodite/TheDrummer/Cydonia-24B-v4.3".to_owned())]
+            [(
+                "aihorde".to_owned(),
+                "aphrodite/TheDrummer/Cydonia-24B-v4.3".to_owned()
+            )]
         );
     }
 
@@ -1733,7 +1771,8 @@ combos:
         // `anthropic` is an anthropic-family wire, which this build dispatches,
         // so it keeps its slot alongside the OpenAI target.
         let cfg = parse(TWO_COMBO_YAML).expect("config parses");
-        let server = ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
+        let server =
+            ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
         let combo = server.combo("default").expect("default combo exists");
         let ids: Vec<String> = server
             .candidates(Some(combo))
@@ -1746,7 +1785,8 @@ combos:
     #[test]
     fn lists_combo_ids_as_the_routable_models() {
         let cfg = parse(TWO_COMBO_YAML).expect("config parses");
-        let server = ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
+        let server =
+            ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
         let ids: Vec<String> = server.model_cards().into_iter().map(|c| c.id).collect();
         assert_eq!(ids, ["default", "cheap"]);
     }
@@ -1801,7 +1841,8 @@ combos:
         // reach the `Candidate`, which is the only thing `by_weight` reads.
         let cfg = Config::parse(WEIGHTED_TARGETS_YAML, |name| Ok(Some(format!("k-{name}"))))
             .expect("the map form of a target parses");
-        let server = ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
+        let server =
+            ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
         let combo = server.combo("spread").expect("the combo");
         let got = server.candidates(Some(combo));
         assert_eq!(got.len(), 2);
@@ -1816,10 +1857,14 @@ combos:
         // unweighted config must keep behaving exactly as it did.
         let cfg = Config::parse(WEIGHTED_TARGETS_YAML, |name| Ok(Some(format!("k-{name}"))))
             .expect("parses");
-        let server = ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
+        let server =
+            ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
         let got = server.candidates(server.combo("spread"));
         assert_eq!(got[1].weight, 7);
-        assert_eq!(got[0].weight, 1, "the unweighted target takes the uniform share");
+        assert_eq!(
+            got[0].weight, 1,
+            "the unweighted target takes the uniform share"
+        );
     }
 
     #[test]
@@ -1844,10 +1889,7 @@ combos:
         let mut server = flat();
         server.prices = table;
         server.providers[0].input_usd_per_mtok = None;
-        assert_eq!(
-            server.candidates(None)[1].input_usd_per_mtok,
-            Some(0.59)
-        );
+        assert_eq!(server.candidates(None)[1].input_usd_per_mtok, Some(0.59));
     }
 
     #[test]
@@ -1875,14 +1917,22 @@ combos:
     fn store_with(entries: &[(&str, &str, &str)]) -> CredentialStore {
         let store = CredentialStore::open_in_memory(&StoreSecret::generate()).expect("store opens");
         for (provider, name, value) in entries {
-            store.insert(provider, name, &StoreSecret::new(value.as_bytes().to_vec())).expect("insert");
+            store
+                .insert(provider, name, &StoreSecret::new(value.as_bytes().to_vec()))
+                .expect("insert");
         }
         store
     }
 
     /// The key `TWO_COMBO_YAML`'s `openai` provider resolves to.
     fn openai_key(server: &ServerConfig) -> &str {
-        server.providers.iter().find(|p| p.id.as_str() == "openai").expect("openai row").api_key.as_str()
+        server
+            .providers
+            .iter()
+            .find(|p| p.id.as_str() == "openai")
+            .expect("openai row")
+            .api_key
+            .as_str()
     }
 
     #[test]
@@ -1891,8 +1941,8 @@ combos:
         // encrypted copy decorative.
         let cfg = parse(TWO_COMBO_YAML).expect("config parses");
         let store = store_with(&[("openai", "openai", "sk-from-store")]);
-        let server =
-            ServerConfig::from_ar_config(&cfg, None, None, false, Some(&store)).expect("combos build");
+        let server = ServerConfig::from_ar_config(&cfg, None, None, false, Some(&store))
+            .expect("combos build");
         assert_eq!(openai_key(&server), "sk-from-store");
     }
 
@@ -1900,8 +1950,8 @@ combos:
     fn falls_back_to_the_var_when_the_store_has_no_row() {
         let cfg = parse(TWO_COMBO_YAML).expect("config parses");
         let store = store_with(&[("groq", "groq", "sk-unrelated")]);
-        let server =
-            ServerConfig::from_ar_config(&cfg, None, None, false, Some(&store)).expect("combos build");
+        let server = ServerConfig::from_ar_config(&cfg, None, None, false, Some(&store))
+            .expect("combos build");
         // `TWO_COMBO_YAML` declares literals, so the fallback value is the
         // literal, not an expanded `$VAR`.
         assert_eq!(openai_key(&server), "k-openai");
@@ -1913,7 +1963,8 @@ combos:
         // entry must still reach the executor rather than become a resolve error.
         let yaml = "keys:\n  openai: \"\"\nproviders:\n  - id: openai\n    key: openai\ncombos:\n  - id: c\n    strategy: priority\n    targets:\n      - openai/gpt-5.4\n";
         let cfg = parse(yaml).expect("config parses");
-        let server = ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
+        let server =
+            ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
         assert!(openai_key(&server).is_empty());
     }
 
@@ -1934,15 +1985,19 @@ combos:
         // A store that is present, holds the name, and will not hand it over.
         // Falling through to `$VAR` here would dispatch a *different* credential
         // and report the mismatch as a provider 401.
-        let path = std::env::temp_dir().join(format!("ar-server-unreadable-{}.db", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("ar-server-unreadable-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         {
             let writer =
                 CredentialStore::open_with_material(&path, &StoreSecret::generate()).expect("open");
-            writer.insert("openai", "openai", &StoreSecret::new(b"sk-stored".to_vec())).expect("insert");
+            writer
+                .insert("openai", "openai", &StoreSecret::new(b"sk-stored".to_vec()))
+                .expect("insert");
         }
         // Same file, another install's master: the row is there and unreadable.
-        let store = CredentialStore::open_with_material(&path, &StoreSecret::generate()).expect("reopen");
+        let store =
+            CredentialStore::open_with_material(&path, &StoreSecret::generate()).expect("reopen");
         let cfg = parse(TWO_COMBO_YAML).expect("config parses");
         assert!(matches!(
             ServerConfig::from_ar_config(&cfg, None, None, false, Some(&store)),
@@ -1978,7 +2033,12 @@ combos:
         let cfg = parse(CUSTOM_YAML).expect("config parses");
         let server =
             ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("the node merges");
-        assert_eq!(server.combo("default").expect("the combo").targets[0].provider.as_str(), "local-gateway");
+        assert_eq!(
+            server.combo("default").expect("the combo").targets[0]
+                .provider
+                .as_str(),
+            "local-gateway"
+        );
     }
 
     #[test]
@@ -1986,7 +2046,10 @@ combos:
         let cfg = parse(CUSTOM_YAML).expect("config parses");
         let server =
             ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("the node merges");
-        assert_eq!(server.providers[0].base_url, "https://api.example.invalid/v1");
+        assert_eq!(
+            server.providers[0].base_url,
+            "https://api.example.invalid/v1"
+        );
     }
 
     #[test]
@@ -1994,7 +2057,13 @@ combos:
         let cfg = parse(CUSTOM_YAML).expect("config parses");
         let server =
             ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("the node merges");
-        assert_eq!(server.providers[0].headers.get("x-api-key").map(String::as_str), Some("hdr"));
+        assert_eq!(
+            server.providers[0]
+                .headers
+                .get("x-api-key")
+                .map(String::as_str),
+            Some("hdr")
+        );
     }
 
     #[test]
@@ -2011,7 +2080,9 @@ combos:
         let cfg = parse(&yaml).expect("config parses");
         assert!(matches!(
             ServerConfig::from_ar_config(&cfg, None, None, false, None),
-            Err(ComboError::CustomProvider(ar_registry::MergeError::Collides { .. }))
+            Err(ComboError::CustomProvider(
+                ar_registry::MergeError::Collides { .. }
+            ))
         ));
     }
 
@@ -2023,7 +2094,11 @@ combos:
         let cfg = parse(&yaml).expect("config parses");
         let server =
             ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("the node merges");
-        let ids: Vec<String> = server.candidates(None).iter().map(|c| c.provider.as_str().to_owned()).collect();
+        let ids: Vec<String> = server
+            .candidates(None)
+            .iter()
+            .map(|c| c.provider.as_str().to_owned())
+            .collect();
         assert_eq!(ids, ["local-gateway"]);
     }
 
@@ -2039,15 +2114,26 @@ combos:
 
     #[test]
     fn every_mode_round_trips_through_its_spelling() {
-        for mode in [AuthMode::Open, AuthMode::Required, AuthMode::DegradeInvalidToAnon] {
-            assert_eq!(AuthMode::parse(mode.as_str()), mode, "{mode:?} did not round-trip");
+        for mode in [
+            AuthMode::Open,
+            AuthMode::Required,
+            AuthMode::DegradeInvalidToAnon,
+        ] {
+            assert_eq!(
+                AuthMode::parse(mode.as_str()),
+                mode,
+                "{mode:?} did not round-trip"
+            );
         }
     }
 
     #[test]
     fn a_modes_spelling_is_matched_case_and_space_insensitively() {
         assert_eq!(AuthMode::parse("  OPEN "), AuthMode::Open);
-        assert_eq!(AuthMode::parse("Degrade-Invalid-To-Anon"), AuthMode::DegradeInvalidToAnon);
+        assert_eq!(
+            AuthMode::parse("Degrade-Invalid-To-Anon"),
+            AuthMode::DegradeInvalidToAnon
+        );
         // The short spelling is a convenience, not a second name for the mode.
         assert_eq!(AuthMode::parse("degrade"), AuthMode::DegradeInvalidToAnon);
     }
@@ -2085,8 +2171,15 @@ combos:
             },
         );
         for (name, config) in [("from_ar_config", &from_file), ("from_env", &from_env)] {
-            assert!(config.http_master_key.is_some(), "{name} did not arm the gate");
-            assert_eq!(config.auth_mode, AuthMode::DegradeInvalidToAnon, "{name} ignored {AUTH_MODE_VAR}");
+            assert!(
+                config.http_master_key.is_some(),
+                "{name} did not arm the gate"
+            );
+            assert_eq!(
+                config.auth_mode,
+                AuthMode::DegradeInvalidToAnon,
+                "{name} ignored {AUTH_MODE_VAR}"
+            );
             assert_eq!(
                 config.stream_deadline("gpt-5.4"),
                 Duration::from_secs(600),
@@ -2103,11 +2196,15 @@ combos:
         // behaviour. Asserted rather than assumed, because "it defaults the same"
         // is exactly the kind of thing a future default change breaks silently.
         let cfg = parse(TWO_COMBO_YAML).expect("config parses");
-        let server = ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
+        let server =
+            ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
         assert_eq!(server.auth_mode, AuthMode::Required);
         assert!(server.http_master_key.is_none());
         assert!(server.timeouts.is_empty());
-        assert_eq!(server.stream_deadline("gpt-5.4"), crate::app::REQUEST_TIMEOUT);
+        assert_eq!(
+            server.stream_deadline("gpt-5.4"),
+            crate::app::REQUEST_TIMEOUT
+        );
     }
 
     #[test]
@@ -2138,8 +2235,14 @@ combos:
         // Base64 is deliberately not accepted: a silently different encoding than
         // the one `AR_MASTER_KEY` uses is how a key ends up wrong in a way that
         // only shows up as a gate that never opens.
-        assert!(super::decode_master(&"a".repeat(43)).is_err(), "base64 was accepted");
-        assert!(super::decode_master(&"z".repeat(64)).is_err(), "non-hex was accepted");
+        assert!(
+            super::decode_master(&"a".repeat(43)).is_err(),
+            "base64 was accepted"
+        );
+        assert!(
+            super::decode_master(&"z".repeat(64)).is_err(),
+            "non-hex was accepted"
+        );
     }
 
     #[test]
@@ -2147,7 +2250,10 @@ combos:
         let mut config = flat();
         config.http_master_key = Some(ar_keys::Secret::new(vec![0xab; ar_keys::KEY_LEN]));
         let text = format!("{config:?}");
-        assert!(!text.contains(&"ab".repeat(8)), "the gate key leaked: {text}");
+        assert!(
+            !text.contains(&"ab".repeat(8)),
+            "the gate key leaked: {text}"
+        );
         assert!(text.contains("redacted"), "unexpected Debug: {text}");
     }
 
@@ -2169,7 +2275,10 @@ combos:
         assert_eq!(table.get("claude"), Some(&Duration::from_secs(300)));
         // A model nobody named gets no entry, so it falls through to the default
         // rather than inheriting another model's.
-        assert!(!table.contains_key("other"), "an unnamed model got a deadline: {table:?}");
+        assert!(
+            !table.contains_key("other"),
+            "an unnamed model got a deadline: {table:?}"
+        );
     }
 
     #[test]
@@ -2191,8 +2300,14 @@ combos:
         // A bad timeout is not a reason to refuse to route: the affected model
         // falls back to the default, which is the documented answer.
         let table = super::parse_timeouts("gpt-5.4=0,claude=soon,nano=60");
-        assert!(!table.contains_key("gpt-5.4"), "a zero deadline was accepted: {table:?}");
-        assert!(!table.contains_key("claude"), "an unparseable one was accepted: {table:?}");
+        assert!(
+            !table.contains_key("gpt-5.4"),
+            "a zero deadline was accepted: {table:?}"
+        );
+        assert!(
+            !table.contains_key("claude"),
+            "an unparseable one was accepted: {table:?}"
+        );
         assert_eq!(table.get("nano"), Some(&Duration::from_secs(60)));
     }
 

@@ -22,7 +22,11 @@ impl NormalizedUsage {
     /// Builds a usage record from explicit counts, deriving `total`.
     #[must_use]
     pub fn new(prompt: u32, completion: u32) -> Self {
-        Self { prompt, completion, total: prompt.saturating_add(completion) }
+        Self {
+            prompt,
+            completion,
+            total: prompt.saturating_add(completion),
+        }
     }
 
     /// Collapses a provider `usage` object using the ported precedence.
@@ -120,12 +124,18 @@ mod tests {
 
     #[test]
     fn prefers_input_over_prompt_tokens_when_both_present() {
-        assert_eq!(NormalizedUsage::from_usage(&json!({ "input": 7, "prompt_tokens": 9 })).prompt, 7);
+        assert_eq!(
+            NormalizedUsage::from_usage(&json!({ "input": 7, "prompt_tokens": 9 })).prompt,
+            7
+        );
     }
 
     #[test]
     fn falls_back_to_prompt_tokens_when_input_absent() {
-        assert_eq!(NormalizedUsage::from_usage(&json!({ "prompt_tokens": 9 })).prompt, 9);
+        assert_eq!(
+            NormalizedUsage::from_usage(&json!({ "prompt_tokens": 9 })).prompt,
+            9
+        );
     }
 
     #[test]
@@ -136,22 +146,36 @@ mod tests {
 
     #[test]
     fn skips_null_input_tokens_when_prompt_tokens_absent() {
-        assert_eq!(NormalizedUsage::from_usage(&json!({ "input_tokens": null })).prompt, 0);
+        assert_eq!(
+            NormalizedUsage::from_usage(&json!({ "input_tokens": null })).prompt,
+            0
+        );
     }
 
     #[test]
     fn parses_numeric_string_when_field_is_a_string() {
-        assert_eq!(NormalizedUsage::from_usage(&json!({ "prompt_tokens": "42" })).prompt, 42);
+        assert_eq!(
+            NormalizedUsage::from_usage(&json!({ "prompt_tokens": "42" })).prompt,
+            42
+        );
     }
 
     #[test]
     fn counts_zero_completion_tokens_when_reported_as_zero() {
-        assert_eq!(NormalizedUsage::from_usage(&json!({ "completion_tokens": 0, "output_tokens": 8 })).completion, 0);
+        assert_eq!(
+            NormalizedUsage::from_usage(&json!({ "completion_tokens": 0, "output_tokens": 8 }))
+                .completion,
+            0
+        );
     }
 
     #[test]
     fn falls_back_to_output_tokens_when_completion_tokens_null() {
-        assert_eq!(NormalizedUsage::from_usage(&json!({ "completion_tokens": null, "output_tokens": 8 })).completion, 8);
+        assert_eq!(
+            NormalizedUsage::from_usage(&json!({ "completion_tokens": null, "output_tokens": 8 }))
+                .completion,
+            8
+        );
     }
 
     #[test]
@@ -161,7 +185,10 @@ mod tests {
 
     #[test]
     fn reads_zero_when_usage_object_is_empty() {
-        assert_eq!(NormalizedUsage::from_usage(&json!({})), NormalizedUsage::new(0, 0));
+        assert_eq!(
+            NormalizedUsage::from_usage(&json!({})),
+            NormalizedUsage::new(0, 0)
+        );
     }
 
     #[test]
@@ -171,12 +198,18 @@ mod tests {
         // read every Ollama reply as zero while the server's own comment
         // claimed the root was the usage.
         let usage = json!({ "prompt_eval_count": 9, "eval_count": 4 });
-        assert_eq!(NormalizedUsage::from_usage(&usage), NormalizedUsage::new(9, 4));
+        assert_eq!(
+            NormalizedUsage::from_usage(&usage),
+            NormalizedUsage::new(9, 4)
+        );
     }
 
     #[test]
     fn prefers_standard_keys_over_ollama_root_when_both_present() {
         let usage = json!({ "prompt_tokens": 5, "eval_count": 4 });
-        assert_eq!(NormalizedUsage::from_usage(&usage), NormalizedUsage::new(5, 4));
+        assert_eq!(
+            NormalizedUsage::from_usage(&usage),
+            NormalizedUsage::new(5, 4)
+        );
     }
 }

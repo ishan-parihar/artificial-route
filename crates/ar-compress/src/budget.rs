@@ -116,9 +116,7 @@ pub fn clamp_to_budget(text: &str, budget: u32) -> Clamp {
     // Stage 1: drop whole non-anchor units, largest first.
     let units: Vec<Unit<'_>> = split_units(text).map(Unit::new).collect();
     let mut dropped: Vec<bool> = vec![false; units.len()];
-    let mut order: Vec<usize> = (0..units.len())
-        .filter(|&i| !units[i].anchor)
-        .collect();
+    let mut order: Vec<usize> = (0..units.len()).filter(|&i| !units[i].anchor).collect();
     order.sort_by(|&a, &b| units[b].tokens.cmp(&units[a].tokens).then(b.cmp(&a)));
 
     // `saturating_sub` on a u64 accumulator: the running figure is an estimate
@@ -304,8 +302,14 @@ fn has_assignment(unit: &str) -> bool {
     if eq == 0 {
         return false;
     }
-    let before = unit[..eq].chars().next_back().is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
-    let has_value = unit[eq + 1..].chars().next().is_some_and(|c| !c.is_ascii_whitespace());
+    let before = unit[..eq]
+        .chars()
+        .next_back()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+    let has_value = unit[eq + 1..]
+        .chars()
+        .next()
+        .is_some_and(|c| !c.is_ascii_whitespace());
     before && has_value
 }
 
@@ -342,7 +346,8 @@ mod tests {
     use ar_tokens::count_text;
 
     fn long_prose(lines: usize) -> String {
-        let line = "the quick brown fox jumps over the lazy dog while the cat watches from a warm sill. ";
+        let line =
+            "the quick brown fox jumps over the lazy dog while the cat watches from a warm sill. ";
         (0..lines)
             .map(|i| format!("{i}{line}\n"))
             .collect::<String>()
@@ -415,7 +420,11 @@ mod tests {
         // shrinks and the anchor survives whole.
         let text = format!("error: see https://example.com/x\n{}", long_prose(10));
         let clamp = clamp_to_budget(&text, count_text("error: see https://example.com/x") + 4);
-        assert!(clamp.text.contains("https://example.com/x"), "{}", clamp.text);
+        assert!(
+            clamp.text.contains("https://example.com/x"),
+            "{}",
+            clamp.text
+        );
     }
 
     #[test]
@@ -445,7 +454,9 @@ mod tests {
 
     #[test]
     fn does_not_anchor_a_bare_prose_line() {
-        assert!(!is_anchor("the deploy waits for a human to approve the change"));
+        assert!(!is_anchor(
+            "the deploy waits for a human to approve the change"
+        ));
     }
 
     #[test]
@@ -461,7 +472,10 @@ mod tests {
 
     #[test]
     fn keeps_decimal_number_inside_a_sentence() {
-        assert_eq!(split_sentences("pi is 3.14 exactly"), vec!["pi is 3.14 exactly"]);
+        assert_eq!(
+            split_sentences("pi is 3.14 exactly"),
+            vec!["pi is 3.14 exactly"]
+        );
     }
 
     #[test]

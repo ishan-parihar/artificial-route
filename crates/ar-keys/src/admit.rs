@@ -121,16 +121,29 @@ pub struct LaneSpec {
 
 impl LaneSpec {
     /// `q100/30s` — the interactive lane from `docs/04-subsystems.md`.
-    pub const INTERACTIVE: Self =
-        Self { capacity: 100, queue_cap: 100, wait: Duration::from_secs(30), never_queue: false };
+    pub const INTERACTIVE: Self = Self {
+        capacity: 100,
+        queue_cap: 100,
+        wait: Duration::from_secs(30),
+        never_queue: false,
+    };
 
     /// `q50/never-queue`. `docs/04-subsystems.md` calls this `mgmt`; the roadmap
     /// calls it `batch`. Same lane.
-    pub const BATCH: Self = Self { capacity: 50, queue_cap: 50, wait: Duration::ZERO, never_queue: true };
+    pub const BATCH: Self = Self {
+        capacity: 50,
+        queue_cap: 50,
+        wait: Duration::ZERO,
+        never_queue: true,
+    };
 
     /// `q20/600s` — the heavy lane from `docs/04-subsystems.md`.
-    pub const HEAVY: Self =
-        Self { capacity: 20, queue_cap: 20, wait: Duration::from_secs(600), never_queue: false };
+    pub const HEAVY: Self = Self {
+        capacity: 20,
+        queue_cap: 20,
+        wait: Duration::from_secs(600),
+        never_queue: false,
+    };
 
     /// A lane that never queues sheds after this long, so `Retry-After: 0` is
     /// never emitted.
@@ -257,7 +270,9 @@ impl AdmitError {
 /// caller comes straight back into the queue it was just shed from.
 #[must_use]
 fn retry_after_secs(d: Duration) -> u64 {
-    d.as_secs().saturating_add(u64::from(d.subsec_nanos() != 0)).max(1)
+    d.as_secs()
+        .saturating_add(u64::from(d.subsec_nanos() != 0))
+        .max(1)
 }
 
 /// A granted admission. Dropping it returns the permit.
@@ -267,7 +282,10 @@ pub struct Lease {
     /// Held only for its `Drop`. Nothing needs the permit itself — dropping the
     /// lease is what returns it — and a public accessor would only invite a
     /// caller to hold one permit per request forever.
-    #[expect(dead_code, reason = "RAII: the permit's Drop is what returns it to the semaphore")]
+    #[expect(
+        dead_code,
+        reason = "RAII: the permit's Drop is what returns it to the semaphore"
+    )]
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
     waited: Duration,
 }
@@ -315,7 +333,10 @@ impl RpmLeases {
     /// # Errors
     /// [`AdmitError::RateLimited`] when the bucket is empty.
     fn check(&self, key_id: &str, lane: Lane) -> Result<(), AdmitError> {
-        let mut buckets = self.buckets.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut buckets = self
+            .buckets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Instant::now();
 
         if !buckets.contains_key(key_id) && buckets.len() >= self.max_conns {
@@ -328,7 +349,11 @@ impl RpmLeases {
             // of locking it out for the process lifetime.
             buckets.retain(|_, (seen, _)| now.duration_since(*seen) < self.idle_ttl);
             while buckets.len() >= self.max_conns {
-                let Some(oldest) = buckets.iter().min_by_key(|(_, (seen, _))| *seen).map(|(k, _)| k.clone()) else {
+                let Some(oldest) = buckets
+                    .iter()
+                    .min_by_key(|(_, (seen, _))| *seen)
+                    .map(|(k, _)| k.clone())
+                else {
                     break;
                 };
                 buckets.remove(&oldest);
@@ -343,7 +368,10 @@ impl RpmLeases {
             Ok(()) => Ok(()),
             Err(not_until) => {
                 let wait = not_until.wait_time_from(QuantaClock::default().now());
-                Err(AdmitError::RateLimited { lane, retry_after: retry_after_secs(wait) })
+                Err(AdmitError::RateLimited {
+                    lane,
+                    retry_after: retry_after_secs(wait),
+                })
             }
         }
     }
@@ -367,7 +395,12 @@ struct LaneState {
 
 impl LaneState {
     fn new(spec: LaneSpec, capacity: usize) -> Self {
-        Self { spec, capacity, sem: Arc::new(tokio::sync::Semaphore::new(capacity)), queued: AtomicUsize::new(0) }
+        Self {
+            spec,
+            capacity,
+            sem: Arc::new(tokio::sync::Semaphore::new(capacity)),
+            queued: AtomicUsize::new(0),
+        }
     }
 
     fn in_flight(&self) -> usize {
@@ -423,14 +456,24 @@ impl Admission {
         // force is 54%, not 20%. This formula yields `min(60, 3) = 3`, exactly a
         // fifth of 15.
         let other = configured.saturating_sub(specs[Lane::Heavy.index()].capacity);
-        let share_cap = (other.saturating_mul(HEAVY_SHARE_NUM) / (HEAVY_SHARE_DEN - HEAVY_SHARE_NUM)).max(1);
+        let share_cap =
+            (other.saturating_mul(HEAVY_SHARE_NUM) / (HEAVY_SHARE_DEN - HEAVY_SHARE_NUM)).max(1);
         // Indexed rather than matched on value: two lanes may legitimately
         // share a `LaneSpec`, and a value match would clamp whichever one was
         // built second.
         let states = [
-            LaneState::new(specs[Lane::Interactive.index()], specs[Lane::Interactive.index()].capacity),
-            LaneState::new(specs[Lane::Batch.index()], specs[Lane::Batch.index()].capacity),
-            LaneState::new(specs[Lane::Heavy.index()], specs[Lane::Heavy.index()].capacity.min(share_cap)),
+            LaneState::new(
+                specs[Lane::Interactive.index()],
+                specs[Lane::Interactive.index()].capacity,
+            ),
+            LaneState::new(
+                specs[Lane::Batch.index()],
+                specs[Lane::Batch.index()].capacity,
+            ),
+            LaneState::new(
+                specs[Lane::Heavy.index()],
+                specs[Lane::Heavy.index()].capacity.min(share_cap),
+            ),
         ];
         let total = states.iter().map(|lane| lane.capacity).sum();
         Ok(Self {
@@ -447,7 +490,10 @@ impl Admission {
     /// # Errors
     /// [`AdmitError::ZeroRpm`] if `rpm` is zero.
     pub fn defaults(rpm: u32) -> Result<Self, AdmitError> {
-        Self::new([LaneSpec::INTERACTIVE, LaneSpec::BATCH, LaneSpec::HEAVY], rpm)
+        Self::new(
+            [LaneSpec::INTERACTIVE, LaneSpec::BATCH, LaneSpec::HEAVY],
+            rpm,
+        )
     }
 
     /// Attaches an audit ring. Shed and admitted requests are recorded with the
@@ -478,11 +524,18 @@ impl Admission {
 
         if let Ok(permit) = Arc::clone(&state.sem).try_acquire_owned() {
             self.audit(lane, Outcome::Ok, "granted");
-            return Ok(Lease { lane, permit: Some(permit), waited: Duration::ZERO });
+            return Ok(Lease {
+                lane,
+                permit: Some(permit),
+                waited: Duration::ZERO,
+            });
         }
 
         if state.spec.never_queue {
-            let e = AdmitError::Busy { lane, retry_after: retry_after_secs(state.spec.shed_retry_after()) };
+            let e = AdmitError::Busy {
+                lane,
+                retry_after: retry_after_secs(state.spec.shed_retry_after()),
+            };
             self.audit(lane, Outcome::Shed, e.detail());
             return Err(e);
         }
@@ -503,13 +556,18 @@ impl Admission {
             return Err(e);
         }
 
-        let waited = tokio::time::timeout(state.spec.wait, Arc::clone(&state.sem).acquire_owned()).await;
+        let waited =
+            tokio::time::timeout(state.spec.wait, Arc::clone(&state.sem).acquire_owned()).await;
         state.queued.fetch_sub(1, Ordering::AcqRel);
 
         match waited {
             Ok(Ok(permit)) => {
                 self.audit(lane, Outcome::Ok, "queued");
-                Ok(Lease { lane, permit: Some(permit), waited: started.elapsed() })
+                Ok(Lease {
+                    lane,
+                    permit: Some(permit),
+                    waited: started.elapsed(),
+                })
             }
             Ok(Err(_)) => Err(AdmitError::Shutdown),
             Err(_elapsed) => {
@@ -575,10 +633,15 @@ const _: fn() = || {
 mod tests {
     use std::time::Duration;
 
-    use super::{AdmitError, Admission, HEAVY_SHARE_DEN, HEAVY_SHARE_NUM, Lane, LaneSpec};
+    use super::{Admission, AdmitError, HEAVY_SHARE_DEN, HEAVY_SHARE_NUM, Lane, LaneSpec};
 
     fn spec(capacity: usize, queue_cap: usize, wait_ms: u64, never_queue: bool) -> LaneSpec {
-        LaneSpec { capacity, queue_cap, wait: Duration::from_millis(wait_ms), never_queue }
+        LaneSpec {
+            capacity,
+            queue_cap,
+            wait: Duration::from_millis(wait_ms),
+            never_queue,
+        }
     }
 
     #[tokio::test]
@@ -586,8 +649,15 @@ mod tests {
         // heavy is configured far larger than the other two lanes, so the clamp
         // is the only thing keeping it from being the system. other = 8 + 4 = 12,
         // and a fifth of a total that includes heavy solves to other / 4 = 3.
-        let adm = Admission::new([spec(8, 64, 50, false), spec(4, 4, 0, true), spec(60, 1, 200, false)], 10_000)
-            .expect("build");
+        let adm = Admission::new(
+            [
+                spec(8, 64, 50, false),
+                spec(4, 4, 0, true),
+                spec(60, 1, 200, false),
+            ],
+            10_000,
+        )
+        .expect("build");
         assert_eq!(adm.capacity(Lane::Heavy), 3);
         assert_eq!(adm.total_capacity(), 15);
 
@@ -603,15 +673,25 @@ mod tests {
         assert_eq!(adm.in_flight(Lane::Heavy), 3);
 
         // Interactive has not been touched and is still immediately servable.
-        let interactive = adm.acquire(Lane::Interactive, "human").await.expect("interactive must be admitted");
+        let interactive = adm
+            .acquire(Lane::Interactive, "human")
+            .await
+            .expect("interactive must be admitted");
         assert_eq!(interactive.waited(), Duration::ZERO);
         assert_eq!(adm.in_flight(Lane::Interactive), 1);
     }
 
     #[tokio::test]
     async fn sheds_heavy_with_a_retry_after_once_its_queue_is_full() {
-        let adm = Admission::new([spec(8, 64, 50, false), spec(4, 4, 0, true), spec(60, 1, 200, false)], 10_000)
-            .expect("build");
+        let adm = Admission::new(
+            [
+                spec(8, 64, 50, false),
+                spec(4, 4, 0, true),
+                spec(60, 1, 200, false),
+            ],
+            10_000,
+        )
+        .expect("build");
         let mut held = Vec::new();
         while held.len() < 40 {
             match adm.acquire(Lane::Heavy, "flood").await {
@@ -625,12 +705,32 @@ mod tests {
             async move { adm.acquire(Lane::Heavy, "queued").await }
         });
         tokio::time::sleep(Duration::from_millis(20)).await;
-        assert_eq!(adm.queued(Lane::Heavy), 1, "the spawned request must be waiting");
+        assert_eq!(
+            adm.queued(Lane::Heavy),
+            1,
+            "the spawned request must be waiting"
+        );
 
-        let err = adm.acquire(Lane::Heavy, "late").await.expect_err("the one queue slot is taken");
+        let err = adm
+            .acquire(Lane::Heavy, "late")
+            .await
+            .expect_err("the one queue slot is taken");
         queued.abort();
-        assert!(matches!(err, AdmitError::QueueFull { position: 1, queue_cap: 1, .. }), "{err}");
-        assert!(err.retry_after().is_some_and(|s| s >= 1), "never emit Retry-After: 0");
+        assert!(
+            matches!(
+                err,
+                AdmitError::QueueFull {
+                    position: 1,
+                    queue_cap: 1,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert!(
+            err.retry_after().is_some_and(|s| s >= 1),
+            "never emit Retry-After: 0"
+        );
     }
 
     #[tokio::test]
@@ -643,8 +743,15 @@ mod tests {
 
     #[tokio::test]
     async fn heavy_holds_at_most_a_fifth_of_in_force_capacity() {
-        let adm = Admission::new([spec(4, 4, 0, false), spec(1, 1, 0, false), spec(100, 1, 100, false)], 10_000)
-            .expect("build");
+        let adm = Admission::new(
+            [
+                spec(4, 4, 0, false),
+                spec(1, 1, 0, false),
+                spec(100, 1, 100, false),
+            ],
+            10_000,
+        )
+        .expect("build");
         assert_eq!(adm.capacity(Lane::Heavy), 1, "other = 5, so other / 4 = 1");
         assert!(
             adm.capacity(Lane::Heavy) * HEAVY_SHARE_DEN <= adm.total_capacity() * HEAVY_SHARE_NUM,
@@ -656,23 +763,59 @@ mod tests {
 
     #[tokio::test]
     async fn batch_sheds_immediately_rather_than_queueing() {
-        let adm = Admission::new([spec(1, 1, 0, false), spec(1, 1, 0, true), spec(1, 1, 0, false)], 10_000).expect("build");
+        let adm = Admission::new(
+            [
+                spec(1, 1, 0, false),
+                spec(1, 1, 0, true),
+                spec(1, 1, 0, false),
+            ],
+            10_000,
+        )
+        .expect("build");
         let _held = adm.acquire(Lane::Batch, "c1").await.expect("first batch");
-        let err = adm.acquire(Lane::Batch, "c2").await.expect_err("batch never queues");
+        let err = adm
+            .acquire(Lane::Batch, "c2")
+            .await
+            .expect_err("batch never queues");
         assert!(matches!(err, AdmitError::Busy { .. }), "{err}");
     }
 
     #[tokio::test]
     async fn a_waiter_times_out_and_reports_the_budget() {
-        let adm = Admission::new([spec(1, 4, 30, false), spec(1, 1, 0, true), spec(1, 1, 0, false)], 10_000).expect("build");
-        let _held = adm.acquire(Lane::Interactive, "c1").await.expect("hold the only permit");
-        let err = adm.acquire(Lane::Interactive, "c2").await.expect_err("should time out");
-        assert!(matches!(err, AdmitError::QueueTimeout { wait_ms: 30, .. }), "{err}");
+        let adm = Admission::new(
+            [
+                spec(1, 4, 30, false),
+                spec(1, 1, 0, true),
+                spec(1, 1, 0, false),
+            ],
+            10_000,
+        )
+        .expect("build");
+        let _held = adm
+            .acquire(Lane::Interactive, "c1")
+            .await
+            .expect("hold the only permit");
+        let err = adm
+            .acquire(Lane::Interactive, "c2")
+            .await
+            .expect_err("should time out");
+        assert!(
+            matches!(err, AdmitError::QueueTimeout { wait_ms: 30, .. }),
+            "{err}"
+        );
     }
 
     #[tokio::test]
     async fn a_released_permit_serves_the_waiter() {
-        let adm = Admission::new([spec(1, 4, 500, false), spec(1, 1, 0, true), spec(1, 1, 0, false)], 10_000).expect("build");
+        let adm = Admission::new(
+            [
+                spec(1, 4, 500, false),
+                spec(1, 1, 0, true),
+                spec(1, 1, 0, false),
+            ],
+            10_000,
+        )
+        .expect("build");
         let held = adm.acquire(Lane::Interactive, "c1").await.expect("hold");
         let waiter = {
             let adm = adm.clone();
@@ -687,20 +830,48 @@ mod tests {
 
     #[tokio::test]
     async fn an_exhausted_rpm_lease_sheds_the_next_request() {
-        let adm = Admission::new([spec(8, 8, 0, false), spec(8, 8, 0, true), spec(8, 8, 0, false)], 1).expect("build");
+        let adm = Admission::new(
+            [
+                spec(8, 8, 0, false),
+                spec(8, 8, 0, true),
+                spec(8, 8, 0, false),
+            ],
+            1,
+        )
+        .expect("build");
         // 1 rpm: the first request spends the token, the second must wait.
         let _first = adm.acquire(Lane::Interactive, "c1").await.expect("first");
-        let err = adm.acquire(Lane::Interactive, "c1").await.expect_err("rpm exhausted");
+        let err = adm
+            .acquire(Lane::Interactive, "c1")
+            .await
+            .expect_err("rpm exhausted");
         assert!(matches!(err, AdmitError::RateLimited { .. }), "{err}");
         assert!(err.retry_after().is_some_and(|s| s >= 1));
     }
 
     #[tokio::test]
     async fn the_rpm_bucket_is_per_connection() {
-        let adm = Admission::new([spec(8, 8, 0, false), spec(8, 8, 0, true), spec(8, 8, 0, false)], 1).expect("build");
-        let _a = adm.acquire(Lane::Interactive, "c1").await.expect("c1 first");
-        assert!(adm.acquire(Lane::Interactive, "c1").await.is_err(), "c1 is out of tokens");
-        assert!(adm.acquire(Lane::Interactive, "c2").await.is_ok(), "c2 has its own bucket");
+        let adm = Admission::new(
+            [
+                spec(8, 8, 0, false),
+                spec(8, 8, 0, true),
+                spec(8, 8, 0, false),
+            ],
+            1,
+        )
+        .expect("build");
+        let _a = adm
+            .acquire(Lane::Interactive, "c1")
+            .await
+            .expect("c1 first");
+        assert!(
+            adm.acquire(Lane::Interactive, "c1").await.is_err(),
+            "c1 is out of tokens"
+        );
+        assert!(
+            adm.acquire(Lane::Interactive, "c2").await.is_ok(),
+            "c2 has its own bucket"
+        );
     }
 
     #[test]

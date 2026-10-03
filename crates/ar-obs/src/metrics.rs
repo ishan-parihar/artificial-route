@@ -27,7 +27,14 @@ const OTHER: &str = "other";
 /// Fixed duration buckets in microseconds. Fixed so the exposition shape is
 /// stable: a Prometheus counter that renames buckets is one that resets.
 const DURATION_US: [u64; 8] = [
-    1_000, 5_000, 25_000, 100_000, 500_000, 2_000_000, 30_000_000, 120_000_000,
+    1_000,
+    5_000,
+    25_000,
+    100_000,
+    500_000,
+    2_000_000,
+    30_000_000,
+    120_000_000,
 ];
 /// Fixed queue-wait buckets. The zero bound is real: a request that never
 /// entered a lane is a different case from a shed one.
@@ -349,8 +356,14 @@ impl Metrics {
         // Every HELP/TYPE block precedes any sample: a scraper reads TYPE as a
         // declaration of what follows, not a summary of what came before.
         for (name, help) in [
-            ("ar_requests_total", "Requests, by provider|family|decision."),
-            ("ar_tokens_in_total", "Prompt tokens, by provider|family|decision."),
+            (
+                "ar_requests_total",
+                "Requests, by provider|family|decision.",
+            ),
+            (
+                "ar_tokens_in_total",
+                "Prompt tokens, by provider|family|decision.",
+            ),
             (
                 "ar_tokens_out_total",
                 "Completion tokens, by provider|family|decision.",
@@ -399,8 +412,11 @@ impl Metrics {
             "ar_request_duration_us",
             "Request duration in microseconds.",
         );
-        lock(&self.queue_wait_us)
-            .render(&mut out, "ar_queue_wait_us", "Lane wait in microseconds.");
+        lock(&self.queue_wait_us).render(
+            &mut out,
+            "ar_queue_wait_us",
+            "Lane wait in microseconds.",
+        );
         out
     }
 }

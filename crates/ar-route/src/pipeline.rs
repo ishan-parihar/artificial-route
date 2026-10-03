@@ -319,8 +319,14 @@ const TASK_STAGES: &[(TaskType, &[(StageName, FitnessTier)])] = &[
             (StageName::Reflect, FitnessTier::BestReasoning),
         ],
     ),
-    (TaskType::Medium, &[(StageName::Execute, FitnessTier::Moderate)]),
-    (TaskType::Simple, &[(StageName::Execute, FitnessTier::Cheapest)]),
+    (
+        TaskType::Medium,
+        &[(StageName::Execute, FitnessTier::Moderate)],
+    ),
+    (
+        TaskType::Simple,
+        &[(StageName::Execute, FitnessTier::Cheapest)],
+    ),
 ];
 
 /// Builds the default pipeline for a task type and request.
@@ -402,11 +408,7 @@ const FIX_USER: &str = "Original request: {original_request}\n\nReflection feedb
 /// judge never ran, the literal `{reflection_response}` reaches the model and
 /// the stage visibly did not get its input, instead of silently receiving an
 /// empty turn.
-fn render_prompt(
-    stage: StageName,
-    request: &str,
-    context: &StageContext,
-) -> (String, String) {
+fn render_prompt(stage: StageName, request: &str, context: &StageContext) -> (String, String) {
     let (system, user) = match stage {
         StageName::Plan => (PLAN_SYSTEM, PLAN_USER),
         StageName::Execute => (EXECUTE_SYSTEM, EXECUTE_USER),
@@ -577,10 +579,7 @@ fn strip_code_fence(text: &str) -> Option<String> {
 /// `Strategy::Pipeline` ([`crate::Strategy::Pipeline`]) picks the provider for a
 /// stage; this runs the stage. Keeping the two apart is why
 /// [`StageExecutorArgs`] carries a [`FitnessTier`] rather than a provider.
-pub fn execute_pipeline<E: StageExecutor>(
-    config: &PipelineConfig,
-    executor: &E,
-) -> PipelineResult {
+pub fn execute_pipeline<E: StageExecutor>(config: &PipelineConfig, executor: &E) -> PipelineResult {
     let mut results: Vec<StageResult> = Vec::with_capacity(config.stages.len());
     let mut context = StageContext::default();
     let mut fallback = false;
@@ -824,11 +823,7 @@ mod tests {
         );
 
         assert_eq!(
-            result
-                .stages
-                .iter()
-                .map(|s| s.stage)
-                .collect::<Vec<_>>(),
+            result.stages.iter().map(|s| s.stage).collect::<Vec<_>>(),
             vec![
                 StageName::Plan,
                 StageName::Execute,

@@ -248,7 +248,10 @@ impl Resilience {
         let until = now + backoff.max(retry_after.unwrap_or(Duration::ZERO));
         state.insert(
             Strng::from(key),
-            Cooldown { until, failures: failures.saturating_add(1) },
+            Cooldown {
+                until,
+                failures: failures.saturating_add(1),
+            },
         );
         until.saturating_duration_since(now)
     }
@@ -285,7 +288,9 @@ impl Resilience {
     /// Consecutive failure count for `key`, 0 when healthy.
     #[must_use]
     pub fn failures(&self, key: &str) -> u32 {
-        self.state.lock().map_or(0, |s| s.get(key).map_or(0, |c| c.failures))
+        self.state
+            .lock()
+            .map_or(0, |s| s.get(key).map_or(0, |c| c.failures))
     }
 
     /// `base * 2^failures`, clamped to `max`.
@@ -363,7 +368,12 @@ impl Resilience {
         }
         scopes.locks.insert(
             key,
-            ModelLock { until, failures, last_failure: now, applied },
+            ModelLock {
+                until,
+                failures,
+                last_failure: now,
+                applied,
+            },
         );
         applied
     }
@@ -571,7 +581,8 @@ impl Resilience {
     fn reset_window(&self, class: BreakerClass, open_cycles: u32) -> Duration {
         let base = self.reset_override.unwrap_or_else(|| class.reset());
         let ceiling = base.saturating_mul(1u32 << BREAKER_BACKOFF_STEPS);
-        base.saturating_mul(1u32 << open_cycles.min(BREAKER_BACKOFF_STEPS)).min(ceiling)
+        base.saturating_mul(1u32 << open_cycles.min(BREAKER_BACKOFF_STEPS))
+            .min(ceiling)
     }
 
     /// Test-only: shrink the escalation window so escalation and sweep
@@ -631,7 +642,9 @@ impl Default for Resilience {
 mod tests {
     use std::time::Duration;
 
-    use super::{BreakerClass, BreakerState, LockReason, Resilience, QUOTA_COOLDOWN_CAP, quota_cooldown};
+    use super::{
+        BreakerClass, BreakerState, LockReason, QUOTA_COOLDOWN_CAP, Resilience, quota_cooldown,
+    };
 
     #[test]
     fn reports_cooling_after_failure() {
@@ -706,7 +719,10 @@ mod tests {
         let applied = r.lock_model("p", "dead", LockReason::Throttled, Duration::from_secs(120));
         assert_eq!(applied, Duration::from_secs(120));
         assert!(r.is_cooling_for("p", "dead"));
-        assert!(!r.is_cooling_for("p", "alive"), "sibling model keeps serving");
+        assert!(
+            !r.is_cooling_for("p", "alive"),
+            "sibling model keeps serving"
+        );
         assert!(!r.is_cooling("p"), "the provider key never cooled");
     }
 
@@ -728,7 +744,10 @@ mod tests {
         let throttled = r.lock_model("p", "a", LockReason::Throttled, Duration::from_secs(120));
         let quota = r.lock_model("p", "b", LockReason::QuotaExhausted, quota_cooldown());
         assert_eq!(throttled, Duration::from_secs(120));
-        assert!(quota > Duration::from_secs(3600), "a spent allowance waits for the day");
+        assert!(
+            quota > Duration::from_secs(3600),
+            "a spent allowance waits for the day"
+        );
         assert!(quota <= QUOTA_COOLDOWN_CAP);
     }
 
@@ -752,7 +771,10 @@ mod tests {
         let first = r.lock_model("p", "m", LockReason::Throttled, Duration::from_millis(100));
         std::thread::sleep(Duration::from_millis(40));
         let second = r.lock_model("p", "m", LockReason::Throttled, Duration::from_millis(100));
-        assert_eq!((first, second), (Duration::from_millis(100), Duration::from_millis(200)));
+        assert_eq!(
+            (first, second),
+            (Duration::from_millis(100), Duration::from_millis(200))
+        );
     }
 
     #[test]
@@ -771,7 +793,11 @@ mod tests {
     fn retires_a_terminal_model_instead_of_cooling_it() {
         let r = Resilience::new();
         let applied = r.lock_model("p", "m", LockReason::Terminal, Duration::from_secs(60));
-        assert_eq!(applied, Duration::ZERO, "a retirement has no window to report");
+        assert_eq!(
+            applied,
+            Duration::ZERO,
+            "a retirement has no window to report"
+        );
         assert!(r.is_retired_model("p", "m"));
         assert!(r.is_cooling_for("p", "m"));
         assert!(r.model_cooling("p", "m").is_none());

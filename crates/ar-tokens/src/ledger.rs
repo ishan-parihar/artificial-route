@@ -335,7 +335,14 @@ impl Ledger {
         prices: &PricingTable,
     ) -> Result<ResponseMeta, TokenError> {
         let meta = ResponseMeta::from_upstream(prices, provider, model, upstream_usage);
-        self.record(&Entry { key_id, provider, model, usage: meta.usage(), cost: meta.cost(), created_at })?;
+        self.record(&Entry {
+            key_id,
+            provider,
+            model,
+            usage: meta.usage(),
+            cost: meta.cost(),
+            created_at,
+        })?;
         Ok(meta)
     }
 
@@ -378,7 +385,12 @@ impl Ledger {
         // stored 0 would deny every subsequent request.
         self.conn.execute(
             UPSERT_CAP,
-            params![cap.key_id, cap.usd_micros.map(to_i64), cap.tokens.map(to_i64), i64::from(cap.refuse_unpriced)],
+            params![
+                cap.key_id,
+                cap.usd_micros.map(to_i64),
+                cap.tokens.map(to_i64),
+                i64::from(cap.refuse_unpriced)
+            ],
         )?;
         Ok(())
     }
@@ -390,9 +402,9 @@ impl Ledger {
     ///
     /// Returns [`TokenError::Sqlite`] on a read failure.
     pub fn cap(&self, key_id: &str) -> Result<Option<Cap>, TokenError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT usd_micros, token_cap, refuse_unpriced FROM key_caps WHERE key_id = ?1")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT usd_micros, token_cap, refuse_unpriced FROM key_caps WHERE key_id = ?1",
+        )?;
         let mut rows = stmt.query([key_id])?;
         let Some(row) = rows.next()? else {
             return Ok(None);
@@ -416,7 +428,12 @@ impl Ledger {
             [key_id],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         )?;
-        Ok(Spend { usd: Usd { micros: to_u64(usd) }, tokens: to_u64(tokens) })
+        Ok(Spend {
+            usd: Usd {
+                micros: to_u64(usd),
+            },
+            tokens: to_u64(tokens),
+        })
     }
 
     /// Decides whether a key may spend `projected` on a request that will use
@@ -437,7 +454,12 @@ impl Ledger {
     /// # Errors
     ///
     /// Returns [`TokenError::Sqlite`] on a read failure.
-    pub fn admit(&self, key_id: &str, projected: Cost, projected_tokens: u32) -> Result<Verdict, TokenError> {
+    pub fn admit(
+        &self,
+        key_id: &str,
+        projected: Cost,
+        projected_tokens: u32,
+    ) -> Result<Verdict, TokenError> {
         let Some(cap) = self.cap(key_id)? else {
             return Ok(Verdict::Allow);
         };
@@ -480,7 +502,9 @@ impl Ledger {
                 provider: row.get(1)?,
                 model: row.get(2)?,
                 total_tokens: to_u32(row.get::<_, i64>(3)?),
-                cost_usd: Usd { micros: to_u64(row.get::<_, i64>(4)?) },
+                cost_usd: Usd {
+                    micros: to_u64(row.get::<_, i64>(4)?),
+                },
                 priced: row.get::<_, i64>(5)? != 0,
             });
             if rows.len() >= limit {
@@ -492,7 +516,15 @@ impl Ledger {
             [],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         )?;
-        Ok(CostReport { rows, totals: Spend { usd: Usd { micros: to_u64(usd) }, tokens: to_u64(tokens) } })
+        Ok(CostReport {
+            rows,
+            totals: Spend {
+                usd: Usd {
+                    micros: to_u64(usd),
+                },
+                tokens: to_u64(tokens),
+            },
+        })
     }
 }
 
@@ -539,7 +571,10 @@ mod tests {
             provider,
             model,
             usage: NormalizedUsage::new(tokens, 0),
-            cost: Cost { usd: Usd { micros: 1_000 }, priced: true },
+            cost: Cost {
+                usd: Usd { micros: 1_000 },
+                priced: true,
+            },
             created_at: 1_700_000_000,
         }
     }
@@ -552,7 +587,14 @@ mod tests {
 
     fn priced_table() -> PricingTable {
         let mut t = PricingTable::default();
-        t.set("openai", "gpt-4o", Prices { input_micros_per_mtok: 2_500_000, output_micros_per_mtok: 10_000_000 });
+        t.set(
+            "openai",
+            "gpt-4o",
+            Prices {
+                input_micros_per_mtok: 2_500_000,
+                output_micros_per_mtok: 10_000_000,
+            },
+        );
         t
     }
 
@@ -563,53 +605,140 @@ mod tests {
     #[test]
     fn ledgers_usage_when_completed() {
         let ledger = Ledger::open_in_memory().expect("open");
-        ledger.record(&entry("k1", "openai", "gpt-4o", 1_200)).expect("record");
+        ledger
+            .record(&entry("k1", "openai", "gpt-4o", 1_200))
+            .expect("record");
         assert_eq!(ledger.spend("k1").expect("spend").tokens, 1_200);
     }
 
     #[test]
     fn blocks_when_over_budget() {
         let ledger = Ledger::open_in_memory().expect("open");
-        ledger.set_cap(&Cap { key_id: "k1".into(), usd_micros: Some(1_000), tokens: None, refuse_unpriced: false }).expect("cap");
-        ledger.record(&entry("k1", "openai", "gpt-4o", 10)).expect("record");
-        let verdict = ledger.admit("k1", Cost { usd: Usd { micros: 500 }, priced: true }, 10).expect("admit");
-        assert_eq!(verdict.reason(), Some(DenyReason::UsdCap { spent: Usd { micros: 1_500 }, cap: Usd { micros: 1_000 } }));
+        ledger
+            .set_cap(&Cap {
+                key_id: "k1".into(),
+                usd_micros: Some(1_000),
+                tokens: None,
+                refuse_unpriced: false,
+            })
+            .expect("cap");
+        ledger
+            .record(&entry("k1", "openai", "gpt-4o", 10))
+            .expect("record");
+        let verdict = ledger
+            .admit(
+                "k1",
+                Cost {
+                    usd: Usd { micros: 500 },
+                    priced: true,
+                },
+                10,
+            )
+            .expect("admit");
+        assert_eq!(
+            verdict.reason(),
+            Some(DenyReason::UsdCap {
+                spent: Usd { micros: 1_500 },
+                cap: Usd { micros: 1_000 }
+            })
+        );
     }
 
     #[test]
     fn maps_denial_to_payment_required() {
-        assert_eq!(DenyReason::TokenCap { spent: 2, cap: 1 }.status().as_u16(), 402);
+        assert_eq!(
+            DenyReason::TokenCap { spent: 2, cap: 1 }.status().as_u16(),
+            402
+        );
     }
 
     #[test]
     fn allows_when_no_cap_installed() {
         let ledger = Ledger::open_in_memory().expect("open");
-        assert_eq!(ledger.admit("k1", Cost::UNPRICED, 1_000_000).expect("admit"), Verdict::Allow);
+        assert_eq!(
+            ledger
+                .admit("k1", Cost::UNPRICED, 1_000_000)
+                .expect("admit"),
+            Verdict::Allow
+        );
     }
 
     #[test]
     fn enforces_token_cap_when_flat_rate_cost_is_zero() {
         let ledger = Ledger::open_in_memory().expect("open");
-        ledger.set_cap(&Cap { key_id: "k1".into(), usd_micros: Some(1_000_000), tokens: Some(1_000), refuse_unpriced: false }).expect("cap");
-        let cost = flat_rate_table().cost("claude", "claude-sonnet-4", NormalizedUsage::new(1_000, 0));
-        ledger.record(&Entry { cost, ..entry("k1", "claude", "claude-sonnet-4", 1_000) }).expect("record");
-        let verdict = ledger.admit("k1", Cost { usd: Usd::ZERO, priced: true }, 100).expect("admit");
-        assert_eq!(verdict.reason(), Some(DenyReason::TokenCap { spent: 1_100, cap: 1_000 }));
+        ledger
+            .set_cap(&Cap {
+                key_id: "k1".into(),
+                usd_micros: Some(1_000_000),
+                tokens: Some(1_000),
+                refuse_unpriced: false,
+            })
+            .expect("cap");
+        let cost =
+            flat_rate_table().cost("claude", "claude-sonnet-4", NormalizedUsage::new(1_000, 0));
+        ledger
+            .record(&Entry {
+                cost,
+                ..entry("k1", "claude", "claude-sonnet-4", 1_000)
+            })
+            .expect("record");
+        let verdict = ledger
+            .admit(
+                "k1",
+                Cost {
+                    usd: Usd::ZERO,
+                    priced: true,
+                },
+                100,
+            )
+            .expect("admit");
+        assert_eq!(
+            verdict.reason(),
+            Some(DenyReason::TokenCap {
+                spent: 1_100,
+                cap: 1_000
+            })
+        );
     }
 
     #[test]
     fn enforces_token_cap_when_model_is_unpriced() {
         let ledger = Ledger::open_in_memory().expect("open");
-        ledger.set_cap(&Cap { key_id: "k1".into(), usd_micros: Some(1_000_000), tokens: Some(500), refuse_unpriced: false }).expect("cap");
+        ledger
+            .set_cap(&Cap {
+                key_id: "k1".into(),
+                usd_micros: Some(1_000_000),
+                tokens: Some(500),
+                refuse_unpriced: false,
+            })
+            .expect("cap");
         let verdict = ledger.admit("k1", Cost::UNPRICED, 500).expect("admit");
-        assert_eq!(verdict.reason(), Some(DenyReason::TokenCap { spent: 500, cap: 500 }));
+        assert_eq!(
+            verdict.reason(),
+            Some(DenyReason::TokenCap {
+                spent: 500,
+                cap: 500
+            })
+        );
     }
 
     #[test]
     fn ignores_cap_with_neither_arm_set() {
         let ledger = Ledger::open_in_memory().expect("open");
-        ledger.set_cap(&Cap { key_id: "k1".into(), usd_micros: None, tokens: None, refuse_unpriced: false }).expect("cap");
-        assert_eq!(ledger.admit("k1", Cost::UNPRICED, 9_999_999).expect("admit"), Verdict::Allow);
+        ledger
+            .set_cap(&Cap {
+                key_id: "k1".into(),
+                usd_micros: None,
+                tokens: None,
+                refuse_unpriced: false,
+            })
+            .expect("cap");
+        assert_eq!(
+            ledger
+                .admit("k1", Cost::UNPRICED, 9_999_999)
+                .expect("admit"),
+            Verdict::Allow
+        );
     }
 
     #[test]
@@ -618,14 +747,31 @@ mod tests {
         // refusing by default would break every key whose pricing table has a
         // gap -- so the flag exists and defaults off.
         let ledger = Ledger::open_in_memory().expect("open");
-        ledger.set_cap(&Cap { key_id: "k1".into(), usd_micros: Some(1_000_000), tokens: None, refuse_unpriced: false }).expect("cap");
-        assert_eq!(ledger.admit("k1", Cost::UNPRICED, 10).expect("admit"), Verdict::Allow);
+        ledger
+            .set_cap(&Cap {
+                key_id: "k1".into(),
+                usd_micros: Some(1_000_000),
+                tokens: None,
+                refuse_unpriced: false,
+            })
+            .expect("cap");
+        assert_eq!(
+            ledger.admit("k1", Cost::UNPRICED, 10).expect("admit"),
+            Verdict::Allow
+        );
     }
 
     #[test]
     fn refuses_an_unpriced_model_when_the_cap_asks_to_fail_closed() {
         let ledger = Ledger::open_in_memory().expect("open");
-        ledger.set_cap(&Cap { key_id: "k1".into(), usd_micros: Some(1_000_000), tokens: None, refuse_unpriced: true }).expect("cap");
+        ledger
+            .set_cap(&Cap {
+                key_id: "k1".into(),
+                usd_micros: Some(1_000_000),
+                tokens: None,
+                refuse_unpriced: true,
+            })
+            .expect("cap");
         let verdict = ledger.admit("k1", Cost::UNPRICED, 10).expect("admit");
         assert_eq!(verdict.reason(), Some(DenyReason::Unpriced));
     }
@@ -635,9 +781,22 @@ mod tests {
         // The flag is about *unknown* cost, not about spending: a priced request
         // on a fail-closed key is decided by the arms as usual.
         let ledger = Ledger::open_in_memory().expect("open");
-        ledger.set_cap(&Cap { key_id: "k1".into(), usd_micros: Some(1_000_000), tokens: Some(500), refuse_unpriced: true }).expect("cap");
-        let priced = Cost { usd: Usd { micros: 1 }, priced: true };
-        assert_eq!(ledger.admit("k1", priced, 10).expect("admit"), Verdict::Allow);
+        ledger
+            .set_cap(&Cap {
+                key_id: "k1".into(),
+                usd_micros: Some(1_000_000),
+                tokens: Some(500),
+                refuse_unpriced: true,
+            })
+            .expect("cap");
+        let priced = Cost {
+            usd: Usd { micros: 1 },
+            priced: true,
+        };
+        assert_eq!(
+            ledger.admit("k1", priced, 10).expect("admit"),
+            Verdict::Allow
+        );
     }
 
     #[test]
@@ -645,15 +804,30 @@ mod tests {
         // A flat-rate provider is a known $0, not an unknown price. Refusing it
         // would refuse every subscription key.
         let ledger = Ledger::open_in_memory().expect("open");
-        ledger.set_cap(&Cap { key_id: "k1".into(), usd_micros: None, tokens: Some(500), refuse_unpriced: true }).expect("cap");
-        let flat = Cost { usd: Usd::ZERO, priced: true };
+        ledger
+            .set_cap(&Cap {
+                key_id: "k1".into(),
+                usd_micros: None,
+                tokens: Some(500),
+                refuse_unpriced: true,
+            })
+            .expect("cap");
+        let flat = Cost {
+            usd: Usd::ZERO,
+            priced: true,
+        };
         assert_eq!(ledger.admit("k1", flat, 10).expect("admit"), Verdict::Allow);
     }
 
     #[test]
     fn round_trips_the_fail_closed_flag_through_the_cap_table() {
         let ledger = Ledger::open_in_memory().expect("open");
-        let cap = Cap { key_id: "k1".into(), usd_micros: None, tokens: None, refuse_unpriced: true };
+        let cap = Cap {
+            key_id: "k1".into(),
+            usd_micros: None,
+            tokens: None,
+            refuse_unpriced: true,
+        };
         ledger.set_cap(&cap).expect("cap");
         assert_eq!(ledger.cap("k1").expect("cap"), Some(cap));
     }
@@ -683,14 +857,26 @@ mod tests {
         }
         let ledger = Ledger::open(&path).expect("reopen");
         let cap = ledger.cap("k1").expect("cap").expect("a row");
-        assert_eq!((cap.usd_micros, cap.tokens, cap.refuse_unpriced), (Some(5_000), Some(900), false));
+        assert_eq!(
+            (cap.usd_micros, cap.tokens, cap.refuse_unpriced),
+            (Some(5_000), Some(900), false)
+        );
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn records_the_usage_a_response_reported() {
         let ledger = Ledger::open_in_memory().expect("open");
-        ledger.record_response("k1", "openai", "gpt-4o", &upstream_usage(), 1_700_000_000, &priced_table()).expect("record");
+        ledger
+            .record_response(
+                "k1",
+                "openai",
+                "gpt-4o",
+                &upstream_usage(),
+                1_700_000_000,
+                &priced_table(),
+            )
+            .expect("record");
         assert_eq!(ledger.spend("k1").expect("spend").tokens, 2_000_000);
     }
 
@@ -701,7 +887,16 @@ mod tests {
         // number half the real one.
         let ledger = Ledger::open_in_memory().expect("open");
         let usage = json!({ "input_tokens": 10, "cache_read_input_tokens": 4, "cache_creation_input_tokens": 1, "output_tokens": 2 });
-        let meta = ledger.record_response("k1", "anthropic", "claude-sonnet-4", &usage, 1_700_000_000, &priced_table()).expect("record");
+        let meta = ledger
+            .record_response(
+                "k1",
+                "anthropic",
+                "claude-sonnet-4",
+                &usage,
+                1_700_000_000,
+                &priced_table(),
+            )
+            .expect("record");
         assert_eq!(meta.tokens_in(), 15);
         assert_eq!(ledger.spend("k1").expect("spend").tokens, 17);
     }
@@ -711,8 +906,20 @@ mod tests {
         // The contract the response headers lean on: the returned meta and the
         // persisted row are one computation read twice, never two that can drift.
         let ledger = Ledger::open_in_memory().expect("open");
-        let meta = ledger.record_response("k1", "openai", "gpt-4o", &upstream_usage(), 1_700_000_000, &priced_table()).expect("record");
-        assert_eq!(meta.cost().usd.micros, ledger.report(1).expect("report").rows[0].cost_usd.micros);
+        let meta = ledger
+            .record_response(
+                "k1",
+                "openai",
+                "gpt-4o",
+                &upstream_usage(),
+                1_700_000_000,
+                &priced_table(),
+            )
+            .expect("record");
+        assert_eq!(
+            meta.cost().usd.micros,
+            ledger.report(1).expect("report").rows[0].cost_usd.micros
+        );
     }
 
     #[test]
@@ -720,7 +927,16 @@ mod tests {
         // A served request with no measurement is still a served request; a gap
         // would read downstream as "no request happened".
         let ledger = Ledger::open_in_memory().expect("open");
-        let meta = ledger.record_response("k1", "openai", "gpt-4o", &json!({}), 1_700_000_000, &priced_table()).expect("record");
+        let meta = ledger
+            .record_response(
+                "k1",
+                "openai",
+                "gpt-4o",
+                &json!({}),
+                1_700_000_000,
+                &priced_table(),
+            )
+            .expect("record");
         assert_eq!(meta.usage(), NormalizedUsage::new(0, 0));
         assert_eq!(ledger.report(1).expect("report").rows.len(), 1);
     }
@@ -728,14 +944,38 @@ mod tests {
     #[test]
     fn records_a_flat_rate_response_as_priced_zero() {
         let ledger = Ledger::open_in_memory().expect("open");
-        let meta = ledger.record_response("k1", "claude", "claude-sonnet-4", &upstream_usage(), 1_700_000_000, &flat_rate_table()).expect("record");
-        assert_eq!(meta.cost(), Cost { usd: Usd::ZERO, priced: true });
+        let meta = ledger
+            .record_response(
+                "k1",
+                "claude",
+                "claude-sonnet-4",
+                &upstream_usage(),
+                1_700_000_000,
+                &flat_rate_table(),
+            )
+            .expect("record");
+        assert_eq!(
+            meta.cost(),
+            Cost {
+                usd: Usd::ZERO,
+                priced: true
+            }
+        );
     }
 
     #[test]
     fn records_an_unpriced_model_as_unpriced_rather_than_free() {
         let ledger = Ledger::open_in_memory().expect("open");
-        let meta = ledger.record_response("k1", "openai", "no-such-model", &upstream_usage(), 1_700_000_000, &priced_table()).expect("record");
+        let meta = ledger
+            .record_response(
+                "k1",
+                "openai",
+                "no-such-model",
+                &upstream_usage(),
+                1_700_000_000,
+                &priced_table(),
+            )
+            .expect("record");
         assert_eq!(meta.cost(), Cost::UNPRICED);
     }
 
@@ -743,7 +983,16 @@ mod tests {
     fn records_every_response_of_a_session_separately() {
         let ledger = Ledger::open_in_memory().expect("open");
         for _ in 0..3 {
-            ledger.record_response("k1", "openai", "gpt-4o", &upstream_usage(), 1_700_000_000, &priced_table()).expect("record");
+            ledger
+                .record_response(
+                    "k1",
+                    "openai",
+                    "gpt-4o",
+                    &upstream_usage(),
+                    1_700_000_000,
+                    &priced_table(),
+                )
+                .expect("record");
         }
         assert_eq!(ledger.report(10).expect("report").rows.len(), 3);
     }
@@ -751,7 +1000,10 @@ mod tests {
     #[test]
     fn records_batch_in_one_transaction_when_given_several() {
         let ledger = Ledger::open_in_memory().expect("open");
-        let batch = [entry("k1", "openai", "gpt-4o", 10), entry("k1", "openai", "gpt-4o", 20)];
+        let batch = [
+            entry("k1", "openai", "gpt-4o", 10),
+            entry("k1", "openai", "gpt-4o", 20),
+        ];
         ledger.record_batch(&batch).expect("batch");
         assert_eq!(ledger.spend("k1").expect("spend").tokens, 30);
     }
@@ -759,23 +1011,38 @@ mod tests {
     #[test]
     fn rejects_update_when_row_already_written() {
         let ledger = Ledger::open_in_memory().expect("open");
-        ledger.record(&entry("k1", "openai", "gpt-4o", 10)).expect("record");
-        let err = ledger.conn.execute("UPDATE usage SET cost_micros = 0", []).expect_err("append-only");
+        ledger
+            .record(&entry("k1", "openai", "gpt-4o", 10))
+            .expect("record");
+        let err = ledger
+            .conn
+            .execute("UPDATE usage SET cost_micros = 0", [])
+            .expect_err("append-only");
         assert!(err.to_string().contains("append-only"));
     }
 
     #[test]
     fn rejects_delete_when_row_already_written() {
         let ledger = Ledger::open_in_memory().expect("open");
-        ledger.record(&entry("k1", "openai", "gpt-4o", 10)).expect("record");
-        let err = ledger.conn.execute("DELETE FROM usage", []).expect_err("append-only");
+        ledger
+            .record(&entry("k1", "openai", "gpt-4o", 10))
+            .expect("record");
+        let err = ledger
+            .conn
+            .execute("DELETE FROM usage", [])
+            .expect_err("append-only");
         assert!(err.to_string().contains("append-only"));
     }
 
     #[test]
     fn reads_cap_back_when_installed() {
         let ledger = Ledger::open_in_memory().expect("open");
-        let cap = Cap { key_id: "k1".into(), usd_micros: Some(5_000), tokens: None, refuse_unpriced: false };
+        let cap = Cap {
+            key_id: "k1".into(),
+            usd_micros: Some(5_000),
+            tokens: None,
+            refuse_unpriced: false,
+        };
         ledger.set_cap(&cap).expect("cap");
         assert_eq!(ledger.cap("k1").expect("cap"), Some(cap));
     }
@@ -789,20 +1056,29 @@ mod tests {
     #[test]
     fn sums_totals_across_keys_when_reported() {
         let ledger = Ledger::open_in_memory().expect("open");
-        ledger.record(&entry("k1", "openai", "gpt-4o", 10)).expect("record");
-        ledger.record(&entry("k2", "groq", "llama", 5)).expect("record");
+        ledger
+            .record(&entry("k1", "openai", "gpt-4o", 10))
+            .expect("record");
+        ledger
+            .record(&entry("k2", "groq", "llama", 5))
+            .expect("record");
         assert_eq!(ledger.report(10).expect("report").totals.tokens, 15);
     }
 
     #[test]
     fn renders_empty_state_when_no_rows() {
-        assert_eq!(CostReport::default().toon(), "cost: 0 rows — no usage recorded\n");
+        assert_eq!(
+            CostReport::default().toon(),
+            "cost: 0 rows — no usage recorded\n"
+        );
     }
 
     #[test]
     fn renders_header_and_count_when_rows_present() {
         let ledger = Ledger::open_in_memory().expect("open");
-        ledger.record(&entry("k1", "openai", "gpt-4o", 10)).expect("record");
+        ledger
+            .record(&entry("k1", "openai", "gpt-4o", 10))
+            .expect("record");
         let toon = ledger.report(10).expect("report").toon();
         assert!(toon.starts_with("cost[1]{key_id,provider,model,tokens,usd}\n"));
     }
@@ -810,7 +1086,9 @@ mod tests {
     #[test]
     fn reads_back_what_the_same_connection_wrote() {
         let ledger = Ledger::open_in_memory().expect("open");
-        ledger.record(&entry("k1", "openai", "gpt-4o", 10)).expect("record");
+        ledger
+            .record(&entry("k1", "openai", "gpt-4o", 10))
+            .expect("record");
         let report = ledger.report(10).expect("report");
         assert_eq!(report.rows[0].key_id, "k1");
     }
@@ -820,5 +1098,4 @@ mod tests {
         fn assert_send<T: Send>() {}
         assert_send::<Ledger>();
     }
-
 }

@@ -155,12 +155,12 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bytes::Bytes;
 use reqwest::{StatusCode, Url};
-use uuid::Uuid;
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::{ArExec, ChatStream, Dispatch, ExecError};
 
@@ -253,38 +253,38 @@ const REFRESH_BODY_SCAN: usize = 2 * 1024;
 const TOKEN_ENDPOINT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// RFC 8628 §3.2's default poll interval, used when the provider names none
-    /// (or names zero).
-    ///
-    /// §3.2 says a client that omits `interval` waits this long, and it is a floor
-    /// on *our* politeness in both directions: an endpoint that wants more
-    /// cadence than 5s should have said so, and one that says nothing cannot make
-    /// this build into a hot loop.
-    const DEVICE_DEFAULT_INTERVAL_SECS: u64 = 5;
+/// (or names zero).
+///
+/// §3.2 says a client that omits `interval` waits this long, and it is a floor
+/// on *our* politeness in both directions: an endpoint that wants more
+/// cadence than 5s should have said so, and one that says nothing cannot make
+/// this build into a hot loop.
+const DEVICE_DEFAULT_INTERVAL_SECS: u64 = 5;
 
-    /// The cadence a kilo-shaped grant is polled at when it names no `interval`.
-    ///
-    /// §3.2's own default stays the answer for every grant that reads like the
-    /// RFC; this is the one provider whose endpoint wants a poll faster than that,
-    /// and it wants it *silently* — it publishes no `interval` field at all, so
-    /// the only evidence it is not an RFC grant is that its other fields are not
-    /// RFC either. Hence the trigger: applied only when the expiry itself arrived
-    /// camelCase (see [`initiate_device`]), so an RFC-shaped grant that omits
-    /// `interval` still gets [`DEVICE_DEFAULT_INTERVAL_SECS`].
-    ///
-    /// Faster than the RFC floor by design, and not a hot loop: 3s is a poll
-    /// rate, not a spin, and it is the provider's own number rather than a guess
-    /// at one.
-    const DEVICE_CAMEL_INTERVAL_SECS: u64 = 3;
+/// The cadence a kilo-shaped grant is polled at when it names no `interval`.
+///
+/// §3.2's own default stays the answer for every grant that reads like the
+/// RFC; this is the one provider whose endpoint wants a poll faster than that,
+/// and it wants it *silently* — it publishes no `interval` field at all, so
+/// the only evidence it is not an RFC grant is that its other fields are not
+/// RFC either. Hence the trigger: applied only when the expiry itself arrived
+/// camelCase (see [`initiate_device`]), so an RFC-shaped grant that omits
+/// `interval` still gets [`DEVICE_DEFAULT_INTERVAL_SECS`].
+///
+/// Faster than the RFC floor by design, and not a hot loop: 3s is a poll
+/// rate, not a spin, and it is the provider's own number rather than a guess
+/// at one.
+const DEVICE_CAMEL_INTERVAL_SECS: u64 = 3;
 
-    /// The device-code placeholder a `device_poll_url` may carry: `{code}`.
-    ///
-    /// Some providers address the grant by path (`/poll/{code}`) rather than by
-    /// body parameter, and which one a given provider does cannot be inferred from
-    /// its id without inventing a wire format (AGENTS.md) — so the substitution is
-    /// the operator's to declare in `config.yaml` and [`poll_device`]'s to
-    /// perform. A URL without the placeholder is polled byte-identically, which is
-    /// what keeps every existing provider on exactly the request it had.
-    const DEVICE_POLL_CODE_PLACEHOLDER: &str = "{code}";
+/// The device-code placeholder a `device_poll_url` may carry: `{code}`.
+///
+/// Some providers address the grant by path (`/poll/{code}`) rather than by
+/// body parameter, and which one a given provider does cannot be inferred from
+/// its id without inventing a wire format (AGENTS.md) — so the substitution is
+/// the operator's to declare in `config.yaml` and [`poll_device`]'s to
+/// perform. A URL without the placeholder is polled byte-identically, which is
+/// what keeps every existing provider on exactly the request it had.
+const DEVICE_POLL_CODE_PLACEHOLDER: &str = "{code}";
 
 /// How much §3.5's `slow_down` adds to the wait, per its own wording.
 ///
@@ -461,9 +461,10 @@ impl OAuthKind {
             // registers for `invalid_client`, and it is listed in
             // [`CARVE_OUT_TERMINAL_STATUS`] so `reason_in` can find the reason in a
             // body and the generated CHECK can admit the row.
-            (Self::GrokCli, "invalid_client") => {
-                Some(RefreshFault::Unrecoverable { status: 401, reason: "invalid_client" })
-            }
+            (Self::GrokCli, "invalid_client") => Some(RefreshFault::Unrecoverable {
+                status: 401,
+                reason: "invalid_client",
+            }),
             _ => None,
         }
     }
@@ -573,7 +574,9 @@ impl std::fmt::Display for RefreshFault {
     /// two ways.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Transient(reason) => write!(f, "transient ({reason}); the session is still usable"),
+            Self::Transient(reason) => {
+                write!(f, "transient ({reason}); the session is still usable")
+            }
             Self::Unrecoverable { status, reason } => {
                 write!(f, "terminal (refresh returned {status}: {reason})")
             }
@@ -652,8 +655,10 @@ pub const CARVE_OUT_TERMINAL_STATUS: &[(u16, &str)] = &[(401, "invalid_client")]
 #[must_use]
 pub fn terminal_check_constraint() -> String {
     let mut sql = String::from("CHECK (terminal_status IS NULL OR (");
-    for (i, (status, reason)) in
-        TERMINAL_REFRESH_STATUS.iter().chain(CARVE_OUT_TERMINAL_STATUS).enumerate()
+    for (i, (status, reason)) in TERMINAL_REFRESH_STATUS
+        .iter()
+        .chain(CARVE_OUT_TERMINAL_STATUS)
+        .enumerate()
     {
         if i > 0 {
             sql.push_str(" OR ");
@@ -690,7 +695,10 @@ pub fn classify_refresh(kind: OAuthKind, status: u16, body: &str) -> RefreshFaul
         .iter()
         .any(|(s, r)| *s == status && *r == reason)
     {
-        return RefreshFault::Unrecoverable { status, reason: static_reason(reason) };
+        return RefreshFault::Unrecoverable {
+            status,
+            reason: static_reason(reason),
+        };
     }
     RefreshFault::Transient("unrecognised-auth-failure")
 }
@@ -738,7 +746,10 @@ fn reason_in(body: &str) -> &str {
     {
         return reason;
     }
-    if ACCOUNT_DISABLED_ALIASES.iter().any(|phrase| head.contains(*phrase)) {
+    if ACCOUNT_DISABLED_ALIASES
+        .iter()
+        .any(|phrase| head.contains(*phrase))
+    {
         "account_disabled"
     } else {
         "unauthorized"
@@ -828,7 +839,11 @@ impl OAuthToken {
     /// A token with no refresh path and no expiry.
     #[must_use]
     pub fn new(access: Secret) -> Self {
-        Self { access, refresh: None, expires_at: None }
+        Self {
+            access,
+            refresh: None,
+            expires_at: None,
+        }
     }
 
     /// Attaches the refresh token.
@@ -875,7 +890,8 @@ impl OAuthToken {
     /// a token cannot know which provider it is about to be sent to.
     #[must_use]
     pub fn is_expiring_within(&self, now: u64, lead_secs: u64) -> bool {
-        self.expires_at.is_some_and(|at| at <= now.saturating_add(lead_secs))
+        self.expires_at
+            .is_some_and(|at| at <= now.saturating_add(lead_secs))
     }
 
     /// Whether the token is at or past its expiry, with the default
@@ -1048,7 +1064,8 @@ impl Session {
     /// change while the session is in flight.
     #[must_use]
     pub fn refresh_lead_secs(&self) -> u64 {
-        self.refresh_lead_secs.unwrap_or_else(|| self.kind.refresh_lead_secs())
+        self.refresh_lead_secs
+            .unwrap_or_else(|| self.kind.refresh_lead_secs())
     }
 
     /// The registry provider id.
@@ -1157,9 +1174,10 @@ impl TerminalReport {
                 "reason": self.reason,
             }
         });
-        Bytes::from(serde_json::to_vec(&body).unwrap_or_else(|_| {
-            br#"{"error":{"type":"oauth_terminal"}}"#.to_vec()
-        }))
+        Bytes::from(
+            serde_json::to_vec(&body)
+                .unwrap_or_else(|_| br#"{"error":{"type":"oauth_terminal"}}"#.to_vec()),
+        )
     }
 
     /// The fault a retired session reports on every later call.
@@ -1229,7 +1247,12 @@ pub trait RotationSink: Send {
     ///
     /// `false` is never an error the caller must handle. It means "somebody
     /// fresher got there first", which is the good outcome.
-    fn persist_rotation(&self, provider: &str, presented: Option<&str>, renewed: &OAuthToken) -> bool;
+    fn persist_rotation(
+        &self,
+        provider: &str,
+        presented: Option<&str>,
+        renewed: &OAuthToken,
+    ) -> bool;
 }
 
 /// One authenticated provider connection, in state `S`.
@@ -1382,7 +1405,10 @@ impl Connection<Unconnected> {
     /// unauthenticated and be reported as the provider's own 401.
     pub fn connect(self, token: OAuthToken) -> Result<Connection<Connected>, RefreshFault> {
         if token.access().expose().trim().is_empty() {
-            return Err(RefreshFault::Unrecoverable { status: 401, reason: "empty_access_token" });
+            return Err(RefreshFault::Unrecoverable {
+                status: 401,
+                reason: "empty_access_token",
+            });
         }
         Ok(Connection {
             session: self.session,
@@ -1409,7 +1435,9 @@ pub struct Grant {
 impl std::fmt::Debug for Grant {
     /// The hash is safe to print; the token is not.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Grant").field("hash", &self.hash).finish_non_exhaustive()
+        f.debug_struct("Grant")
+            .field("hash", &self.hash)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1431,7 +1459,10 @@ impl Grant {
 
     fn of(token: OAuthToken) -> Self {
         let hash = token_hash(token.access.expose());
-        Self { token: token.access, hash }
+        Self {
+            token: token.access,
+            hash,
+        }
     }
 }
 
@@ -1456,7 +1487,9 @@ impl Connection<Connected> {
             return Err(report.into_fault());
         }
         let current = self.token.read().await.clone();
-        if origin == Origin::Probe || !current.is_expiring_within(now, self.session.refresh_lead_secs()) {
+        if origin == Origin::Probe
+            || !current.is_expiring_within(now, self.session.refresh_lead_secs())
+        {
             return Ok(Grant::of(current));
         }
         self.rotate(token_hash(current.access.expose())).await
@@ -1507,22 +1540,18 @@ impl Connection<Connected> {
         // The lock is the connection's, not the pool's: two *connections* sharing
         // a refresh token is the reuse case the pool prevents, and serialising
         // across connections would serialise unrelated providers.
-        let _single_flight = match tokio::time::timeout(
-            self.refresh_lock_bound,
-            self.refresh_lock.lock(),
-        )
-        .await
-        {
-            Ok(guard) => guard,
-            Err(_) => {
-                tracing::error!(
-                    provider = %self.session.provider(),
-                    bound_secs = self.refresh_lock_bound.as_secs(),
-                    "refresh lock held past its bound; a concurrent refresh is wedged"
-                );
-                return Err(RefreshFault::Transient("refresh-lock-wedged"));
-            }
-        };
+        let _single_flight =
+            match tokio::time::timeout(self.refresh_lock_bound, self.refresh_lock.lock()).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    tracing::error!(
+                        provider = %self.session.provider(),
+                        bound_secs = self.refresh_lock_bound.as_secs(),
+                        "refresh lock held past its bound; a concurrent refresh is wedged"
+                    );
+                    return Err(RefreshFault::Transient("refresh-lock-wedged"));
+                }
+            };
         if let Some(fresh) = self.pool.take(stale) {
             *self.token.write().await = fresh.clone();
             return Ok(Grant::of(fresh));
@@ -1612,7 +1641,9 @@ impl Connection<Connected> {
             Err(fault) => return Err(self.record(fault).await),
         };
 
-        let stream = core.post(&shape.with_api_key(first.token.expose()), canonical, abort).await?;
+        let stream = core
+            .post(&shape.with_api_key(first.token.expose()), canonical, abort)
+            .await?;
         if stream.status() != StatusCode::UNAUTHORIZED {
             return Ok(stream);
         }
@@ -1623,7 +1654,9 @@ impl Connection<Connected> {
             Err(fault) => return Err(self.record(fault).await),
         };
 
-        let retry = core.post(&shape.with_api_key(second.token.expose()), canonical, abort).await?;
+        let retry = core
+            .post(&shape.with_api_key(second.token.expose()), canonical, abort)
+            .await?;
         if retry.status() != StatusCode::UNAUTHORIZED {
             return Ok(retry);
         }
@@ -1633,7 +1666,9 @@ impl Connection<Connected> {
         // so the next request fails here instead of burning another token.
         let (status, body, _) = retry.into_failure().await;
         let text = String::from_utf8_lossy(&body[..body.len().min(REFRESH_BODY_SCAN)]).into_owned();
-        Err(self.record(classify_refresh(self.kind(), status.as_u16(), &text)).await)
+        Err(self
+            .record(classify_refresh(self.kind(), status.as_u16(), &text))
+            .await)
     }
 }
 
@@ -1671,7 +1706,11 @@ impl HttpRefresher {
     /// ([`RefreshFault::Unrecoverable`]), not a construction failure.
     #[must_use]
     pub fn new(client: reqwest::Client) -> Self {
-        Self { client, timeout: TOKEN_ENDPOINT_TIMEOUT, breaker: Arc::new(RefreshBreaker::new()) }
+        Self {
+            client,
+            timeout: TOKEN_ENDPOINT_TIMEOUT,
+            breaker: Arc::new(RefreshBreaker::new()),
+        }
     }
 
     /// Overrides the refresh timeout.
@@ -1789,7 +1828,10 @@ impl RefreshBreaker {
     /// threshold.
     pub fn record_failure(&self, provider: &str, now: u64) {
         let Ok(mut state) = self.state.lock() else {
-            tracing::warn!(provider, "refresh breaker lock poisoned; blackout unavailable");
+            tracing::warn!(
+                provider,
+                "refresh breaker lock poisoned; blackout unavailable"
+            );
             return;
         };
         let entry = state.entry(provider.to_owned()).or_default();
@@ -1808,7 +1850,9 @@ impl RefreshBreaker {
     /// Consecutive failures recorded for `provider` since its last success.
     #[must_use]
     pub fn failures(&self, provider: &str) -> u32 {
-        self.state.lock().map_or(0, |state| state.get(provider).map_or(0, |entry| entry.failures))
+        self.state.lock().map_or(0, |state| {
+            state.get(provider).map_or(0, |entry| entry.failures)
+        })
     }
 }
 
@@ -1820,12 +1864,18 @@ impl Refresher for HttpRefresher {
     ) -> Pin<Box<dyn Future<Output = Result<OAuthToken, RefreshFault>> + Send + 'a>> {
         Box::pin(async move {
             let Some(url) = session.token_url() else {
-                return Err(RefreshFault::Unrecoverable { status: 400, reason: "no_refresh_token" });
+                return Err(RefreshFault::Unrecoverable {
+                    status: 400,
+                    reason: "no_refresh_token",
+                });
             };
             let Some(refresh) = current.refresh.as_ref() else {
                 // Nothing to present. Terminal by construction — there is no
                 // second source for a refresh token.
-                return Err(RefreshFault::Unrecoverable { status: 400, reason: "no_refresh_token" });
+                return Err(RefreshFault::Unrecoverable {
+                    status: 400,
+                    reason: "no_refresh_token",
+                });
             };
 
             // The breaker gates the whole refresh, before a single token use is
@@ -1834,7 +1884,10 @@ impl Refresher for HttpRefresher {
             // finished — the breaker never speaks for the account's validity.
             let provider = session.provider();
             if self.breaker.is_blocked(provider, unix_now()) {
-                tracing::warn!(provider, "refresh circuit breaker open; not attempting a refresh");
+                tracing::warn!(
+                    provider,
+                    "refresh circuit breaker open; not attempting a refresh"
+                );
                 return Err(RefreshFault::Transient("refresh-breaker-open"));
             }
 
@@ -1902,7 +1955,14 @@ impl HttpRefresher {
         form: &[(&str, &str)],
         current: &OAuthToken,
     ) -> Result<OAuthToken, RefreshFault> {
-        let response = match self.client.post(url).form(form).timeout(self.timeout).send().await {
+        let response = match self
+            .client
+            .post(url)
+            .form(form)
+            .timeout(self.timeout)
+            .send()
+            .await
+        {
             Ok(r) => r,
             // A transport failure is the definition of transient: no verdict
             // was produced, so nothing about the account was learned.
@@ -1924,7 +1984,9 @@ impl HttpRefresher {
             .and_then(serde_json::Value::as_str)
             .map(Secret::new)
         else {
-            return Err(RefreshFault::Transient("refresh-response-has-no-access-token"));
+            return Err(RefreshFault::Transient(
+                "refresh-response-has-no-access-token",
+            ));
         };
 
         // §5.1: `refresh_token` is optional on a refresh response, and its
@@ -1957,7 +2019,11 @@ fn retry_delay(attempt: usize) -> Duration {
         .min(REFRESH_MAX_DELAY_MS);
     // `attempt >= 1` always here, and the shift is capped, so no overflow.
     let jitter_millis = u64::from(jitter_byte()) * base / 255;
-    Duration::from_millis((base.saturating_sub(base / 2)).saturating_add(jitter_millis).max(1))
+    Duration::from_millis(
+        (base.saturating_sub(base / 2))
+            .saturating_add(jitter_millis)
+            .max(1),
+    )
 }
 
 /// One draw from the OS entropy pool, as a `0..=255` scale factor.
@@ -1986,14 +2052,22 @@ fn expiry_at(parsed: &serde_json::Value, now: u64) -> u64 {
     parsed
         .get("expires_in")
         .and_then(serde_json::Value::as_u64)
-        .map_or_else(|| now.saturating_add(EXPIRES_IN_FALLBACK_SECS), |secs| now.saturating_add(secs))
+        .map_or_else(
+            || now.saturating_add(EXPIRES_IN_FALLBACK_SECS),
+            |secs| now.saturating_add(secs),
+        )
 }
 
 /// `reqwest`'s own reason, narrowed to the two the taxonomy distinguishes.
 ///
 /// Its message is unbounded, and this crate does not echo provider text into
 /// error strings, so a static reason is what the taxonomy gets.
-fn transport_reason(e: &reqwest::Error) -> &'static str {    if e.is_timeout() { "refresh-transport-timeout" } else { "refresh-transport-failure" }
+fn transport_reason(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout() {
+        "refresh-transport-timeout"
+    } else {
+        "refresh-transport-failure"
+    }
 }
 
 /// The provider-secret an [`OAuthToken`] carries.
@@ -2326,9 +2400,10 @@ fn code_in(url: &Url, expected_state: &str) -> Result<String, LoginError> {
     if let Some(error) = denied {
         return Err(LoginError::LoginDenied(provider_error(&error)));
     }
-    code.filter(|value| !value.is_empty()).ok_or(LoginError::ExchangeFailed(
-        RefreshFault::Transient("callback-carries-no-code"),
-    ))
+    code.filter(|value| !value.is_empty())
+        .ok_or(LoginError::ExchangeFailed(RefreshFault::Transient(
+            "callback-carries-no-code",
+        )))
 }
 
 /// A provider's `?error=` value, bounded and defaulted.
@@ -2364,8 +2439,8 @@ fn io_reason(e: &std::io::Error) -> String {
 /// variants — so a caller cannot pass Path A output to Path B's parser and get a
 /// weaker verdict.
 pub fn parse_callback_url(url: &str, expected_state: &str) -> Result<String, LoginError> {
-    let parsed =
-        Url::parse(url).map_err(|_| LoginError::ExchangeFailed(RefreshFault::Transient("not-a-callback-url")))?;
+    let parsed = Url::parse(url)
+        .map_err(|_| LoginError::ExchangeFailed(RefreshFault::Transient("not-a-callback-url")))?;
     code_in(&parsed, expected_state)
 }
 
@@ -2490,7 +2565,9 @@ pub fn authorize_url(req: &AuthorizeRequest) -> Result<String, LoginError> {
     let mut url = Url::parse(endpoint).map_err(|_| LoginError::NoAuthorizationUrl)?;
 
     let mut query = url.query_pairs_mut();
-    query.append_pair("response_type", "code").append_pair("client_id", client_id);
+    query
+        .append_pair("response_type", "code")
+        .append_pair("client_id", client_id);
     // The original text, not `redirect`: §4.1.3 wants the same bytes the
     // authorize request carried, and `Url` normalises (`/path` gains a trailing
     // `/`, a host gains a lowercased case) which would break the match.
@@ -2567,7 +2644,11 @@ pub async fn exchange_code(
         Ok(response) => response,
         // A transport failure is transient by definition: no verdict was
         // produced, so nothing was learned about the account.
-        Err(e) => return Err(LoginError::ExchangeFailed(RefreshFault::Transient(transport_reason(&e)))),
+        Err(e) => {
+            return Err(LoginError::ExchangeFailed(RefreshFault::Transient(
+                transport_reason(&e),
+            )));
+        }
     };
 
     let status = response.status().as_u16();
@@ -2575,7 +2656,11 @@ pub async fn exchange_code(
     let raw = response.bytes().await.unwrap_or_default();
     let body = String::from_utf8_lossy(&raw[..raw.len().min(REFRESH_BODY_SCAN)]).into_owned();
     if !success {
-        return Err(LoginError::ExchangeFailed(classify_refresh(session.kind(), status, &body)));
+        return Err(LoginError::ExchangeFailed(classify_refresh(
+            session.kind(),
+            status,
+            &body,
+        )));
     }
 
     let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|_| {
@@ -2732,7 +2817,7 @@ pub async fn initiate_device(
         form.push(("scope", scope));
     }
 
-let response = match core
+    let response = match core
         .client()
         .post(url)
         .form(&form)
@@ -2743,7 +2828,11 @@ let response = match core
         Ok(response) => response,
         // A transport failure is transient by definition: no verdict was
         // produced, so nothing was learned about the account.
-        Err(e) => return Err(LoginError::ExchangeFailed(RefreshFault::Transient(transport_reason(&e)))),
+        Err(e) => {
+            return Err(LoginError::ExchangeFailed(RefreshFault::Transient(
+                transport_reason(&e),
+            )));
+        }
     };
 
     let status = response.status().as_u16();
@@ -2751,7 +2840,11 @@ let response = match core
     let raw = response.bytes().await.unwrap_or_default();
     let body = String::from_utf8_lossy(&raw[..raw.len().min(REFRESH_BODY_SCAN)]).into_owned();
     if !success {
-        return Err(LoginError::ExchangeFailed(classify_refresh(session.kind(), status, &body)));
+        return Err(LoginError::ExchangeFailed(classify_refresh(
+            session.kind(),
+            status,
+            &body,
+        )));
     }
 
     let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|_| {
@@ -2913,8 +3006,10 @@ pub async fn poll_device(
         // poll before the first wait is a guaranteed `authorization_pending`.
         // Clamped to the remaining budget so a long interval cannot overshoot
         // the deadline on its own.
-        tokio::time::sleep(wait.min(deadline.saturating_duration_since(tokio::time::Instant::now())))
-            .await;
+        tokio::time::sleep(
+            wait.min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+        )
+        .await;
         if tokio::time::Instant::now() >= deadline {
             // The caller's budget or the grant's `expires_in`, whichever came
             // first. `LoginExpired` rather than an exchange fault: no provider
@@ -2993,9 +3088,8 @@ pub async fn poll_device(
             (_, _, Some("slow_down")) => {
                 // §3.5's own step, capped so the next poll still lands inside the
                 // grant's lifetime rather than being overtaken by the expiry.
-                wait = (wait + Duration::from_secs(SLOW_DOWN_STEP_SECS)).min(Duration::from_secs(
-                    DEVICE_POLL_INTERVAL_CEILING_SECS,
-                ));
+                wait = (wait + Duration::from_secs(SLOW_DOWN_STEP_SECS))
+                    .min(Duration::from_secs(DEVICE_POLL_INTERVAL_CEILING_SECS));
             }
             // Any other answer, including one whose `error` code §3.5 does not
             // name, goes to the shared classifier rather than straight back into
@@ -3021,19 +3115,22 @@ pub async fn poll_device(
 /// that returns an access token without a refresh token means "there is no
 /// renewal" either way, and two parsers would let that drift.
 fn token_from_body(body: &str) -> Result<OAuthToken, LoginError> {
-    let parsed: serde_json::Value = serde_json::from_str(body)
-        .map_err(|_| LoginError::ExchangeFailed(RefreshFault::Transient("unreadable-refresh-response")))?;
+    let parsed: serde_json::Value = serde_json::from_str(body).map_err(|_| {
+        LoginError::ExchangeFailed(RefreshFault::Transient("unreadable-refresh-response"))
+    })?;
     // `token` is the same fact under a name some providers publish, so it is a
     // fallback rather than a replacement: §5.1's own spelling is tried first and an
     // RFC-shaped response is read exactly as before.
-    let Some(access) = string_field(&parsed, "access_token").or_else(|| string_field(&parsed, "token"))
+    let Some(access) =
+        string_field(&parsed, "access_token").or_else(|| string_field(&parsed, "token"))
     else {
         return Err(LoginError::ExchangeFailed(RefreshFault::Transient(
             "refresh-response-has-no-access-token",
         )));
     };
 
-    let mut token = OAuthToken::new(Secret::new(&access)).with_expiry(expiry_at(&parsed, unix_now()));
+    let mut token =
+        OAuthToken::new(Secret::new(&access)).with_expiry(expiry_at(&parsed, unix_now()));
     // §5.1: optional, and its absence means this session cannot be renewed —
     // the first 401 is then terminal, which `Session::can_refresh` reports
     // rather than a later dispatch discovering. No path here invents one.
@@ -3063,8 +3160,8 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::{Arc, Mutex};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use ar_config::Secret;
@@ -3073,13 +3170,14 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        CallbackListener, Connected, DEVICE_DEFAULT_INTERVAL_SECS, Dispatch, EXPIRES_IN_FALLBACK_SECS,
-        ExecError, HttpRefresher, LoginError, NON_ROTATING_REFRESH_LEAD_SECS, OAuthKind, OAuthToken,
-        Origin, PKCE_VERIFIER_MIN_LEN, REFRESH_BREAKER_THRESHOLD, REFRESH_LEAD_SECS, REFRESH_MAX_ATTEMPTS,
-        RefreshBreaker, RefreshFault, Refresher, RotationPool, RotationSink, Session,
-        TERMINAL_REFRESH_STATUS, TerminalReport, Unconnected, authorize_url, classify_refresh,
-        code_challenge_for, exchange_code, expiry_at, initiate_device, new_authorize_request,
-        parse_callback_url, poll_device, terminal_check_constraint, token_hash, unix_now,
+        CallbackListener, Connected, DEVICE_DEFAULT_INTERVAL_SECS, Dispatch,
+        EXPIRES_IN_FALLBACK_SECS, ExecError, HttpRefresher, LoginError,
+        NON_ROTATING_REFRESH_LEAD_SECS, OAuthKind, OAuthToken, Origin, PKCE_VERIFIER_MIN_LEN,
+        REFRESH_BREAKER_THRESHOLD, REFRESH_LEAD_SECS, REFRESH_MAX_ATTEMPTS, RefreshBreaker,
+        RefreshFault, Refresher, RotationPool, RotationSink, Session, TERMINAL_REFRESH_STATUS,
+        TerminalReport, Unconnected, authorize_url, classify_refresh, code_challenge_for,
+        exchange_code, expiry_at, initiate_device, new_authorize_request, parse_callback_url,
+        poll_device, terminal_check_constraint, token_hash, unix_now,
     };
     use crate::oauth::Connection;
 
@@ -3107,11 +3205,19 @@ mod tests {
 
     impl Counting {
         fn ok(prefix: &'static str) -> Self {
-            Self { calls: AtomicUsize::new(0), prefix, fault: None }
+            Self {
+                calls: AtomicUsize::new(0),
+                prefix,
+                fault: None,
+            }
         }
 
         fn failing(fault: RefreshFault) -> Self {
-            Self { calls: AtomicUsize::new(0), prefix: "x", fault: Some(fault) }
+            Self {
+                calls: AtomicUsize::new(0),
+                prefix: "x",
+                fault: Some(fault),
+            }
         }
 
         fn calls(&self) -> usize {
@@ -3124,8 +3230,9 @@ mod tests {
             &'a self,
             _session: &'a Session,
             _current: &'a OAuthToken,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<OAuthToken, RefreshFault>> + Send + 'a>>
-        {
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<OAuthToken, RefreshFault>> + Send + 'a>,
+        > {
             // Counted before the token is handed out, so a concurrent burst would
             // provably reach this line more than once if the lock were not held.
             let nth = self.calls.fetch_add(1, Ordering::SeqCst);
@@ -3133,9 +3240,11 @@ mod tests {
                 if let Some(fault) = self.fault {
                     return Err(fault);
                 }
-                Ok(OAuthToken::new(Secret::new(&format!("{}-{nth}", self.prefix)))
-                    .with_refresh(Secret::new("rotated-refresh"))
-                    .with_expiry(unix_now() + 3600))
+                Ok(
+                    OAuthToken::new(Secret::new(&format!("{}-{nth}", self.prefix)))
+                        .with_refresh(Secret::new("rotated-refresh"))
+                        .with_expiry(unix_now() + 3600),
+                )
             })
         }
     }
@@ -3187,7 +3296,9 @@ mod tests {
 
     #[test]
     fn treats_a_named_terminal_row_as_terminal() {
-        assert!(classify_refresh(OAuthKind::Cline, 400, r#"{"error":"invalid_grant"}"#).is_terminal());
+        assert!(
+            classify_refresh(OAuthKind::Cline, 400, r#"{"error":"invalid_grant"}"#).is_terminal()
+        );
     }
 
     #[test]
@@ -3195,7 +3306,10 @@ mod tests {
         // The reference executor's own terminal set, ported. Without the carve-out
         // this falls through to the transient default and retries a refresh that
         // can never succeed.
-        assert!(classify_refresh(OAuthKind::GrokCli, 401, r#"{"error":"invalid_client"}"#).is_terminal());
+        assert!(
+            classify_refresh(OAuthKind::GrokCli, 401, r#"{"error":"invalid_client"}"#)
+                .is_terminal()
+        );
     }
 
     #[test]
@@ -3203,7 +3317,9 @@ mod tests {
         // The carve-out is scoped: the shared scan now finds `invalid_client`, but a
         // kind with no arm for it still lands on the transient fallthrough, exactly
         // as it did before the reason became findable.
-        assert!(!classify_refresh(OAuthKind::Codex, 401, r#"{"error":"invalid_client"}"#).is_terminal());
+        assert!(
+            !classify_refresh(OAuthKind::Codex, 401, r#"{"error":"invalid_client"}"#).is_terminal()
+        );
     }
 
     #[test]
@@ -3288,7 +3404,9 @@ mod tests {
 
     #[test]
     fn treats_this_service_disabled_in_this_account_as_terminal() {
-        assert_account_disabled_phrase(r#"{"error":"this service has been disabled in this account"}"#);
+        assert_account_disabled_phrase(
+            r#"{"error":"this service has been disabled in this account"}"#,
+        );
     }
 
     #[test]
@@ -3296,7 +3414,9 @@ mod tests {
         // The trailing clause providers add is not a second alias: the shorter
         // entry already contains it, which is why the alias list has six entries
         // for seven observed wordings.
-        assert_account_disabled_phrase("this service has been disabled in this account for violation of the terms");
+        assert_account_disabled_phrase(
+            "this service has been disabled in this account for violation of the terms",
+        );
     }
 
     /// A prose account-dead body must retire the session with the row's reason.
@@ -3305,7 +3425,10 @@ mod tests {
         // unambiguously terminal was the one a human-readable body could not reach.
         assert_eq!(
             classify_refresh(OAuthKind::Cline, 403, body),
-            RefreshFault::Unrecoverable { status: 403, reason: "account_disabled" },
+            RefreshFault::Unrecoverable {
+                status: 403,
+                reason: "account_disabled"
+            },
             "{body}",
         );
     }
@@ -3313,18 +3436,25 @@ mod tests {
     #[test]
     fn treats_claude_invalid_grant_as_transient() {
         let fault = classify_refresh(OAuthKind::Claude, 400, r#"{"error":"invalid_grant"}"#);
-        assert_eq!(fault, RefreshFault::Transient("claude-invalid-grant-survives"));
+        assert_eq!(
+            fault,
+            RefreshFault::Transient("claude-invalid-grant-survives")
+        );
     }
 
     #[test]
     fn keeps_invalid_grant_terminal_when_no_carve_out_applies() {
-        assert!(classify_refresh(OAuthKind::Codex, 400, r#"{"error":"invalid_grant"}"#).is_terminal());
+        assert!(
+            classify_refresh(OAuthKind::Codex, 400, r#"{"error":"invalid_grant"}"#).is_terminal()
+        );
     }
 
     #[test]
     fn keeps_cursor_token_revoked_terminal() {
         // The carve-out is narrow: it rescues `expired`, not a revocation.
-        assert!(classify_refresh(OAuthKind::Cursor, 401, r#"{"error":"token_revoked"}"#).is_terminal());
+        assert!(
+            classify_refresh(OAuthKind::Cursor, 401, r#"{"error":"token_revoked"}"#).is_terminal()
+        );
     }
 
     #[test]
@@ -3332,7 +3462,9 @@ mod tests {
         let sql = terminal_check_constraint();
         for (status, reason) in TERMINAL_REFRESH_STATUS {
             assert!(
-                sql.contains(&format!("terminal_status = {status} AND terminal_reason = '{reason}'")),
+                sql.contains(&format!(
+                    "terminal_status = {status} AND terminal_reason = '{reason}'"
+                )),
                 "{sql}"
             );
         }
@@ -3348,7 +3480,9 @@ mod tests {
         // The classifier can emit this pair, so a store that took the generated
         // clause has to be able to hold it: a terminal verdict the CHECK refuses
         // would be dropped rather than recorded.
-        let fault = OAuthKind::GrokCli.carve_out("invalid_client").expect("grok-cli's terminal row");
+        let fault = OAuthKind::GrokCli
+            .carve_out("invalid_client")
+            .expect("grok-cli's terminal row");
         let sql = terminal_check_constraint();
         assert!(
             sql.contains(&format!(
@@ -3385,7 +3519,10 @@ mod tests {
         );
         assert_eq!(
             pending.connect(OAuthToken::new(Secret::new("  "))).err(),
-            Some(RefreshFault::Unrecoverable { status: 401, reason: "empty_access_token" })
+            Some(RefreshFault::Unrecoverable {
+                status: 401,
+                reason: "empty_access_token"
+            })
         );
     }
 
@@ -3422,10 +3559,15 @@ mod tests {
         let mut tasks = Vec::new();
         for _ in 0..8 {
             let conn = Arc::clone(&conn);
-            tasks.push(tokio::spawn(async move { conn.grant_at(Origin::Client, now).await }));
+            tasks.push(tokio::spawn(async move {
+                conn.grant_at(Origin::Client, now).await
+            }));
         }
         for task in tasks {
-            assert!(task.await.expect("no panic").is_ok(), "every caller gets a usable token");
+            assert!(
+                task.await.expect("no panic").is_ok(),
+                "every caller gets a usable token"
+            );
         }
         assert_eq!(refresher.calls(), 1, "eight concurrent grants, one refresh");
     }
@@ -3436,17 +3578,28 @@ mod tests {
         // already rotated, and must claim that token instead of refreshing again.
         let pool = Arc::new(RotationPool::new());
         let refresher = Arc::new(Counting::ok("fresh"));
-        let conn = Connection::pending(session(), Arc::clone(&pool), refresher.clone() as Arc<dyn Refresher>)
-            .connect(expired_token())
-            .expect("an access token connects");
+        let conn = Connection::pending(
+            session(),
+            Arc::clone(&pool),
+            refresher.clone() as Arc<dyn Refresher>,
+        )
+        .connect(expired_token())
+        .expect("an access token connects");
         let stale = token_hash("synthetic-old-access");
 
         let first = conn.rotate(stale).await.expect("first rotation");
         assert_eq!(first.token().expose(), "fresh-0");
         assert_eq!(refresher.calls(), 1);
 
-        let second = conn.rotate(stale).await.expect("the recorded rotation is claimed");
-        assert_eq!(second.token().expose(), "fresh-0", "the same renewal, not a second one");
+        let second = conn
+            .rotate(stale)
+            .await
+            .expect("the recorded rotation is claimed");
+        assert_eq!(
+            second.token().expose(),
+            "fresh-0",
+            "the same renewal, not a second one"
+        );
         assert_eq!(refresher.calls(), 1, "no refresh_token_reuse");
     }
 
@@ -3456,12 +3609,22 @@ mod tests {
         // moves the connection's own token forward, so a *later* dispatch is
         // served without a round trip rather than re-sending a stale bearer.
         let refresher = Arc::new(Counting::ok("fresh"));
-        let conn = Connection::pending(session(), Arc::new(RotationPool::new()), refresher.clone() as Arc<dyn Refresher>)
-            .connect(expired_token())
-            .expect("an access token connects");
+        let conn = Connection::pending(
+            session(),
+            Arc::new(RotationPool::new()),
+            refresher.clone() as Arc<dyn Refresher>,
+        )
+        .connect(expired_token())
+        .expect("an access token connects");
 
-        let rotated = conn.rotate(token_hash("synthetic-old-access")).await.expect("rotation");
-        let later = conn.grant(Origin::Client).await.expect("the installed token");
+        let rotated = conn
+            .rotate(token_hash("synthetic-old-access"))
+            .await
+            .expect("rotation");
+        let later = conn
+            .grant(Origin::Client)
+            .await
+            .expect("the installed token");
         assert_eq!(later.token().expose(), rotated.token().expose());
         assert_eq!(refresher.calls(), 1, "one refresh served both");
     }
@@ -3471,11 +3634,22 @@ mod tests {
         // R4: a health check must not spend a rotating token.
         let pool = Arc::new(RotationPool::new());
         let refresher = Arc::new(Counting::ok("fresh"));
-        let conn = Connection::pending(session(), Arc::clone(&pool), refresher.clone() as Arc<dyn Refresher>)
-            .connect(expired_token())
-            .expect("an access token connects");
-        let grant = conn.grant_at(Origin::Probe, unix_now()).await.expect("a probe grant");
-        assert_eq!(grant.token().expose(), "synthetic-old-access", "the cached token, expired or not");
+        let conn = Connection::pending(
+            session(),
+            Arc::clone(&pool),
+            refresher.clone() as Arc<dyn Refresher>,
+        )
+        .connect(expired_token())
+        .expect("an access token connects");
+        let grant = conn
+            .grant_at(Origin::Probe, unix_now())
+            .await
+            .expect("a probe grant");
+        assert_eq!(
+            grant.token().expose(),
+            "synthetic-old-access",
+            "the cached token, expired or not"
+        );
         assert_eq!(refresher.calls(), 0, "a probe never refreshes");
     }
 
@@ -3483,9 +3657,13 @@ mod tests {
     async fn writes_no_rotation_for_a_probe_origin() {
         let pool = Arc::new(RotationPool::new());
         let refresher = Arc::new(Counting::ok("fresh"));
-        let conn = Connection::pending(session(), Arc::clone(&pool), refresher.clone() as Arc<dyn Refresher>)
-            .connect(expired_token())
-            .expect("an access token connects");
+        let conn = Connection::pending(
+            session(),
+            Arc::clone(&pool),
+            refresher.clone() as Arc<dyn Refresher>,
+        )
+        .connect(expired_token())
+        .expect("an access token connects");
         let _ = conn.grant_at(Origin::Probe, unix_now()).await;
         assert_eq!(pool.pending(), 0, "a probe leaves the rotation cache alone");
     }
@@ -3494,12 +3672,21 @@ mod tests {
     async fn does_not_quarantine_a_session_whose_refresh_failed_transiently() {
         // The point of the transient classification: a refresh endpoint having a
         // bad moment must not retire an account that still works.
-        let refresher = Arc::new(Counting::failing(RefreshFault::Transient("refresh-endpoint-unavailable")));
-        let conn = Connection::pending(session(), Arc::new(RotationPool::new()), refresher as Arc<dyn Refresher>)
-            .connect(expired_token())
-            .expect("an access token connects");
+        let refresher = Arc::new(Counting::failing(RefreshFault::Transient(
+            "refresh-endpoint-unavailable",
+        )));
+        let conn = Connection::pending(
+            session(),
+            Arc::new(RotationPool::new()),
+            refresher as Arc<dyn Refresher>,
+        )
+        .connect(expired_token())
+        .expect("an access token connects");
         let err = conn.rotate(token_hash("synthetic-old-access")).await.err();
-        assert_eq!(err, Some(RefreshFault::Transient("refresh-endpoint-unavailable")));
+        assert_eq!(
+            err,
+            Some(RefreshFault::Transient("refresh-endpoint-unavailable"))
+        );
         assert_eq!(conn.terminal().await, None, "no retirement on a transient");
     }
 
@@ -3524,7 +3711,9 @@ mod tests {
                 (StatusCode::UNAUTHORIZED, r#"{"error":"invalid_token"}"#)
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback binds");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback binds");
         let addr = listener.local_addr().expect("bound socket has an address");
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
@@ -3549,7 +3738,12 @@ mod tests {
             headers: &BTreeMap::new(),
         };
         let stream = conn
-            .dispatch(&core, &shape, br#"{"model":"m"}"#, &CancellationToken::new())
+            .dispatch(
+                &core,
+                &shape,
+                br#"{"model":"m"}"#,
+                &CancellationToken::new(),
+            )
             .await
             .expect("the retry succeeds");
         server.abort();
@@ -3565,10 +3759,11 @@ mod tests {
         // `ar-server` turns into a visible 401 — never a bare 502. The body's
         // reason has to be a row that survived the audit, so this is
         // `token_revoked`; a `invalid_token` body now reads as retry.
-        let app = axum::Router::new().fallback(|| async {
-            (StatusCode::UNAUTHORIZED, r#"{"error":"token_revoked"}"#)
-        });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback binds");
+        let app = axum::Router::new()
+            .fallback(|| async { (StatusCode::UNAUTHORIZED, r#"{"error":"token_revoked"}"#) });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback binds");
         let addr = listener.local_addr().expect("bound socket has an address");
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
@@ -3593,7 +3788,12 @@ mod tests {
             headers: &BTreeMap::new(),
         };
         let err = conn
-            .dispatch(&core, &shape, br#"{"model":"m"}"#, &CancellationToken::new())
+            .dispatch(
+                &core,
+                &shape,
+                br#"{"model":"m"}"#,
+                &CancellationToken::new(),
+            )
             .await
             .err();
         server.abort();
@@ -3603,7 +3803,10 @@ mod tests {
         let Some(ExecError::OAuthTerminal(report)) = err else {
             panic!("expected a typed oauth terminal, got {err:?}");
         };
-        assert_eq!((report.provider.as_str(), report.reason), ("kimi-coding", "token_revoked"));
+        assert_eq!(
+            (report.provider.as_str(), report.reason),
+            ("kimi-coding", "token_revoked")
+        );
         assert_eq!(refresher.calls(), 1, "one rotation, then stop");
     }
 
@@ -3612,10 +3815,11 @@ mod tests {
         // The demoted-row end of the same path: a 401 body naming only
         // `invalid_token` has no terminal verdict behind it, so the second 401
         // becomes a transport failure and the session stays usable.
-        let app = axum::Router::new().fallback(|| async {
-            (StatusCode::UNAUTHORIZED, r#"{"error":"invalid_token"}"#)
-        });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback binds");
+        let app = axum::Router::new()
+            .fallback(|| async { (StatusCode::UNAUTHORIZED, r#"{"error":"invalid_token"}"#) });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback binds");
         let addr = listener.local_addr().expect("bound socket has an address");
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
@@ -3640,7 +3844,12 @@ mod tests {
             headers: &BTreeMap::new(),
         };
         let err = conn
-            .dispatch(&core, &shape, br#"{"model":"m"}"#, &CancellationToken::new())
+            .dispatch(
+                &core,
+                &shape,
+                br#"{"model":"m"}"#,
+                &CancellationToken::new(),
+            )
             .await
             .err();
         server.abort();
@@ -3649,7 +3858,11 @@ mod tests {
             matches!(err, Some(ExecError::Transport(_))),
             "expected a retryable transport failure, got {err:?}",
         );
-        assert_eq!(conn.terminal().await, None, "a transient verdict must not retire the session");
+        assert_eq!(
+            conn.terminal().await,
+            None,
+            "a transient verdict must not retire the session"
+        );
         assert_eq!(refresher.calls(), 1, "one rotation, then stop");
     }
 
@@ -3659,9 +3872,13 @@ mod tests {
             status: 400,
             reason: "invalid_grant",
         }));
-        let conn = Connection::pending(session(), Arc::new(RotationPool::new()), refresher as Arc<dyn Refresher>)
-            .connect(expired_token())
-            .expect("an access token connects");
+        let conn = Connection::pending(
+            session(),
+            Arc::new(RotationPool::new()),
+            refresher as Arc<dyn Refresher>,
+        )
+        .connect(expired_token())
+        .expect("an access token connects");
         let err = conn.grant(Origin::Client).await.err();
         assert!(err.expect("a fault").is_terminal());
         assert_eq!(
@@ -3674,19 +3891,31 @@ mod tests {
     #[tokio::test]
     async fn leaves_a_session_alive_when_the_refresh_fault_is_transient() {
         let refresher = Arc::new(Counting::failing(RefreshFault::Transient("flaky")));
-        let conn = Connection::pending(session(), Arc::new(RotationPool::new()), refresher as Arc<dyn Refresher>)
-            .connect(expired_token())
-            .expect("an access token connects");
+        let conn = Connection::pending(
+            session(),
+            Arc::new(RotationPool::new()),
+            refresher as Arc<dyn Refresher>,
+        )
+        .connect(expired_token())
+        .expect("an access token connects");
         assert!(conn.grant(Origin::Client).await.is_err());
-        assert_eq!(conn.terminal().await, None, "a transient must never retire an account");
+        assert_eq!(
+            conn.terminal().await,
+            None,
+            "a transient must never retire an account"
+        );
     }
 
     #[tokio::test]
     async fn answers_a_retired_session_without_touching_the_network() {
         let refresher = Arc::new(Counting::ok("fresh"));
-        let conn = Connection::pending(session(), Arc::new(RotationPool::new()), refresher.clone() as Arc<dyn Refresher>)
-            .connect(expired_token())
-            .expect("an access token connects");
+        let conn = Connection::pending(
+            session(),
+            Arc::new(RotationPool::new()),
+            refresher.clone() as Arc<dyn Refresher>,
+        )
+        .connect(expired_token())
+        .expect("an access token connects");
         conn.quarantine(TerminalReport {
             provider: "cline".to_owned(),
             refresh_status: 400,
@@ -3694,7 +3923,11 @@ mod tests {
         })
         .await;
         assert!(conn.grant(Origin::Client).await.is_err());
-        assert_eq!(refresher.calls(), 0, "a retired session costs no round trip");
+        assert_eq!(
+            refresher.calls(),
+            0,
+            "a retired session costs no round trip"
+        );
     }
 
     #[tokio::test]
@@ -3716,7 +3949,10 @@ mod tests {
             reason: "account_disabled",
         })
         .await;
-        assert_eq!(conn.terminal().await.map(|r| r.reason), Some("invalid_grant"));
+        assert_eq!(
+            conn.terminal().await.map(|r| r.reason),
+            Some("invalid_grant")
+        );
     }
 
     #[test]
@@ -3747,7 +3983,11 @@ mod tests {
     #[test]
     fn renders_a_terminal_fault_as_the_operator_sentence() {
         assert_eq!(
-            RefreshFault::Unrecoverable { status: 400, reason: "invalid_grant" }.to_string(),
+            RefreshFault::Unrecoverable {
+                status: 400,
+                reason: "invalid_grant"
+            }
+            .to_string(),
             "terminal (refresh returned 400: invalid_grant)"
         );
     }
@@ -3950,21 +4190,24 @@ mod tests {
     async fn token_endpoint(reply: (StatusCode, &'static str)) -> (String, Arc<Mutex<String>>) {
         let seen: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
         let slot = Arc::clone(&seen);
-        let app = axum::Router::new().fallback(move |req: axum::http::Request<axum::body::Body>| {
-            let slot = Arc::clone(&slot);
-            async move {
-                let raw = axum::body::to_bytes(req.into_body(), 64 * 1024)
-                    .await
-                    .unwrap_or_default();
-                // `into_inner` rather than `expect`: a poisoned lock here would
-                // mean an earlier assertion panicked, and that panic is the
-                // failure the test already reported.
-                *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                    String::from_utf8_lossy(&raw).into_owned();
-                reply
-            }
-        });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback binds");
+        let app =
+            axum::Router::new().fallback(move |req: axum::http::Request<axum::body::Body>| {
+                let slot = Arc::clone(&slot);
+                async move {
+                    let raw = axum::body::to_bytes(req.into_body(), 64 * 1024)
+                        .await
+                        .unwrap_or_default();
+                    // `into_inner` rather than `expect`: a poisoned lock here would
+                    // mean an earlier assertion panicked, and that panic is the
+                    // failure the test already reported.
+                    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                        String::from_utf8_lossy(&raw).into_owned();
+                    reply
+                }
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback binds");
         let addr = listener.local_addr().expect("bound socket has an address");
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
@@ -3989,7 +4232,9 @@ mod tests {
         let mut rest = bytes.as_str();
         while let Some(at) = rest.find('%') {
             out.extend_from_slice(&rest.as_bytes()[..at]);
-            let hex = rest.get(at + 1..at + 3).expect("a percent escape carries two digits");
+            let hex = rest
+                .get(at + 1..at + 3)
+                .expect("a percent escape carries two digits");
             out.push(u8::from_str_radix(hex, 16).expect("hex digits"));
             rest = rest.get(at + 3..).unwrap_or_default();
         }
@@ -4010,10 +4255,14 @@ mod tests {
 
     #[test]
     fn generates_a_verifier_the_rfc7636_alphabet_and_length_permit() {
-        let request = new_authorize_request(&login_session(), "http://127.0.0.1:1455/auth/callback");
+        let request =
+            new_authorize_request(&login_session(), "http://127.0.0.1:1455/auth/callback");
         assert!(
             request.verifier.len() >= PKCE_VERIFIER_MIN_LEN
-                && request.verifier.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b)),
+                && request
+                    .verifier
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b)),
             "verifier {:?} is outside RFC 7636's unreserved set or shorter than 43",
             request.verifier
         );
@@ -4039,7 +4288,8 @@ mod tests {
 
     #[test]
     fn keeps_the_verifier_out_of_an_authorize_request_debug() {
-        let request = new_authorize_request(&login_session(), "http://127.0.0.1:1455/auth/callback");
+        let request =
+            new_authorize_request(&login_session(), "http://127.0.0.1:1455/auth/callback");
         assert!(
             !format!("{request:?}").contains(&request.verifier),
             "the verifier is the whole security of PKCE and must not be printable"
@@ -4048,9 +4298,13 @@ mod tests {
 
     #[test]
     fn builds_an_authorize_url_carrying_the_rfc6749_and_7636_parameters() {
-        let request = new_authorize_request(&login_session(), "http://127.0.0.1:1455/auth/callback");
+        let request =
+            new_authorize_request(&login_session(), "http://127.0.0.1:1455/auth/callback");
         let url = authorize_url(&request).expect("a configured session authorizes");
-        let query = url.split_once('?').expect("an authorize url carries a query").1;
+        let query = url
+            .split_once('?')
+            .expect("an authorize url carries a query")
+            .1;
         let pairs: std::collections::HashMap<_, _> = urlencoded_pairs(query).into_iter().collect();
 
         // Borrowed pairs: the expected values live in the fixture or in `request`,
@@ -4064,7 +4318,11 @@ mod tests {
             ("code_challenge_method", "S256"),
             ("state", request.state.as_str()),
         ] {
-            assert_eq!(pairs.get(name).map(String::as_str), Some(value), "{name}={value} in {query}");
+            assert_eq!(
+                pairs.get(name).map(String::as_str),
+                Some(value),
+                "{name}={value} in {query}"
+            );
         }
     }
 
@@ -4077,7 +4335,10 @@ mod tests {
         let url = authorize_url(&request).expect("a configured session authorizes");
         let pairs = urlencoded_pairs(url.split_once('?').expect("a query").1);
         assert_eq!(
-            pairs.iter().filter(|(name, _)| name == "redirect_uri").collect::<Vec<_>>(),
+            pairs
+                .iter()
+                .filter(|(name, _)| name == "redirect_uri")
+                .collect::<Vec<_>>(),
             vec![&("redirect_uri".to_owned(), target.to_owned())],
             "the redirect target survives intact: {url}"
         );
@@ -4089,20 +4350,28 @@ mod tests {
             &Session::new("codex", OAuthKind::Codex).with_client_id("client-synthetic"),
             "http://127.0.0.1:1455/auth/callback",
         );
-        assert_eq!(authorize_url(&request).err(), Some(LoginError::NoAuthorizationUrl));
+        assert_eq!(
+            authorize_url(&request).err(),
+            Some(LoginError::NoAuthorizationUrl)
+        );
     }
 
     #[test]
     fn refuses_to_build_an_authorize_url_for_a_relative_redirect_uri() {
         let request = new_authorize_request(&login_session(), "/auth/callback");
-        assert_eq!(authorize_url(&request).err(), Some(LoginError::InvalidRedirectUri));
+        assert_eq!(
+            authorize_url(&request).err(),
+            Some(LoginError::InvalidRedirectUri)
+        );
     }
 
     #[tokio::test]
     async fn posts_the_rfc6749_code_exchange_fields_to_the_token_endpoint() {
-        let (base, seen) =
-            token_endpoint((StatusCode::OK, r#"{"access_token":"at-1","refresh_token":"rt-1","expires_in":3600}"#))
-                .await;
+        let (base, seen) = token_endpoint((
+            StatusCode::OK,
+            r#"{"access_token":"at-1","refresh_token":"rt-1","expires_in":3600}"#,
+        ))
+        .await;
         let core = crate::ArExec::new().expect("client");
         let session = login_session().with_token_url(format!("{base}/token"));
 
@@ -4130,7 +4399,11 @@ mod tests {
                 "{name}={value} is missing from {pairs:?}"
             );
         }
-        assert_eq!(token.access().expose(), "at-1", "the access token is parsed");
+        assert_eq!(
+            token.access().expose(),
+            "at-1",
+            "the access token is parsed"
+        );
     }
 
     #[tokio::test]
@@ -4140,8 +4413,11 @@ mod tests {
         // optional and its absence mean "keep using the one you have", so a
         // grok-cli session must survive its own refresh rather than lose the row
         // that renews it.
-        let (base, _seen) =
-            token_endpoint((StatusCode::OK, r#"{"access_token":"at-2","expires_in":3600}"#)).await;
+        let (base, _seen) = token_endpoint((
+            StatusCode::OK,
+            r#"{"access_token":"at-2","expires_in":3600}"#,
+        ))
+        .await;
         let session = Session::new("grok-cli", OAuthKind::GrokCli)
             .with_token_url(format!("{base}/token"))
             .with_client_id("grok-public-client");
@@ -4153,23 +4429,31 @@ mod tests {
             .await
             .expect("the mock grants the refresh");
 
-        assert_eq!(token.refresh().map(|refresh| refresh.expose()), Some("rt-grok-1"));
+        assert_eq!(
+            token.refresh().map(|refresh| refresh.expose()),
+            Some("rt-grok-1")
+        );
     }
 
     #[tokio::test]
     async fn posts_the_grok_cli_refresh_as_the_rfc6749_refresh_form() {
         // The reference executor's body, field for field: the shared §6 refresher
         // already emits exactly this, which is why grok-cli needs no wire of its own.
-        let (base, seen) =
-            token_endpoint((StatusCode::OK, r#"{"access_token":"at-2","refresh_token":"rt-2"}"#))
-                .await;
+        let (base, seen) = token_endpoint((
+            StatusCode::OK,
+            r#"{"access_token":"at-2","refresh_token":"rt-2"}"#,
+        ))
+        .await;
         let session = Session::new("grok-cli", OAuthKind::GrokCli)
             .with_token_url(format!("{base}/token"))
             .with_client_id("grok-public-client");
         let refresher = HttpRefresher::new(reqwest::Client::new());
 
         refresher
-            .refresh(&session, &expired_token().with_refresh(Secret::new("rt-grok-1")))
+            .refresh(
+                &session,
+                &expired_token().with_refresh(Secret::new("rt-grok-1")),
+            )
             .await
             .expect("the mock grants the refresh");
 
@@ -4190,8 +4474,7 @@ mod tests {
     async fn sends_the_client_secret_when_the_operator_supplied_one() {
         // A confidential client's secret is a third store row, handed in already
         // decrypted — the same seam an access token uses.
-        let (base, seen) =
-            token_endpoint((StatusCode::OK, r#"{"access_token":"at-1"}"#)).await;
+        let (base, seen) = token_endpoint((StatusCode::OK, r#"{"access_token":"at-1"}"#)).await;
         let core = crate::ArExec::new().expect("client");
         let session = login_session().with_token_url(format!("{base}/token"));
 
@@ -4208,7 +4491,9 @@ mod tests {
 
         let pairs = urlencoded_pairs(&seen.lock().unwrap_or_else(|p| p.into_inner()));
         assert!(
-            pairs.iter().any(|(name, value)| name == "client_secret" && value == "secret-synthetic"),
+            pairs
+                .iter()
+                .any(|(name, value)| name == "client_secret" && value == "secret-synthetic"),
             "a confidential client authenticates: {pairs:?}"
         );
     }
@@ -4217,8 +4502,7 @@ mod tests {
     async fn omits_the_client_secret_for_a_public_pkce_client() {
         // §2.3.1 treats an empty `client_secret` and an absent one differently, so
         // a public client must send no field at all.
-        let (base, seen) =
-            token_endpoint((StatusCode::OK, r#"{"access_token":"at-1"}"#)).await;
+        let (base, seen) = token_endpoint((StatusCode::OK, r#"{"access_token":"at-1"}"#)).await;
         let core = crate::ArExec::new().expect("client");
         let session = login_session().with_token_url(format!("{base}/token"));
 
@@ -4241,9 +4525,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keeps_an_exchange_failure_out_of_the_refreshable_state_when_no_refresh_token_comes_back() {
-        let (base, _seen) =
-            token_endpoint((StatusCode::OK, r#"{"access_token":"at-1","expires_in":3600}"#)).await;
+    async fn keeps_an_exchange_failure_out_of_the_refreshable_state_when_no_refresh_token_comes_back()
+     {
+        let (base, _seen) = token_endpoint((
+            StatusCode::OK,
+            r#"{"access_token":"at-1","expires_in":3600}"#,
+        ))
+        .await;
         let core = crate::ArExec::new().expect("client");
         let session = login_session().with_token_url(format!("{base}/token"));
 
@@ -4376,7 +4664,7 @@ mod tests {
             .with_client_id("client-synthetic")
     }
 
-/// A device endpoint serving both halves: a fixed grant body at `POST /codes`
+    /// A device endpoint serving both halves: a fixed grant body at `POST /codes`
     /// and a queue of replies at `POST /poll`, with the poll count handed back.
     ///
     /// Two routes rather than one queue because the halves have to be told
@@ -4405,7 +4693,10 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .next()
-                .unwrap_or((StatusCode::BAD_REQUEST, r#"{"error":"authorization_pending"}"#))
+                .unwrap_or((
+                    StatusCode::BAD_REQUEST,
+                    r#"{"error":"authorization_pending"}"#,
+                ))
         }
 
         let issues = Arc::new((grant.0, grant.1.to_owned()));
@@ -4432,7 +4723,9 @@ mod tests {
                     async move { pull(counter, slot).await }
                 }),
             );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback binds");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback binds");
         let addr = listener.local_addr().expect("bound socket has an address");
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
@@ -4459,8 +4752,7 @@ mod tests {
     /// Not RFC 8628: §3.2 names four required fields and this sends none of them
     /// under those names. A single opaque `code` is the whole grant, so the two
     /// halves of the poll credential and the string a human types are one value.
-    const DEVICE_GRANT_CAMEL: &str =
-        r#"{"code":"kilo-opaque-code","verificationUrl":"https://kilo.test/device","expiresIn":600}"#;
+    const DEVICE_GRANT_CAMEL: &str = r#"{"code":"kilo-opaque-code","verificationUrl":"https://kilo.test/device","expiresIn":600}"#;
 
     /// The same provider's approval: the token under `token`, gated on `status`,
     /// with no RFC §5.1 field name anywhere in it.
@@ -4479,12 +4771,18 @@ mod tests {
         axum::extract::State(spy): axum::extract::State<PollSpy>,
         uri: axum::http::Uri,
     ) -> (StatusCode, &'static str) {
-        spy.paths.lock().unwrap_or_else(|p| p.into_inner()).push(uri.path().to_owned());
+        spy.paths
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(uri.path().to_owned());
         spy.queue
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .next()
-            .unwrap_or((StatusCode::BAD_REQUEST, r#"{"error":"authorization_pending"}"#))
+            .unwrap_or((
+                StatusCode::BAD_REQUEST,
+                r#"{"error":"authorization_pending"}"#,
+            ))
     }
 
     /// A device endpoint that records the exact path each poll arrived on.
@@ -4501,7 +4799,10 @@ mod tests {
     ) -> (String, Arc<Mutex<Vec<String>>>) {
         let paths: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let issued = Arc::new((grant.0, grant.1.to_owned()));
-        let spy = PollSpy { paths: Arc::clone(&paths), queue: Arc::new(Mutex::new(polls.into_iter())) };
+        let spy = PollSpy {
+            paths: Arc::clone(&paths),
+            queue: Arc::new(Mutex::new(polls.into_iter())),
+        };
 
         let issues = Arc::clone(&issued);
         let app = axum::Router::new()
@@ -4518,7 +4819,9 @@ mod tests {
             .route("/poll", axum::routing::post(poll_spy))
             .route("/poll/{code}", axum::routing::post(poll_spy))
             .with_state(spy);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback binds");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback binds");
         let addr = listener.local_addr().expect("bound socket has an address");
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
@@ -4542,9 +4845,18 @@ mod tests {
             "kilo-opaque-code",
             "`code` is the device code, the half the polls carry"
         );
-        assert_eq!(grant.user_code, "kilo-opaque-code", "`code` is also the code a human types");
-        assert_eq!(grant.verification_uri, "https://kilo.test/device", "`verificationUrl` is where it is typed");
-        assert_eq!(grant.expires_in_secs, 600, "`expiresIn` is the grant's own budget");
+        assert_eq!(
+            grant.user_code, "kilo-opaque-code",
+            "`code` is also the code a human types"
+        );
+        assert_eq!(
+            grant.verification_uri, "https://kilo.test/device",
+            "`verificationUrl` is where it is typed"
+        );
+        assert_eq!(
+            grant.expires_in_secs, 600,
+            "`expiresIn` is the grant's own budget"
+        );
         assert_eq!(
             grant.interval_secs, 3,
             "this provider's own cadence is 3s, and naming none means it, not the RFC's 5s floor"
@@ -4561,7 +4873,10 @@ mod tests {
             vec![
                 (StatusCode::ACCEPTED, ""),
                 (StatusCode::ACCEPTED, ""),
-                (StatusCode::OK, r#"{"access_token":"at-1","expires_in":3600}"#),
+                (
+                    StatusCode::OK,
+                    r#"{"access_token":"at-1","expires_in":3600}"#,
+                ),
             ],
         )
         .await;
@@ -4573,7 +4888,11 @@ mod tests {
             .await
             .expect("202 is a loop state, not a verdict");
 
-        assert_eq!(token.access().expose(), "at-1", "the approval after the 202s still lands");
+        assert_eq!(
+            token.access().expose(),
+            "at-1",
+            "the approval after the 202s still lands"
+        );
         assert_eq!(
             *asked.lock().unwrap_or_else(|p| p.into_inner()),
             3,
@@ -4596,7 +4915,9 @@ mod tests {
         let session = device_session(&base);
         let (_, pending) = initiate_device(&core, &session).await.expect("grant");
 
-        let err = poll_device(&core, &session, &pending, Duration::from_secs(30)).await.err();
+        let err = poll_device(&core, &session, &pending, Duration::from_secs(30))
+            .await
+            .err();
 
         assert_eq!(
             err,
@@ -4624,7 +4945,9 @@ mod tests {
         let session = device_session(&base);
         let (_, pending) = initiate_device(&core, &session).await.expect("grant");
 
-        let err = poll_device(&core, &session, &pending, Duration::from_secs(30)).await.err();
+        let err = poll_device(&core, &session, &pending, Duration::from_secs(30))
+            .await
+            .err();
 
         assert_eq!(
             err,
@@ -4655,8 +4978,15 @@ mod tests {
             .await
             .expect("the provider approved the device");
 
-        assert_eq!(token.access().expose(), "kilo-at", "`token` is the approved access token");
-        assert!(!token.can_refresh(), "this grant carries no refresh half, so none is invented");
+        assert_eq!(
+            token.access().expose(),
+            "kilo-at",
+            "`token` is the approved access token"
+        );
+        assert!(
+            !token.can_refresh(),
+            "this grant carries no refresh half, so none is invented"
+        );
     }
 
     #[tokio::test]
@@ -4690,7 +5020,10 @@ mod tests {
         // URL with nothing to substitute must reach the provider exactly as typed.
         let (base, paths) = device_endpoint_recording_paths(
             (StatusCode::OK, DEVICE_GRANT_BODY),
-            vec![(StatusCode::OK, r#"{"access_token":"at-1","expires_in":3600}"#)],
+            vec![(
+                StatusCode::OK,
+                r#"{"access_token":"at-1","expires_in":3600}"#,
+            )],
         )
         .await;
         let core = crate::ArExec::new().expect("client");
@@ -4712,7 +5045,10 @@ mod tests {
     async fn parses_the_device_grant_when_the_provider_answers_rfc8628_fields() {
         let (base, _) = device_endpoint(
             (StatusCode::OK, DEVICE_GRANT_BODY),
-            vec![(StatusCode::BAD_REQUEST, r#"{"error":"authorization_pending"}"#)],
+            vec![(
+                StatusCode::BAD_REQUEST,
+                r#"{"error":"authorization_pending"}"#,
+            )],
         )
         .await;
         let core = crate::ArExec::new().expect("client");
@@ -4722,17 +5058,27 @@ mod tests {
             .await
             .expect("the mock issues a grant");
 
-        assert_eq!(grant.user_code, "WXYZ-1234", "§3.2's user_code is the code a human types");
+        assert_eq!(
+            grant.user_code, "WXYZ-1234",
+            "§3.2's user_code is the code a human types"
+        );
         assert_eq!(
             grant.verification_uri, "https://auth.test/device",
             "§3.2's verification_uri is where it is typed"
         );
-        assert_eq!(grant.interval_secs, 1, "§3.2's interval is the provider's own cadence");
+        assert_eq!(
+            grant.interval_secs, 1,
+            "§3.2's interval is the provider's own cadence"
+        );
         assert!(
             grant.expires_in_secs > 0,
             "§3.2's expires_in is the grant's budget and must survive parsing"
         );
-        assert_eq!(pending.interval_secs(), grant.interval_secs, "the poll waits what the grant says");
+        assert_eq!(
+            pending.interval_secs(),
+            grant.interval_secs,
+            "the poll waits what the grant says"
+        );
     }
 
     #[tokio::test]
@@ -4758,8 +5104,9 @@ mod tests {
         let (base, _) = device_endpoint((StatusCode::OK, DEVICE_GRANT_BODY), vec![]).await;
         let core = crate::ArExec::new().expect("client");
 
-        let (_, pending) =
-            initiate_device(&core, &device_session(&base)).await.expect("the mock issues a grant");
+        let (_, pending) = initiate_device(&core, &device_session(&base))
+            .await
+            .expect("the mock issues a grant");
 
         assert!(
             !format!("{pending:?}").contains("dc-secret"),
@@ -4772,7 +5119,10 @@ mod tests {
         let (base, asked) = device_endpoint(
             (StatusCode::OK, DEVICE_GRANT_BODY),
             vec![
-                (StatusCode::BAD_REQUEST, r#"{"error":"authorization_pending"}"#),
+                (
+                    StatusCode::BAD_REQUEST,
+                    r#"{"error":"authorization_pending"}"#,
+                ),
                 (
                     StatusCode::OK,
                     r#"{"access_token":"at-1","token_type":"Bearer","expires_in":3600}"#,
@@ -4788,7 +5138,11 @@ mod tests {
             .await
             .expect("the mock approves the device");
 
-        assert_eq!(token.access().expose(), "at-1", "the approved poll returns the access token");
+        assert_eq!(
+            token.access().expose(),
+            "at-1",
+            "the approved poll returns the access token"
+        );
         assert_eq!(
             *asked.lock().unwrap_or_else(|p| p.into_inner()),
             2,
@@ -4800,7 +5154,10 @@ mod tests {
     async fn records_no_refresh_half_when_the_device_grant_returns_no_refresh_token() {
         let (base, _) = device_endpoint(
             (StatusCode::OK, DEVICE_GRANT_BODY),
-            vec![(StatusCode::OK, r#"{"access_token":"at-1","expires_in":3600}"#)],
+            vec![(
+                StatusCode::OK,
+                r#"{"access_token":"at-1","expires_in":3600}"#,
+            )],
         )
         .await;
         let core = crate::ArExec::new().expect("client");
@@ -4814,7 +5171,10 @@ mod tests {
         // kilocode has no refresh grant, so nothing here may invent one: the
         // token records "no renewal" by having no refresh half, and
         // `can_refresh` reports it instead of the first 401 discovering it.
-        assert!(!token.can_refresh(), "a device grant with no refresh_token is not renewable");
+        assert!(
+            !token.can_refresh(),
+            "a device grant with no refresh_token is not renewable"
+        );
     }
 
     #[tokio::test]
@@ -4879,9 +5239,15 @@ mod tests {
         let (base, asked) = device_endpoint(
             (StatusCode::OK, DEVICE_GRANT_BODY),
             vec![
-                (StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"server_error"}"#),
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"error":"server_error"}"#,
+                ),
                 (StatusCode::SERVICE_UNAVAILABLE, "gateway busy"),
-                (StatusCode::OK, r#"{"access_token":"at-1","expires_in":3600}"#),
+                (
+                    StatusCode::OK,
+                    r#"{"access_token":"at-1","expires_in":3600}"#,
+                ),
             ],
         )
         .await;
@@ -4893,7 +5259,11 @@ mod tests {
             .await
             .expect("a transient failure is not a verdict, so the loop keeps asking");
 
-        assert_eq!(token.access().expose(), "at-1", "the eventual approval still lands");
+        assert_eq!(
+            token.access().expose(),
+            "at-1",
+            "the eventual approval still lands"
+        );
         assert_eq!(
             *asked.lock().unwrap_or_else(|p| p.into_inner()),
             3,
@@ -4991,7 +5361,11 @@ mod tests {
             .await
             .err();
 
-        assert_eq!(err, Some(LoginError::LoginExpired), "an elapsed grant is an expiry");
+        assert_eq!(
+            err,
+            Some(LoginError::LoginExpired),
+            "an elapsed grant is an expiry"
+        );
         assert_eq!(
             *asked.lock().unwrap_or_else(|p| p.into_inner()),
             0,
@@ -5005,16 +5379,25 @@ mod tests {
         // to honour the tighter of the two rather than outliving its budget.
         let (base, _) = device_endpoint(
             (StatusCode::OK, DEVICE_GRANT_BODY),
-            vec![(StatusCode::BAD_REQUEST, r#"{"error":"authorization_pending"}"#)],
+            vec![(
+                StatusCode::BAD_REQUEST,
+                r#"{"error":"authorization_pending"}"#,
+            )],
         )
         .await;
         let core = crate::ArExec::new().expect("client");
         let session = device_session(&base);
         let (_, pending) = initiate_device(&core, &session).await.expect("grant");
 
-        let err = poll_device(&core, &session, &pending, Duration::ZERO).await.err();
+        let err = poll_device(&core, &session, &pending, Duration::ZERO)
+            .await
+            .err();
 
-        assert_eq!(err, Some(LoginError::LoginExpired), "a zero budget ends the loop at once");
+        assert_eq!(
+            err,
+            Some(LoginError::LoginExpired),
+            "a zero budget ends the loop at once"
+        );
     }
 
     #[tokio::test]
@@ -5023,7 +5406,10 @@ mod tests {
             (StatusCode::OK, DEVICE_GRANT_BODY),
             vec![
                 (StatusCode::BAD_REQUEST, r#"{"error":"slow_down"}"#),
-                (StatusCode::OK, r#"{"access_token":"at-1","expires_in":3600}"#),
+                (
+                    StatusCode::OK,
+                    r#"{"access_token":"at-1","expires_in":3600}"#,
+                ),
             ],
         )
         .await;
@@ -5036,7 +5422,8 @@ mod tests {
             .expect("slow_down is a loop state, not a failure");
 
         assert_eq!(
-            token.access().expose(), "at-1",
+            token.access().expose(),
+            "at-1",
             "§3.5's slow_down delays the next ask rather than ending the login"
         );
     }
@@ -5105,7 +5492,9 @@ mod tests {
                     .unwrap_or((StatusCode::BAD_REQUEST, r#"{"error":"server_error"}"#))
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback binds");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback binds");
         let addr = listener.local_addr().expect("bound socket has an address");
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
@@ -5125,11 +5514,14 @@ mod tests {
         let (base, asked) = scripted_endpoint(vec![
             (StatusCode::SERVICE_UNAVAILABLE, r#"{"error":"upstream"}"#),
             (StatusCode::SERVICE_UNAVAILABLE, r#"{"error":"upstream"}"#),
-            (StatusCode::OK, r#"{"access_token":"at-granted","expires_in":3600}"#),
+            (
+                StatusCode::OK,
+                r#"{"access_token":"at-granted","expires_in":3600}"#,
+            ),
         ])
         .await;
-        let session = Session::new("codex", OAuthKind::Codex)
-            .with_token_url(format!("{base}/token"));
+        let session =
+            Session::new("codex", OAuthKind::Codex).with_token_url(format!("{base}/token"));
         let refresher = HttpRefresher::new(reqwest::Client::new());
 
         let token = refresher
@@ -5138,7 +5530,11 @@ mod tests {
             .expect("the third attempt grants");
 
         assert_eq!(token.access().expose(), "at-granted");
-        assert_eq!(asked_how_often(&asked), REFRESH_MAX_ATTEMPTS, "every attempt was spent");
+        assert_eq!(
+            asked_how_often(&asked),
+            REFRESH_MAX_ATTEMPTS,
+            "every attempt was spent"
+        );
     }
 
     #[tokio::test]
@@ -5147,10 +5543,13 @@ mod tests {
         // spent or revoked, and a second attempt would spend a second one to learn
         // the same thing. Three attempts here would be three refresh-token uses
         // against a provider that has already said no.
-        let (base, asked) = scripted_endpoint(vec![(StatusCode::BAD_REQUEST, r#"{"error":"invalid_grant"}"#)])
-            .await;
-        let session = Session::new("codex", OAuthKind::Codex)
-            .with_token_url(format!("{base}/token"));
+        let (base, asked) = scripted_endpoint(vec![(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"invalid_grant"}"#,
+        )])
+        .await;
+        let session =
+            Session::new("codex", OAuthKind::Codex).with_token_url(format!("{base}/token"));
         let refresher = HttpRefresher::new(reqwest::Client::new());
 
         let fault = refresher
@@ -5158,8 +5557,18 @@ mod tests {
             .await
             .expect_err("invalid_grant is terminal");
 
-        assert_eq!(fault, RefreshFault::Unrecoverable { status: 400, reason: "invalid_grant" });
-        assert_eq!(asked_how_often(&asked), 1, "a terminal verdict is not retried");
+        assert_eq!(
+            fault,
+            RefreshFault::Unrecoverable {
+                status: 400,
+                reason: "invalid_grant"
+            }
+        );
+        assert_eq!(
+            asked_how_often(&asked),
+            1,
+            "a terminal verdict is not retried"
+        );
     }
 
     #[tokio::test]
@@ -5167,8 +5576,8 @@ mod tests {
         // The threshold, proven from the outside: five failing refreshes in, and
         // the sixth never reaches the endpoint at all.
         let (base, asked) = scripted_endpoint(Vec::new()).await;
-        let session = Session::new("codex", OAuthKind::Codex)
-            .with_token_url(format!("{base}/token"));
+        let session =
+            Session::new("codex", OAuthKind::Codex).with_token_url(format!("{base}/token"));
         let refresher = HttpRefresher::new(reqwest::Client::new());
         let token = expired_token().with_refresh(Secret::new("rt-1"));
 
@@ -5180,10 +5589,17 @@ mod tests {
         }
         let spent = asked_how_often(&asked);
 
-        let fault = refresher.refresh(&session, &token).await.expect_err("the breaker is open");
+        let fault = refresher
+            .refresh(&session, &token)
+            .await
+            .expect_err("the breaker is open");
 
         assert_eq!(fault, RefreshFault::Transient("refresh-breaker-open"));
-        assert_eq!(asked_how_often(&asked), spent, "the endpoint was not asked again");
+        assert_eq!(
+            asked_how_often(&asked),
+            spent,
+            "the endpoint was not asked again"
+        );
     }
 
     #[tokio::test]
@@ -5233,7 +5649,11 @@ mod tests {
         .expect("an access token connects");
 
         assert!(conn.grant_at(Origin::Client, 1_000).await.is_ok());
-        assert_eq!(refresher.calls(), 0, "six minutes left is beyond the five-minute lead");
+        assert_eq!(
+            refresher.calls(),
+            0,
+            "six minutes left is beyond the five-minute lead"
+        );
     }
 
     #[tokio::test]
@@ -5256,7 +5676,11 @@ mod tests {
         .expect("an access token connects");
 
         assert!(conn.grant_at(Origin::Client, 1_000).await.is_ok());
-        assert_eq!(refresher.calls(), 1, "four minutes left is inside the five-minute lead");
+        assert_eq!(
+            refresher.calls(),
+            1,
+            "four minutes left is inside the five-minute lead"
+        );
     }
 
     #[test]
@@ -5265,14 +5689,20 @@ mod tests {
         // account can be tuned without changing every other session of the kind.
         let tuned = Session::new("codex", OAuthKind::Codex).with_refresh_lead_secs(60);
         assert_eq!(tuned.refresh_lead_secs(), 60);
-        assert_eq!(Session::new("codex", OAuthKind::Codex).refresh_lead_secs(), REFRESH_LEAD_SECS);
+        assert_eq!(
+            Session::new("codex", OAuthKind::Codex).refresh_lead_secs(),
+            REFRESH_LEAD_SECS
+        );
     }
 
     #[test]
     fn gives_a_non_rotating_provider_the_longer_lead() {
         // Google refresh tokens are permanent, so an early refresh buys no safety
         // and only adds chatter. Every other kind rotates and waits.
-        assert_eq!(OAuthKind::GeminiCli.refresh_lead_secs(), NON_ROTATING_REFRESH_LEAD_SECS);
+        assert_eq!(
+            OAuthKind::GeminiCli.refresh_lead_secs(),
+            NON_ROTATING_REFRESH_LEAD_SECS
+        );
         assert_eq!(OAuthKind::Codex.refresh_lead_secs(), REFRESH_LEAD_SECS);
     }
 
@@ -5287,8 +5717,9 @@ mod tests {
                 &'a self,
                 _session: &'a Session,
                 _current: &'a OAuthToken,
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<OAuthToken, RefreshFault>> + Send + 'a>>
-            {
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<OAuthToken, RefreshFault>> + Send + 'a>,
+            > {
                 Box::pin(std::future::pending())
             }
         }
@@ -5326,13 +5757,17 @@ mod tests {
         // `expires_in` is optional in §5.1. Treating its absence as "expires now"
         // would mint a token that is already stale, so every dispatch would decide
         // it had to refresh — one wasted refresh-token use per request, forever.
-        let (base, _) = token_endpoint((StatusCode::OK, r#"{"access_token":"at-no-expiry"}"#)).await;
-        let session = Session::new("grok-cli", OAuthKind::GrokCli)
-            .with_token_url(format!("{base}/token"));
+        let (base, _) =
+            token_endpoint((StatusCode::OK, r#"{"access_token":"at-no-expiry"}"#)).await;
+        let session =
+            Session::new("grok-cli", OAuthKind::GrokCli).with_token_url(format!("{base}/token"));
         let refresher = HttpRefresher::new(reqwest::Client::new());
 
         let token = refresher
-            .refresh(&session, &expired_token().with_refresh(Secret::new("rt-grok-1")))
+            .refresh(
+                &session,
+                &expired_token().with_refresh(Secret::new("rt-grok-1")),
+            )
             .await
             .expect("the mock grants the refresh");
 
@@ -5366,15 +5801,17 @@ mod tests {
     }
 
     impl RotationSink for RecordingSink {
-        fn persist_rotation(&self, provider: &str, presented: Option<&str>, renewed: &OAuthToken) -> bool {
-            self.writes
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .push((
-                    provider.to_owned(),
-                    presented.map(str::to_owned),
-                    renewed.access().expose().to_owned(),
-                ));
+        fn persist_rotation(
+            &self,
+            provider: &str,
+            presented: Option<&str>,
+            renewed: &OAuthToken,
+        ) -> bool {
+            self.writes.lock().unwrap_or_else(|p| p.into_inner()).push((
+                provider.to_owned(),
+                presented.map(str::to_owned),
+                renewed.access().expose().to_owned(),
+            ));
             self.persisted
         }
     }
@@ -5393,16 +5830,26 @@ mod tests {
         // just spent. The tuple asserted is the sink's whole input — provider,
         // token exchanged, token received — so it is also the guard's.
         let (writes, sink) = recording_sink(true);
-        let conn = Connection::pending(session(), Arc::new(RotationPool::new()), Arc::new(Counting::ok("rotated")))
-            .with_sink(Box::new(sink))
-            .connect(expired_token().with_refresh(Secret::new("rt-1")))
-            .expect("an access token connects");
+        let conn = Connection::pending(
+            session(),
+            Arc::new(RotationPool::new()),
+            Arc::new(Counting::ok("rotated")),
+        )
+        .with_sink(Box::new(sink))
+        .connect(expired_token().with_refresh(Secret::new("rt-1")))
+        .expect("an access token connects");
 
-        conn.rotate(token_hash("synthetic-old-access")).await.expect("the refresh succeeds");
+        conn.rotate(token_hash("synthetic-old-access"))
+            .await
+            .expect("the refresh succeeds");
 
         assert_eq!(
             *writes.lock().unwrap_or_else(|p| p.into_inner()),
-            vec![("cline".to_owned(), Some("rt-1".to_owned()), "rotated-0".to_owned())]
+            vec![(
+                "cline".to_owned(),
+                Some("rt-1".to_owned()),
+                "rotated-0".to_owned()
+            )]
         );
     }
 
@@ -5412,12 +5859,19 @@ mod tests {
         // accepted this token, so the caller must still get it. Only the stored
         // state is in question, and it is already fresher.
         let (_, sink) = recording_sink(false);
-        let conn = Connection::pending(session(), Arc::new(RotationPool::new()), Arc::new(Counting::ok("rotated")))
-            .with_sink(Box::new(sink))
-            .connect(expired_token().with_refresh(Secret::new("rt-1")))
-            .expect("an access token connects");
+        let conn = Connection::pending(
+            session(),
+            Arc::new(RotationPool::new()),
+            Arc::new(Counting::ok("rotated")),
+        )
+        .with_sink(Box::new(sink))
+        .connect(expired_token().with_refresh(Secret::new("rt-1")))
+        .expect("an access token connects");
 
-        let grant = conn.rotate(token_hash("synthetic-old-access")).await.expect("the request still succeeds");
+        let grant = conn
+            .rotate(token_hash("synthetic-old-access"))
+            .await
+            .expect("the request still succeeds");
 
         assert_eq!(grant.token().expose(), "rotated-0");
     }
@@ -5427,11 +5881,19 @@ mod tests {
         // A deployment with no credential store is the supported `$VAR`-only
         // install, and its rotations must keep working exactly as they did.
         let refresher = Arc::new(Counting::ok("rotated"));
-        let conn = Connection::pending(session(), Arc::new(RotationPool::new()), refresher.clone() as Arc<dyn Refresher>)
-            .connect(expired_token().with_refresh(Secret::new("rt-1")))
-            .expect("an access token connects");
+        let conn = Connection::pending(
+            session(),
+            Arc::new(RotationPool::new()),
+            refresher.clone() as Arc<dyn Refresher>,
+        )
+        .connect(expired_token().with_refresh(Secret::new("rt-1")))
+        .expect("an access token connects");
 
-        assert!(conn.rotate(token_hash("synthetic-old-access")).await.is_ok());
+        assert!(
+            conn.rotate(token_hash("synthetic-old-access"))
+                .await
+                .is_ok()
+        );
         assert_eq!(refresher.calls(), 1);
     }
 }

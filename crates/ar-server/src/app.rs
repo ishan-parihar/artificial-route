@@ -266,10 +266,13 @@ impl Components {
         // `with_exec` and never mentions a master key — still gets the gate
         // `AR_HTTP_MASTER_KEY` armed. That is the difference between a gate that
         // exists and one nothing can turn on.
-        let master: Option<ar_keys::Secret> = self
-            .master_key
-            .map(ar_keys::Secret::new)
-            .or_else(|| self.config.http_master_key.as_ref().map(ar_keys::Secret::to_owned_secret));
+        let master: Option<ar_keys::Secret> =
+            self.master_key.map(ar_keys::Secret::new).or_else(|| {
+                self.config
+                    .http_master_key
+                    .as_ref()
+                    .map(ar_keys::Secret::to_owned_secret)
+            });
         let auth_mode = self.config.auth_mode;
         let config = Arc::new(self.config);
         let mut cards = config.model_cards();
@@ -321,12 +324,12 @@ fn build_cache(bytes: Option<Option<u64>>) -> Option<Arc<ar_cache::Cache>> {
 
 /// Builds the bearer gate, reporting a rejected master key on stderr.
 ///
-    /// A gate that cannot be built is a gate that is **off**, and that is the
-    /// dangerous direction on a routable bind — so the warning names the
-    /// variable an operator would set and says the gate is disabled, rather than
-    /// being a line that scrolls past. [`ServerConfig::public`] through
-    /// [`bind_addr`] is the other half of the same property: a server with no
-    /// gate refuses a routable bind unless the operator declared it public.
+/// A gate that cannot be built is a gate that is **off**, and that is the
+/// dangerous direction on a routable bind — so the warning names the
+/// variable an operator would set and says the gate is disabled, rather than
+/// being a line that scrolls past. [`ServerConfig::public`] through
+/// [`bind_addr`] is the other half of the same property: a server with no
+/// gate refuses a routable bind unless the operator declared it public.
 fn build_gate(master: &[u8]) -> Option<Arc<AuthGate>> {
     match AuthGate::new(master) {
         Ok(gate) => Some(Arc::new(gate)),
@@ -376,13 +379,8 @@ impl ArExec for NullExec {
         _endpoint: &'a str,
         _content_type: &'a str,
         _body: &'a [u8],
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<ar_route::MediaReply, ar_route::ExecError>>
-                + Send
-                + 'a,
-        >,
-    > {
+    ) -> Pin<Box<dyn Future<Output = Result<ar_route::MediaReply, ar_route::ExecError>> + Send + 'a>>
+    {
         Box::pin(async move {
             Err(ar_route::ExecError(format!(
                 "no provider is configured; refusing media dispatch to {provider}"
@@ -428,7 +426,10 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/ocr", axum::routing::post(media::ocr))
         .layer(RequestBodyLimitLayer::new(MEDIA_BODY_BYTES));
     Router::new()
-        .route("/v1/chat/completions", axum::routing::post(routes::chat_completions))
+        .route(
+            "/v1/chat/completions",
+            axum::routing::post(routes::chat_completions),
+        )
         .route("/v1/messages", axum::routing::post(routes::messages))
         .route("/v1/responses", axum::routing::post(routes::responses))
         .route("/api/chat", axum::routing::post(routes::ollama_chat))
@@ -436,7 +437,10 @@ pub fn app(state: AppState) -> Router {
         // configured against `/v1/completions` is a client this server would
         // otherwise 404 for no reason. Same handler, so the two routes cannot
         // drift.
-        .route("/v1/completions", axum::routing::post(routes::chat_completions))
+        .route(
+            "/v1/completions",
+            axum::routing::post(routes::chat_completions),
+        )
         .merge(media)
         // `.head()` is spelled out: axum answers an unregistered method with
         // 405, so a `.get()`-only route turns an SDK's HEAD availability probe
@@ -458,7 +462,10 @@ pub fn app(state: AppState) -> Router {
             timeout,
         ))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
-        .layer(axum::middleware::from_fn_with_state(state.clone(), trace_id))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            trace_id,
+        ))
         // Outermost, and last in the chain: outermost so a preflight is answered
         // from the headers alone, and last so it wraps the fallback too.
         .layer(axum::middleware::from_fn(cors))
@@ -563,7 +570,8 @@ async fn trace_id(State(state): State<AppState>, req: Request, next: Next) -> Re
         .map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_owned);
 
     let path = req.uri().path().to_owned();
-    let span = tracing::info_span!("http.request", trace_id = %id, method = %req.method(), path = %path);
+    let span =
+        tracing::info_span!("http.request", trace_id = %id, method = %req.method(), path = %path);
     let _guard = span.enter();
 
     let mut resp = next.run(req).await;
@@ -657,7 +665,9 @@ pub fn bind_addr(host: &str, port: u16, public: bool) -> Result<std::net::Socket
             // With the flag set, a bare interface name (`0.0.0.0`, `::`) still
             // has to become a socket address, so it is spelled out rather than
             // handed to the listener as a string.
-            Err(_) if host_only == "0.0.0.0" => std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            Err(_) if host_only == "0.0.0.0" => {
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+            }
             Err(_) if host_only == "::" => std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
             Err(e) => {
                 return Err(BindError::Malformed {
@@ -689,7 +699,9 @@ fn gated(
     // interface" to the resolver, so treating it as loopback would be the one
     // reading of it that opens the gate.
     if !loopback && !public {
-        return Err(BindError::NotPublic { host: host.to_owned() });
+        return Err(BindError::NotPublic {
+            host: host.to_owned(),
+        });
     }
     Ok(std::net::SocketAddr::new(ip, port))
 }
@@ -740,10 +752,7 @@ mod tests {
 
     #[test]
     fn buckets_429_as_throttled() {
-        assert_eq!(
-            classify(StatusCode::TOO_MANY_REQUESTS),
-            Outcome::Throttled
-        );
+        assert_eq!(classify(StatusCode::TOO_MANY_REQUESTS), Outcome::Throttled);
     }
 
     #[test]
@@ -844,14 +853,12 @@ mod tests {
     /// `/healthz` answering on a proxy with no upstream is itself a property
     /// worth a test depending on.
     fn router() -> axum::Router {
-        app(
-            Components::unconfigured(ServerConfig::single(
-                0,
-                ar_route::Strategy::Priority,
-                Vec::new(),
-            ))
-            .into_state(),
-        )
+        app(Components::unconfigured(ServerConfig::single(
+            0,
+            ar_route::Strategy::Priority,
+            Vec::new(),
+        ))
+        .into_state())
     }
 
     /// The status of one request through [`router`].
@@ -892,10 +899,7 @@ mod tests {
             .method("OPTIONS")
             .uri("/v1/chat/completions")
             .header(axum::http::header::ORIGIN, "http://localhost:5173")
-            .header(
-                axum::http::header::ACCESS_CONTROL_REQUEST_METHOD,
-                "POST",
-            )
+            .header(axum::http::header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
             .header(
                 axum::http::header::ACCESS_CONTROL_REQUEST_HEADERS,
                 "x-omniroute-compression",
@@ -953,7 +957,10 @@ mod tests {
         // The fallback sits inside every layer, so a client still gets the id its
         // logs will be correlated by.
         let resp = response_of("GET", "/nope").await;
-        assert!(resp.headers().contains_key(TRACE_HEADER), "no trace id on a 404");
+        assert!(
+            resp.headers().contains_key(TRACE_HEADER),
+            "no trace id on a 404"
+        );
     }
 
     // --- CORS / OPTIONS ------------------------------------------------
@@ -985,7 +992,10 @@ mod tests {
             .get(header::ACCESS_CONTROL_ALLOW_METHODS)
             .and_then(|v| v.to_str().ok())
             .expect("methods advertised");
-        assert!(methods.contains("POST"), "a chat route needs POST: {methods}");
+        assert!(
+            methods.contains("POST"),
+            "a chat route needs POST: {methods}"
+        );
         let allowed = resp
             .headers()
             .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
@@ -996,8 +1006,16 @@ mod tests {
         // header that gates one of them. Lowercased first because HTTP header
         // names are case-insensitive and the value is the reference gateway's
         // spelling, not this crate's.
-        for needed in ["authorization", "x-api-key", "x-goog-api-key", "anthropic-version"] {
-            assert!(allowed.contains(needed), "preflight would reject {needed}: {allowed}");
+        for needed in [
+            "authorization",
+            "x-api-key",
+            "x-goog-api-key",
+            "anthropic-version",
+        ] {
+            assert!(
+                allowed.contains(needed),
+                "preflight would reject {needed}: {allowed}"
+            );
         }
     }
 
@@ -1011,7 +1029,9 @@ mod tests {
             .expect("request builds");
         let resp = send(router(), req).await;
         assert_eq!(
-            resp.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
             Some("https://example.test")
         );
         // Without this a shared cache hands one origin's response to another.
@@ -1028,7 +1048,9 @@ mod tests {
         // something to a cross-origin caller has nothing to say to one that is
         // not making one.
         assert!(
-            !resp.headers().contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            !resp
+                .headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN),
             "a non-browser caller was handed an origin policy"
         );
     }
@@ -1044,7 +1066,10 @@ mod tests {
             .body(axum::body::Body::empty())
             .expect("request builds");
         let resp = send(router(), req).await;
-        assert!(resp.headers().contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+        assert!(
+            resp.headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        );
     }
 
     #[tokio::test]
@@ -1059,7 +1084,10 @@ mod tests {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse().ok())
             .expect("a max age is advertised");
-        assert!(max_age >= 60, "a browser would re-ask mid-stream: {max_age}s");
+        assert!(
+            max_age >= 60,
+            "a browser would re-ask mid-stream: {max_age}s"
+        );
     }
 
     // --- the model-aware deadline --------------------------------------
@@ -1074,7 +1102,9 @@ mod tests {
     #[test]
     fn a_named_model_gets_its_own_deadline() {
         let mut config = ServerConfig::single(0, ar_route::Strategy::Priority, Vec::new());
-        config.timeouts.insert("reasoner".to_owned(), Duration::from_secs(600));
+        config
+            .timeouts
+            .insert("reasoner".to_owned(), Duration::from_secs(600));
         assert_eq!(config.stream_deadline("reasoner"), Duration::from_secs(600));
         // A model nobody named keeps the old answer, so one config line cannot
         // change the behaviour of every other request.
@@ -1088,7 +1118,9 @@ mod tests {
         // model-aware timeout could fire — the wrong order, and the client would
         // see the layer's number rather than the model's.
         let mut config = ServerConfig::single(0, ar_route::Strategy::Priority, Vec::new());
-        config.timeouts.insert("reasoner".to_owned(), Duration::from_secs(600));
+        config
+            .timeouts
+            .insert("reasoner".to_owned(), Duration::from_secs(600));
         assert_eq!(config.max_deadline(), Duration::from_secs(600));
     }
 
@@ -1097,7 +1129,9 @@ mod tests {
         // A model asking for *less* is honoured per request, but the layer stays
         // at the default so it cannot pre-empt a different model's wider ask.
         let mut config = ServerConfig::single(0, ar_route::Strategy::Priority, Vec::new());
-        config.timeouts.insert("quick".to_owned(), Duration::from_secs(5));
+        config
+            .timeouts
+            .insert("quick".to_owned(), Duration::from_secs(5));
         assert_eq!(config.stream_deadline("quick"), Duration::from_secs(5));
         assert_eq!(config.max_deadline(), REQUEST_TIMEOUT);
     }
@@ -1109,8 +1143,13 @@ mod tests {
         // requests off before the per-request timeout could fire, which is the
         // failure the whole two-layer arrangement exists to prevent.
         let mut config = ServerConfig::single(0, ar_route::Strategy::Priority, Vec::new());
-        config.timeouts.insert("*".to_owned(), Duration::from_secs(300));
-        assert_eq!(config.stream_deadline("any-model"), Duration::from_secs(300));
+        config
+            .timeouts
+            .insert("*".to_owned(), Duration::from_secs(300));
+        assert_eq!(
+            config.stream_deadline("any-model"),
+            Duration::from_secs(300)
+        );
         assert_eq!(config.max_deadline(), Duration::from_secs(300));
     }
 
@@ -1121,9 +1160,15 @@ mod tests {
         // its own deadline has to fit inside the layer's cover, or the client sees
         // the layer's 504 — which names no model and no timeout.
         let mut config = ServerConfig::single(0, ar_route::Strategy::Priority, Vec::new());
-        config.timeouts.insert("reasoner".to_owned(), Duration::from_secs(600));
-        config.timeouts.insert("quick".to_owned(), Duration::from_secs(5));
-        config.timeouts.insert("*".to_owned(), Duration::from_secs(90));
+        config
+            .timeouts
+            .insert("reasoner".to_owned(), Duration::from_secs(600));
+        config
+            .timeouts
+            .insert("quick".to_owned(), Duration::from_secs(5));
+        config
+            .timeouts
+            .insert("*".to_owned(), Duration::from_secs(90));
         let cover = config.max_deadline();
         for model in ["reasoner", "quick", "anything-else"] {
             assert!(
@@ -1142,17 +1187,25 @@ mod tests {
         let mut config = ServerConfig::single(
             0,
             ar_route::Strategy::Priority,
-            vec![crate::exec::ProviderConfig::new(
-                ar_route::ProviderId::new("p"),
-                "http://127.0.0.1:1/v1",
-                "k",
-            )
-            .with_model("m")],
+            vec![
+                crate::exec::ProviderConfig::new(
+                    ar_route::ProviderId::new("p"),
+                    "http://127.0.0.1:1/v1",
+                    "k",
+                )
+                .with_model("m"),
+            ],
         );
-        config.timeouts.insert("m".to_owned(), Duration::from_secs(1));
+        config
+            .timeouts
+            .insert("m".to_owned(), Duration::from_secs(1));
         let exec = std::sync::Arc::new(Hangs);
         let resp = send(
-            app(Components { exec, ..Components::unconfigured(config) }.into_state()),
+            app(Components {
+                exec,
+                ..Components::unconfigured(config)
+            }
+            .into_state()),
             post_chat(r#"{"model":"m","stream":true,"messages":[]}"#, &[]).await,
         )
         .await;
@@ -1161,7 +1214,10 @@ mod tests {
         assert_eq!(body["error"]["code"], "upstream_timeout");
         assert_eq!(body["error"]["reason"], "model_deadline");
         assert!(
-            body["error"]["message"].as_str().unwrap_or_default().contains("\"m\""),
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("\"m\""),
             "the 504 must name the model, not just the timeout: {body}"
         );
     }
@@ -1180,9 +1236,8 @@ mod tests {
             _canonical: &'a ar_route::CanonicalRequest,
         ) -> std::pin::Pin<
             Box<
-                dyn std::future::Future<
-                        Output = Result<ar_route::Upstream, ar_route::ExecError>,
-                    > + Send
+                dyn std::future::Future<Output = Result<ar_route::Upstream, ar_route::ExecError>>
+                    + Send
                     + 'a,
             >,
         > {
@@ -1197,9 +1252,8 @@ mod tests {
             _body: &'a [u8],
         ) -> std::pin::Pin<
             Box<
-                dyn std::future::Future<
-                        Output = Result<ar_route::MediaReply, ar_route::ExecError>,
-                    > + Send
+                dyn std::future::Future<Output = Result<ar_route::MediaReply, ar_route::ExecError>>
+                    + Send
                     + 'a,
             >,
         > {
@@ -1216,14 +1270,20 @@ mod tests {
         // 600s model the layer still held at 120s would never see its own
         // timeout — it would see the layer's 504, which names no model.
         let mut config = ServerConfig::single(0, ar_route::Strategy::Priority, Vec::new());
-        config.timeouts.insert("m".to_owned(), Duration::from_secs(600));
+        config
+            .timeouts
+            .insert("m".to_owned(), Duration::from_secs(600));
         let resp = send(
             app(Components::unconfigured(config).into_state()),
             post_chat(r#"{"model":"m","messages":[]}"#, &[]).await,
         )
         .await;
         // 503 from the null executor: the request was not cut off on the way in.
-        assert_eq!(resp.status(), 503, "the layer cut the request before dispatch");
+        assert_eq!(
+            resp.status(),
+            503,
+            "the layer cut the request before dispatch"
+        );
     }
 
     // --- the gate is armable, and off by default ----------------------
@@ -1264,13 +1324,11 @@ mod tests {
     fn gated_with(master: &[u8], mode: crate::config::AuthMode) -> axum::Router {
         let mut config = ServerConfig::single(0, ar_route::Strategy::Priority, Vec::new());
         config.auth_mode = mode;
-        app(
-            Components {
-                master_key: Some(master.to_vec()),
-                ..Components::unconfigured(config)
-            }
-            .into_state(),
-        )
+        app(Components {
+            master_key: Some(master.to_vec()),
+            ..Components::unconfigured(config)
+        }
+        .into_state())
     }
 
     #[test]
@@ -1280,7 +1338,10 @@ mod tests {
         let mut config = ServerConfig::single(0, ar_route::Strategy::Priority, Vec::new());
         config.auth_mode = crate::config::AuthMode::DegradeInvalidToAnon;
         let state = Components::unconfigured(config).into_state();
-        assert_eq!(state.auth_mode, crate::config::AuthMode::DegradeInvalidToAnon);
+        assert_eq!(
+            state.auth_mode,
+            crate::config::AuthMode::DegradeInvalidToAnon
+        );
     }
 
     /// A server whose gate is armed with `master`, in the default mode.
@@ -1289,7 +1350,10 @@ mod tests {
     }
 
     /// A chat POST with a JSON body, plus any extra headers.
-    async fn post_chat(body: &str, extra: &[(&str, &str)]) -> axum::http::Request<axum::body::Body> {
+    async fn post_chat(
+        body: &str,
+        extra: &[(&str, &str)],
+    ) -> axum::http::Request<axum::body::Body> {
         let mut req = axum::http::Request::builder()
             .method("POST")
             .uri("/v1/chat/completions")
@@ -1310,12 +1374,19 @@ mod tests {
         // The code is the OpenAI-compatible spelling a client branches on; the
         // `reason` is what separates "you sent nothing" from "what you sent is
         // wrong" without either reaching the client verbatim.
-        let resp = send(gated(MASTER), post_chat(r#"{"model":"m","messages":[]}"#, &[]).await).await;
+        let resp = send(
+            gated(MASTER),
+            post_chat(r#"{"model":"m","messages":[]}"#, &[]).await,
+        )
+        .await;
         assert_eq!(resp.status(), 401);
         let body = json_of(resp).await;
         assert_eq!(body["error"]["code"], "invalid_api_key");
         assert_eq!(body["error"]["type"], "authentication_error");
-        assert!(body["error"]["reason"].is_string(), "no reason to branch on: {body}");
+        assert!(
+            body["error"]["reason"].is_string(),
+            "no reason to branch on: {body}"
+        );
     }
 
     #[tokio::test]
@@ -1365,8 +1436,11 @@ mod tests {
         let other = foreign_token();
         let resp = send(
             gated_with(MASTER, crate::config::AuthMode::DegradeInvalidToAnon),
-            post_chat(r#"{"model":"m","messages":[]}"#, &[("authorization", &format!("Bearer {other}"))])
-                .await,
+            post_chat(
+                r#"{"model":"m","messages":[]}"#,
+                &[("authorization", &format!("Bearer {other}"))],
+            )
+            .await,
         )
         .await;
         // 503 rather than 401: the request passed the gate and reached the
@@ -1385,7 +1459,11 @@ mod tests {
             post_chat(r#"{"model":"m","messages":[]}"#, &[]).await,
         )
         .await;
-        assert_eq!(resp.status(), 503, "degrade refused a credential-less request");
+        assert_eq!(
+            resp.status(),
+            503,
+            "degrade refused a credential-less request"
+        );
     }
 
     #[tokio::test]
@@ -1395,10 +1473,18 @@ mod tests {
         let token = accepted_token();
         let resp = send(
             gated(MASTER),
-            post_chat(r#"{"model":"m","messages":[]}"#, &[("x-goog-api-key", &token)]).await,
+            post_chat(
+                r#"{"model":"m","messages":[]}"#,
+                &[("x-goog-api-key", &token)],
+            )
+            .await,
         )
         .await;
-        assert_eq!(resp.status(), 503, "the x-goog-api-key matrix row did not authenticate");
+        assert_eq!(
+            resp.status(),
+            503,
+            "the x-goog-api-key matrix row did not authenticate"
+        );
     }
 
     #[tokio::test]
@@ -1420,7 +1506,11 @@ mod tests {
     #[tokio::test]
     async fn an_unarmed_server_serves_an_anonymous_request() {
         // The property every default in this change rests on.
-        let resp = send(router(), post_chat(r#"{"model":"m","messages":[]}"#, &[]).await).await;
+        let resp = send(
+            router(),
+            post_chat(r#"{"model":"m","messages":[]}"#, &[]).await,
+        )
+        .await;
         assert_ne!(resp.status(), 401);
     }
 
@@ -1436,7 +1526,11 @@ mod tests {
             .await,
         )
         .await;
-        assert_eq!(resp.status(), 503, "the x-api-key matrix row did not authenticate");
+        assert_eq!(
+            resp.status(),
+            503,
+            "the x-api-key matrix row did not authenticate"
+        );
     }
 
     #[test]
@@ -1463,7 +1557,12 @@ mod tests {
         .into_state();
         let token = accepted_token();
         assert!(
-            state.auth.as_deref().expect("gate configured").verify(&token).is_ok(),
+            state
+                .auth
+                .as_deref()
+                .expect("gate configured")
+                .verify(&token)
+                .is_ok(),
             "the explicit key did not win"
         );
     }

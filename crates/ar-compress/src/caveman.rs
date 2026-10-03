@@ -79,56 +79,194 @@ const FILLER: u8 = 1;
 /// [`Intensity`] gate.
 const PHRASES: [Phrase; 46] = [
     // Purpose clauses that restate the next clause.
-    Phrase { text: "in order to", tier: FILLER },
-    Phrase { text: "so as to", tier: FILLER },
-    Phrase { text: "due to the fact that", tier: FILLER },
-    Phrase { text: "the reason is because", tier: FILLER },
-    Phrase { text: "at this point in time", tier: FILLER },
-    Phrase { text: "for the purpose of", tier: FILLER },
-    Phrase { text: "with the goal of", tier: FILLER },
-    Phrase { text: "in an effort to", tier: FILLER },
+    Phrase {
+        text: "in order to",
+        tier: FILLER,
+    },
+    Phrase {
+        text: "so as to",
+        tier: FILLER,
+    },
+    Phrase {
+        text: "due to the fact that",
+        tier: FILLER,
+    },
+    Phrase {
+        text: "the reason is because",
+        tier: FILLER,
+    },
+    Phrase {
+        text: "at this point in time",
+        tier: FILLER,
+    },
+    Phrase {
+        text: "for the purpose of",
+        tier: FILLER,
+    },
+    Phrase {
+        text: "with the goal of",
+        tier: FILLER,
+    },
+    Phrase {
+        text: "in an effort to",
+        tier: FILLER,
+    },
     // Meta-commentary about the message itself.
-    Phrase { text: "it is important to note that", tier: FILLER },
-    Phrase { text: "it should be noted that", tier: FILLER },
-    Phrase { text: "please note that", tier: FILLER },
-    Phrase { text: "keep in mind that", tier: FILLER },
-    Phrase { text: "note that the", tier: FILLER },
-    Phrase { text: "note that this", tier: FILLER },
-    Phrase { text: "as you may know", tier: FILLER },
-    Phrase { text: "as we discussed earlier", tier: FILLER },
-    Phrase { text: "as previously mentioned", tier: FILLER },
-    Phrase { text: "as mentioned before", tier: FILLER },
-    Phrase { text: "as previously stated", tier: FILLER },
+    Phrase {
+        text: "it is important to note that",
+        tier: FILLER,
+    },
+    Phrase {
+        text: "it should be noted that",
+        tier: FILLER,
+    },
+    Phrase {
+        text: "please note that",
+        tier: FILLER,
+    },
+    Phrase {
+        text: "keep in mind that",
+        tier: FILLER,
+    },
+    Phrase {
+        text: "note that the",
+        tier: FILLER,
+    },
+    Phrase {
+        text: "note that this",
+        tier: FILLER,
+    },
+    Phrase {
+        text: "as you may know",
+        tier: FILLER,
+    },
+    Phrase {
+        text: "as we discussed earlier",
+        tier: FILLER,
+    },
+    Phrase {
+        text: "as previously mentioned",
+        tier: FILLER,
+    },
+    Phrase {
+        text: "as mentioned before",
+        tier: FILLER,
+    },
+    Phrase {
+        text: "as previously stated",
+        tier: FILLER,
+    },
     // Politeness that carries no instruction.
-    Phrase { text: "could you please", tier: FILLER },
-    Phrase { text: "would you please", tier: FILLER },
-    Phrase { text: "can you please", tier: FILLER },
-    Phrase { text: "i would like you to", tier: FILLER },
-    Phrase { text: "thank you so much", tier: FILLER },
-    Phrase { text: "thanks in advance", tier: FILLER },
-    Phrase { text: "i really appreciate", tier: FILLER },
-    Phrase { text: "you're welcome", tier: FILLER },
-    Phrase { text: "glad to help", tier: FILLER },
-    Phrase { text: "feel free to", tier: FILLER },
-    Phrase { text: "let me know if", tier: FILLER },
-    Phrase { text: "at your convenience", tier: FILLER },
-    Phrase { text: "when you get a chance", tier: FILLER },
+    Phrase {
+        text: "could you please",
+        tier: FILLER,
+    },
+    Phrase {
+        text: "would you please",
+        tier: FILLER,
+    },
+    Phrase {
+        text: "can you please",
+        tier: FILLER,
+    },
+    Phrase {
+        text: "i would like you to",
+        tier: FILLER,
+    },
+    Phrase {
+        text: "thank you so much",
+        tier: FILLER,
+    },
+    Phrase {
+        text: "thanks in advance",
+        tier: FILLER,
+    },
+    Phrase {
+        text: "i really appreciate",
+        tier: FILLER,
+    },
+    Phrase {
+        text: "you're welcome",
+        tier: FILLER,
+    },
+    Phrase {
+        text: "glad to help",
+        tier: FILLER,
+    },
+    Phrase {
+        text: "feel free to",
+        tier: FILLER,
+    },
+    Phrase {
+        text: "let me know if",
+        tier: FILLER,
+    },
+    Phrase {
+        text: "at your convenience",
+        tier: FILLER,
+    },
+    Phrase {
+        text: "when you get a chance",
+        tier: FILLER,
+    },
     // Hedging. Referent-free: the sentence behind it says the same thing.
-    Phrase { text: "it seems like", tier: NOISE },
-    Phrase { text: "it appears that", tier: NOISE },
-    Phrase { text: "i think that", tier: NOISE },
-    Phrase { text: "i believe that", tier: NOISE },
-    Phrase { text: "to summarize", tier: NOISE },
-    Phrase { text: "in summary", tier: NOISE },
-    Phrase { text: "to recap", tier: NOISE },
+    Phrase {
+        text: "it seems like",
+        tier: NOISE,
+    },
+    Phrase {
+        text: "it appears that",
+        tier: NOISE,
+    },
+    Phrase {
+        text: "i think that",
+        tier: NOISE,
+    },
+    Phrase {
+        text: "i believe that",
+        tier: NOISE,
+    },
+    Phrase {
+        text: "to summarize",
+        tier: NOISE,
+    },
+    Phrase {
+        text: "in summary",
+        tier: NOISE,
+    },
+    Phrase {
+        text: "to recap",
+        tier: NOISE,
+    },
     // Bare filler adverbs.
-    Phrase { text: "of course", tier: NOISE },
-    Phrase { text: "certainly", tier: NOISE },
-    Phrase { text: "absolutely", tier: NOISE },
-    Phrase { text: "basically", tier: NOISE },
-    Phrase { text: "essentially", tier: NOISE },
-    Phrase { text: "literally", tier: NOISE },
-    Phrase { text: "actually", tier: NOISE },
+    Phrase {
+        text: "of course",
+        tier: NOISE,
+    },
+    Phrase {
+        text: "certainly",
+        tier: NOISE,
+    },
+    Phrase {
+        text: "absolutely",
+        tier: NOISE,
+    },
+    Phrase {
+        text: "basically",
+        tier: NOISE,
+    },
+    Phrase {
+        text: "essentially",
+        tier: NOISE,
+    },
+    Phrase {
+        text: "literally",
+        tier: NOISE,
+    },
+    Phrase {
+        text: "actually",
+        tier: NOISE,
+    },
 ];
 
 /// Noun abbreviations, gated at [`Intensity::Ultra`].
@@ -317,7 +455,8 @@ fn match_phrase_at(text: &str, i: usize, rung: u8) -> Option<usize> {
 /// The index just past the abbreviable noun at `i` and its replacement, when the
 /// rung unlocks [`ABBREVIATIONS`] and the match sits on word boundaries.
 fn match_abbreviation_at(text: &str, i: usize, rung: u8) -> Option<(usize, &'static str)> {
-    if rung < Engine::Caveman.rung(Intensity::Ultra) || (i > 0 && is_word_byte(text.as_bytes()[i - 1]))
+    if rung < Engine::Caveman.rung(Intensity::Ultra)
+        || (i > 0 && is_word_byte(text.as_bytes()[i - 1]))
     {
         return None;
     }
@@ -367,7 +506,14 @@ fn code_dominant(text: &str) -> bool {
 /// that matters here: code lines carry punctuation prose does not.
 fn looks_like_code(line: &str) -> bool {
     const HINTS: [&str; 8] = [
-        "fn ", "def ", "class ", "function ", "import ", "return ", "const ", "pub ",
+        "fn ",
+        "def ",
+        "class ",
+        "function ",
+        "import ",
+        "return ",
+        "const ",
+        "pub ",
     ];
     line.contains('{')
         || line.contains(';')
@@ -467,8 +613,14 @@ mod tests {
     #[test]
     fn abbreviates_a_noun_only_at_the_ultra_rung() {
         let src = "The database configuration caches every request response header value.";
-        assert!(!caveman_at(src, Intensity::Full).contains("db"), "full must not abbreviate");
-        assert!(caveman_at(src, Intensity::Ultra).contains("db config"), "ultra did not abbreviate");
+        assert!(
+            !caveman_at(src, Intensity::Full).contains("db"),
+            "full must not abbreviate"
+        );
+        assert!(
+            caveman_at(src, Intensity::Ultra).contains("db config"),
+            "ultra did not abbreviate"
+        );
     }
 
     #[test]

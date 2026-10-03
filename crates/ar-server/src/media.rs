@@ -37,7 +37,7 @@ use std::collections::HashMap;
 
 use crate::app::AppState;
 use crate::routes::{
-    DECISION_HEADER, SESSION_HEADER, RouteReject, authorize, error_because, require_json, resolve,
+    DECISION_HEADER, RouteReject, SESSION_HEADER, authorize, error_because, require_json, resolve,
 };
 
 /// `POST /v1/embeddings` — text in, vectors out, response re-rendered.
@@ -82,8 +82,16 @@ pub async fn transcriptions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    audio_route(&state, &headers, uri.path(), "transcriptions", "/audio/transcriptions", query, body)
-        .await
+    audio_route(
+        &state,
+        &headers,
+        uri.path(),
+        "transcriptions",
+        "/audio/transcriptions",
+        query,
+        body,
+    )
+    .await
 }
 
 /// `POST /v1/audio/translations` — multipart audio in, English text out,
@@ -95,8 +103,16 @@ pub async fn translations(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    audio_route(&state, &headers, uri.path(), "translations", "/audio/translations", query, body)
-        .await
+    audio_route(
+        &state,
+        &headers,
+        uri.path(),
+        "translations",
+        "/audio/translations",
+        query,
+        body,
+    )
+    .await
 }
 
 /// The shared body of the two multipart audio routes: auth, `?model=` route
@@ -349,10 +365,11 @@ mod tests {
             content_type: &'a str,
             body: &'a [u8],
         ) -> Pin<Box<dyn Future<Output = Result<MediaReply, ExecError>> + Send + 'a>> {
-            self.seen
-                .lock()
-                .expect("recorder lock")
-                .push((endpoint.to_owned(), content_type.to_owned(), body.to_vec()));
+            self.seen.lock().expect("recorder lock").push((
+                endpoint.to_owned(),
+                content_type.to_owned(),
+                body.to_vec(),
+            ));
             let status = self.status;
             let reply = self.reply;
             let error = self.error;
@@ -375,12 +392,14 @@ mod tests {
         let mut config = crate::config::ServerConfig::single(
             0,
             Strategy::Priority,
-            vec![crate::exec::ProviderConfig::new(
-                ProviderId::new("p"),
-                "http://127.0.0.1:1/v1",
-                "k",
-            )
-            .with_model("m")],
+            vec![
+                crate::exec::ProviderConfig::new(
+                    ProviderId::new("p"),
+                    "http://127.0.0.1:1/v1",
+                    "k",
+                )
+                .with_model("m"),
+            ],
         );
         config.combos = vec![crate::config::RouteCombo::new(
             "m",
@@ -448,7 +467,11 @@ mod tests {
             error: false,
         });
         let router = crate::app::app(routed_under(exec));
-        let resp = drive(&router, post("/v1/ocr", r#"{"model":"nope","document":"x"}"#)).await;
+        let resp = drive(
+            &router,
+            post("/v1/ocr", r#"{"model":"nope","document":"x"}"#),
+        )
+        .await;
 
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = body_of(resp).await;
@@ -507,8 +530,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let recorded = seen.lock().expect("recorder");
         assert_eq!(
-            recorded[0].0,
-            "/audio/transcriptions",
+            recorded[0].0, "/audio/transcriptions",
             "wrong endpoint: {:?}",
             recorded[0]
         );
@@ -569,8 +591,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let recorded = seen.lock().expect("recorder");
         assert_eq!(
-            recorded[0].0,
-            "/audio/translations",
+            recorded[0].0, "/audio/translations",
             "wrong endpoint: {:?}",
             recorded[0]
         );
@@ -592,7 +613,10 @@ mod tests {
         let router = crate::app::app(routed_under(exec));
         let resp = drive(
             &router,
-            post("/v1/images/generations", r#"{"model":"m","prompt":"a cat"}"#),
+            post(
+                "/v1/images/generations",
+                r#"{"model":"m","prompt":"a cat"}"#,
+            ),
         )
         .await;
 

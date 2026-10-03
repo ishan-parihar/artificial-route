@@ -49,7 +49,9 @@
 
 use serde_json::json;
 
-use crate::anthropic::{AnthropicBlock, AnthropicBlockContent, AnthropicContent, AnthropicMessages};
+use crate::anthropic::{
+    AnthropicBlock, AnthropicBlockContent, AnthropicContent, AnthropicMessages,
+};
 use crate::canonical::{CanonicalChat, CanonicalResponse, MediaPart, Msg, Role};
 use crate::gemini::{GeminiChat, GeminiContent, GeminiPart};
 use crate::media::Modality;
@@ -674,7 +676,10 @@ fn gemini_content(content: GeminiContent) -> Result<Vec<Msg>, TranslateError> {
         }
 
         if let Some(response) = part.function_response.as_ref() {
-            tool_msgs.push(Msg::new(Role::Tool, gemini_function_response_text(response)));
+            tool_msgs.push(Msg::new(
+                Role::Tool,
+                gemini_function_response_text(response),
+            ));
             continue;
         }
 
@@ -714,9 +719,10 @@ fn gemini_content(content: GeminiContent) -> Result<Vec<Msg>, TranslateError> {
 /// anyway.
 fn gemini_function_response_text(response: &crate::gemini::GeminiFunctionResponse) -> String {
     let payload = match response.response.as_ref() {
-        Some(serde_json::Value::Object(fields)) if fields.contains_key("result") => {
-            fields.get("result").cloned().unwrap_or(serde_json::Value::Null)
-        }
+        Some(serde_json::Value::Object(fields)) if fields.contains_key("result") => fields
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
         Some(other) => other.clone(),
         None => serde_json::json!({}),
     };
@@ -1052,7 +1058,9 @@ mod tests {
         let chat: OpenAIChat = serde_json::from_str(raw).expect("fixture is valid OpenAI chat");
 
         assert_eq!(
-            to_canonical(chat).expect("fixture is translatable").max_tokens,
+            to_canonical(chat)
+                .expect("fixture is translatable")
+                .max_tokens,
             Some(128)
         );
     }
@@ -1116,7 +1124,8 @@ mod tests {
 
     #[test]
     fn accepts_null_content_when_tool_turn() {
-        let raw = r#"{"model":"m","messages":[{"role":"tool","content":null,"tool_call_id":"c1"}]}"#;
+        let raw =
+            r#"{"model":"m","messages":[{"role":"tool","content":null,"tool_call_id":"c1"}]}"#;
         let chat: OpenAIChat = serde_json::from_str(raw).expect("fixture is valid OpenAI chat");
 
         let canonical = to_canonical(chat).expect("fixture is translatable");
@@ -1185,7 +1194,10 @@ mod tests {
         let raw = r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
         let chat: OpenAIChat = serde_json::from_str(raw).expect("fixture is valid OpenAI chat");
 
-        assert_eq!(chat_modality(&to_canonical(chat).expect("text is translatable")), Modality::Text);
+        assert_eq!(
+            chat_modality(&to_canonical(chat).expect("text is translatable")),
+            Modality::Text
+        );
     }
 
     #[test]
@@ -1319,10 +1331,9 @@ mod tests {
     /// model, and must fail there rather than at the upstream.
     #[test]
     fn rejects_gemini_when_model_never_lifted_from_the_path() {
-        let req: GeminiChat = serde_json::from_str(
-            r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#,
-        )
-        .expect("fixture is valid Gemini");
+        let req: GeminiChat =
+            serde_json::from_str(r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#)
+                .expect("fixture is valid Gemini");
 
         assert!(matches!(
             gemini_to_canonical(req),
@@ -1358,13 +1369,22 @@ mod tests {
     #[test]
     fn errors_for_every_missing_pair_in_the_reference_matrix() {
         let missing = missing_pairs();
-        assert!(!missing.is_empty(), "the matrix is not empty and this build misses cells");
+        assert!(
+            !missing.is_empty(),
+            "the matrix is not empty and this build misses cells"
+        );
 
         for pair in missing {
             let err = pair_named(pair.name)
                 .expect_err("a listed missing pair must not resolve to an implementation");
-            assert!(matches!(&err, TranslateError::UnsupportedPair { pair: name } if name == pair.name));
-            assert!(!pair.reference.is_empty(), "{} names no reference file", pair.name);
+            assert!(
+                matches!(&err, TranslateError::UnsupportedPair { pair: name } if name == pair.name)
+            );
+            assert!(
+                !pair.reference.is_empty(),
+                "{} names no reference file",
+                pair.name
+            );
         }
     }
 
@@ -1446,6 +1466,9 @@ mod tests {
     #[test]
     fn keeps_one_pair_name_for_the_antigravity_gemini_twin() {
         assert!(pair_named("canonical-to-gemini").is_ok());
-        assert!(pair_named("canonical-to-antigravity").is_err(), "the twin is one cell, not two");
+        assert!(
+            pair_named("canonical-to-antigravity").is_err(),
+            "the twin is one cell, not two"
+        );
     }
 }

@@ -252,9 +252,9 @@ impl IdempotencyStore {
         self.inner.lock().map_or(0, |i| i.bytes)
     }
 
-/// Live slot count, for `/metrics` and tests.
-#[must_use]
-pub fn len(&self) -> usize {
+    /// Live slot count, for `/metrics` and tests.
+    #[must_use]
+    pub fn len(&self) -> usize {
         let now = now_ms();
         // A poisoned lock reads as empty, matching `bytes()`: a metrics
         // counter that reports zero is recoverable, a panic in `/metrics` is
@@ -392,7 +392,17 @@ mod tests {
     fn an_expired_answer_replays_as_proceed_not_as_a_stale_body() {
         let store = IdempotencyStore::with_limits(Duration::from_millis(5), 1 << 20);
         store.begin("t", "k");
-        store.complete("t", "k", Entry::new(200, "text/plain", "x", crate::entry::now_ms(), Duration::from_millis(5)));
+        store.complete(
+            "t",
+            "k",
+            Entry::new(
+                200,
+                "text/plain",
+                "x",
+                crate::entry::now_ms(),
+                Duration::from_millis(5),
+            ),
+        );
         std::thread::sleep(Duration::from_millis(10));
         assert_eq!(store.begin("t", "k"), Replay::Proceed);
     }

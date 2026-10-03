@@ -21,7 +21,11 @@ use crate::contract::{Candidate, ProviderId, Strng};
 /// `NaN` score sorts nondeterministically. Upstream's `clamp01` does the same
 /// thing for the same reason.
 fn clamp01(v: f64) -> f64 {
-    if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 }
+    if v.is_finite() {
+        v.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 /// Provider circuit-breaker state, as reported by the caller's telemetry.
@@ -119,7 +123,10 @@ const RESET_WINDOW_SECS: f64 = 2_592_000.0;
 /// `None` tier is [`AccountTier::Standard`], and an absent or zero reset
 /// interval earns no bonus. Ported from `calculateTierScore`.
 fn tier_priority(tier: Option<AccountTier>, reset_secs: Option<u64>) -> f64 {
-    let base = tier.map_or_else(|| AccountTier::Standard.base_score(), AccountTier::base_score);
+    let base = tier.map_or_else(
+        || AccountTier::Standard.base_score(),
+        AccountTier::base_score,
+    );
     let bonus = match reset_secs {
         Some(s) if s > 0 => (1.0 - s as f64 / RESET_WINDOW_SECS).max(0.0),
         _ => 0.0,
@@ -297,8 +304,7 @@ impl AutoCandidate {
     /// inventing values here would be a second source of truth for them.
     #[must_use]
     pub fn as_candidate(&self) -> Candidate {
-        let mut c = Candidate::new(self.provider.clone(), self.model.clone())
-            .with_rank(self.rank);
+        let mut c = Candidate::new(self.provider.clone(), self.model.clone()).with_rank(self.rank);
         if let Some(price) = self.input_usd_per_mtok {
             c = c.with_price(price);
         }
@@ -756,8 +762,8 @@ pub(crate) fn healthy_factors() -> Factors {
 #[cfg(test)]
 mod tests {
     use super::{
-        AccountTier, AutoCandidate, CircuitState, Factors, Weights, pool_maxima, reliability_factor,
-        score, score_pool, tier_priority,
+        AccountTier, AutoCandidate, CircuitState, Factors, Weights, pool_maxima,
+        reliability_factor, score, score_pool, tier_priority,
     };
     use crate::contract::ProviderId;
 
@@ -790,7 +796,10 @@ mod tests {
     fn scores_cheapest_when_cost_inv_dominates() {
         let cheap = score(&healthy(), &Weights::cost_saver());
         let dear = score(
-            &Factors { cost_inv: 0.0, ..healthy() },
+            &Factors {
+                cost_inv: 0.0,
+                ..healthy()
+            },
             &Weights::cost_saver(),
         );
         assert!(cheap > dear, "{cheap} !> {dear}");
@@ -823,10 +832,8 @@ mod tests {
     #[test]
     fn ranks_open_breaker_below_closed() {
         let pool = [
-            AutoCandidate::new(ProviderId::new("p-open"), "m")
-                .with_breaker(CircuitState::Open),
-            AutoCandidate::new(ProviderId::new("p-closed"), "m")
-                .with_breaker(CircuitState::Closed),
+            AutoCandidate::new(ProviderId::new("p-open"), "m").with_breaker(CircuitState::Open),
+            AutoCandidate::new(ProviderId::new("p-closed"), "m").with_breaker(CircuitState::Closed),
         ];
         let ranked = score_pool(&pool, &Weights::balanced(), |_| 0.5);
         assert_eq!(ranked[0].provider.as_str(), "p-closed");
@@ -856,7 +863,11 @@ mod tests {
     fn floors_pool_maxima_against_empty_pool() {
         assert_eq!(
             pool_maxima(&[]),
-            super::PoolMaxima { max_cost: 0.001, max_latency_ms: 1.0, max_stddev_ms: 0.001 }
+            super::PoolMaxima {
+                max_cost: 0.001,
+                max_latency_ms: 1.0,
+                max_stddev_ms: 0.001
+            }
         );
     }
 

@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use ar_keys::AuditLine;
 use ar_obs::audit::AuditLedger;
 use ar_obs::{
-    Cache, CHANNEL_CAP, Decision, Family, Metrics, ObsError, Queue, RAW_TTL_SECS, Request,
-    RETENTION_DAYS, TraceWriter, MAX_SERIES,
+    CHANNEL_CAP, Cache, Decision, Family, MAX_SERIES, Metrics, ObsError, Queue, RAW_TTL_SECS,
+    RETENTION_DAYS, Request, TraceWriter,
 };
 
 /// A temp path unique to one test, so the suite can run in parallel.
@@ -79,7 +79,11 @@ fn caps_cardinality_when_many_models() {
     for i in 0..10_000 {
         metrics.observe(&request(&format!("prov-{i}")));
     }
-    assert!(metrics.series_len() <= MAX_SERIES, "{}", metrics.series_len());
+    assert!(
+        metrics.series_len() <= MAX_SERIES,
+        "{}",
+        metrics.series_len()
+    );
 }
 
 /// A redacted row is the key id and the bounded labels, and nothing else.
@@ -111,12 +115,17 @@ fn hides_raw_row_after_ttl() {
     let path = scratch("ttl");
     let ledger = AuditLedger::open_raw(&path, "admin-secret", "admin-secret").expect("open");
     let now = 1_700_000_000u64;
-    ledger.append_raw(&line(), "raw excerpt", now).expect("append");
+    ledger
+        .append_raw(&line(), "raw excerpt", now)
+        .expect("append");
     let expiry = now + RAW_TTL_SECS;
     let visible = ledger.query(0, expiry - 1).expect("query");
     let expired = ledger.query(0, expiry).expect("query");
     let _ = fs::remove_file(&path);
-    assert!(visible.iter().any(|r| r.contains("raw excerpt")), "{visible:?}");
+    assert!(
+        visible.iter().any(|r| r.contains("raw excerpt")),
+        "{visible:?}"
+    );
     assert!(expired.is_empty(), "{expired:?}");
 }
 
@@ -135,8 +144,7 @@ fn prunes_when_file_is_past_retention() {
     drop(TraceWriter::start(&path).expect("start"));
 
     let stale = path.join("ar-trace-0.jsonl").exists();
-    let kept = path.join("ar-trace-99999999.jsonl").exists()
-        && path.join("keep-me.txt").exists();
+    let kept = path.join("ar-trace-99999999.jsonl").exists() && path.join("keep-me.txt").exists();
     let _ = fs::remove_dir_all(&path);
     assert!(!stale, "a file past 7d should be pruned");
     assert!(kept, "prune is a janitor, not a reaper");

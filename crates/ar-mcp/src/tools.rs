@@ -43,8 +43,8 @@ use std::time::Instant;
 
 use ar_keys::{Admission, Lane};
 use ar_route::{
-    AutoCandidate, AutoCombo, AutoSelector, Candidate, LkgpPins, ProviderId, RouteError, RouteTrace,
-    Strategy, explain_route, pick,
+    AutoCandidate, AutoCombo, AutoSelector, Candidate, LkgpPins, ProviderId, RouteError,
+    RouteTrace, Strategy, explain_route, pick,
 };
 use ar_tokens::{Cap, CostReport, Ledger, Spend, TokenError};
 use serde::Serialize;
@@ -159,7 +159,10 @@ fn permit(
     if have.permits(need) {
         return Ok(());
     }
-    let denied = Error::ScopeDenied { tool: tool.name(), need };
+    let denied = Error::ScopeDenied {
+        tool: tool.name(),
+        need,
+    };
     write_row(
         audit,
         tool.name(),
@@ -188,7 +191,15 @@ fn record<T: Serialize>(
         ),
         Err(e) => (format!("error: {e}"), CallOutcome::Error),
     };
-    write_row(audit, tool.name(), took, key_id, &input.to_string(), &body, call);
+    write_row(
+        audit,
+        tool.name(),
+        took,
+        key_id,
+        &input.to_string(),
+        &body,
+        call,
+    );
 }
 
 /// One key's admission state, supplied by a host that runs **without**
@@ -300,10 +311,19 @@ pub fn get_health(adm: &Admission, breakers_open: u32, cache: (u64, u64)) -> Hea
     let mean = if capacity == 0 {
         0.0
     } else {
-        per_lane.iter().copied().map(LaneLoad::utilisation).sum::<f32>() / 3.0
+        per_lane
+            .iter()
+            .copied()
+            .map(LaneLoad::utilisation)
+            .sum::<f32>()
+            / 3.0
     };
     Health {
-        lanes: Lanes { keys: capacity, admitted: in_flight, mean_pressure: mean },
+        lanes: Lanes {
+            keys: capacity,
+            admitted: in_flight,
+            mean_pressure: mean,
+        },
         per_lane,
         breakers_open,
         cache_hits: cache.0,
@@ -330,7 +350,11 @@ impl Health {
             lanes: Lanes {
                 keys: keys.len(),
                 admitted,
-                mean_pressure: if admitted == 0 { 0.0 } else { sum / admitted as f32 },
+                mean_pressure: if admitted == 0 {
+                    0.0
+                } else {
+                    sum / admitted as f32
+                },
             },
             per_lane: [LaneLoad::default(); 3],
             breakers_open,
@@ -398,7 +422,11 @@ pub(crate) fn list_combos(name: &str, strategy: &Strategy, candidates: &[Candida
             providers.push(p);
         }
     }
-    Combo { name: name.to_string(), strategy: format!("{strategy:?}"), providers }
+    Combo {
+        name: name.to_string(),
+        strategy: format!("{strategy:?}"),
+        providers,
+    }
 }
 
 /// `ar_switch_combo`. Idempotent: re-activating the live combo is a no-op
@@ -409,12 +437,19 @@ pub(crate) fn switch_combo(state: &mut ComboState, name: &str, active: bool) -> 
     if changed {
         state.active = want;
     }
-    Switch { name: name.to_string(), active, changed }
+    Switch {
+        name: name.to_string(),
+        active,
+        changed,
+    }
 }
 
 /// `ar_check_quota`. Reads the ledger; it decides nothing.
 pub(crate) fn check_quota(ledger: &Ledger, key_id: &str) -> Result<Quota, TokenError> {
-    Ok(Quota { spend: ledger.spend(key_id)?, cap: ledger.cap(key_id)? })
+    Ok(Quota {
+        spend: ledger.spend(key_id)?,
+        cap: ledger.cap(key_id)?,
+    })
 }
 
 /// `ar_route_request`. Pure delegation to the router. `execute:*`-gated by
@@ -461,17 +496,21 @@ mod tests {
     use super::{
         ComboState, Health, HealthSource, KeyPressure, get_health, guard, guard_async, switch_combo,
     };
+    use crate::Tool;
     use crate::audit::{Audit, CallOutcome};
     use crate::scope::Scope;
-    use crate::Tool;
     use ar_keys::{Admission, Lane, LaneSpec};
     use ar_route::{Candidate, ProviderId, Strategy};
     use std::sync::atomic::AtomicU64;
 
     fn pool() -> Vec<Candidate> {
         vec![
-            Candidate::new(ProviderId::new("openai"), "gpt-4o").with_price(2.50).with_rank(0),
-            Candidate::new(ProviderId::new("groq"), "llama-3.3-70b").with_price(0.59).with_rank(1),
+            Candidate::new(ProviderId::new("openai"), "gpt-4o")
+                .with_price(2.50)
+                .with_rank(0),
+            Candidate::new(ProviderId::new("groq"), "llama-3.3-70b")
+                .with_price(0.59)
+                .with_rank(1),
         ]
     }
 
@@ -484,13 +523,23 @@ mod tests {
     }
 
     fn admission() -> Admission {
-        Admission::new([LaneSpec::INTERACTIVE, LaneSpec::BATCH, LaneSpec::HEAVY], 600).expect("build")
+        Admission::new(
+            [LaneSpec::INTERACTIVE, LaneSpec::BATCH, LaneSpec::HEAVY],
+            600,
+        )
+        .expect("build")
     }
 
     #[test]
     fn route_request_calls_the_router() {
-        let w = super::route_request(Strategy::CostOptimized, None, &pool(), &AtomicU64::new(0), None)
-            .expect("pick");
+        let w = super::route_request(
+            Strategy::CostOptimized,
+            None,
+            &pool(),
+            &AtomicU64::new(0),
+            None,
+        )
+        .expect("pick");
         assert_eq!(w.as_str(), "groq");
     }
 
@@ -536,18 +585,27 @@ mod tests {
             refuse_unpriced: false,
         };
         ledger.set_cap(&cap).expect("cap");
-        assert_eq!(super::check_quota(&ledger, "k1").expect("quota").cap, Some(cap));
+        assert_eq!(
+            super::check_quota(&ledger, "k1").expect("quota").cap,
+            Some(cap)
+        );
     }
 
     #[test]
     fn cost_report_delegates_to_the_ledger() {
         let ledger = ar_tokens::Ledger::open_in_memory().expect("ledger");
-        assert_eq!(super::cost_report(&ledger, 10).expect("report").rows.len(), 0);
+        assert_eq!(
+            super::cost_report(&ledger, 10).expect("report").rows.len(),
+            0
+        );
     }
 
     #[test]
     fn explain_produces_a_trace_for_an_auto_combo() {
-        let pool = [ar_route::AutoCandidate::new(ar_route::ProviderId::new("groq"), "llama-3.3-70b")];
+        let pool = [ar_route::AutoCandidate::new(
+            ar_route::ProviderId::new("groq"),
+            "llama-3.3-70b",
+        )];
         let combo = ar_route::AutoCombo::new(ar_route::AutoVariant::Balanced);
         let trace = super::explain(&combo, &pool, &ar_route::AutoSelector::new()).expect("trace");
         assert_eq!(trace.provider.as_str(), "groq");
@@ -561,7 +619,10 @@ mod tests {
 
     #[test]
     fn get_health_marks_its_source_live() {
-        assert_eq!(get_health(&admission(), 0, (0, 0)).source, HealthSource::Live);
+        assert_eq!(
+            get_health(&admission(), 0, (0, 0)).source,
+            HealthSource::Live
+        );
     }
 
     #[test]
@@ -575,8 +636,16 @@ mod tests {
     fn snapshot_health_averages_admitted_keys_only() {
         let h = Health::from_snapshot(
             &[
-                KeyPressure { key_id: "a".into(), admitted: true, pressure: 0.2 },
-                KeyPressure { key_id: "b".into(), admitted: false, pressure: 1.0 },
+                KeyPressure {
+                    key_id: "a".into(),
+                    admitted: true,
+                    pressure: 0.2,
+                },
+                KeyPressure {
+                    key_id: "b".into(),
+                    admitted: false,
+                    pressure: 1.0,
+                },
             ],
             0,
             (0, 0),
@@ -586,7 +655,10 @@ mod tests {
 
     #[test]
     fn snapshot_health_says_it_is_a_snapshot() {
-        assert_eq!(Health::from_snapshot(&[], 0, (0, 0)).source, HealthSource::Snapshot);
+        assert_eq!(
+            Health::from_snapshot(&[], 0, (0, 0)).source,
+            HealthSource::Snapshot
+        );
     }
 
     #[test]
@@ -629,7 +701,10 @@ mod tests {
         );
         assert!(r.is_err(), "the scope check still refuses");
         let row = audit.get(0).expect("get").expect("row");
-        assert!(row.contains("|denied|"), "a refusal must leave a row: {row}");
+        assert!(
+            row.contains("|denied|"),
+            "a refusal must leave a row: {row}"
+        );
     }
 
     #[test]
@@ -645,7 +720,10 @@ mod tests {
         );
         assert!(r.is_err());
         let row = audit.get(0).expect("get").expect("row");
-        assert!(row.contains("|error|"), "a failed body must not read as ok: {row}");
+        assert!(
+            row.contains("|error|"),
+            "a failed body must not read as ok: {row}"
+        );
     }
 
     #[test]
@@ -655,7 +733,11 @@ mod tests {
         for tool in Tool::ALL {
             let need = tool.scope();
             assert_ne!(need, Scope::NONE, "{} asks for nothing", tool.name());
-            assert!(!Scope::NONE.permits(need), "{} is reachable unscoped", tool.name());
+            assert!(
+                !Scope::NONE.permits(need),
+                "{} is reachable unscoped",
+                tool.name()
+            );
         }
     }
 
@@ -676,7 +758,11 @@ mod tests {
         // The narrow-grant refusal, stated on the catalog rather than on one tool.
         let read_only = Scope::parse("read:*").expect("known");
         for tool in [Tool::AuthComplete, Tool::AuthLogout] {
-            assert!(!read_only.permits(tool.scope()), "{} is reachable under read:*", tool.name());
+            assert!(
+                !read_only.permits(tool.scope()),
+                "{} is reachable under read:*",
+                tool.name()
+            );
         }
     }
 
@@ -704,9 +790,7 @@ mod tests {
             &audit,
             "k1",
             &serde_json::json!({ "session_id": "s1" }),
-            || async {
-                panic!("the body must not run")
-            },
+            || async { panic!("the body must not run") },
         )
         .await;
         assert!(r.is_err(), "a write tool is refused under a read grant");
@@ -731,7 +815,10 @@ mod tests {
     #[tokio::test]
     async fn lane_load_reports_a_held_permit() {
         let adm = admission();
-        let held = adm.acquire(Lane::Interactive, "k1").await.expect("interactive");
+        let held = adm
+            .acquire(Lane::Interactive, "k1")
+            .await
+            .expect("interactive");
         let h = get_health(&adm, 0, (0, 0));
         assert_eq!(h.per_lane[Lane::Interactive.index()].in_flight, 1);
         drop(held);
@@ -743,7 +830,14 @@ mod tests {
         // refactor cannot silently swap `tool` and `key_id`.
         let audit = audit("order.redb");
         let seq = audit
-            .record("ar_cost_report", std::time::Duration::ZERO, "k9", "{}", "x", CallOutcome::Ok)
+            .record(
+                "ar_cost_report",
+                std::time::Duration::ZERO,
+                "k9",
+                "{}",
+                "x",
+                CallOutcome::Ok,
+            )
             .expect("record");
         let row = audit.get(seq).expect("get").expect("row");
         assert!(row.starts_with("ar_cost_report|0|k9|"), "{row}");

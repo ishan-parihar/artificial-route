@@ -6,8 +6,8 @@
 
 use ar_translate::{
     AnthropicMessages, CanonicalChat, CanonicalResponse, FinishReason, GeminiChat, Msg, OllamaChat,
-    OpenAIChat, ResponsesApi, Role, anthropic_to_canonical, gemini_to_canonical, ollama_to_canonical,
-    render_openai_body, responses_to_canonical, to_canonical, to_openai, Usage,
+    OpenAIChat, ResponsesApi, Role, Usage, anthropic_to_canonical, gemini_to_canonical,
+    ollama_to_canonical, render_openai_body, responses_to_canonical, to_canonical, to_openai,
 };
 
 /// Pair 1: OpenAI chat request -> canonical.
@@ -233,10 +233,12 @@ fn canonical_chat_to_openai_body_when_sampling_set() {
     let chat: OpenAIChat = serde_json::from_str(raw).expect("fixture is valid OpenAI chat");
     let canonical = to_canonical(chat).expect("fixture is translatable");
 
-    let body = String::from_utf8(render_openai_body(&canonical))
-        .expect("a rendered body is UTF-8");
+    let body = String::from_utf8(render_openai_body(&canonical)).expect("a rendered body is UTF-8");
 
-    insta::assert_json_snapshot!("canonical_chat_to_openai_body", body.parse::<serde_json::Value>().expect("the body is JSON"));
+    insta::assert_json_snapshot!(
+        "canonical_chat_to_openai_body",
+        body.parse::<serde_json::Value>().expect("the body is JSON")
+    );
 }
 
 /// The same body with no sampling set. `serde` accepts `"temperature": null`, and
@@ -251,10 +253,12 @@ fn canonical_chat_to_openai_body_omits_absent_sampling() {
         stream: false,
     };
 
-    let body = String::from_utf8(render_openai_body(&canonical))
-        .expect("a rendered body is UTF-8");
+    let body = String::from_utf8(render_openai_body(&canonical)).expect("a rendered body is UTF-8");
 
-    assert!(!body.contains("null"), "an absent field must be absent: {body}");
+    assert!(
+        !body.contains("null"),
+        "an absent field must be absent: {body}"
+    );
 }
 
 /// canonical -> OpenAI -> canonical, with a media part in the middle.
@@ -270,8 +274,7 @@ fn round_trips_canonical_through_openai_when_media_carried() {
     let chat: OpenAIChat = serde_json::from_str(raw).expect("fixture is valid OpenAI chat");
     let canonical = to_canonical(chat).expect("fixture is translatable");
 
-    let body = String::from_utf8(render_openai_body(&canonical))
-        .expect("a rendered body is UTF-8");
+    let body = String::from_utf8(render_openai_body(&canonical)).expect("a rendered body is UTF-8");
     let reparsed: OpenAIChat = serde_json::from_str(&body).expect("the body parses as OpenAI chat");
     let round_tripped = to_canonical(reparsed).expect("the reparsed body is translatable");
 

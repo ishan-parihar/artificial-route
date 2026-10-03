@@ -154,7 +154,8 @@ impl ScopeSet {
     pub fn parse(wire: &str) -> Result<Self, KeyError> {
         let mut set = Self::EMPTY;
         for token in wire.split_whitespace() {
-            let scope = Scope::parse(token).ok_or_else(|| KeyError::UnknownScope(token.to_string()))?;
+            let scope =
+                Scope::parse(token).ok_or_else(|| KeyError::UnknownScope(token.to_string()))?;
             set = set.with(scope);
         }
         Ok(set)
@@ -163,7 +164,11 @@ impl ScopeSet {
     /// The space-delimited wire form, in [`Scope::ALL`] order.
     #[must_use]
     pub fn to_wire(self) -> String {
-        let granted: Vec<&str> = Scope::ALL.into_iter().filter(|s| self.grants(*s)).map(Scope::as_str).collect();
+        let granted: Vec<&str> = Scope::ALL
+            .into_iter()
+            .filter(|s| self.grants(*s))
+            .map(Scope::as_str)
+            .collect();
         granted.join(" ")
     }
 
@@ -346,7 +351,10 @@ impl Tokens {
             return Err(KeyError::Revoked { jti: verified.jti });
         }
         if !verified.scopes.grants(need) {
-            return Err(KeyError::ScopeDenied { needed: need.as_str(), granted: verified.scopes.to_wire() });
+            return Err(KeyError::ScopeDenied {
+                needed: need.as_str(),
+                granted: verified.scopes.to_wire(),
+            });
         }
         Ok(verified)
     }
@@ -401,9 +409,17 @@ impl Tokens {
             device_id: req.device_id.map(str::to_string),
             scope: req.scopes.to_wire(),
         };
-        let token = jsonwebtoken::encode(&Header::new(Algorithm::HS256), &claims, &self.encoding_key())
-            .map_err(|_| KeyError::Crypto("token-sign"))?;
-        Ok(Half { token, jti: claims.jti, expires_at: exp })
+        let token = jsonwebtoken::encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &self.encoding_key(),
+        )
+        .map_err(|_| KeyError::Crypto("token-sign"))?;
+        Ok(Half {
+            token,
+            jti: claims.jti,
+            expires_at: exp,
+        })
     }
 
     fn encoding_key(&self) -> EncodingKey {
@@ -435,8 +451,13 @@ impl Tokens {
 /// [`KeyError::Crypto`] if the clock predates 1970, which would make every
 /// `exp` negative and silently mint a token that is already dead.
 fn now_epoch() -> Result<i64, KeyError> {
-    i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| KeyError::Crypto("clock before epoch"))?.as_secs())
-        .map_err(|_| KeyError::Crypto("epoch does not fit i64"))
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| KeyError::Crypto("clock before epoch"))?
+            .as_secs(),
+    )
+    .map_err(|_| KeyError::Crypto("epoch does not fit i64"))
 }
 
 /// A random token id.
@@ -468,7 +489,11 @@ mod tests {
     use crate::secret::{KeyMeta, MasterKey, Salt, Secret};
 
     fn master() -> MasterKey {
-        MasterKey::new(Secret::generate(), KeyMeta::with_params(HashParams::FAST, Salt::generate())).expect("derive")
+        MasterKey::new(
+            Secret::generate(),
+            KeyMeta::with_params(HashParams::FAST, Salt::generate()),
+        )
+        .expect("derive")
     }
 
     #[test]
@@ -503,7 +528,12 @@ mod tests {
     fn introspect_returns_the_key_id_and_device() {
         let t = Tokens::new(&master());
         let issued = t
-            .issue(Issue { key_id: "team-a", scopes: ScopeSet::all(), device_id: Some("laptop"), ttl: None })
+            .issue(Issue {
+                key_id: "team-a",
+                scopes: ScopeSet::all(),
+                device_id: Some("laptop"),
+                ttl: None,
+            })
             .expect("issue");
         let v = t.introspect(&issued.access).expect("introspect");
         assert_eq!(v.key_id, "team-a");
@@ -513,7 +543,14 @@ mod tests {
     #[test]
     fn the_pair_has_two_distinct_ids() {
         let t = Tokens::new(&master());
-        let i = t.issue(Issue { key_id: "k", scopes: ScopeSet::all(), device_id: None, ttl: None }).expect("issue");
+        let i = t
+            .issue(Issue {
+                key_id: "k",
+                scopes: ScopeSet::all(),
+                device_id: None,
+                ttl: None,
+            })
+            .expect("issue");
         let a = t.introspect(&i.access).expect("introspect access");
         let r = t.introspect(&i.refresh).expect("introspect refresh");
         assert_ne!(a.jti, r.jti);
@@ -522,7 +559,14 @@ mod tests {
     #[test]
     fn access_and_refresh_carry_different_expiries() {
         let t = Tokens::new(&master());
-        let i = t.issue(Issue { key_id: "k", scopes: ScopeSet::all(), device_id: None, ttl: None }).expect("issue");
+        let i = t
+            .issue(Issue {
+                key_id: "k",
+                scopes: ScopeSet::all(),
+                device_id: None,
+                ttl: None,
+            })
+            .expect("issue");
         assert!(i.refresh_expires_at > i.expires_at);
     }
 
@@ -530,14 +574,28 @@ mod tests {
     fn refuses_a_token_signed_by_another_key() {
         let a = Tokens::new(&master());
         let b = Tokens::new(&master());
-        let i = a.issue(Issue { key_id: "k", scopes: ScopeSet::all(), device_id: None, ttl: None }).expect("issue");
+        let i = a
+            .issue(Issue {
+                key_id: "k",
+                scopes: ScopeSet::all(),
+                device_id: None,
+                ttl: None,
+            })
+            .expect("issue");
         assert!(b.introspect(&i.access).is_err());
     }
 
     #[test]
     fn refuses_a_tampered_token() {
         let t = Tokens::new(&master());
-        let i = t.issue(Issue { key_id: "k", scopes: ScopeSet::all(), device_id: None, ttl: None }).expect("issue");
+        let i = t
+            .issue(Issue {
+                key_id: "k",
+                scopes: ScopeSet::all(),
+                device_id: None,
+                ttl: None,
+            })
+            .expect("issue");
         let bad = format!("{}x", i.access);
         assert!(t.introspect(&bad).is_err());
     }
@@ -571,7 +629,12 @@ mod tests {
         let issuer = Tokens::new(&master());
         let other = Tokens::with_audience(&master(), "artificial-route", "someone-else");
         let i = issuer
-            .issue(Issue { key_id: "k", scopes: ScopeSet::all(), device_id: None, ttl: None })
+            .issue(Issue {
+                key_id: "k",
+                scopes: ScopeSet::all(),
+                device_id: None,
+                ttl: None,
+            })
             .expect("issue");
         assert!(other.introspect(&i.access).is_err());
     }

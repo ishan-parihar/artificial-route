@@ -160,7 +160,11 @@ pub fn request_key_with(
 /// Serialises to a `Value` first so the canonical form is the same one
 /// [`request_key`] hashes, whether the caller arrived by `json!` or by `derive`.
 #[must_use]
-pub fn request_key_of<T: Serialize + std::fmt::Debug>(tenant: &str, model: &str, body: &T) -> CacheKey {
+pub fn request_key_of<T: Serialize + std::fmt::Debug>(
+    tenant: &str,
+    model: &str,
+    body: &T,
+) -> CacheKey {
     match serde_json::to_value(body) {
         Ok(value) => request_key(tenant, model, &value),
         // A `Serialize` impl that cannot produce a `Value` is a broken
@@ -287,7 +291,10 @@ mod tests {
     #[test]
     fn field_name_order_in_key_of_does_not_matter() {
         let (x, y) = (json!(1), json!(2));
-        assert_eq!(key_of(&[("a", &x), ("b", &y)]), key_of(&[("b", &y), ("a", &x)]));
+        assert_eq!(
+            key_of(&[("a", &x), ("b", &y)]),
+            key_of(&[("b", &y), ("a", &x)])
+        );
     }
 
     #[test]
@@ -304,9 +311,15 @@ mod tests {
             model: String,
             messages: Vec<String>,
         }
-        let typed = Body { model: "m".into(), messages: vec!["hi".into()] };
+        let typed = Body {
+            model: "m".into(),
+            messages: vec!["hi".into()],
+        };
         let value = json!({"model": "m", "messages": ["hi"]});
-        assert_eq!(request_key_of("t", "m", &typed), request_key("t", "m", &value));
+        assert_eq!(
+            request_key_of("t", "m", &typed),
+            request_key("t", "m", &value)
+        );
     }
 
     #[test]
@@ -338,7 +351,8 @@ mod tests {
         assert_eq!(hex.len(), 64);
         let mut bytes = [0u8; 32];
         for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
-            let pair = std::str::from_utf8(chunk).map_or(0u8, |s| u8::from_str_radix(s, 16).unwrap_or(0));
+            let pair =
+                std::str::from_utf8(chunk).map_or(0u8, |s| u8::from_str_radix(s, 16).unwrap_or(0));
             bytes[i] = pair;
         }
         assert_eq!(&bytes, key.as_bytes());

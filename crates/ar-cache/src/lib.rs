@@ -155,19 +155,28 @@ impl Lookup {
     /// A miss.
     #[must_use]
     pub fn miss() -> Self {
-        Self { state: CacheState::Miss, entry: None }
+        Self {
+            state: CacheState::Miss,
+            entry: None,
+        }
     }
 
     /// A bypass.
     #[must_use]
     pub fn bypass() -> Self {
-        Self { state: CacheState::Bypass, entry: None }
+        Self {
+            state: CacheState::Bypass,
+            entry: None,
+        }
     }
 
     /// A hit carrying `entry`.
     #[must_use]
     pub fn hit(entry: Entry) -> Self {
-        Self { state: CacheState::Hit, entry: Some(entry) }
+        Self {
+            state: CacheState::Hit,
+            entry: Some(entry),
+        }
     }
 
     /// The cached body, if this was a hit.
@@ -563,7 +572,10 @@ mod tests {
     #[test]
     fn config_with_disk_sets_the_path() {
         let cfg = CacheConfig::memory_only().with_disk("/tmp/ar-cache-test.redb");
-        assert_eq!(cfg.disk_path.as_deref(), Some(std::path::Path::new("/tmp/ar-cache-test.redb")));
+        assert_eq!(
+            cfg.disk_path.as_deref(),
+            Some(std::path::Path::new("/tmp/ar-cache-test.redb"))
+        );
     }
 
     #[test]

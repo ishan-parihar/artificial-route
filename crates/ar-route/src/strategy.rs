@@ -72,7 +72,7 @@ use http::StatusCode;
 
 use crate::auto::Factors;
 use crate::contract::{
-    CanonicalRequest, Candidate, ChunkStream, ExecError, Executor, ProviderId, Strng, Upstream,
+    Candidate, CanonicalRequest, ChunkStream, ExecError, Executor, ProviderId, Strng, Upstream,
 };
 use crate::error::RouteError;
 
@@ -137,7 +137,11 @@ pub struct TargetLoad {
 impl TargetLoad {
     /// What a target nothing is known about scores.
     fn unknown() -> Self {
-        Self { served: 0, reliability: None, latency_inv: None }
+        Self {
+            served: 0,
+            reliability: None,
+            latency_inv: None,
+        }
     }
 
     /// `p2c`'s score for this target under `in_flight` units of live load:
@@ -217,11 +221,16 @@ impl TargetLoads {
     /// documented neutral pair and degrades to the load term it always had —
     /// the same contract every unpopulated optional signal in [`Candidate`]
     /// carries.
-    #[allow(dead_code, reason = "write path for the caller's telemetry; no producer in-crate yet")]
+    #[allow(
+        dead_code,
+        reason = "write path for the caller's telemetry; no producer in-crate yet"
+    )]
     pub fn observe(&self, target: &Candidate, factors: &Factors) {
         let (reliability, latency_inv) = factors.load_signals();
         if let Ok(mut rows) = self.rows.lock() {
-            let row = rows.entry(Strng::from(execution_key(target))).or_insert(TargetLoad::unknown());
+            let row = rows
+                .entry(Strng::from(execution_key(target)))
+                .or_insert(TargetLoad::unknown());
             row.reliability = Some(reliability);
             row.latency_inv = Some(latency_inv);
         }
@@ -230,7 +239,9 @@ impl TargetLoads {
     /// Records that this router has served one request on `target`.
     pub fn serve(&self, target: &Candidate) {
         if let Ok(mut rows) = self.rows.lock() {
-            let row = rows.entry(Strng::from(execution_key(target))).or_insert(TargetLoad::unknown());
+            let row = rows
+                .entry(Strng::from(execution_key(target)))
+                .or_insert(TargetLoad::unknown());
             row.served = row.served.saturating_add(1);
         }
     }
@@ -252,7 +263,9 @@ impl TargetLoads {
         if rows.is_empty() {
             return TargetLoad::unknown();
         }
-        rows.get(execution_key(target).as_str()).copied().unwrap_or_else(TargetLoad::unknown)
+        rows.get(execution_key(target).as_str())
+            .copied()
+            .unwrap_or_else(TargetLoad::unknown)
     }
 
     /// The table [`by_p2c`] and [`by_least_used`] read.
@@ -430,7 +443,7 @@ impl Strategy {
     pub fn all() -> &'static [Strategy] {
         use Strategy::{
             CacheOptimized, ContextOptimized, ContextRelay, CostOptimized, Deferred, ExpiryFirst,
-            FillFirst, Fusion, Headroom, Lkgp, LeastUsed, P2c, Pipeline, Priority, QuotaShareFair,
+            FillFirst, Fusion, Headroom, LeastUsed, Lkgp, P2c, Pipeline, Priority, QuotaShareFair,
             QuotaWeighted, Random, ResetAware, ResetWindow, RoundRobin, StrictRandom, Weighted,
         };
         &[
@@ -636,11 +649,7 @@ impl<'a> Pool<'a> {
         let Some(skip) = skip else {
             return Self::All(candidates);
         };
-        let kept: Vec<Candidate> = candidates
-            .iter()
-            .filter(|c| !skip(c))
-            .cloned()
-            .collect();
+        let kept: Vec<Candidate> = candidates.iter().filter(|c| !skip(c)).cloned().collect();
         if kept.len() == candidates.len() {
             Self::All(candidates)
         } else {
@@ -837,7 +846,13 @@ fn by_reset_window<'a>(candidates: &'a [Candidate], first: &'a Candidate) -> &'a
 /// window is absent or its reset time was never reported.
 fn rollover(c: &Candidate) -> u64 {
     c.quota
-        .map(|q| if q.reset_at_secs == 0 { u64::MAX } else { q.reset_at_secs })
+        .map(|q| {
+            if q.reset_at_secs == 0 {
+                u64::MAX
+            } else {
+                q.reset_at_secs
+            }
+        })
         .unwrap_or(u64::MAX)
 }
 
@@ -1109,7 +1124,11 @@ fn by_cached_prefix<'a>(
     model: &str,
     first: &'a Candidate,
 ) -> &'a Candidate {
-    let best = candidates.iter().map(|c| c.cached_prefix_tokens).max().unwrap_or(0);
+    let best = candidates
+        .iter()
+        .map(|c| c.cached_prefix_tokens)
+        .max()
+        .unwrap_or(0);
     if best == 0 {
         return by_affinity(candidates, session, model, first);
     }
@@ -1153,8 +1172,9 @@ fn fusion_leader<'a>(
     first: &'a Candidate,
 ) -> &'a Candidate {
     match session.and_then(|s| affinity_key(s, model)) {
-        Some(key) => affinity_leader(fusion_panel(candidates, session, model), &key)
-            .unwrap_or(first),
+        Some(key) => {
+            affinity_leader(fusion_panel(candidates, session, model), &key).unwrap_or(first)
+        }
         None => fusion_panel(candidates, None, model)
             .into_iter()
             .next()
@@ -1176,7 +1196,13 @@ fn fusion_panel<'a>(
     if let Some(key) = session.and_then(|s| affinity_key(s, model))
         && let Some(leader) = affinity_leader(panel.iter().copied(), &key)
     {
-        panel.sort_by_key(|c| if c.provider == leader.provider { 0u8 } else { 1u8 });
+        panel.sort_by_key(|c| {
+            if c.provider == leader.provider {
+                0u8
+            } else {
+                1u8
+            }
+        });
     } else {
         panel.sort_by_key(|c| c.rank);
     }
@@ -1238,28 +1264,23 @@ impl FusionOutcome {
     /// The provider whose answer this fan-out returns.
     #[must_use]
     pub fn winner(&self) -> Option<&ProviderId> {
-        self.trace
-            .iter()
-            .find(|v| v.winner)
-            .map(|v| &v.provider)
+        self.trace.iter().find(|v| v.winner).map(|v| &v.provider)
     }
 
     /// Status to report to the client: the winner's own, `503` when the panel was
     /// empty, `502` when every member was asked and none answered 2xx.
     #[must_use]
     pub fn status(&self) -> StatusCode {
-        self.upstream
-            .as_ref()
-            .map_or_else(
-                || {
-                    if self.trace.is_empty() {
-                        StatusCode::SERVICE_UNAVAILABLE
-                    } else {
-                        StatusCode::BAD_GATEWAY
-                    }
-                },
-                |u| u.status,
-            )
+        self.upstream.as_ref().map_or_else(
+            || {
+                if self.trace.is_empty() {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::BAD_GATEWAY
+                }
+            },
+            |u| u.status,
+        )
     }
 }
 
@@ -1318,12 +1339,9 @@ pub async fn dispatch_fusion<E: Executor + ?Sized>(
         body: non_streaming_body(&canonical.body),
         ..canonical.clone()
     };
-    let settled = futures::future::join_all(
-        panel
-            .iter()
-            .map(|c| exec.call(&c.provider, &panel_request)),
-    )
-    .await;
+    let settled =
+        futures::future::join_all(panel.iter().map(|c| exec.call(&c.provider, &panel_request)))
+            .await;
 
     let mut trace = Vec::with_capacity(panel.len());
     let mut answers: Vec<(ProviderId, String)> = Vec::with_capacity(panel.len());
@@ -1455,18 +1473,16 @@ impl PipelineOutcome {
     /// intermediate stage ended the chain, `503` when there were no stages.
     #[must_use]
     pub fn status(&self) -> StatusCode {
-        self.upstream
-            .as_ref()
-            .map_or_else(
-                || {
-                    if self.trace.is_empty() {
-                        StatusCode::SERVICE_UNAVAILABLE
-                    } else {
-                        StatusCode::BAD_GATEWAY
-                    }
-                },
-                |u| u.status,
-            )
+        self.upstream.as_ref().map_or_else(
+            || {
+                if self.trace.is_empty() {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::BAD_GATEWAY
+                }
+            },
+            |u| u.status,
+        )
     }
 }
 
@@ -1772,21 +1788,27 @@ mod tests {
     use http::StatusCode;
 
     use super::{
-        EXPIRY_MAX_SCORE, Factors, MODEL_SCOPE, PANEL_BODY_BYTES, Strategy, TargetLoad, TargetLoads,
-        affinity_key, dispatch_fusion, dispatch_pipeline, expiry_first_score, hours_until_reset, pick,
-        pick_filtered, pick_for_model, reset_aware_score, splitmix,
+        EXPIRY_MAX_SCORE, Factors, MODEL_SCOPE, PANEL_BODY_BYTES, Strategy, TargetLoad,
+        TargetLoads, affinity_key, dispatch_fusion, dispatch_pipeline, expiry_first_score,
+        hours_until_reset, pick, pick_filtered, pick_for_model, reset_aware_score, splitmix,
     };
     use crate::contract::{
-        CanonicalRequest, Candidate, ExecError, Executor, ProviderId, QuotaWindow, Upstream,
+        Candidate, CanonicalRequest, ExecError, Executor, ProviderId, QuotaWindow, Upstream,
     };
     use crate::error::RouteError;
     use crate::fusion_judge::MAX_PANEL;
 
     fn cands() -> Vec<Candidate> {
         vec![
-            Candidate::new("openai".into(), "gpt-4o").with_price(2.50).with_rank(0),
-            Candidate::new("groq".into(), "llama-3.3-70b").with_price(0.59).with_rank(1),
-            Candidate::new("together".into(), "mixtral").with_price(0.20).with_rank(2),
+            Candidate::new("openai".into(), "gpt-4o")
+                .with_price(2.50)
+                .with_rank(0),
+            Candidate::new("groq".into(), "llama-3.3-70b")
+                .with_price(0.59)
+                .with_rank(1),
+            Candidate::new("together".into(), "mixtral")
+                .with_price(0.20)
+                .with_rank(2),
         ]
     }
 
@@ -1830,10 +1852,16 @@ mod tests {
     }
 
     fn routed_session(strategy: Strategy, candidates: &[Candidate], session: &str) -> String {
-        pick(strategy, Some(session), candidates, &AtomicU64::new(0), None)
-            .expect("candidates present")
-            .as_str()
-            .to_owned()
+        pick(
+            strategy,
+            Some(session),
+            candidates,
+            &AtomicU64::new(0),
+            None,
+        )
+        .expect("candidates present")
+        .as_str()
+        .to_owned()
     }
 
     fn quota(limit: u64, used: u64, reset_at_secs: u64) -> QuotaWindow {
@@ -1850,7 +1878,10 @@ mod tests {
             .map(|t| serde_json::json!({ "role": "user", "content": t }))
             .collect();
         let body = serde_json::json!({ "model": "m", "messages": messages, "stream": false });
-        CanonicalRequest::new("m", Bytes::from(serde_json::to_vec(&body).expect("body builds")))
+        CanonicalRequest::new(
+            "m",
+            Bytes::from(serde_json::to_vec(&body).expect("body builds")),
+        )
     }
 
     /// Records every call and answers a fixed script: 2xx with
@@ -1875,9 +1906,7 @@ mod tests {
         /// Answers `status` to the first call, 2xx to the rest.
         fn first_fails(status: StatusCode, stages: usize) -> Self {
             let mut script = vec![(status, "refused".to_owned())];
-            script.extend(
-                (1..stages).map(|n| (StatusCode::OK, format!("stage-{n} output"))),
-            );
+            script.extend((1..stages).map(|n| (StatusCode::OK, format!("stage-{n} output"))));
             Self {
                 script: Mutex::new(script),
                 seen: Mutex::new(Vec::new()),
@@ -1919,11 +1948,12 @@ mod tests {
                 .and_then(|s| s.get(index).or_else(|| s.last()).cloned())
                 .unwrap_or((StatusCode::OK, String::new()));
             Box::pin(async move {
-                let payload =
-                    Bytes::from(serde_json::to_vec(&serde_json::json!({
+                let payload = Bytes::from(
+                    serde_json::to_vec(&serde_json::json!({
                         "message": { "role": "assistant", "content": next.1 }
                     }))
-                    .expect("body builds"));
+                    .expect("body builds"),
+                );
                 Ok(if next.0.is_success() {
                     Upstream::success(Box::pin(futures::stream::iter([payload])))
                 } else {
@@ -2047,18 +2077,15 @@ mod tests {
                     .to_owned()
             })
             .collect();
-        assert_eq!(seen, ["openai", "groq", "together", "openai", "groq", "together"]);
+        assert_eq!(
+            seen,
+            ["openai", "groq", "together", "openai", "groq", "together"]
+        );
     }
 
     #[test]
     fn errors_when_no_candidates() {
-        let got = pick(
-            Strategy::Priority,
-            None,
-            &[],
-            &AtomicU64::new(0),
-            None,
-        );
+        let got = pick(Strategy::Priority, None, &[], &AtomicU64::new(0), None);
         assert!(matches!(got, Err(RouteError::NoCandidates)));
     }
 
@@ -2073,12 +2100,18 @@ mod tests {
             &AtomicU64::new(0),
             None,
         );
-        assert!(matches!(got, Err(RouteError::DeferredStrategy(Strategy::Deferred("auto")))));
+        assert!(matches!(
+            got,
+            Err(RouteError::DeferredStrategy(Strategy::Deferred("auto")))
+        ));
     }
 
     #[test]
     fn parses_unknown_name_as_deferred() {
-        assert_eq!(Strategy::parse("rotund-robin"), Strategy::Deferred("unknown"));
+        assert_eq!(
+            Strategy::parse("rotund-robin"),
+            Strategy::Deferred("unknown")
+        );
     }
 
     #[test]
@@ -2086,7 +2119,10 @@ mod tests {
         // `quota-share` is the reference's internal spelling (auto-minted `qtSd/`
         // combos); `quota-share-fair` is the visible one. Both must dispatch.
         assert_eq!(Strategy::parse("quota-share"), Strategy::QuotaShareFair);
-        assert_eq!(Strategy::parse("quota-share-fair"), Strategy::QuotaShareFair);
+        assert_eq!(
+            Strategy::parse("quota-share-fair"),
+            Strategy::QuotaShareFair
+        );
     }
 
     /// The reference's `normalizeRoutingStrategy` aliases resolve to the variant
@@ -2120,10 +2156,8 @@ mod tests {
         // waste its quota must win, or the leftover is simply lost.
         let now = now_secs();
         let cands = [
-            Candidate::new(p("a"), "m")
-                .with_quota(QuotaWindow::new(100, 50, now + 6 * 3600)),
-            Candidate::new(p("b"), "m")
-                .with_quota(QuotaWindow::new(100, 50, now + 72 * 3600)),
+            Candidate::new(p("a"), "m").with_quota(QuotaWindow::new(100, 50, now + 6 * 3600)),
+            Candidate::new(p("b"), "m").with_quota(QuotaWindow::new(100, 50, now + 72 * 3600)),
         ];
         assert_eq!(winner("expiry-first", &cands).as_str(), "a");
     }
@@ -2132,10 +2166,8 @@ mod tests {
     fn expiry_first_prefers_more_usable_quota_at_the_same_deadline() {
         let now = now_secs();
         let cands = [
-            Candidate::new(p("a"), "m")
-                .with_quota(QuotaWindow::new(100, 90, now + 3600)),
-            Candidate::new(p("b"), "m")
-                .with_quota(QuotaWindow::new(100, 10, now + 3600)),
+            Candidate::new(p("a"), "m").with_quota(QuotaWindow::new(100, 90, now + 3600)),
+            Candidate::new(p("b"), "m").with_quota(QuotaWindow::new(100, 10, now + 3600)),
         ];
         assert_eq!(winner("expiry-first", &cands).as_str(), "b");
     }
@@ -2147,10 +2179,12 @@ mod tests {
         // also pins that the clamp keeps `total_cmp` a total order.
         let now = now_secs();
         let cands = [
-            Candidate::new(p("a"), "m")
-                .with_quota(QuotaWindow::new(100, 100, now + 60)),
-            Candidate::new(p("b"), "m")
-                .with_quota(QuotaWindow::new(100, 20, now + 3600 * 24 * 365)),
+            Candidate::new(p("a"), "m").with_quota(QuotaWindow::new(100, 100, now + 60)),
+            Candidate::new(p("b"), "m").with_quota(QuotaWindow::new(
+                100,
+                20,
+                now + 3600 * 24 * 365,
+            )),
         ];
         assert_eq!(winner("expiry-first", &cands).as_str(), "b");
         let ranked = [expiry_first_score(&cands[0]), expiry_first_score(&cands[1])];
@@ -2182,10 +2216,8 @@ mod tests {
         // pool. Bounded, not `inf` — see `expiry_first_score`.
         let now = now_secs();
         let cands = [
-            Candidate::new(p("a"), "m")
-                .with_quota(QuotaWindow::new(100, 50, now - 3600)),
-            Candidate::new(p("b"), "m")
-                .with_quota(QuotaWindow::new(100, 50, now + 30 * 3600)),
+            Candidate::new(p("a"), "m").with_quota(QuotaWindow::new(100, 50, now - 3600)),
+            Candidate::new(p("b"), "m").with_quota(QuotaWindow::new(100, 50, now + 30 * 3600)),
         ];
         assert_eq!(winner("expiry-first", &cands).as_str(), "a");
         assert!(
@@ -2203,7 +2235,8 @@ mod tests {
         // by prose, and a dropped divisor fails here instead of silently
         // pushing every real deadline into the clamp.
         let now = now_secs();
-        let hour_away = Candidate::new(p("a"), "m").with_quota(QuotaWindow::new(100, 20, now + 3600));
+        let hour_away =
+            Candidate::new(p("a"), "m").with_quota(QuotaWindow::new(100, 20, now + 3600));
         let score = expiry_first_score(&hour_away);
         assert!(
             (score - 0.8).abs() < 0.01,
@@ -2211,7 +2244,11 @@ mod tests {
         );
 
         // The two boundary readings the unit decides.
-        assert_eq!(hours_until_reset(0), None, "no reset reported is no deadline");
+        assert_eq!(
+            hours_until_reset(0),
+            None,
+            "no reset reported is no deadline"
+        );
         let rolled = Candidate::new(p("a"), "m").with_quota(QuotaWindow::new(100, 20, now));
         assert!(
             expiry_first_score(&rolled) > score,
@@ -2253,7 +2290,10 @@ mod tests {
 
     #[test]
     fn every_live_strategy_name_round_trips() {
-        for s in Strategy::all().iter().filter(|s| s.deferred_name().is_none()) {
+        for s in Strategy::all()
+            .iter()
+            .filter(|s| s.deferred_name().is_none())
+        {
             assert_eq!(Strategy::parse(s.as_str()), *s);
         }
     }
@@ -2265,8 +2305,12 @@ mod tests {
         // 99:1 over 200 seeded draws. Seeded, so this is a fixed computation
         // rather than a coin flip.
         let c = vec![
-            Candidate::new("heavy".into(), "m").with_weight(99).with_rank(1),
-            Candidate::new("light".into(), "m").with_weight(1).with_rank(0),
+            Candidate::new("heavy".into(), "m")
+                .with_weight(99)
+                .with_rank(1),
+            Candidate::new("light".into(), "m")
+                .with_weight(1)
+                .with_rank(0),
         ];
         let heavy = (0..200)
             .filter(|seed| routed_seeded(Strategy::Weighted, &c, *seed) == "heavy")
@@ -2279,7 +2323,9 @@ mod tests {
         // The reference is an identity comparator: the attempt loop drains the
         // head. A cheaper, healthier, higher-weight target must not move it.
         let c = vec![
-            Candidate::new("head".into(), "m").with_price(9.0).with_rank(0),
+            Candidate::new("head".into(), "m")
+                .with_price(9.0)
+                .with_rank(0),
             Candidate::new("cheap".into(), "m")
                 .with_price(0.01)
                 .with_weight(99)
@@ -2296,8 +2342,12 @@ mod tests {
         // score the neutral pair, so the load term decides — the behaviour this
         // function had before the ledger existed.
         let c = vec![
-            Candidate::new("busy".into(), "m").with_in_flight(9).with_rank(0),
-            Candidate::new("idle".into(), "m").with_in_flight(0).with_rank(1),
+            Candidate::new("busy".into(), "m")
+                .with_in_flight(9)
+                .with_rank(0),
+            Candidate::new("idle".into(), "m")
+                .with_in_flight(0)
+                .with_rank(1),
         ];
         let idle = (0..200)
             .filter(|seed| routed_seeded(Strategy::P2c, &c, *seed) == "idle")
@@ -2338,8 +2388,12 @@ mod tests {
         // draw. The healthy one is the *busier* of the two — the case a
         // load-only comparison gets backwards.
         let c = vec![
-            Candidate::new("p2c-healthy".into(), "m").with_in_flight(4).with_rank(0),
-            Candidate::new("p2c-unknown".into(), "m").with_in_flight(0).with_rank(1),
+            Candidate::new("p2c-healthy".into(), "m")
+                .with_in_flight(4)
+                .with_rank(0),
+            Candidate::new("p2c-unknown".into(), "m")
+                .with_in_flight(0)
+                .with_rank(1),
         ];
         TargetLoads::global().observe(&c[0], &healthy(1.0, 1.0));
         let wins = (0..200)
@@ -2354,8 +2408,12 @@ mod tests {
         // fallbacks are 0.5 and 0.25 for exactly this reason, and a scorer that
         // zeroed them would route away from every provider it had not watched.
         let c = vec![
-            Candidate::new("p2c-broken".into(), "m").with_in_flight(0).with_rank(0),
-            Candidate::new("p2c-silent".into(), "m").with_in_flight(0).with_rank(1),
+            Candidate::new("p2c-broken".into(), "m")
+                .with_in_flight(0)
+                .with_rank(0),
+            Candidate::new("p2c-silent".into(), "m")
+                .with_in_flight(0)
+                .with_rank(1),
         ];
         TargetLoads::global().observe(&c[0], &healthy(0.0, 0.0));
         let wins = (0..200)
@@ -2369,10 +2427,21 @@ mod tests {
         // No clock, no RNG beyond the draw itself: the same target and the same
         // in-flight count always score the same, which is what lets the two
         // tests above assert over 200 seeds instead of one.
-        let load = TargetLoad { served: 0, reliability: Some(0.8), latency_inv: Some(0.6) };
+        let load = TargetLoad {
+            served: 0,
+            reliability: Some(0.8),
+            latency_inv: Some(0.6),
+        };
         assert_eq!(load.p2c_score(3), load.p2c_score(3));
-        assert!(load.p2c_score(0) > load.p2c_score(9), "more load, lower score");
-        let failing = TargetLoad { served: 0, reliability: Some(0.0), latency_inv: Some(0.0) };
+        assert!(
+            load.p2c_score(0) > load.p2c_score(9),
+            "more load, lower score"
+        );
+        let failing = TargetLoad {
+            served: 0,
+            reliability: Some(0.0),
+            latency_inv: Some(0.0),
+        };
         assert!(
             TargetLoad::unknown().p2c_score(0) > failing.p2c_score(0),
             "an unobserved target scores its neutral, not zero"
@@ -2388,8 +2457,12 @@ mod tests {
     #[test]
     fn picks_the_least_busy_when_least_used() {
         let c = vec![
-            Candidate::new("busy".into(), "m").with_in_flight(9).with_rank(0),
-            Candidate::new("idle".into(), "m").with_in_flight(0).with_rank(1),
+            Candidate::new("busy".into(), "m")
+                .with_in_flight(9)
+                .with_rank(0),
+            Candidate::new("idle".into(), "m")
+                .with_in_flight(0)
+                .with_rank(1),
         ];
         assert_eq!(routed(Strategy::LeastUsed, &c), "idle");
     }
@@ -2476,8 +2549,12 @@ mod tests {
     #[test]
     fn prefers_the_soonest_rollover_when_reset_window() {
         let c = vec![
-            Candidate::new("late".into(), "m").with_quota(quota(10, 0, 9_000)).with_rank(0),
-            Candidate::new("soon".into(), "m").with_quota(quota(10, 0, 1_000)).with_rank(1),
+            Candidate::new("late".into(), "m")
+                .with_quota(quota(10, 0, 9_000))
+                .with_rank(0),
+            Candidate::new("soon".into(), "m")
+                .with_quota(quota(10, 0, 1_000))
+                .with_rank(1),
         ];
         assert_eq!(routed(Strategy::ResetWindow, &c), "soon");
     }
@@ -2669,8 +2746,9 @@ mod tests {
         // The HRW leader is a pure function of (key, candidate set): a follower
         // resolves the same conversation to the same upstream.
         let c = cands();
-        let mut seen: Vec<String> =
-            (0..20).map(|_| routed_session(Strategy::ContextRelay, &c, "s7")).collect();
+        let mut seen: Vec<String> = (0..20)
+            .map(|_| routed_session(Strategy::ContextRelay, &c, "s7"))
+            .collect();
         seen.sort();
         seen.dedup();
         assert_eq!(seen.len(), 1);
@@ -2686,8 +2764,12 @@ mod tests {
     #[test]
     fn prefers_the_widest_context_window_when_context_optimized() {
         let c = vec![
-            Candidate::new("small".into(), "m").with_context_window(8_000).with_rank(0),
-            Candidate::new("big".into(), "m").with_context_window(200_000).with_rank(1),
+            Candidate::new("small".into(), "m")
+                .with_context_window(8_000)
+                .with_rank(0),
+            Candidate::new("big".into(), "m")
+                .with_context_window(200_000)
+                .with_rank(1),
         ];
         assert_eq!(routed(Strategy::ContextOptimized, &c), "big");
     }
@@ -2695,7 +2777,9 @@ mod tests {
     #[test]
     fn sends_an_unknown_window_last_when_context_optimized() {
         let c = vec![
-            Candidate::new("known".into(), "m").with_context_window(8_000).with_rank(0),
+            Candidate::new("known".into(), "m")
+                .with_context_window(8_000)
+                .with_rank(0),
             Candidate::new("unknown".into(), "m").with_rank(1),
         ];
         assert_eq!(routed(Strategy::ContextOptimized, &c), "known");
@@ -2704,8 +2788,12 @@ mod tests {
     #[test]
     fn prefers_the_cached_prefix_when_cache_optimized() {
         let c = vec![
-            Candidate::new("cold".into(), "m").with_cached_prefix(0).with_rank(0),
-            Candidate::new("warm".into(), "m").with_cached_prefix(12_000).with_rank(1),
+            Candidate::new("cold".into(), "m")
+                .with_cached_prefix(0)
+                .with_rank(0),
+            Candidate::new("warm".into(), "m")
+                .with_cached_prefix(12_000)
+                .with_rank(1),
         ];
         assert_eq!(routed(Strategy::CacheOptimized, &c), "warm");
     }
@@ -2717,8 +2805,12 @@ mod tests {
         // The one place `fusion` and `context-relay` differ: a pinned leader
         // with no quota left must stop being the leader.
         let c = vec![
-            Candidate::new("pinned".into(), "m").with_rank(0).with_quota(quota(10, 10, 9_000)),
-            Candidate::new("fresh".into(), "m").with_rank(1).with_quota(quota(10, 0, 9_000)),
+            Candidate::new("pinned".into(), "m")
+                .with_rank(0)
+                .with_quota(quota(10, 10, 9_000)),
+            Candidate::new("fresh".into(), "m")
+                .with_rank(1)
+                .with_quota(quota(10, 0, 9_000)),
         ];
         assert_eq!(routed(Strategy::Fusion, &c), "fresh");
     }
@@ -2731,8 +2823,12 @@ mod tests {
     #[test]
     fn skips_an_exhausted_stage_when_pipeline() {
         let c = vec![
-            Candidate::new("first".into(), "m").with_rank(0).with_quota(quota(10, 10, 1)),
-            Candidate::new("second".into(), "m").with_rank(1).with_quota(quota(10, 0, 1)),
+            Candidate::new("first".into(), "m")
+                .with_rank(0)
+                .with_quota(quota(10, 10, 1)),
+            Candidate::new("second".into(), "m")
+                .with_rank(1)
+                .with_quota(quota(10, 0, 1)),
         ];
         assert_eq!(routed(Strategy::Pipeline, &c), "second");
     }
@@ -2825,24 +2921,24 @@ mod tests {
     /// An over-cap member is dropped from the panel rather than truncated — a
     /// body cut mid-answer does not parse, so truncating would keep the cost and
     /// lose the answer.
-/// The cap and the panel ceiling are independent bounds on the same buffer, so
-/// their PRODUCT is the real ceiling and only one of them being pinned proves
-/// nothing: `AUTO_VARIANTS` and `ROUTE_STRATEGIES` both drifted to numbers that
-/// were individually plausible and jointly wrong. This is the budget row of
-/// `docs/00-overview.md` — 20 heavy concurrent requests under 400MB — so the
-/// fan-out's share is asserted rather than asserted-in-prose.
-#[test]
-fn panel_bounds_fit_the_ram_budget() {
-    let panel = crate::fusion_judge::MAX_PANEL * PANEL_BODY_BYTES;
-    assert!(
-        panel <= 32 * 1024 * 1024,
-        "one fan-out buffers up to {panel} bytes ({MAX_PANEL} x {PANEL_BODY_BYTES}); \
+    /// The cap and the panel ceiling are independent bounds on the same buffer, so
+    /// their PRODUCT is the real ceiling and only one of them being pinned proves
+    /// nothing: `AUTO_VARIANTS` and `ROUTE_STRATEGIES` both drifted to numbers that
+    /// were individually plausible and jointly wrong. This is the budget row of
+    /// `docs/00-overview.md` — 20 heavy concurrent requests under 400MB — so the
+    /// fan-out's share is asserted rather than asserted-in-prose.
+    #[test]
+    fn panel_bounds_fit_the_ram_budget() {
+        let panel = crate::fusion_judge::MAX_PANEL * PANEL_BODY_BYTES;
+        assert!(
+            panel <= 32 * 1024 * 1024,
+            "one fan-out buffers up to {panel} bytes ({MAX_PANEL} x {PANEL_BODY_BYTES}); \
          20 of those must fit docs/00's <400MB heavy-request row"
-    );
-}
+        );
+    }
 
-#[test]
-fn drops_a_panel_member_whose_body_exceeds_the_cap() {
+    #[test]
+    fn drops_a_panel_member_whose_body_exceeds_the_cap() {
         let cands = vec![
             Candidate::new(p("small"), "m").with_rank(0),
             Candidate::new(p("huge"), "m").with_rank(1),

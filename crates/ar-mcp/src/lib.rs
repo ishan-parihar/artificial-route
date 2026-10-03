@@ -41,8 +41,8 @@ pub use audit::{AUDIT_OUTPUT_LIMIT, Audit, AuditError, CallOutcome, input_hash};
 pub use login::{AuthTarget, LOGIN_TTL, PendingLogin, PendingLogins, PendingRow};
 pub use scope::Scope;
 pub use tools::{
-    Combo, ComboState, Health, HealthSource, KeyPressure, LaneLoad, Lanes, ModelRow, Quota, Switch, get_health,
-    guard, guard_async,
+    Combo, ComboState, Health, HealthSource, KeyPressure, LaneLoad, Lanes, ModelRow, Quota, Switch,
+    get_health, guard, guard_async,
 };
 
 /// Everything a tool call can fail with.
@@ -331,7 +331,10 @@ mod tests {
 
     #[test]
     fn parse_round_trips() {
-        assert_eq!(Tool::parse("ar_cost_report").expect("known"), Tool::CostReport);
+        assert_eq!(
+            Tool::parse("ar_cost_report").expect("known"),
+            Tool::CostReport
+        );
     }
 
     #[test]
@@ -375,8 +378,10 @@ mod tests {
     #[test]
     fn search_preserves_catalog_order() {
         let hits = tool_search("a");
-        let positions: Vec<usize> =
-            hits.iter().map(|t| Tool::ALL.iter().position(|x| x == *t).expect("in ALL")).collect();
+        let positions: Vec<usize> = hits
+            .iter()
+            .map(|t| Tool::ALL.iter().position(|x| x == *t).expect("in ALL"))
+            .collect();
         assert!(positions.windows(2).all(|w| w[0] < w[1]), "{positions:?}");
     }
 
@@ -388,13 +393,20 @@ mod tests {
 
     #[test]
     fn a_bad_argument_says_what_it_got() {
-        let msg = Error::BadArgument { name: "active", got: "a string" }.to_string();
+        let msg = Error::BadArgument {
+            name: "active",
+            got: "a string",
+        }
+        .to_string();
         assert!(msg.contains("active") && msg.contains("a string"), "{msg}");
     }
 
     #[test]
     fn a_missing_argument_names_only_the_argument() {
-        assert_eq!(Error::MissingArgument { name: "name" }.to_string(), "missing argument: name");
+        assert_eq!(
+            Error::MissingArgument { name: "name" }.to_string(),
+            "missing argument: name"
+        );
     }
 
     #[test]

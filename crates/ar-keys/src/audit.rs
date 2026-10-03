@@ -102,7 +102,15 @@ pub struct AuditLine {
 
 impl fmt::Display for AuditLine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} key={} {} {} {}", self.at, self.key_id, self.action.as_str(), self.outcome.as_str(), self.detail)
+        write!(
+            f,
+            "{} key={} {} {} {}",
+            self.at,
+            self.key_id,
+            self.action.as_str(),
+            self.outcome.as_str(),
+            self.detail
+        )
     }
 }
 
@@ -121,7 +129,10 @@ impl Audit {
     /// A ring holding at most `cap` lines. A `cap` of 0 keeps nothing.
     #[must_use]
     pub fn new(cap: usize) -> Self {
-        Self { cap, lines: Mutex::new(VecDeque::with_capacity(cap.min(DEFAULT_CAP))) }
+        Self {
+            cap,
+            lines: Mutex::new(VecDeque::with_capacity(cap.min(DEFAULT_CAP))),
+        }
     }
 
     /// Records one line.
@@ -134,23 +145,38 @@ impl Audit {
         if self.cap == 0 {
             return;
         }
-        let Ok(mut lines) = self.lines.lock() else { return };
+        let Ok(mut lines) = self.lines.lock() else {
+            return;
+        };
         if lines.len() == self.cap {
             lines.pop_front();
         }
-        lines.push_back(AuditLine { at: now_epoch(), key_id, action, outcome, detail });
+        lines.push_back(AuditLine {
+            at: now_epoch(),
+            key_id,
+            action,
+            outcome,
+            detail,
+        });
     }
 
     /// A snapshot of the retained lines, oldest first.
     #[must_use]
     pub fn lines(&self) -> Vec<AuditLine> {
-        self.lines.lock().map_or_else(|e| e.into_inner().iter().cloned().collect(), |l| l.iter().cloned().collect())
+        self.lines.lock().map_or_else(
+            |e| e.into_inner().iter().cloned().collect(),
+            |l| l.iter().cloned().collect(),
+        )
     }
 
     /// The retained lines rendered, oldest first.
     #[must_use]
     pub fn to_text(&self) -> String {
-        self.lines().iter().map(ToString::to_string).collect::<Vec<_>>().join("\n")
+        self.lines()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Number of retained lines.
@@ -173,7 +199,9 @@ impl Default for Audit {
 }
 
 fn now_epoch() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 #[cfg(test)]
@@ -186,7 +214,10 @@ mod tests {
     fn renders_the_key_id_and_the_action() {
         let a = Audit::new(8);
         a.record(intern("team-a"), Action::Revoke, Outcome::Ok, "jti=abc");
-        assert_eq!(a.to_text(), format!("{} key=team-a revoke ok jti=abc", a.lines()[0].at));
+        assert_eq!(
+            a.to_text(),
+            format!("{} key=team-a revoke ok jti=abc", a.lines()[0].at)
+        );
     }
 
     #[test]
@@ -195,7 +226,11 @@ mod tests {
         a.record(intern("a"), Action::Verify, Outcome::Ok, "");
         a.record(intern("b"), Action::Verify, Outcome::Ok, "");
         a.record(intern("c"), Action::Verify, Outcome::Ok, "");
-        let ids: Vec<_> = a.lines().into_iter().map(|l| l.key_id.to_string()).collect();
+        let ids: Vec<_> = a
+            .lines()
+            .into_iter()
+            .map(|l| l.key_id.to_string())
+            .collect();
         assert_eq!(ids, ["b", "c"]);
     }
 
@@ -211,7 +246,10 @@ mod tests {
         let a = Audit::default();
         for _ in 0..(super::DEFAULT_CAP * 4) {
             a.record(intern("k"), Action::Admit, Outcome::Shed, "lane=heavy");
-            assert!(a.len() <= super::DEFAULT_CAP, "the ring must not grow past its cap");
+            assert!(
+                a.len() <= super::DEFAULT_CAP,
+                "the ring must not grow past its cap"
+            );
         }
     }
 }

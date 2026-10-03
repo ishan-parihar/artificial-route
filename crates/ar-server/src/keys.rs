@@ -200,7 +200,11 @@ fn header_value<'h>(headers: &'h HeaderMap, name: &str) -> Option<&'h str> {
 /// empty, and a second spelling of "what a segment is" is the kind of thing that
 /// later disagrees with the router's.
 fn path_token(path: &str) -> Option<&str> {
-    let segments: Vec<&str> = path.split('/').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let segments: Vec<&str> = path
+        .split('/')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
     match segments.as_slice() {
         ["vscode", token, ..] => Some(*token),
         ["api", "v1", "vscode", token, ..] => Some(*token),
@@ -388,7 +392,10 @@ mod tests {
     fn an_options_request_carries_no_credential() {
         // The CORS layer answers OPTIONS before the handlers, so this is the
         // shape a preflight has when it arrives with no credential at all.
-        assert_eq!(extract_credential((&HeaderMap::new(), "/v1/messages")), None);
+        assert_eq!(
+            extract_credential((&HeaderMap::new(), "/v1/messages")),
+            None
+        );
     }
 
     #[test]
@@ -417,8 +424,7 @@ mod tests {
         // Minted by `ar-keys` directly with a read-only scope set, which is the
         // shape an operator over-issues by accident.
         let master = ar_keys::MasterKey::new(
-            ar_keys::Secret::from_slice(b"0123456789abcdef0123456789abcdef")
-                .expect("key length"),
+            ar_keys::Secret::from_slice(b"0123456789abcdef0123456789abcdef").expect("key length"),
             ar_keys::KeyMeta::generate(),
         )
         .expect("master key");
@@ -472,7 +478,10 @@ mod tests {
         // The build name is `claude-code` where the CLI name is `claude-cli`;
         // both are in the reference gateway's regex and only one is a bare
         // substring of the other.
-        let (h, p) = source(&[("user-agent", "claude-code/2.0.1 (external, cli)"), ("x-api-key", "sk-ant")]);
+        let (h, p) = source(&[
+            ("user-agent", "claude-code/2.0.1 (external, cli)"),
+            ("x-api-key", "sk-ant"),
+        ]);
         assert_eq!(extract_credential((&h, &p)).as_deref(), Some("sk-ant"));
     }
 
@@ -480,7 +489,10 @@ mod tests {
     fn an_anthropic_user_agent_alone_is_enough() {
         // The `anthropic` arm, which is what a client naming itself only as
         // "anthropic-sdk/x" sends.
-        let (h, p) = source(&[("user-agent", "anthropic-sdk/0.20"), ("x-api-key", "sk-ant")]);
+        let (h, p) = source(&[
+            ("user-agent", "anthropic-sdk/0.20"),
+            ("x-api-key", "sk-ant"),
+        ]);
         assert_eq!(extract_credential((&h, &p)).as_deref(), Some("sk-ant"));
     }
 
@@ -536,7 +548,10 @@ mod tests {
             headers(&[("authorization", "Bearer some-other-vendors-token")]),
             "/vscode/sk-alias/chat/completions".to_owned(),
         );
-        assert_eq!(extract_credential((&h, &p)).as_deref(), Some("some-other-vendors-token"));
+        assert_eq!(
+            extract_credential((&h, &p)).as_deref(),
+            Some("some-other-vendors-token")
+        );
     }
 
     #[test]
@@ -571,8 +586,12 @@ mod tests {
 
     #[test]
     fn an_absent_credential_is_a_401_under_required() {
-        let err = admit(&gate(), (&HeaderMap::new(), "/v1/messages"), AuthMode::Required)
-            .expect_err("required means a credential is required");
+        let err = admit(
+            &gate(),
+            (&HeaderMap::new(), "/v1/messages"),
+            AuthMode::Required,
+        )
+        .expect_err("required means a credential is required");
         assert!(err.contains("access token"), "unhelpful error: {err}");
     }
 
@@ -604,8 +623,7 @@ mod tests {
         );
         let (anon, p) = source(&[]);
         assert_eq!(
-            admit(&gate, (&anon, &p), AuthMode::Open)
-                .expect("anonymous serves under Open"),
+            admit(&gate, (&anon, &p), AuthMode::Open).expect("anonymous serves under Open"),
             None,
         );
     }
@@ -641,8 +659,15 @@ mod tests {
         let g = gate();
         let token = g.issue_for_tests("key-1").expect("token mints").access;
         let (h, p) = source(&[("authorization", &format!("Bearer {token}"))]);
-        for mode in [AuthMode::Open, AuthMode::Required, AuthMode::DegradeInvalidToAnon] {
-            assert!(admit(&g, (&h, &p), mode).is_ok(), "{mode:?} refused a valid token");
+        for mode in [
+            AuthMode::Open,
+            AuthMode::Required,
+            AuthMode::DegradeInvalidToAnon,
+        ] {
+            assert!(
+                admit(&g, (&h, &p), mode).is_ok(),
+                "{mode:?} refused a valid token"
+            );
         }
     }
 
@@ -669,7 +694,10 @@ mod tests {
             .to_owned();
         let reason = admit(&gate(), (&h, &p), AuthMode::Required)
             .expect_err("a foreign token must be refused");
-        assert!(!reason.contains(&token), "the token leaked into the reason: {reason}");
+        assert!(
+            !reason.contains(&token),
+            "the token leaked into the reason: {reason}"
+        );
     }
 
     // --- header parsing, since the case-insensitivity is load-bearing ----
@@ -677,7 +705,10 @@ mod tests {
     #[test]
     fn header_names_are_matched_case_insensitively_by_http() {
         let h = headers(&[("X-Api-Key", "sk-x"), ("Anthropic-Version", "2023-06-01")]);
-        assert_eq!(extract_credential((&h, "/v1/messages")).as_deref(), Some("sk-x"));
+        assert_eq!(
+            extract_credential((&h, "/v1/messages")).as_deref(),
+            Some("sk-x")
+        );
     }
 
     #[test]

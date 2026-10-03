@@ -46,8 +46,8 @@
 //! audit row, or "every tool leaves a row" would have an exception written in the
 //! code that implements the audit.
 
-use std::sync::{Arc, Mutex, PoisonError};
 use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use ar_exec::{
     ArExec, LoginError, authorize_url, exchange_code, new_authorize_request, parse_callback_url,
@@ -185,7 +185,10 @@ impl Host {
 
     /// The provider a login call names, or a refusal naming what is missing.
     fn auth_target(&self, provider: &str) -> Result<&AuthTarget, Error> {
-        self.auth.iter().find(|t| t.provider() == provider).ok_or(Error::Auth(LoginError::NoAuthorizationUrl))
+        self.auth
+            .iter()
+            .find(|t| t.provider() == provider)
+            .ok_or(Error::Auth(LoginError::NoAuthorizationUrl))
     }
 
     /// The credential *names* this host has stored, sorted, narrowed to one
@@ -197,7 +200,9 @@ impl Host {
     /// prefix match is what picks `codex_refresh` up alongside `codex` without
     /// this being a second table of "which rows belong to which provider".
     fn stored_keys(&self, provider: Option<&str>) -> Vec<String> {
-        let Some(store) = self.store() else { return Vec::new() };
+        let Some(store) = self.store() else {
+            return Vec::new();
+        };
         match store.list_names() {
             Ok(names) => names
                 .into_iter()
@@ -228,7 +233,10 @@ impl Host {
         for combo in &self.combos {
             for c in Self::routable(combo) {
                 let row = AutoCandidate::new(c.provider.clone(), &c.model);
-                if !seen.iter().any(|s| s.provider == row.provider && s.model == row.model) {
+                if !seen
+                    .iter()
+                    .any(|s| s.provider == row.provider && s.model == row.model)
+                {
                     seen.push(row);
                 }
             }
@@ -269,7 +277,10 @@ impl<'a> Args<'a> {
         match self.raw.and_then(|r| r.get(key)) {
             None | Some(serde_json::Value::Null) => Ok(fallback),
             Some(serde_json::Value::Bool(b)) => Ok(*b),
-            Some(other) => Err(Error::BadArgument { name: key, got: kind_of(other) }),
+            Some(other) => Err(Error::BadArgument {
+                name: key,
+                got: kind_of(other),
+            }),
         }
     }
 
@@ -279,10 +290,16 @@ impl<'a> Args<'a> {
         match self.raw.and_then(|r| r.get(key)) {
             None | Some(serde_json::Value::Null) => Ok(default),
             Some(serde_json::Value::Number(n)) => {
-                let v = n.as_u64().ok_or(Error::BadArgument { name: key, got: "negative" })?;
+                let v = n.as_u64().ok_or(Error::BadArgument {
+                    name: key,
+                    got: "negative",
+                })?;
                 Ok(usize::try_from(v).unwrap_or(ceiling).min(ceiling))
             }
-            Some(other) => Err(Error::BadArgument { name: key, got: kind_of(other) }),
+            Some(other) => Err(Error::BadArgument {
+                name: key,
+                got: kind_of(other),
+            }),
         }
     }
 }
@@ -324,18 +341,33 @@ fn string_prop() -> serde_json::Value {
 /// The rmcp-facing description of one catalog entry.
 fn describe(tool: Tool) -> McpTool {
     let (properties, required): (serde_json::Value, &[&str]) = match tool {
-        Tool::GetHealth | Tool::ListCombos | Tool::CostReport | Tool::ListModels | Tool::ExplainRoute => {
-            (serde_json::json!({}), &[])
-        }
-        Tool::SwitchCombo => (serde_json::json!({ "name": string_prop(), "active": { "type": "boolean" } }), &["name"]),
+        Tool::GetHealth
+        | Tool::ListCombos
+        | Tool::CostReport
+        | Tool::ListModels
+        | Tool::ExplainRoute => (serde_json::json!({}), &[]),
+        Tool::SwitchCombo => (
+            serde_json::json!({ "name": string_prop(), "active": { "type": "boolean" } }),
+            &["name"],
+        ),
         Tool::CheckQuota => (serde_json::json!({ "key_id": string_prop() }), &[]),
-        Tool::RouteRequest => (serde_json::json!({ "combo": string_prop(), "session": string_prop() }), &[]),
-        Tool::AuthLoginUrl => (serde_json::json!({ "provider": string_prop() }), &["provider"]),
-        Tool::AuthComplete => {
-            (serde_json::json!({ "session_id": string_prop(), "code_or_url": string_prop() }), &["session_id", "code_or_url"])
-        }
+        Tool::RouteRequest => (
+            serde_json::json!({ "combo": string_prop(), "session": string_prop() }),
+            &[],
+        ),
+        Tool::AuthLoginUrl => (
+            serde_json::json!({ "provider": string_prop() }),
+            &["provider"],
+        ),
+        Tool::AuthComplete => (
+            serde_json::json!({ "session_id": string_prop(), "code_or_url": string_prop() }),
+            &["session_id", "code_or_url"],
+        ),
         Tool::AuthStatus => (serde_json::json!({ "provider": string_prop() }), &[]),
-        Tool::AuthLogout => (serde_json::json!({ "provider": string_prop() }), &["provider"]),
+        Tool::AuthLogout => (
+            serde_json::json!({ "provider": string_prop() }),
+            &["provider"],
+        ),
     };
     // `read_only_hint` is the one annotation a client can act on without trusting
     // this server, and it is exactly the distinction `Tool::scope` already draws:
@@ -366,118 +398,156 @@ impl Server {
         // would clone it eight times per invocation.
         let input = serde_json::Value::Object(args.clone());
         let outcome = match tool {
-            Tool::GetHealth => crate::guard(tool, host.scope, &host.audit, &host.key_id, &input, || {
-                Ok(serde_json::to_value(crate::tools::get_health(&host.admission, 0, (0, 0)))
-                    .unwrap_or(serde_json::Value::Null))
-            }),
-            Tool::ListCombos => crate::guard(tool, host.scope, &host.audit, &host.key_id, &input, || {
-                let rows: Vec<serde_json::Value> = host
-                    .combos
-                    .iter()
-                    .map(|c| {
-                        serde_json::to_value(crate::tools::list_combos(&c.name, &c.strategy, &c.candidates))
+            Tool::GetHealth => {
+                crate::guard(tool, host.scope, &host.audit, &host.key_id, &input, || {
+                    Ok(
+                        serde_json::to_value(crate::tools::get_health(&host.admission, 0, (0, 0)))
+                            .unwrap_or(serde_json::Value::Null),
+                    )
+                })
+            }
+            Tool::ListCombos => {
+                crate::guard(tool, host.scope, &host.audit, &host.key_id, &input, || {
+                    let rows: Vec<serde_json::Value> = host
+                        .combos
+                        .iter()
+                        .map(|c| {
+                            serde_json::to_value(crate::tools::list_combos(
+                                &c.name,
+                                &c.strategy,
+                                &c.candidates,
+                            ))
                             .unwrap_or(serde_json::Value::Null)
-                    })
-                    .collect();
-                Ok(serde_json::json!({ "combos": rows }))
-            }),
-            Tool::SwitchCombo => crate::guard(tool, host.scope, &host.audit, &host.key_id, &input, || {
-                let name = raw.str("name").ok_or(Error::MissingArgument { name: "name" })?;
-                let active = raw.flag("active", true)?;
-                let mut state = host
-                    .active
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                let switch: Switch = crate::tools::switch_combo(&mut state, name, active);
-                Ok(serde_json::to_value(switch).unwrap_or(serde_json::Value::Null))
-            }),
-            Tool::CheckQuota => crate::guard(tool, host.scope, &host.audit, &host.key_id, &input, || {
-                let key = raw.str("key_id").unwrap_or(&host.key_id);
-                let q = crate::tools::check_quota(&host.ledger()?, key)?;
-                // `Quota` is not `Serialize`, so the transport renders it from
-                // its public fields — the crate-instructed path, not a second
-                // shape invented here.
-                let cap = q.cap.map(|c| serde_json::json!({ "usd_micros": c.usd_micros, "tokens": c.tokens }));
-                Ok(serde_json::json!({ "key_id": key, "spend": spend_json(q.spend), "cap": cap }))
-            }),
-            Tool::RouteRequest => crate::guard(tool, host.scope, &host.audit, &host.key_id, &input, || {
-                let combo = host
-                    .combo(raw.str("combo"))
-                    .ok_or_else(|| Error::UnknownCombo(raw.str("combo").unwrap_or("<live>").to_owned()))?;
-                // `None` for the pin table, on purpose: this body is a pure
-                // pick, and a pin is recorded on a *dispatched* success that
-                // never happens here. Passing an empty table would advertise
-                // session stickiness this tool cannot honour; `lkgp` therefore
-                // falls back to priority, which is the truth.
-                let picked = crate::tools::route_request(
-                    combo.strategy,
-                    raw.str("session"),
-                    &combo.candidates,
-                    &host.cursor,
-                    None,
-                )?;
-                Ok(serde_json::json!({ "combo": combo.name, "provider": picked.as_str() }))
-            }),
-            Tool::CostReport => crate::guard(tool, host.scope, &host.audit, &host.key_id, &input, || {
-                let report = crate::tools::cost_report(&host.ledger()?, raw.count("limit", 50, 1000)?)?;
-                // `CostReport::toon` is `ar-tokens`' own renderer for exactly this
-                // shape, so the text block is TOON and the structured value is
-                // the same rows in JSON — one query, two renderings, no second
-                // shape.
-                Ok(serde_json::json!({ "toon": report.toon(), "rows": report.rows.len(), "totals_usd_micros": report.totals.usd.micros }))
-            }),
-            Tool::ListModels => crate::guard(tool, host.scope, &host.audit, &host.key_id, &input, || {
-                let Some(combo) = host.combo(raw.str("combo")) else {
-                    return Ok(serde_json::json!({ "models": [] }));
-                };
-                let routable: Vec<Candidate> = Host::routable(combo).cloned().collect();
-                Ok(serde_json::json!({ "models": crate::tools::list_models(&routable) }))
-            }),
-            Tool::ExplainRoute => crate::guard(tool, host.scope, &host.audit, &host.key_id, &input, || {
-                let variant = match raw.str("variant") {
-                    None => AutoVariant::Balanced,
-                    Some(name) => AutoVariant::parse(name)
-                        .ok_or_else(|| Error::UnknownVariant(name.to_owned()))?,
-                };
-                let pool = host.auto_pool();
-                let trace = crate::tools::explain(&AutoCombo::new(variant), &pool, &AutoSelector::new())?;
-                Ok(serde_json::json!({
-                    "variant": trace.variant,
-                    "provider": trace.provider.as_str(),
-                    "model": trace.model.as_ref(),
-                    "score": trace.score,
-                    "reason": format!("{:?}", trace.reason),
-                    "fallbacks": trace.fallbacks.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
-                }))
-            }),
+                        })
+                        .collect();
+                    Ok(serde_json::json!({ "combos": rows }))
+                })
+            }
+            Tool::SwitchCombo => {
+                crate::guard(tool, host.scope, &host.audit, &host.key_id, &input, || {
+                    let name = raw
+                        .str("name")
+                        .ok_or(Error::MissingArgument { name: "name" })?;
+                    let active = raw.flag("active", true)?;
+                    let mut state = host.active.lock().unwrap_or_else(PoisonError::into_inner);
+                    let switch: Switch = crate::tools::switch_combo(&mut state, name, active);
+                    Ok(serde_json::to_value(switch).unwrap_or(serde_json::Value::Null))
+                })
+            }
+            Tool::CheckQuota => {
+                crate::guard(tool, host.scope, &host.audit, &host.key_id, &input, || {
+                    let key = raw.str("key_id").unwrap_or(&host.key_id);
+                    let q = crate::tools::check_quota(&host.ledger()?, key)?;
+                    // `Quota` is not `Serialize`, so the transport renders it from
+                    // its public fields — the crate-instructed path, not a second
+                    // shape invented here.
+                    let cap = q.cap.map(
+                        |c| serde_json::json!({ "usd_micros": c.usd_micros, "tokens": c.tokens }),
+                    );
+                    Ok(
+                        serde_json::json!({ "key_id": key, "spend": spend_json(q.spend), "cap": cap }),
+                    )
+                })
+            }
+            Tool::RouteRequest => {
+                crate::guard(tool, host.scope, &host.audit, &host.key_id, &input, || {
+                    let combo = host.combo(raw.str("combo")).ok_or_else(|| {
+                        Error::UnknownCombo(raw.str("combo").unwrap_or("<live>").to_owned())
+                    })?;
+                    // `None` for the pin table, on purpose: this body is a pure
+                    // pick, and a pin is recorded on a *dispatched* success that
+                    // never happens here. Passing an empty table would advertise
+                    // session stickiness this tool cannot honour; `lkgp` therefore
+                    // falls back to priority, which is the truth.
+                    let picked = crate::tools::route_request(
+                        combo.strategy,
+                        raw.str("session"),
+                        &combo.candidates,
+                        &host.cursor,
+                        None,
+                    )?;
+                    Ok(serde_json::json!({ "combo": combo.name, "provider": picked.as_str() }))
+                })
+            }
+            Tool::CostReport => {
+                crate::guard(tool, host.scope, &host.audit, &host.key_id, &input, || {
+                    let report =
+                        crate::tools::cost_report(&host.ledger()?, raw.count("limit", 50, 1000)?)?;
+                    // `CostReport::toon` is `ar-tokens`' own renderer for exactly this
+                    // shape, so the text block is TOON and the structured value is
+                    // the same rows in JSON — one query, two renderings, no second
+                    // shape.
+                    Ok(
+                        serde_json::json!({ "toon": report.toon(), "rows": report.rows.len(), "totals_usd_micros": report.totals.usd.micros }),
+                    )
+                })
+            }
+            Tool::ListModels => {
+                crate::guard(tool, host.scope, &host.audit, &host.key_id, &input, || {
+                    let Some(combo) = host.combo(raw.str("combo")) else {
+                        return Ok(serde_json::json!({ "models": [] }));
+                    };
+                    let routable: Vec<Candidate> = Host::routable(combo).cloned().collect();
+                    Ok(serde_json::json!({ "models": crate::tools::list_models(&routable) }))
+                })
+            }
+            Tool::ExplainRoute => {
+                crate::guard(tool, host.scope, &host.audit, &host.key_id, &input, || {
+                    let variant = match raw.str("variant") {
+                        None => AutoVariant::Balanced,
+                        Some(name) => AutoVariant::parse(name)
+                            .ok_or_else(|| Error::UnknownVariant(name.to_owned()))?,
+                    };
+                    let pool = host.auto_pool();
+                    let trace = crate::tools::explain(
+                        &AutoCombo::new(variant),
+                        &pool,
+                        &AutoSelector::new(),
+                    )?;
+                    Ok(serde_json::json!({
+                        "variant": trace.variant,
+                        "provider": trace.provider.as_str(),
+                        "model": trace.model.as_ref(),
+                        "score": trace.score,
+                        "reason": format!("{:?}", trace.reason),
+                        "fallbacks": trace.fallbacks.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
+                    }))
+                })
+            }
             // The two read login tools: build the public half of a login, and
             // report the pending ones. Neither writes anything, which is why
             // `read:*` is the whole of what they need.
-            Tool::AuthLoginUrl => crate::guard(tool, host.scope, &host.audit, &host.key_id, &input, || {
-                let provider = raw.str("provider").ok_or(Error::MissingArgument { name: "provider" })?;
-                let target = host.auth_target(provider)?;
-                let request = new_authorize_request(&target.session, &target.redirect_uri);
-                let url = authorize_url(&request)?;
-                let session_id = host.pending.start(target.provider(), request, url.clone());
-                Ok(serde_json::json!({
-                    "provider": target.provider(),
-                    "session_id": session_id,
-                    "authorize_url": url,
-                    "redirect_uri": target.redirect_uri,
-                    "expires_in_secs": LOGIN_TTL.as_secs(),
-                }))
-            }),
-            Tool::AuthStatus => crate::guard(tool, host.scope, &host.audit, &host.key_id, &input, || {
-                let provider = raw.str("provider");
-                // Provider *names*, not `AuthTarget`s: `Session` has no `Serialize`
-                // and this answer goes to an agent that will read it aloud.
-                Ok(serde_json::json!({
-                    "providers": host.auth.iter().map(|t| t.provider()).collect::<Vec<_>>(),
-                    "pending": host.pending.rows(),
-                    "stored_keys": host.stored_keys(provider),
-                }))
-            }),
-        Tool::AuthComplete | Tool::AuthLogout => {
+            Tool::AuthLoginUrl => {
+                crate::guard(tool, host.scope, &host.audit, &host.key_id, &input, || {
+                    let provider = raw
+                        .str("provider")
+                        .ok_or(Error::MissingArgument { name: "provider" })?;
+                    let target = host.auth_target(provider)?;
+                    let request = new_authorize_request(&target.session, &target.redirect_uri);
+                    let url = authorize_url(&request)?;
+                    let session_id = host.pending.start(target.provider(), request, url.clone());
+                    Ok(serde_json::json!({
+                        "provider": target.provider(),
+                        "session_id": session_id,
+                        "authorize_url": url,
+                        "redirect_uri": target.redirect_uri,
+                        "expires_in_secs": LOGIN_TTL.as_secs(),
+                    }))
+                })
+            }
+            Tool::AuthStatus => {
+                crate::guard(tool, host.scope, &host.audit, &host.key_id, &input, || {
+                    let provider = raw.str("provider");
+                    // Provider *names*, not `AuthTarget`s: `Session` has no `Serialize`
+                    // and this answer goes to an agent that will read it aloud.
+                    Ok(serde_json::json!({
+                        "providers": host.auth.iter().map(|t| t.provider()).collect::<Vec<_>>(),
+                        "pending": host.pending.rows(),
+                        "stored_keys": host.stored_keys(provider),
+                    }))
+                })
+            }
+            Tool::AuthComplete | Tool::AuthLogout => {
                 // Dispatched from `call_tool` with its own body; reaching one here
                 // would mean the guard ran twice.
                 return render(Err(Error::UnknownTool(tool.name().to_owned())));
@@ -498,59 +568,93 @@ impl Server {
     /// → complete (this call) → persist (the two store rows) → verify (read the
     /// row back, so "armed" means the store answered rather than that the insert
     /// did not throw).
-async fn complete(&self, args: &JsonObject) -> CallToolResult {
+    async fn complete(&self, args: &JsonObject) -> CallToolResult {
         let host = &*self.host;
         let raw = Args::new(Some(args));
         let input = serde_json::Value::Object(args.clone());
-        let outcome = crate::guard_async(Tool::AuthComplete, host.scope, &host.audit, &host.key_id, &input, || async {
-            let session_id = raw.str("session_id").ok_or(Error::MissingArgument { name: "session_id" })?.to_owned();
-            let pasted = raw.str("code_or_url").ok_or(Error::MissingArgument { name: "code_or_url" })?.trim().to_owned();
-            // `take` before the exchange, not after: a failed exchange must not
-            // leave the verifier redeemable, and the upstream code is spent either
-            // way once it has been sent.
-            let pending = host.pending.take(&session_id).ok_or(Error::NoPendingSession(session_id.clone()))?;
-            let target = host.auth_target(pending.provider())?.clone();
-            let code = code_from(&pasted, &pending.request().state)?;
-            // A confidential client's secret is a store row like any other, read
-            // only because the session declared one. `None` for a public PKCE
-            // client, which is the common case. `get_text` rather than `get`
-            // because the exchange wants `ar_config::Secret`, and `ar-keys`
-            // spells its bytes — so the UTF-8 check happens once, in the store,
-            // instead of being re-derived here.
-            let store = host.store().ok_or_else(|| Error::StoreRequired(host.store_path.display().to_string()))?;
-            let secret = match target.client_secret_key.as_deref() {
-                Some(row) => store.get_text(row).map_err(Error::from)?.map(|text| ar_config::Secret::new(&text)),
-                None => None,
-            };
-            let token = exchange_code(
-                &host.exec,
-                &target.session,
-                &code,
-                &pending.request().verifier,
-                &pending.request().redirect_uri,
-                secret.as_ref(),
-            )
-            .await?;
-            // Persist before reporting: a login that printed success and lost the
-            // token would be the one failure an operator cannot detect. The two
-            // `Secret` types are bridged here, once, at the one boundary that
-            // holds both.
-            store
-                .insert(target.provider(), &target.access_key, &store_secret(token.access().expose()))
-                .map_err(Error::from)?;
-            if let (Some(row), Some(refresh)) = (target.refresh_key.as_deref(), token.refresh()) {
-                store.insert(target.provider(), row, &store_secret(refresh.expose())).map_err(Error::from)?;
-            }
-            // The verify step: read the row back rather than trusting the insert,
-            // so `armed` is a fact about the store and not about this function.
-            let armed = store.get(&target.access_key).map_err(Error::from)?.is_some();
-            Ok(serde_json::json!({
-                "provider": target.provider(),
-                "status": if armed { "armed" } else { "failed" },
-                "armed": armed,
-                "stored_keys": host.stored_keys(Some(target.provider())),
-            }))
-        })
+        let outcome = crate::guard_async(
+            Tool::AuthComplete,
+            host.scope,
+            &host.audit,
+            &host.key_id,
+            &input,
+            || async {
+                let session_id = raw
+                    .str("session_id")
+                    .ok_or(Error::MissingArgument { name: "session_id" })?
+                    .to_owned();
+                let pasted = raw
+                    .str("code_or_url")
+                    .ok_or(Error::MissingArgument {
+                        name: "code_or_url",
+                    })?
+                    .trim()
+                    .to_owned();
+                // `take` before the exchange, not after: a failed exchange must not
+                // leave the verifier redeemable, and the upstream code is spent either
+                // way once it has been sent.
+                let pending = host
+                    .pending
+                    .take(&session_id)
+                    .ok_or(Error::NoPendingSession(session_id.clone()))?;
+                let target = host.auth_target(pending.provider())?.clone();
+                let code = code_from(&pasted, &pending.request().state)?;
+                // A confidential client's secret is a store row like any other, read
+                // only because the session declared one. `None` for a public PKCE
+                // client, which is the common case. `get_text` rather than `get`
+                // because the exchange wants `ar_config::Secret`, and `ar-keys`
+                // spells its bytes — so the UTF-8 check happens once, in the store,
+                // instead of being re-derived here.
+                let store = host
+                    .store()
+                    .ok_or_else(|| Error::StoreRequired(host.store_path.display().to_string()))?;
+                let secret = match target.client_secret_key.as_deref() {
+                    Some(row) => store
+                        .get_text(row)
+                        .map_err(Error::from)?
+                        .map(|text| ar_config::Secret::new(&text)),
+                    None => None,
+                };
+                let token = exchange_code(
+                    &host.exec,
+                    &target.session,
+                    &code,
+                    &pending.request().verifier,
+                    &pending.request().redirect_uri,
+                    secret.as_ref(),
+                )
+                .await?;
+                // Persist before reporting: a login that printed success and lost the
+                // token would be the one failure an operator cannot detect. The two
+                // `Secret` types are bridged here, once, at the one boundary that
+                // holds both.
+                store
+                    .insert(
+                        target.provider(),
+                        &target.access_key,
+                        &store_secret(token.access().expose()),
+                    )
+                    .map_err(Error::from)?;
+                if let (Some(row), Some(refresh)) = (target.refresh_key.as_deref(), token.refresh())
+                {
+                    store
+                        .insert(target.provider(), row, &store_secret(refresh.expose()))
+                        .map_err(Error::from)?;
+                }
+                // The verify step: read the row back rather than trusting the insert,
+                // so `armed` is a fact about the store and not about this function.
+                let armed = store
+                    .get(&target.access_key)
+                    .map_err(Error::from)?
+                    .is_some();
+                Ok(serde_json::json!({
+                    "provider": target.provider(),
+                    "status": if armed { "armed" } else { "failed" },
+                    "armed": armed,
+                    "stored_keys": host.stored_keys(Some(target.provider())),
+                }))
+            },
+        )
         .await;
         render(outcome)
     }
@@ -565,29 +669,42 @@ async fn complete(&self, args: &JsonObject) -> CallToolResult {
         let host = &*self.host;
         let raw = Args::new(Some(args));
         let input = serde_json::Value::Object(args.clone());
-        let outcome = crate::guard(Tool::AuthLogout, host.scope, &host.audit, &host.key_id, &input, || {
-            let provider = raw.str("provider").ok_or(Error::MissingArgument { name: "provider" })?.to_owned();
-            let target = host.auth_target(&provider)?;
-            let mut removed = 0_usize;
-            if let Some(store) = host.store() {
-                for name in [Some(target.access_key.as_str()), target.refresh_key.as_deref()]
+        let outcome = crate::guard(
+            Tool::AuthLogout,
+            host.scope,
+            &host.audit,
+            &host.key_id,
+            &input,
+            || {
+                let provider = raw
+                    .str("provider")
+                    .ok_or(Error::MissingArgument { name: "provider" })?
+                    .to_owned();
+                let target = host.auth_target(&provider)?;
+                let mut removed = 0_usize;
+                if let Some(store) = host.store() {
+                    for name in [
+                        Some(target.access_key.as_str()),
+                        target.refresh_key.as_deref(),
+                    ]
                     .into_iter()
                     .flatten()
-                {
-                    if store.remove(name).map_err(Error::from)? {
-                        removed += 1;
+                    {
+                        if store.remove(name).map_err(Error::from)? {
+                            removed += 1;
+                        }
                     }
                 }
-            }
-            // Drop any half-finished login too, so a logout cannot be undone by a
-            // code pasted just before it.
-            host.pending.discard(&provider);
-            Ok(serde_json::json!({
-                "provider": target.provider(),
-                "removed": removed,
-                "stored_keys": host.stored_keys(Some(target.provider())),
-            }))
-        });
+                // Drop any half-finished login too, so a logout cannot be undone by a
+                // code pasted just before it.
+                host.pending.discard(&provider);
+                Ok(serde_json::json!({
+                    "provider": target.provider(),
+                    "removed": removed,
+                    "stored_keys": host.stored_keys(Some(target.provider())),
+                }))
+            },
+        );
         render(outcome)
     }
 
@@ -688,7 +805,11 @@ impl ServerHandler for Server {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        let tools: Vec<McpTool> = Tool::ALL.into_iter().map(describe).chain([describe_search()]).collect();
+        let tools: Vec<McpTool> = Tool::ALL
+            .into_iter()
+            .map(describe)
+            .chain([describe_search()])
+            .collect();
         Ok(ListToolsResult::with_all_items(tools))
     }
 
@@ -710,7 +831,11 @@ impl ServerHandler for Server {
                 // An unknown name is a routing failure, not a tool failure: this
                 // server cannot find the tool at all, which is the case MCP wants
                 // a protocol error for.
-                Err(e) => Err(ErrorData::new(ErrorCode::METHOD_NOT_FOUND, e.to_string(), None)),
+                Err(e) => Err(ErrorData::new(
+                    ErrorCode::METHOD_NOT_FOUND,
+                    e.to_string(),
+                    None,
+                )),
             }
         };
         Ok(CallToolResponse::Complete(outcome.unwrap_or_else(|e| {
@@ -729,11 +854,17 @@ impl ServerHandler for Server {
 /// abort the process, and a host that asked for a control plane deserves a
 /// message it can print.
 pub async fn serve_stdio(host: Host) -> Result<(), Error> {
-    let service = Server { host: Arc::new(host) }
-        .serve(rmcp::transport::stdio())
+    let service = Server {
+        host: Arc::new(host),
+    }
+    .serve(rmcp::transport::stdio())
+    .await
+    .map_err(|e| Error::Transport(e.to_string()))?;
+    service
+        .waiting()
         .await
-        .map_err(|e| Error::Transport(e.to_string()))?;
-    service.waiting().await.map(|_| ()).map_err(|e| Error::Transport(e.to_string()))
+        .map(|_| ())
+        .map_err(|e| Error::Transport(e.to_string()))
 }
 
 /// Whether the stdio server is wired.
@@ -747,13 +878,16 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
 
-use super::{Args, Host, Mutex, STDIO_WIRED, TOOL_SEARCH_NAME, code_from, describe, describe_search, render, spend_json};
-use crate::login::{AuthTarget, LOGIN_TTL, PendingLogins};
-use crate::scope::Scope;
-use crate::Tool;
-use ar_exec::{OAuthKind, Session};
-use ar_keys::{Admission, LaneSpec};
-use ar_route::ProviderId;
+    use super::{
+        Args, Host, Mutex, STDIO_WIRED, TOOL_SEARCH_NAME, code_from, describe, describe_search,
+        render, spend_json,
+    };
+    use crate::Tool;
+    use crate::login::{AuthTarget, LOGIN_TTL, PendingLogins};
+    use crate::scope::Scope;
+    use ar_exec::{OAuthKind, Session};
+    use ar_keys::{Admission, LaneSpec};
+    use ar_route::ProviderId;
 
     /// `redb` allows one open handle per file, and the tests run in parallel, so
     /// every host gets its own name and therefore its own ledger and audit db.
@@ -762,11 +896,20 @@ use ar_route::ProviderId;
             combos: vec![super::HostCombo {
                 name: "cheap".to_owned(),
                 strategy: ar_route::Strategy::CostOptimized,
-                candidates: vec![ar_route::Candidate::new(ProviderId::new("groq"), "llama-3.3-70b")],
-                pool: vec![ar_route::Candidate::new(ProviderId::new("together"), "mixtral")],
+                candidates: vec![ar_route::Candidate::new(
+                    ProviderId::new("groq"),
+                    "llama-3.3-70b",
+                )],
+                pool: vec![ar_route::Candidate::new(
+                    ProviderId::new("together"),
+                    "mixtral",
+                )],
             }],
-            admission: Admission::new([LaneSpec::INTERACTIVE, LaneSpec::BATCH, LaneSpec::HEAVY], 600)
-                .expect("build"),
+            admission: Admission::new(
+                [LaneSpec::INTERACTIVE, LaneSpec::BATCH, LaneSpec::HEAVY],
+                600,
+            )
+            .expect("build"),
             ledger_path: scratch(name, "ledger.sqlite"),
             store_path: scratch(name, "credentials.db"),
             exec: ar_exec::ArExec::new().expect("client"),
@@ -834,7 +977,10 @@ use ar_route::ProviderId;
         // A typo'd argument must fail at the host's client, not arrive here and
         // be silently dropped.
         let d = describe(Tool::SwitchCombo);
-        assert_eq!(d.input_schema.get("additionalProperties"), Some(&serde_json::json!(false)));
+        assert_eq!(
+            d.input_schema.get("additionalProperties"),
+            Some(&serde_json::json!(false))
+        );
     }
 
     #[test]
@@ -892,7 +1038,10 @@ use ar_route::ProviderId;
         let before = h.audit.len();
         let s = super::Server { host: Arc::new(h) };
         let out = s.call(Tool::GetHealth, &serde_json::Map::new());
-        assert!(out.is_error.is_none() || out.is_error == Some(false), "{out:?}");
+        assert!(
+            out.is_error.is_none() || out.is_error == Some(false),
+            "{out:?}"
+        );
         assert_eq!(s.host.audit.len(), before + 1, "one call, one row");
     }
 
@@ -902,25 +1051,44 @@ use ar_route::ProviderId;
         h.scope = Scope::NONE;
         let s = super::Server { host: Arc::new(h) };
         let out = s.call(Tool::GetHealth, &serde_json::Map::new());
-        assert_eq!(out.is_error, Some(true), "a default-deny refusal is visible: {out:?}");
+        assert_eq!(
+            out.is_error,
+            Some(true),
+            "a default-deny refusal is visible: {out:?}"
+        );
     }
 
     #[test]
     fn a_switch_activates_the_named_combo_and_is_idempotent() {
         let h = host("switch");
         let s = super::Server { host: Arc::new(h) };
-        let first = s.call(Tool::SwitchCombo, &args(serde_json::json!({ "name": "cheap" })));
-        let second = s.call(Tool::SwitchCombo, &args(serde_json::json!({ "name": "cheap" })));
+        let first = s.call(
+            Tool::SwitchCombo,
+            &args(serde_json::json!({ "name": "cheap" })),
+        );
+        let second = s.call(
+            Tool::SwitchCombo,
+            &args(serde_json::json!({ "name": "cheap" })),
+        );
         let changed = |r: &rmcp::model::CallToolResult| {
-            r.structured_content.as_ref().and_then(|v| v.get("changed")).and_then(serde_json::Value::as_bool)
+            r.structured_content
+                .as_ref()
+                .and_then(|v| v.get("changed"))
+                .and_then(serde_json::Value::as_bool)
         };
         assert_eq!(changed(&first), Some(true), "{first:?}");
-        assert_eq!(changed(&second), Some(false), "re-activating is a no-op: {second:?}");
+        assert_eq!(
+            changed(&second),
+            Some(false),
+            "re-activating is a no-op: {second:?}"
+        );
     }
 
     #[test]
     fn the_search_tool_returns_the_catalog_it_was_asked_about() {
-        let s = super::Server { host: Arc::new(host("search-body")) };
+        let s = super::Server {
+            host: Arc::new(host("search-body")),
+        };
         let out = s.search(&args(serde_json::json!({ "query": "switch" })));
         let names = out.structured_content.expect("body");
         assert_eq!(names["tools"][0]["name"], "ar_switch_combo", "{names}");
@@ -928,7 +1096,9 @@ use ar_route::ProviderId;
 
     #[test]
     fn the_search_tool_leaves_a_row_like_every_other_tool() {
-        let s = super::Server { host: Arc::new(host("search-row")) };
+        let s = super::Server {
+            host: Arc::new(host("search-row")),
+        };
         let before = s.host.audit.len();
         s.search(&serde_json::Map::new());
         assert_eq!(s.host.audit.len(), before + 1);
@@ -949,10 +1119,17 @@ use ar_route::ProviderId;
     fn list_models_reports_the_bench_a_combo_can_fall_back_to() {
         // The bench is routable, so hiding it here would make `ar mcp` answer
         // "what can this combo reach" with less than `ar serve` can.
-        let s = super::Server { host: Arc::new(host("list-models")) };
+        let s = super::Server {
+            host: Arc::new(host("list-models")),
+        };
         let out = s.call(Tool::ListModels, &serde_json::Map::new());
         let rows = out.structured_content.expect("body");
-        let names: Vec<&str> = rows["models"].as_array().expect("array").iter().filter_map(|m| m["model"].as_str()).collect();
+        let names: Vec<&str> = rows["models"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(|m| m["model"].as_str())
+            .collect();
         assert_eq!(names, ["llama-3.3-70b", "mixtral"], "{rows}");
     }
 
@@ -975,10 +1152,21 @@ use ar_route::ProviderId;
 
     #[test]
     fn a_login_url_call_hands_back_a_url_and_a_session_id() {
-        let s = super::Server { host: Arc::new(host("login-url")) };
-        let out = s.call(Tool::AuthLoginUrl, &args(serde_json::json!({ "provider": "codex" })));
+        let s = super::Server {
+            host: Arc::new(host("login-url")),
+        };
+        let out = s.call(
+            Tool::AuthLoginUrl,
+            &args(serde_json::json!({ "provider": "codex" })),
+        );
         let body = out.structured_content.expect("body");
-        assert!(body["authorize_url"].as_str().expect("url").contains("code_challenge="), "{body}");
+        assert!(
+            body["authorize_url"]
+                .as_str()
+                .expect("url")
+                .contains("code_challenge="),
+            "{body}"
+        );
         assert!(body["session_id"].as_str().is_some(), "{body}");
     }
 
@@ -987,31 +1175,62 @@ use ar_route::ProviderId;
         // The "never returns a secret" test, as a shape: an answer with exactly the
         // keys the schema declares cannot be carrying a verifier or a token,
         // because there is no field for one.
-        let s = super::Server { host: Arc::new(host("login-verifier")) };
-        let out = s.call(Tool::AuthLoginUrl, &args(serde_json::json!({ "provider": "codex" })));
+        let s = super::Server {
+            host: Arc::new(host("login-verifier")),
+        };
+        let out = s.call(
+            Tool::AuthLoginUrl,
+            &args(serde_json::json!({ "provider": "codex" })),
+        );
         let body = out.structured_content.expect("body");
-        let keys: Vec<&str> = body.as_object().expect("object").keys().map(String::as_str).collect();
+        let keys: Vec<&str> = body
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
         assert_eq!(
             keys,
-            ["authorize_url", "expires_in_secs", "provider", "redirect_uri", "session_id"],
+            [
+                "authorize_url",
+                "expires_in_secs",
+                "provider",
+                "redirect_uri",
+                "session_id"
+            ],
             "{body}"
         );
     }
 
     #[test]
     fn a_status_call_lists_the_provider_and_the_pending_login() {
-        let s = super::Server { host: Arc::new(host("login-status")) };
-        s.call(Tool::AuthLoginUrl, &args(serde_json::json!({ "provider": "codex" })));
+        let s = super::Server {
+            host: Arc::new(host("login-status")),
+        };
+        s.call(
+            Tool::AuthLoginUrl,
+            &args(serde_json::json!({ "provider": "codex" })),
+        );
         let out = s.call(Tool::AuthStatus, &serde_json::Map::new());
         let body = out.structured_content.expect("body");
         assert_eq!(body["providers"][0], "codex", "{body}");
-        assert_eq!(body["pending"].as_array().expect("array").len(), 1, "{body}");
+        assert_eq!(
+            body["pending"].as_array().expect("array").len(),
+            1,
+            "{body}"
+        );
     }
 
     #[tokio::test]
     async fn completing_an_unknown_session_is_a_clean_error() {
-        let s = super::Server { host: Arc::new(host("login-unknown")) };
-        let out = s.complete(&args(serde_json::json!({ "session_id": "nope", "code_or_url": "abc" }))).await;
+        let s = super::Server {
+            host: Arc::new(host("login-unknown")),
+        };
+        let out = s
+            .complete(&args(
+                serde_json::json!({ "session_id": "nope", "code_or_url": "abc" }),
+            ))
+            .await;
         assert_eq!(out.is_error, Some(true), "{out:?}");
     }
 
@@ -1021,12 +1240,19 @@ use ar_route::ProviderId;
         h.scope = Scope::READ;
         let s = super::Server { host: Arc::new(h) };
         let out = s.logout(&args(serde_json::json!({ "provider": "codex" })));
-        assert_eq!(out.is_error, Some(true), "a default-deny refusal is visible: {out:?}");
+        assert_eq!(
+            out.is_error,
+            Some(true),
+            "a default-deny refusal is visible: {out:?}"
+        );
     }
 
     #[test]
     fn a_bare_code_is_accepted_where_a_whole_redirect_is_not_required() {
-        assert_eq!(code_from("plain-code", "st8").expect("bare code"), "plain-code");
+        assert_eq!(
+            code_from("plain-code", "st8").expect("bare code"),
+            "plain-code"
+        );
     }
 
     #[test]
@@ -1036,24 +1262,30 @@ use ar_route::ProviderId;
         assert!(e.to_string().contains("state"), "{e}");
     }
 
-#[test]
+    #[test]
     fn an_empty_paste_is_an_expiry_rather_than_a_bare_code() {
         assert!(code_from("", "st8").is_err());
     }
 
     #[test]
     fn a_denied_redirect_reports_the_provider_own_reason() {
-        let request =
-            ar_exec::new_authorize_request(&auth_target().session, "http://127.0.0.1:1455/callback");
-        let url =
-            format!("http://127.0.0.1:1455/callback?error=access_denied&state={}", request.state);
+        let request = ar_exec::new_authorize_request(
+            &auth_target().session,
+            "http://127.0.0.1:1455/callback",
+        );
+        let url = format!(
+            "http://127.0.0.1:1455/callback?error=access_denied&state={}",
+            request.state
+        );
         let e = code_from(&url, &request.state).expect_err("a refusal is not a code");
         assert!(e.to_string().contains("access_denied"), "{e}");
     }
 
     #[test]
     fn a_logout_is_idempotent_for_a_provider_with_nothing_stored() {
-        let s = super::Server { host: Arc::new(host("login-logout")) };
+        let s = super::Server {
+            host: Arc::new(host("login-logout")),
+        };
         let out = s.logout(&args(serde_json::json!({ "provider": "codex" })));
         let body = out.structured_content.expect("body");
         assert_eq!(body["removed"], serde_json::json!(0), "{body}");

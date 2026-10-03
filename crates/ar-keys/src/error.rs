@@ -34,7 +34,9 @@ pub enum KeyError {
     /// tree, not a secret. Supporting it means adding `scrypt`, the 28-byte
     /// static salt, and the `sha256(master)[0..16]` dynamic-salt generation that
     /// older rows may still use.
-    #[error("`enc:v1:` credential (scrypt + static salt, 16B IV, no AAD, fail-open) is not supported; add `scrypt` to migrate it")]
+    #[error(
+        "`enc:v1:` credential (scrypt + static salt, 16B IV, no AAD, fail-open) is not supported; add `scrypt` to migrate it"
+    )]
     LegacyV1,
 
     /// A primitive refused. The payload names the operation, never the input.
@@ -135,7 +137,9 @@ pub enum KeyError {
     /// Carries the offending *name*, which is a `keys:` label and therefore
     /// already public in `config.yaml`; [`crate::CredentialStore::list_names`]
     /// hands the same strings to `ar doctor` unencrypted.
-    #[error("an `anonymous` session holds no credential; drop the reference to `{placement}` or change the session kind")]
+    #[error(
+        "an `anonymous` session holds no credential; drop the reference to `{placement}` or change the session kind"
+    )]
     AnonymousCredential {
         /// The credential name the caller tried to attach.
         placement: String,

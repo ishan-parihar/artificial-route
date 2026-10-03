@@ -122,9 +122,9 @@ pub mod url;
 // because every consumer needs more than one of these, and a path-per-item import
 // list is a second place to forget an item.
 pub use crate::oauth::{
-    AuthorizeRequest, CallbackListener, Connected, Connection, HttpRefresher, LoginError, OAuthKind,
-    OAuthToken, Origin, Refresher, RotationPool, Session, TERMINAL_REFRESH_STATUS, Unconnected,
-    authorize_url, exchange_code, new_authorize_request, parse_callback_url,
+    AuthorizeRequest, CallbackListener, Connected, Connection, HttpRefresher, LoginError,
+    OAuthKind, OAuthToken, Origin, Refresher, RotationPool, Session, TERMINAL_REFRESH_STATUS,
+    Unconnected, authorize_url, exchange_code, new_authorize_request, parse_callback_url,
     terminal_check_constraint,
 };
 
@@ -373,7 +373,8 @@ impl ArExec {
         canonical: &[u8],
         abort: &CancellationToken,
     ) -> Result<ChatStream, ExecError> {
-        self.post_rendered(d, self.render_request(d, canonical)?, abort).await
+        self.post_rendered(d, self.render_request(d, canonical)?, abort)
+            .await
     }
 
     /// POSTs a body that has already been rendered into `d`'s wire.
@@ -428,11 +429,7 @@ impl ArExec {
     ///
     /// [`ExecError::UnsupportedWire`] for a wire with no renderer, or one of the
     /// encode errors when the canonical body is not a JSON object.
-    pub fn render_request(
-        &self,
-        d: &Dispatch<'_>,
-        canonical: &[u8],
-    ) -> Result<Bytes, ExecError> {
+    pub fn render_request(&self, d: &Dispatch<'_>, canonical: &[u8]) -> Result<Bytes, ExecError> {
         let Some(wire) = outbound_wire(d.wire_format) else {
             return Err(ExecError::UnsupportedWire(d.wire_format));
         };
@@ -564,8 +561,13 @@ pub fn rewrite_model(body: &[u8], upstream_model: &str) -> Result<Bytes, ExecErr
     let Some(obj) = value.as_object_mut() else {
         return Err(ExecError::NotAnObject);
     };
-    obj.insert("model".to_owned(), serde_json::Value::String(upstream_model.to_owned()));
-    serde_json::to_vec(&value).map(Bytes::from).map_err(ExecError::Encode)
+    obj.insert(
+        "model".to_owned(),
+        serde_json::Value::String(upstream_model.to_owned()),
+    );
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(ExecError::Encode)
 }
 
 /// Waits for response headers, racing the caller's abort against the start
@@ -595,10 +597,7 @@ async fn await_start(
 /// `retry_after` is passed rather than read off the headers so both callers
 /// share the single [`parse_retry_after`] — one 24 h cap, one spelling of the
 /// RFC, no second place to drift.
-async fn upstream_error(
-    response: reqwest::Response,
-    retry_after: Option<Duration>,
-) -> ExecError {
+async fn upstream_error(response: reqwest::Response, retry_after: Option<Duration>) -> ExecError {
     let status = response.status().as_u16();
     let raw = response.bytes().await.unwrap_or_default();
     let body = String::from_utf8_lossy(&raw[..raw.len().min(ERROR_BODY_CAP)]);
@@ -684,7 +683,9 @@ impl ChatStream {
     /// being dropped. A truncated body is the client's cue that the answer is
     /// incomplete, and silently ending early looks identical to a short answer.
     pub fn into_bytes(self) -> impl Stream<Item = Result<Bytes, ExecError>> + Send + use<> {
-        let Self { response, abort, .. } = self;
+        let Self {
+            response, abort, ..
+        } = self;
         stream! {
             let mut body = response.bytes_stream();
             loop {
@@ -937,7 +938,10 @@ mod tests {
     }
 
     fn extra(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-        pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
     }
 
     #[test]
@@ -981,7 +985,10 @@ mod tests {
     #[test]
     fn skips_a_provider_header_when_its_name_is_invalid() {
         let headers = build_headers("sk-x", false, &extra(&[("bad header", "v")]));
-        assert!(!format!("{headers:?}").contains("bad header"), "{headers:?}");
+        assert!(
+            !format!("{headers:?}").contains("bad header"),
+            "{headers:?}"
+        );
     }
 
     #[test]
@@ -1016,7 +1023,7 @@ mod tests {
         ));
     }
 
-            /// A canonical body in the shape `ar-route` hands the executor, carrying a
+    /// A canonical body in the shape `ar-route` hands the executor, carrying a
     /// system turn and a user turn so every renderer's hoisting is exercised.
     const CANONICAL: &[u8] =
         br#"{"model":"auto","messages":[{"role":"system","content":"be terse"},{"role":"user","content":"hi"}],"max_tokens":64,"stream":true}"#;
@@ -1046,7 +1053,9 @@ mod tests {
     /// key order is alphabetical: an assertion on a rendered body has to read the
     /// value, not a substring of the text.
     fn rendered(exec: &ArExec, d: &Dispatch<'_>) -> (String, serde_json::Value) {
-        let bytes = exec.render_request(d, CANONICAL).expect("a renderable wire");
+        let bytes = exec
+            .render_request(d, CANONICAL)
+            .expect("a renderable wire");
         let text = String::from_utf8(bytes.to_vec()).expect("utf-8 body");
         let value = serde_json::from_str(&text)
             .unwrap_or_else(|e| panic!("{} body is not json: {text}\n{e}", d.wire_format.as_str()));
@@ -1071,8 +1080,8 @@ mod tests {
 
     #[test]
     fn maps_every_named_registry_wire_to_a_renderer() {
-    // The unblock, asserted on the mapping rather than on a count: every
-    // dialect the registry names except `custom` has one.
+        // The unblock, asserted on the mapping rather than on a count: every
+        // dialect the registry names except `custom` has one.
         for format in [
             WireFormat::Openai,
             WireFormat::Anthropic,
@@ -1083,19 +1092,26 @@ mod tests {
             WireFormat::Clova,
             WireFormat::Kiro,
         ] {
-            assert!(outbound_wire(format).is_some(), "{format:?} has no renderer");
+            assert!(
+                outbound_wire(format).is_some(),
+                "{format:?} has no renderer"
+            );
         }
-        assert_eq!(outbound_wire(WireFormat::Custom), None, "custom has no renderer");
+        assert_eq!(
+            outbound_wire(WireFormat::Custom),
+            None,
+            "custom has no renderer"
+        );
     }
 
     #[test]
     fn maps_each_registry_wire_to_the_renderer_named_for_that_wire() {
-    // The two enums can drift — `ar-registry` is a catalog label set and
-    // `OutboundWire` is a "can this build send it" set — so the pairing is
-    // asserted per variant rather than assumed. A new `ar-registry` label with
-    // no renderer fails the first test; a wrong pairing fails this one.
-    // `Custom` is included and asserted `None`, so an added variant cannot
-    // silently become dispatchable.
+        // The two enums can drift — `ar-registry` is a catalog label set and
+        // `OutboundWire` is a "can this build send it" set — so the pairing is
+        // asserted per variant rather than assumed. A new `ar-registry` label with
+        // no renderer fails the first test; a wrong pairing fails this one.
+        // `Custom` is included and asserted `None`, so an added variant cannot
+        // silently become dispatchable.
         let pairs = [
             (WireFormat::Openai, OutboundWire::Openai),
             (WireFormat::Anthropic, OutboundWire::Claude),
@@ -1107,9 +1123,17 @@ mod tests {
             (WireFormat::Kiro, OutboundWire::Kiro),
         ];
         for (format, wire) in pairs {
-            assert_eq!(outbound_wire(format), Some(wire), "{format:?} is wired wrong");
+            assert_eq!(
+                outbound_wire(format),
+                Some(wire),
+                "{format:?} is wired wrong"
+            );
         }
-        assert_eq!(outbound_wire(WireFormat::Custom), None, "custom has no renderer");
+        assert_eq!(
+            outbound_wire(WireFormat::Custom),
+            None,
+            "custom has no renderer"
+        );
     }
 
     /// The default path must not move: same bytes, same model rewrite. Asserted
@@ -1147,9 +1171,14 @@ mod tests {
 
     #[test]
     fn dispatches_a_claude_wire_provider_in_the_anthropic_dialect() {
-        let (body, value) =
-            rendered(&ArExec::new().unwrap(), &dispatch_shape(WireFormat::Anthropic, "claude-sonnet-4-5"));
-        assert_eq!(value["model"], "claude-sonnet-4-5", "the provider's spelling wins: {body}");
+        let (body, value) = rendered(
+            &ArExec::new().unwrap(),
+            &dispatch_shape(WireFormat::Anthropic, "claude-sonnet-4-5"),
+        );
+        assert_eq!(
+            value["model"], "claude-sonnet-4-5",
+            "the provider's spelling wins: {body}"
+        );
         // The system turn left the message array for the top-level block, and
         // `max_tokens` is Anthropic's *required* field rather than an option.
         assert_eq!(value["system"][0]["text"], "be terse", "{body}");
@@ -1164,58 +1193,92 @@ mod tests {
         );
         assert_eq!(value["instructions"], "be terse", "{body}");
         assert_eq!(value["max_output_tokens"], 64, "{body}");
-        assert!(value.get("messages").is_none(), "not a chat-completions body: {body}");
+        assert!(
+            value.get("messages").is_none(),
+            "not a chat-completions body: {body}"
+        );
     }
 
     #[test]
     fn dispatches_a_gemini_wire_provider_in_the_gemini_dialect() {
-        let (body, value) =
-            rendered(&ArExec::new().unwrap(), &dispatch_shape(WireFormat::Gemini, "gemini-3-pro"));
-        assert_eq!(value["systemInstruction"]["parts"][0]["text"], "be terse", "{body}");
+        let (body, value) = rendered(
+            &ArExec::new().unwrap(),
+            &dispatch_shape(WireFormat::Gemini, "gemini-3-pro"),
+        );
+        assert_eq!(
+            value["systemInstruction"]["parts"][0]["text"], "be terse",
+            "{body}"
+        );
         assert_eq!(value["generationConfig"]["maxOutputTokens"], 64, "{body}");
-        assert!(value.get("messages").is_none(), "not a chat-completions body: {body}");
+        assert!(
+            value.get("messages").is_none(),
+            "not a chat-completions body: {body}"
+        );
     }
 
     #[test]
     fn dispatches_an_antigravity_wire_provider_with_the_gemini_body() {
         let exec = ArExec::new().unwrap();
         assert_eq!(
-            rendered(&exec, &dispatch_shape(WireFormat::Antigravity, "gemini-3-pro")),
+            rendered(
+                &exec,
+                &dispatch_shape(WireFormat::Antigravity, "gemini-3-pro")
+            ),
             rendered(&exec, &dispatch_shape(WireFormat::Gemini, "gemini-3-pro")),
         );
     }
 
     #[test]
     fn dispatches_a_cursor_wire_provider_in_the_cursor_dialect() {
-        let (body, value) =
-            rendered(&ArExec::new().unwrap(), &dispatch_shape(WireFormat::Cursor, "cursor-small"));
-        assert_eq!(value["messages"][0]["content"], "[System Instructions]\nbe terse", "{body}");
-        assert!(value.get("system").is_none(), "cursor has no system field: {body}");
+        let (body, value) = rendered(
+            &ArExec::new().unwrap(),
+            &dispatch_shape(WireFormat::Cursor, "cursor-small"),
+        );
+        assert_eq!(
+            value["messages"][0]["content"], "[System Instructions]\nbe terse",
+            "{body}"
+        );
+        assert!(
+            value.get("system").is_none(),
+            "cursor has no system field: {body}"
+        );
     }
 
     #[test]
     fn dispatches_a_clova_wire_provider_in_the_clova_dialect() {
-        let (body, value) =
-            rendered(&ArExec::new().unwrap(), &dispatch_shape(WireFormat::Clova, "HCX-005"));
+        let (body, value) = rendered(
+            &ArExec::new().unwrap(),
+            &dispatch_shape(WireFormat::Clova, "HCX-005"),
+        );
         assert_eq!(value["maxTokens"], 64, "{body}");
-        assert!(value.get("max_tokens").is_none(), "the openai spelling is not a clova key: {body}");
+        assert!(
+            value.get("max_tokens").is_none(),
+            "the openai spelling is not a clova key: {body}"
+        );
     }
 
     #[test]
     fn dispatches_a_kiro_wire_provider_in_the_kiro_dialect() {
-        let (body, value) =
-            rendered(&ArExec::new().unwrap(), &dispatch_shape(WireFormat::Kiro, "claude-sonnet-4-5"));
+        let (body, value) = rendered(
+            &ArExec::new().unwrap(),
+            &dispatch_shape(WireFormat::Kiro, "claude-sonnet-4-5"),
+        );
         let current = &value["conversationState"]["currentMessage"]["userInputMessage"];
         assert_eq!(current["modelId"], "claude-sonnet-4-5", "{body}");
-        assert!(value.get("messages").is_none(), "kiro has no messages array: {body}");
+        assert!(
+            value.get("messages").is_none(),
+            "kiro has no messages array: {body}"
+        );
     }
 
     #[test]
     fn leaves_the_caller_model_alone_when_the_provider_declares_none() {
         // A misconfigured mapping must stay visible rather than be papered over
         // with an invented model name.
-        let (body, value) =
-            rendered(&ArExec::new().unwrap(), &dispatch_shape(WireFormat::Anthropic, ""));
+        let (body, value) = rendered(
+            &ArExec::new().unwrap(),
+            &dispatch_shape(WireFormat::Anthropic, ""),
+        );
         assert_eq!(value["model"], "auto", "{body}");
     }
 
@@ -1228,9 +1291,15 @@ mod tests {
     #[test]
     fn reports_a_canonical_body_that_is_not_an_object() {
         let exec = ArExec::new().unwrap();
-        for dialect in [WireFormat::Openai, WireFormat::Anthropic, WireFormat::Gemini] {
+        for dialect in [
+            WireFormat::Openai,
+            WireFormat::Anthropic,
+            WireFormat::Gemini,
+        ] {
             let d = dispatch_shape(dialect, "m-1");
-            let err = exec.render_request(&d, b"[1,2]").expect_err("not an object is refused");
+            let err = exec
+                .render_request(&d, b"[1,2]")
+                .expect_err("not an object is refused");
             assert!(
                 matches!(err, ExecError::NotAnObject),
                 "{dialect:?} named {err:?} for a json array"
@@ -1254,13 +1323,20 @@ mod tests {
         // The model is non-empty throughout, because `rewrite_model` hands a body
         // with no `upstream_model` straight back without parsing it — that
         // short-circuit is the pre-existing OpenAI behaviour, kept byte-identical.
-        for dialect in [WireFormat::Openai, WireFormat::Anthropic, WireFormat::Gemini] {
+        for dialect in [
+            WireFormat::Openai,
+            WireFormat::Anthropic,
+            WireFormat::Gemini,
+        ] {
             let d = dispatch_shape(dialect, "m-1");
             for body in [&b"{"[..], &b"not json"[..]] {
                 let err = exec
                     .render_request(&d, body)
                     .expect_err("a body this build cannot read is refused, not forwarded");
-                assert!(matches!(err, ExecError::Encode(_)), "{dialect:?} on {body:?}: {err:?}");
+                assert!(
+                    matches!(err, ExecError::Encode(_)),
+                    "{dialect:?} on {body:?}: {err:?}"
+                );
             }
         }
     }
@@ -1364,6 +1440,9 @@ mod tests {
             .post_chat(&chat, &def, &Secret::new("sk-x"), &CancellationToken::new())
             .await
             .err();
-        assert!(matches!(err, Some(ExecError::UnsupportedWire(WireFormat::Custom))));
+        assert!(matches!(
+            err,
+            Some(ExecError::UnsupportedWire(WireFormat::Custom))
+        ));
     }
 }

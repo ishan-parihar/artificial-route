@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use ar_compress::{Engine, Intensity, Step};
 use ar_route::{ProviderId, Strategy};
 use ar_server::{
-    Components, ComboTarget, HttpExec, ProviderConfig, RouteCombo, ServerConfig, bind_addr, server,
+    ComboTarget, Components, HttpExec, ProviderConfig, RouteCombo, ServerConfig, bind_addr, server,
 };
 use axum::Router;
 use axum::body::Body;
@@ -216,11 +216,17 @@ fn two_combos(a: &str, b: &str) -> ServerConfig {
 fn free_stack_combo(a: &str, b: &str, bench: &str) -> ServerConfig {
     let mut config = two_combos(a, b);
     config.combos.truncate(1);
-    config.providers.push(ProviderConfig::new(ProviderId::new("c"), bench, "sk-c").with_model("m-c"));
+    config
+        .providers
+        .push(ProviderConfig::new(ProviderId::new("c"), bench, "sk-c").with_model("m-c"));
     let combo = &mut config.combos[0];
     combo.id = "free-stack".to_owned();
-    combo.targets.push(ComboTarget::new(ProviderId::new("b"), "m-b"));
-    combo.pool.push(ComboTarget::new(ProviderId::new("c"), "m-c"));
+    combo
+        .targets
+        .push(ComboTarget::new(ProviderId::new("b"), "m-b"));
+    combo
+        .pool
+        .push(ComboTarget::new(ProviderId::new("c"), "m-c"));
     config
 }
 
@@ -260,12 +266,17 @@ async fn walks_the_bench_only_after_every_target_refuses() {
     let (up, up_seen) = counting_upstream(StatusCode::OK).await;
     let router = boot(free_stack_combo(&down, &down, &up));
 
-    let body = r#"{"model":"free-stack","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let body =
+        r#"{"model":"free-stack","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
     let (status, headers, text) = call(&router, post("/v1/chat/completions", body, &[])).await;
 
     assert_eq!(status, 200, "the bench did not recover the request: {text}");
     // Both targets were actually walked: two refusals before the bench is reached.
-    assert_eq!(calls(&down_seen), 2, "the targets were not both tried first");
+    assert_eq!(
+        calls(&down_seen),
+        2,
+        "the targets were not both tried first"
+    );
     assert_eq!(calls(&up_seen), 1, "the bench was not tried exactly once");
     assert!(
         header_of(&headers, "x-ar-decision").contains("provider=c"),
@@ -284,7 +295,8 @@ async fn never_picks_a_bench_entry_over_a_healthy_target() {
     let (bench, bench_seen) = counting_upstream(StatusCode::OK).await;
     let router = boot(free_stack_combo(&target, &target, &bench));
 
-    let body = r#"{"model":"free-stack","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let body =
+        r#"{"model":"free-stack","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
     let (status, headers, text) = call(&router, post("/v1/chat/completions", body, &[])).await;
 
     assert_eq!(status, 200, "{text}");
@@ -313,7 +325,11 @@ async fn counts_every_upstream_attempt_when_the_bench_recovers_the_request() {
 
     let (status, _, text) = call(
         &s.router,
-        post("/v1/chat/completions", r#"{"model":"free-stack","stream":true,"messages":[{"role":"user","content":"hi"}]}"#, &[]),
+        post(
+            "/v1/chat/completions",
+            r#"{"model":"free-stack","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+            &[],
+        ),
     )
     .await;
 
@@ -324,7 +340,10 @@ async fn counts_every_upstream_attempt_when_the_bench_recovers_the_request() {
         "the two targets were not both dispatched, so the count is not the one this pins"
     );
     assert!(
-        s.state.metrics.render().contains("ar_upstream_attempts_total 3"),
+        s.state
+            .metrics
+            .render()
+            .contains("ar_upstream_attempts_total 3"),
         "three upstream calls were counted as something else: {}",
         s.state.metrics.render()
     );
@@ -344,7 +363,10 @@ async fn sends_each_providers_own_model_spelling() {
     let (_, _, text) = call(&router, post("/v1/chat/completions", body, &[])).await;
 
     assert_eq!(calls(&a_seen), 1);
-    assert!(text.contains("m-a"), "the provider spelling never arrived: {text}");
+    assert!(
+        text.contains("m-a"),
+        "the provider spelling never arrived: {text}"
+    );
     assert!(
         !text.contains("whatever-the-client-asked-for"),
         "the client's spelling reached the provider: {text}"
@@ -383,7 +405,10 @@ async fn routes_a_model_to_its_own_combo() {
             0,
             "{model} also reached the other provider"
         );
-        assert!(text.contains(spelling), "{model} got the wrong model: {text}");
+        assert!(
+            text.contains(spelling),
+            "{model} got the wrong model: {text}"
+        );
         assert!(
             header_of(&headers, "x-ar-decision").contains(&format!("provider={winner}")),
             "{model} decision header was: {}",
@@ -406,8 +431,14 @@ async fn refuses_an_unknown_model_and_names_the_ones_that_exist() {
 
     assert_eq!(status, 400, "an unknown model must not route: {text}");
     assert_eq!(calls(&a_seen), 0, "a refused model still dispatched");
-    assert!(text.contains("gpt-4o"), "the error does not name the model: {text}");
-    assert!(text.contains("fast, careful"), "the error does not list the ids: {text}");
+    assert!(
+        text.contains("gpt-4o"),
+        "the error does not name the model: {text}"
+    );
+    assert!(
+        text.contains("fast, careful"),
+        "the error does not list the ids: {text}"
+    );
     assert_eq!(header_of(&headers, "x-ar-decision"), "strategy=none");
 }
 
@@ -429,7 +460,11 @@ async fn echoes_the_compression_plan_it_applied() {
     // An explicit engine: named, and attributed to the header layer.
     let (_, headers, text) = call(
         &router,
-        post("/v1/chat/completions", body, &[("x-ar-compression", "engine:caveman")]),
+        post(
+            "/v1/chat/completions",
+            body,
+            &[("x-ar-compression", "engine:caveman")],
+        ),
     )
     .await;
     assert_eq!(
@@ -437,12 +472,19 @@ async fn echoes_the_compression_plan_it_applied() {
         "header;engines=caveman",
         "the applied plan was not echoed"
     );
-    assert!(text.contains("hi"), "the compressed prompt did not survive: {text}");
+    assert!(
+        text.contains("hi"),
+        "the compressed prompt did not survive: {text}"
+    );
 
     // An unrecognised value is not a decision and must not claim to be one.
     let (_, headers, _) = call(
         &router,
-        post("/v1/chat/completions", body, &[("x-ar-compression", "engine:nope")]),
+        post(
+            "/v1/chat/completions",
+            body,
+            &[("x-ar-compression", "engine:nope")],
+        ),
     )
     .await;
     assert_eq!(header_of(&headers, "x-ar-compression"), "default;engines=-");
@@ -500,7 +542,11 @@ async fn bypasses_the_cache_for_a_stream_and_says_so() {
         let (_, headers, _) = call(&router, post("/v1/chat/completions", body, &[])).await;
         assert_eq!(header_of(&headers, "x-ar-cache"), "bypass");
     }
-    assert_eq!(calls(&a_seen), 2, "a stream must never be served from cache");
+    assert_eq!(
+        calls(&a_seen),
+        2,
+        "a stream must never be served from cache"
+    );
 }
 
 #[tokio::test]
@@ -516,11 +562,18 @@ async fn refuses_a_prompt_injection_before_dispatch() {
     let (status, headers, text) = call(&router, post("/v1/chat/completions", body, &[])).await;
 
     assert_eq!(status, 400, "an injection was forwarded: {text}");
-    assert_eq!(calls(&a_seen), 0, "a denied prompt still reached a provider");
+    assert_eq!(
+        calls(&a_seen),
+        0,
+        "a denied prompt still reached a provider"
+    );
     assert_eq!(header_of(&headers, "x-ar-guard"), "deny");
     // The rule family is named; the matched text never is.
     assert!(text.contains("prompt refused"), "unhelpful error: {text}");
-    assert!(!text.contains("previous instructions"), "the prompt leaked: {text}");
+    assert!(
+        !text.contains("previous instructions"),
+        "the prompt leaked: {text}"
+    );
 }
 
 #[tokio::test]
@@ -576,7 +629,11 @@ async fn refuses_a_chat_request_without_a_bearer_token_when_a_master_key_is_set(
 
     let (_, _, text) = call(
         &s.router,
-        post("/v1/chat/completions", body, &[("authorization", &format!("Bearer {token}"))]),
+        post(
+            "/v1/chat/completions",
+            body,
+            &[("authorization", &format!("Bearer {token}"))],
+        ),
     )
     .await;
     assert!(text.contains("data:"), "a valid token was refused: {text}");
@@ -590,7 +647,11 @@ async fn refuses_a_chat_request_without_a_bearer_token_when_a_master_key_is_set(
         .access;
     let (status, _, _) = call(
         &s.router,
-        post("/v1/chat/completions", body, &[("authorization", &format!("Bearer {other}"))]),
+        post(
+            "/v1/chat/completions",
+            body,
+            &[("authorization", &format!("Bearer {other}"))],
+        ),
     )
     .await;
     assert_eq!(status, 401, "a foreign token was accepted");
@@ -634,8 +695,15 @@ async fn serves_anthropic_and_ollama_inbound_dialects() {
         ),
     )
     .await;
-    assert_eq!(calls(&a_seen), before + 1, "the ollama route did not dispatch");
-    assert!(text.contains("data:"), "the ollama route did not answer: {text}");
+    assert_eq!(
+        calls(&a_seen),
+        before + 1,
+        "the ollama route did not dispatch"
+    );
+    assert!(
+        text.contains("data:"),
+        "the ollama route did not answer: {text}"
+    );
 }
 
 #[tokio::test]
@@ -657,7 +725,10 @@ async fn refuses_a_chat_body_on_the_responses_route() {
         ),
     )
     .await;
-    assert_eq!(status, 400, "a chat body was accepted on /v1/responses: {text}");
+    assert_eq!(
+        status, 400,
+        "a chat body was accepted on /v1/responses: {text}"
+    );
     assert!(text.contains("input"), "unhelpful error: {text}");
     assert_eq!(calls(&a_seen), 0, "a refused body still dispatched");
 }
@@ -679,7 +750,10 @@ async fn serves_a_responses_body_on_its_own_route() {
         ),
     )
     .await;
-    assert!(text.contains("be terse"), "instructions were not hoisted: {text}");
+    assert!(
+        text.contains("be terse"),
+        "instructions were not hoisted: {text}"
+    );
 }
 
 #[tokio::test]
@@ -739,7 +813,11 @@ async fn prefers_the_header_over_the_combo_engine() {
     let body = r#"{"model":"fast","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
     let (_, headers, _) = call(
         &router,
-        post("/v1/chat/completions", body, &[("x-ar-compression", "engine:caveman")]),
+        post(
+            "/v1/chat/completions",
+            body,
+            &[("x-ar-compression", "engine:caveman")],
+        ),
     )
     .await;
 

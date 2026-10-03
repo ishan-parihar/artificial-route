@@ -495,7 +495,16 @@ mod tests {
     #[test]
     fn candidate_defaults_every_added_signal_to_neutral() {
         let c = Candidate::new(ProviderId::new("groq"), "m");
-        assert_eq!((c.weight, c.in_flight, c.quota, c.context_window, c.cached_prefix_tokens), (1, 0, None, 0, 0));
+        assert_eq!(
+            (
+                c.weight,
+                c.in_flight,
+                c.quota,
+                c.context_window,
+                c.cached_prefix_tokens
+            ),
+            (1, 0, None, 0, 0)
+        );
     }
 
     #[test]
