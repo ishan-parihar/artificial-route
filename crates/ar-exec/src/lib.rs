@@ -1027,7 +1027,12 @@ mod tests {
 
     #[test]
     fn sends_a_provider_declared_header_when_one_is_configured() {
-        let headers = build_headers(WireFormat::Openai, "sk-x", false, &extra(&[("x-api-key", "abc")]));
+        let headers = build_headers(
+            WireFormat::Openai,
+            "sk-x",
+            false,
+            &extra(&[("x-api-key", "abc")]),
+        );
         assert_eq!(headers["x-api-key"], "abc");
     }
 
@@ -1035,13 +1040,23 @@ mod tests {
     fn keeps_accept_when_a_provider_declares_its_own() {
         // The precedence contract: a provider config overrides the content type
         // but cannot claim to be something other than SSE.
-        let headers = build_headers(WireFormat::Openai, "sk-x", true, &extra(&[("accept", "application/json")]));
+        let headers = build_headers(
+            WireFormat::Openai,
+            "sk-x",
+            true,
+            &extra(&[("accept", "application/json")]),
+        );
         assert_eq!(headers[reqwest::header::ACCEPT], "text/event-stream");
     }
 
     #[test]
     fn skips_a_provider_header_when_its_name_is_invalid() {
-        let headers = build_headers(WireFormat::Openai, "sk-x", false, &extra(&[("bad header", "v")]));
+        let headers = build_headers(
+            WireFormat::Openai,
+            "sk-x",
+            false,
+            &extra(&[("bad header", "v")]),
+        );
         assert!(
             !format!("{headers:?}").contains("bad header"),
             "{headers:?}"
