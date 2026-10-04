@@ -90,7 +90,24 @@ jobs:
           cd dist
           sha256sum ar-x86_64-unknown-linux-musl > SHA256SUMS
           cat SHA256SUMS
-          echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          # The dispatch path arrives with GITHUB_REF_NAME=main, so reading the
+          # ref here published a release literally tagged "main" — which the
+          # releases API then reports as the latest, and install.sh would then
+          # try to download from a tag that does not exist. The input wins.
+          TAG="${{ inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      # Guards the bug two runs ago: a mis-dispatched run used to publish a
+      # release literally tagged `main`, which /releases/latest then reported to
+      # every installer. Failing here says why; a generic API error would not.
+      - name: Guard the tag
+        env:
+          TAG: ${{ steps.pkg.outputs.tag }}
+        run: |
+          case "$TAG" in
+            v[0-9]*) ;;
+            *) echo "::error::refusing to publish a release tagged '$TAG' — expected a v* version tag"; exit 1 ;;
+          esac
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
