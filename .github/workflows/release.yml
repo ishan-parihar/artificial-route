@@ -42,6 +42,16 @@ jobs:
       - name: Install musl target
         run: rustup target add x86_64-unknown-linux-musl
 
+      # `rustup target add` supplies musl's Rust std only. A dependency with C
+      # sources still shells out to a musl-targeting C compiler, which the
+      # runner does not have — the first attempt at this workflow failed on
+      # `x86_64-linux-musl-gcc` rather than on anything about the code.
+      - name: Install musl C toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          x86_64-linux-musl-gcc --version
+
       # Same flags the local release build used. `--locked` matters most: without
       # it CI silently resolves fresh dependency versions and ships a binary
       # nobody has run the test suite against.
