@@ -688,6 +688,8 @@ async fn buffer_for_accounting(
     // Only a 2xx that completed is counted. A failover's last upstream failure
     // has nothing spent against it, and an abort has no body to read: zero is
     // the honest figure in both.
+    // Before the destructure below, which holds the outcome's borrow.
+    let attempts = outcome.attempts();
     let AttemptOutcome::Succeeded {
         upstream, provider, ..
     } = outcome
@@ -713,6 +715,7 @@ async fn buffer_for_accounting(
         &canonical.model,
         dialect,
         &body,
+        attempts,
     ) else {
         // Unparseable replies (relay of a provider's HTML error page, say)
         // have no usage to count; the headers keep their zeros on purpose.
@@ -764,6 +767,7 @@ fn read_and_record(
     model: &str,
     dialect: Dialect,
     body: &[u8],
+    attempts: u16,
 ) -> Option<ResponseMeta> {
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
     let usage: &serde_json::Value = if matches!(dialect, Dialect::Ollama) {
@@ -790,7 +794,7 @@ fn read_and_record(
         cache: ar_obs::Cache::Miss,
         queue: ar_obs::Queue::Direct,
         queue_pos: 0,
-        attempts: 1,
+        attempts,
         tokens_in: u64::from(meta.tokens_in()),
         tokens_out: u64::from(meta.tokens_out()),
         cost_micros: meta.cost().usd.micros,

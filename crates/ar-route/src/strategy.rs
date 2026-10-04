@@ -1136,6 +1136,12 @@ impl DeficitMap {
         if let Some(v) = deficits.get_mut(keys[winner]) {
             *v -= 1.0;
         }
+        // A target that left the combo keeps no credit: its deficit would sit
+        // here forever, so the map would grow with every provider ever routed
+        // even though the cap above only bounds whole scopes. Pruning here is
+        // what makes `forget`'s promise hold for a combo that edits its target
+        // list rather than dropping out of rotation.
+        deficits.retain(|k, _| keys.contains(&(&**k as &str)));
         Some(winner)
     }
 

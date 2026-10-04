@@ -1412,12 +1412,16 @@ fn resolve_key(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::time::Duration;
 
     use ar_keys::{CredentialStore, Secret as StoreSecret};
     use ar_route::{QuotaWindow, Strategy};
 
     use ar_config::Config;
+
+    /// Serialises the two tests that set process-global environment variables.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     use super::{
         AUTH_MODE_VAR, AuthMode, ComboError, ComboTarget, DISCOVERY_VAR, DefaultChain,
@@ -2397,20 +2401,26 @@ combos:
 
     /// Sets every named variable, builds, then clears them all.
     ///
-    /// The only test that touches the env is the one above, and it uses this once,
-    /// so a set/clear pair can never overlap another.
+    /// Two tests share this. Cargo runs a crate's tests as threads in one
+    /// process and the environment is process-global, so an overlapping
+    /// set/clear pair would have one test's `remove_var` clearing the other's
+    /// variable mid-build — a flake that looks like a parser bug. `ENV_LOCK`
+    /// serialises the two callers; nothing outside this module touches the env.
     ///
     /// Takes a closure rather than a value because every builder here is
     /// `self -> Self`: a value would have to be constructed before the variables
     /// are set, which is the opposite of what the test is checking.
     fn with_env<T>(vars: &[(&str, &str)], build: impl FnOnce() -> T) -> T {
+        let _held = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for (key, value) in vars {
-            // SAFETY: set and cleared inside this function, and no other test in
-            // this crate touches the environment.
+            // SAFETY: the guard above holds this module's only claim on the
+            // environment, and the variables are cleared before it is released.
             unsafe { std::env::set_var(key, value) };
         }
         let out = build();
         for (key, _) in vars {
+            // SAFETY: as above — still holding the guard, so no other test can
+            // observe a half-cleared environment.
             unsafe { std::env::remove_var(key) };
         }
         out

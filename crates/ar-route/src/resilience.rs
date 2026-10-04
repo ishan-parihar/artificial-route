@@ -625,11 +625,61 @@ fn model_key(provider: &str, model: &str) -> Strng {
 /// boundary needs only the epoch read, so no calendar dependency comes with it.
 #[must_use]
 pub fn quota_cooldown() -> Duration {
-    const DAY: u64 = 24 * 60 * 60;
+    // Tests run this on threads that share a process, so the override is
+    // thread-local: a global would leak one test's clock into another's.
+    #[cfg(test)]
+    if let Some(fixed) = QUOTA_COOLDOWN_OVERRIDE.with(|c| c.get()) {
+        return fixed;
+    }
     let secs = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    Duration::from_secs(DAY - secs % DAY)
+    quota_cooldown_at(secs)
+}
+
+/// Where a test run pretends it is when it asks for the day-lockout.
+///
+/// The answer shrinks toward zero as UTC midnight approaches, so a test that
+/// asserts a quota lockout is *long* fails for the last hour of every day. It
+/// did: five tests, every night between 23:00 and 00:00 UTC.
+#[cfg(test)]
+pub(crate) const NOON_TEST: u64 = 12 * 60 * 60;
+
+#[cfg(test)]
+thread_local! {
+    static QUOTA_COOLDOWN_OVERRIDE: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
+
+/// Pins [`quota_cooldown`] for the current thread until the guard drops.
+///
+/// `# Panics` never: it restores the previous value, so nested use is safe.
+#[cfg(test)]
+pub(crate) struct QuotaClockGuard(Option<Duration>);
+
+#[cfg(test)]
+impl QuotaClockGuard {
+    pub(crate) fn fixed(at: u64) -> Self {
+        let previous = QUOTA_COOLDOWN_OVERRIDE.with(|c| c.replace(Some(quota_cooldown_at(at))));
+        Self(previous)
+    }
+}
+
+#[cfg(test)]
+impl Drop for QuotaClockGuard {
+    fn drop(&mut self) {
+        QUOTA_COOLDOWN_OVERRIDE.with(|c| c.set(self.0));
+    }
+}
+
+/// The day-lockout arithmetic, given a Unix timestamp.
+///
+/// Split from [`quota_cooldown`] because the answer depends on where in the
+/// day it is called: at 23:57 UTC there are 180 seconds of allowance left, not a
+/// day. Production wants the real clock; tests want a fixed instant, or they
+/// assert against midnight's position on the wall.
+fn quota_cooldown_at(unix_secs: u64) -> Duration {
+    const DAY: u64 = 24 * 60 * 60;
+    Duration::from_secs(DAY - unix_secs % DAY)
 }
 
 impl Default for Resilience {
@@ -643,8 +693,36 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        BreakerClass, BreakerState, LockReason, QUOTA_COOLDOWN_CAP, Resilience, quota_cooldown,
+        BreakerClass, BreakerState, LockReason, NOON_TEST, QUOTA_COOLDOWN_CAP, QuotaClockGuard,
+        Resilience, quota_cooldown, quota_cooldown_at,
     };
+
+    /// Noon UTC: half a day of allowance left, so the "waits for the day"
+    /// assertions below hold at any hour the suite happens to run.
+    const NOON: u64 = NOON_TEST;
+
+    #[test]
+    fn quota_cooldown_is_short_at_midnight_which_is_why_tests_pin_the_clock() {
+        // The bug this seam exists for. Without an override the function reads
+        // the wall clock, so a test asserting "a spent allowance waits for the
+        // day" fails whenever the suite happens to run in the last hour of the
+        // day — five tests, every night, for a product that is correct.
+        assert_eq!(quota_cooldown_at(24 * 60 * 60 - 1), Duration::from_secs(1));
+        // Pinned instead, the same assertion holds at any hour.
+        let _clock = QuotaClockGuard::fixed(NOON);
+        assert_eq!(quota_cooldown(), Duration::from_secs(12 * 60 * 60));
+    }
+
+    #[test]
+    fn quota_cooldown_counts_down_to_the_next_day_boundary() {
+        // The property `quota_cooldown()` depends on, pinned at the two extremes
+        // so no run can land on an unlucky hour.
+        assert_eq!(quota_cooldown_at(0), Duration::from_secs(24 * 60 * 60));
+        assert_eq!(quota_cooldown_at(24 * 60 * 60 - 1), Duration::from_secs(1));
+        assert_eq!(quota_cooldown_at(NOON), Duration::from_secs(12 * 60 * 60));
+        // Never zero and never negative: a lockout of zero would fail open.
+        assert!(quota_cooldown_at(u64::MAX) > Duration::ZERO);
+    }
 
     #[test]
     fn reports_cooling_after_failure() {
@@ -729,7 +807,12 @@ mod tests {
     #[test]
     fn preserves_a_longer_existing_lock() {
         let r = Resilience::new();
-        let long = r.lock_model("p", "m", LockReason::QuotaExhausted, quota_cooldown());
+        let long = r.lock_model(
+            "p",
+            "m",
+            LockReason::QuotaExhausted,
+            quota_cooldown_at(NOON),
+        );
         assert!(long > Duration::from_secs(3600));
         let later = r.lock_model("p", "m", LockReason::Throttled, Duration::from_secs(120));
         assert!(
@@ -742,7 +825,12 @@ mod tests {
     fn quota_lockout_outlives_a_throttled_one() {
         let r = Resilience::new();
         let throttled = r.lock_model("p", "a", LockReason::Throttled, Duration::from_secs(120));
-        let quota = r.lock_model("p", "b", LockReason::QuotaExhausted, quota_cooldown());
+        let quota = r.lock_model(
+            "p",
+            "b",
+            LockReason::QuotaExhausted,
+            quota_cooldown_at(NOON),
+        );
         assert_eq!(throttled, Duration::from_secs(120));
         assert!(
             quota > Duration::from_secs(3600),
@@ -758,7 +846,12 @@ mod tests {
         let r = Resilience::new();
         let mut last = Duration::ZERO;
         for _ in 0..6 {
-            last = r.lock_model("p", "m", LockReason::QuotaExhausted, quota_cooldown());
+            last = r.lock_model(
+                "p",
+                "m",
+                LockReason::QuotaExhausted,
+                quota_cooldown_at(NOON),
+            );
         }
         assert_eq!(last, QUOTA_COOLDOWN_CAP);
     }

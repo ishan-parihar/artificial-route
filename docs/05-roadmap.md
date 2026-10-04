@@ -1,24 +1,26 @@
 # 05 — Roadmap P0-P6
 
-**Status (2026-10-03):** P0–P4 shipped in v0.1.0/v0.1.1; P5's guard/obs
+**Status (2026-10-04):** P0–P4 shipped in v0.1.0/v0.1.1; P5's guard/obs
 shipped as crates — `ar-guard` is wired into the request path
-(`ar-server/src/text.rs:32`), while `ar-obs` is a shipped library with **no
-in-tree consumer**: its `Metrics`/`TraceWriter`/`AuditLedger` are not called by
-`ar serve`, which serves its own four counters from `ar-server/src/metrics.rs`.
-Both crates exist and are tested; only the guard is on the request path.
+(`ar-server/src/text.rs:32`), and `ar-obs` now has an in-tree consumer:
+it is the **routing half** of `/metrics`, observed in `read_and_record`
+(the one function every completed request passes through, streams included),
+while `ar-server/src/metrics.rs` keeps the five transport counters the
+`ar_obs` outcome taxonomy cannot express (throttled, failover, upstream
+attempts, catalog refresh). Two renderers, one document.
 P6's media family landed under
 the parity closeout (`docs/07-parity-closeout.md`, wave C: embeddings,
 transcriptions, image-generations, OCR) and `/v1/audio/translations` landed
 afterwards, closing the modality scope; `import --from omniroute|litellm` shipped
 in v0.1.0 (`5cccd13`). The parity-closeout waves A–O are
-complete. Three rows are still open and none is claimed. First, server-side
-live discovery: the models.dev overlay ships in `ar-registry` and `ar import`
-uses it, but the running server's `/v1/models` is still config-static, and
-wiring it reverses a recorded drop of the scheduler. Second,
-`quota-share-fair`'s persisted deficit map. Third, the 12-hour soak run
-itself: the harness is `scripts/soak.sh` and a 3-minute proof run is recorded,
-but 12 hours is not. One more that is not a P-phase row: `ar-obs` is a shipped,
-tested library with no in-tree consumer.
+complete. **One row is still open: the 12-hour soak run itself** — the harness is
+`scripts/soak.sh`, a 3-minute proof is recorded, and a 12h run is in flight, but 12
+hours is not yet claimed. Landed since the last register update (`6a55836`):
+server-side live discovery (`DiscoveredCatalog` as a `ModelCatalog` impl, unioned
+over config, opt-in via `AR_MODEL_DISCOVERY`, default off — the scheduler is a TTL
+tick, **not** the reference's recorded 24h sweep, so that drop is only partially
+reversed) and `quota-share-fair`'s persisted deficit map (`DeficitMap`, keyless of
+any combo id, winner pays 1, converges on the weight ratio).
 The phase gates below still apply to anything a P-phase takes on.
 
 Gate every phase: `cargo test --release` + `cargo clippy --all-targets --all-features --locked -- -D warnings` + RAM check.

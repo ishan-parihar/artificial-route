@@ -630,7 +630,14 @@ mod tests {
     use crate::AttemptOutcome;
     use crate::contract::{CanonicalRequest, ExecError, Executor, ProviderId, Upstream};
     use crate::resilience::BreakerClass;
+    use crate::resilience::QuotaClockGuard;
     use crate::resilience::Resilience;
+
+    /// Noon UTC: half a day of allowance left. Both quota tests below assert a
+    /// day-lockout is *long*, and `attempt_loop` calls `quota_cooldown()`
+    /// internally, so the wall clock would decide whether they pass — they
+    /// failed every night between 23:00 and 00:00 UTC.
+    const NOON: u64 = 12 * 60 * 60;
 
     /// A cloneable verdict description; `Upstream` is not `Clone` because it
     /// owns a boxed stream, so the script stores this instead and builds a
@@ -1032,6 +1039,7 @@ mod tests {
 
     #[test]
     fn quota_429_and_transient_429_diverge_end_to_end() {
+        let _clock = QuotaClockGuard::fixed(NOON);
         let quota_r = Resilience::new();
         let quota_exec = Scripted::new(vec![QUOTA_429, QUOTA_429]);
         let Ok(AttemptOutcome::Retry {
@@ -1071,6 +1079,7 @@ mod tests {
 
     #[test]
     fn a_quota_402_takes_the_same_day_lockout_as_a_quota_429() {
+        let _clock = QuotaClockGuard::fixed(NOON);
         let r = Resilience::new();
         let exec = Scripted::new(vec![PAYMENT_402, PAYMENT_402]);
         let Ok(AttemptOutcome::Retry { after, .. }) =

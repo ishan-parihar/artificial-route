@@ -130,6 +130,13 @@ pub struct DiscoveredCatalog {
     /// re-serves a stale value on error, so the only thing this bounds is how
     /// long a *refresh attempt* may hold a reader.
     wait_secs: u64,
+    /// Built once, reused by every refresh.
+    ///
+    /// A fresh client per tick meant a fresh connection pool and a fresh TLS
+    /// handshake every 60s — 720 of them over a 12-hour run, with `wait_secs`
+    /// then covering the handshake rather than the request. `reqwest::Client`
+    /// is itself the pool, so holding one is the whole fix.
+    client: reqwest::Client,
 }
 
 impl std::fmt::Debug for DiscoveredCatalog {
@@ -147,12 +154,7 @@ impl DiscoveredCatalog {
     /// Builds a catalog that discovers from models.dev over `configured` cards.
     #[must_use]
     pub fn new(configured: Vec<ModelCard>) -> Self {
-        Self {
-            inner: LiveCatalog::default(),
-            configured,
-            ttl: DISCOVERY_TTL,
-            wait_secs: DISCOVERY_WAIT_SECS,
-        }
+        Self::with_bounds(configured, DISCOVERY_TTL, DISCOVERY_WAIT_SECS)
     }
 
     /// Replaces both bounds, for tests and for a config that wants its own.
@@ -163,6 +165,13 @@ impl DiscoveredCatalog {
             configured,
             ttl,
             wait_secs,
+            // A client that cannot be built is the same unreachable-upstream
+            // case a fetch failure is, so the proxy still boots and still serves
+            // its configured cards; each refresh then reports the failure.
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(wait_secs))
+                .build()
+                .unwrap_or_default(),
         }
     }
 
@@ -217,11 +226,8 @@ impl DiscoveredCatalog {
 
     /// One HTTP GET of the models.dev document.
     async fn fetch_once(&self) -> Result<String, DiscoveryError> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.wait_secs))
-            .build()
-            .map_err(|e| DiscoveryError::Fetch(e.to_string()))?;
-        let body = client
+        let body = self
+            .client
             .get(discovery::MODELS_DEV_URL)
             .send()
             .await
