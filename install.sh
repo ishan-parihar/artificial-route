@@ -47,7 +47,6 @@ case "$(uname -m)" in
 esac
 
 ASSET="ar-x86_64-unknown-linux-musl"
-BASE="https://github.com/$REPO/releases/download/$VERSION"
 
 # Newest release tag. Falls back to "v0.0.0" rather than aborting: an API that is
 # rate-limited or briefly down should not make an upgrade path impossible, and a
@@ -63,6 +62,17 @@ LATEST="$(latest_tag || true)"
 [ -n "$LATEST" ] || LATEST="v0.0.0"
 [ -n "$VERSION" ] || VERSION="$LATEST"
 
+# `ar --version` prints `0.1.2` and a release tag is `v0.1.2`. Comparing them
+# raw reports an update available against the version just installed, so both
+# sides are reduced to the bare number before anything compares them.
+LATEST_NUM="${LATEST#v}"
+VERSION_NUM="${VERSION#v}"
+
+# Built here, not next to $ASSET: the newest-tag lookup below is what resolves
+# $VERSION, so a base computed earlier is missing the tag entirely and every
+# download 404s on a path like `.../releases/download//ar-...`.
+BASE="https://github.com/$REPO/releases/download/$VERSION"
+
 installed_tag() {
   [ -x "$TARGET" ] || return 1
   "$TARGET" --version 2>/dev/null | sed -n 's/^ar //p'
@@ -74,7 +84,7 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
   printf 'installed: %s\nlatest:    %s\n' "$CURRENT" "$LATEST"
   if [ "$CURRENT" = "(none)" ]; then
     echo "status:    not installed"
-  elif [ "$CURRENT" = "$LATEST" ]; then
+  elif [ "$CURRENT" = "$LATEST_NUM" ]; then
     echo "status:    up to date"
   else
     echo "status:    update available (run this script again to install $LATEST)"
@@ -111,7 +121,7 @@ chmod +x "$DIR/.ar.new"
 mv "$DIR/.ar.new" "$TARGET"
 INSTALLED="$("$TARGET" --version)"
 
-if [ -n "$CURRENT" ] && [ "$CURRENT" != "$VERSION" ]; then
+if [ -n "$CURRENT" ] && [ "$CURRENT" != "$VERSION_NUM" ]; then
   echo "updated $CURRENT -> $INSTALLED"
 else
   echo "installed $INSTALLED"

@@ -1,5 +1,15 @@
-# Mirror of the live OmniRoute combos on this machine (PORT 20129, v16.3.1),
+# Mirror of the OmniRoute combos that ran on this machine (PORT 20129, v16.3.1),
 # read 2026-09-30 from its storage.sqlite `combos` table.
+#
+# STALE as of 2026-10-04. The live OmniRoute no longer holds these rows. Its
+# process (pid 2637203) runs with DATA_DIR=/home/ishanp/.local/share/omniroute-data,
+# and that database has zero rows in `combos`, `provider_connections`,
+# `registered_keys` and `api_keys`; "small-stack" appears nowhere in any of its
+# 129 tables. `/home/ishanp/.omniroute/storage.sqlite`, the other candidate, is
+# likewise empty, and the live server answers 500 on both /health and
+# /v1/models. So the instance is running but unconfigured, and this file
+# describes a state that no longer exists on disk. It is kept as a record of the
+# shape OmniRoute produced on this box, not as a description of it today.
 #
 # Fidelity notes (deliberate, documented):
 # - Same combo ids, same strategies, same targets in the same order. Model
