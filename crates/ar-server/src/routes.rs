@@ -2161,8 +2161,18 @@ impl Keepalive {
                 let next = tokio::time::timeout(keepalive.interval, stream.next()).await;
                 match next {
                     Ok(Some(chunk)) => {
-                        keepalive.last_terminated =
-                            Some(terminator_seen(&chunk, keepalive.terminator));
+                        // Latches. A stream that carried its terminator is not a
+                        // truncated one, and several upstreams send a trailing
+                        // chunk after it — an empty keep-alive or a usage-only
+                        // frame. Reading the flag off the *last* chunk alone let
+                        // that trailing chunk retract the terminator and made
+                        // ar emit its truncation error AFTER `data: [DONE]`,
+                        // which is a frame a client is told not to expect after
+                        // the end of a stream.
+                        if keepalive.last_terminated != Some(true) {
+                            keepalive.last_terminated =
+                                Some(terminator_seen(&chunk, keepalive.terminator));
+                        }
                         yield Ok(chunk);
                     }
                     // The upstream finished. If its last frame was not a
@@ -4804,6 +4814,41 @@ mod tests {
         assert!(
             dropped.load(Ordering::Relaxed),
             "the upstream stream outlived the client that hung up"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_trailing_chunk_after_the_terminator_does_not_claim_truncation() {
+        // Several upstreams close with `[DONE]` and then one more frame — an
+        // empty keep-alive, or a usage-only tail. Reading "did the LAST chunk
+        // carry the terminator" made ar emit its truncation error *after*
+        // `data: [DONE]`, which is what opencode reports as "the upstream
+        // stream ended before it was complete".
+        let exec = Arc::new(CannedExec(vec![
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: [DONE]\n\n",
+            "data: {}\n\n",
+        ]));
+        let router = crate::app::app(routed_under(exec));
+        let resp = drive(
+            &router,
+            chat(
+                r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ),
+        )
+        .await;
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("the relay ends when the upstream does");
+        let relayed = String::from_utf8_lossy(&bytes);
+        assert!(
+            !relayed.contains("stream_error"),
+            "a terminated stream was called truncated: {relayed}"
+        );
+        assert!(
+            relayed.contains("[DONE]"),
+            "the terminator was not relayed: {relayed}"
         );
     }
 
