@@ -72,8 +72,15 @@ jobs:
           BIN=target/x86_64-unknown-linux-musl/release/ar
           chmod +x "$BIN"
           "$BIN" --version
-          file "$BIN" | tee /dev/stderr | grep -q "statically linked" \
-            || { echo "::error::binary is not static; install.sh promises no runtime deps"; exit 1; }
+          # Match `static` rather than `statically linked`: a PIE binary reports
+          # as "static-pie linked", and the first version of this check demanded
+          # the non-PIE wording and rejected a perfectly good artifact.
+          INFO="$(file -b "$BIN")"
+          echo "$INFO"
+          case "$INFO" in
+            *ELF*static*) ;;
+            *) echo "::error::not a static ELF; install.sh promises no runtime deps"; exit 1 ;;
+          esac
 
       - name: Package
         id: pkg
