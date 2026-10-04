@@ -620,6 +620,7 @@ async fn handle_chat(
             dialect,
             key_id.as_deref(),
             &canonical.model,
+            dispatched,
         );
         ResponseMeta::default()
             .with_latency(dispatched.elapsed())
@@ -872,6 +873,11 @@ struct UsageTee {
     /// Carried so the observation reports what the router actually spent, the
     /// same figure `ar_upstream_attempts_total` counts.
     attempts: u16,
+    /// Taken when the request dispatched, not when the last frame arrived: a
+    /// duration measured from stream completion is the stream's length, not
+    /// the request's cost. `observe` reports `dispatched.elapsed()` so the
+    /// duration histogram holds the request's full wait, not a zero.
+    dispatched: Instant,
 }
 
 impl Stream for UsageTee {
@@ -934,7 +940,7 @@ impl UsageTee {
             tokens_in: u64::from(meta.tokens_in()),
             tokens_out: u64::from(meta.tokens_out()),
             cost_micros: meta.cost().usd.micros,
-            duration_us: meta.latency_ms().saturating_mul(1_000),
+            duration_us: u64::try_from(self.dispatched.elapsed().as_micros()).unwrap_or(u64::MAX),
             queue_wait_us: 0,
         });
     }
@@ -975,6 +981,7 @@ fn account_stream(
     dialect: Dialect,
     key_id: Option<&str>,
     model: &str,
+    dispatched: Instant,
 ) {
     // Before the destructure below, which holds the outcome's borrow.
     let attempts = outcome.attempts();
@@ -1000,6 +1007,7 @@ fn account_stream(
         model: model.to_owned(),
         dialect,
         attempts,
+        dispatched,
     });
 }
 
@@ -2555,7 +2563,7 @@ fn json_response(payload: &serde_json::Value, stale: bool) -> Response {
 mod tests {
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::{
         CACHE_HEADER, COMPRESSION_ECHO, CacheControl, Dialect, FALLBACK_ATTEMPTS_HEADER, Keepalive,
@@ -3878,11 +3886,12 @@ mod tests {
             model: "m".to_owned(),
             dialect: Dialect::OpenAi,
             attempts: 2,
+            dispatched: Instant::now(),
         };
         // Drain to the terminal poll, which is when `record` runs.
         block_on_stream(&mut tee);
 
-        let rendered = tee.state.metrics.render();
+        let rendered = tee.state.metrics.work.render();
         assert!(
             rendered.contains(r#"ar_requests_total{provider="soak-stub""#),
             "a streamed reply must be observed; got:\n{rendered}"
@@ -3924,6 +3933,7 @@ mod tests {
             model: "m".to_owned(),
             dialect: Dialect::OpenAi,
             attempts: 1,
+            dispatched: Instant::now(),
         };
         tee.retain(&huge);
         assert!(tee.head.is_none(), "an over-cap frame was kept");
