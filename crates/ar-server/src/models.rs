@@ -136,7 +136,14 @@ pub struct DiscoveredCatalog {
     /// handshake every 60s — 720 of them over a 12-hour run, with `wait_secs`
     /// then covering the handshake rather than the request. `reqwest::Client`
     /// is itself the pool, so holding one is the whole fix.
-    client: reqwest::Client,
+    ///
+    /// `None` if the builder rejected itself. It cannot become `Some` later, so
+    /// the failure is permanent rather than transient: `fetch_once` reports it
+    /// on every tick and the proxy keeps serving its configured cards, instead
+    /// of silently falling back to a client with *no* timeout — which would
+    /// void `wait_secs` and let a refresh hang forever on an unreachable
+    /// models.dev, the one thing the bound exists to prevent.
+    client: Option<reqwest::Client>,
 }
 
 impl std::fmt::Debug for DiscoveredCatalog {
@@ -167,11 +174,11 @@ impl DiscoveredCatalog {
             wait_secs,
             // A client that cannot be built is the same unreachable-upstream
             // case a fetch failure is, so the proxy still boots and still serves
-            // its configured cards; each refresh then reports the failure.
+            // its configured cards; every refresh then reports the failure.
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(wait_secs))
                 .build()
-                .unwrap_or_default(),
+                .ok(),
         }
     }
 
@@ -226,8 +233,11 @@ impl DiscoveredCatalog {
 
     /// One HTTP GET of the models.dev document.
     async fn fetch_once(&self) -> Result<String, DiscoveryError> {
-        let body = self
+        let client = self
             .client
+            .as_ref()
+            .ok_or_else(|| DiscoveryError::Fetch("discovery client unavailable".to_owned()))?;
+        let body = client
             .get(discovery::MODELS_DEV_URL)
             .send()
             .await

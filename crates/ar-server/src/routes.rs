@@ -780,10 +780,9 @@ fn read_and_record(
     };
     let pricing = &state.config.prices;
     let meta = ResponseMeta::from_upstream(pricing, provider, model, usage);
-    // The observability half. Here rather than at the response site because this
-    // is the one function every completed request passes through — a stream
-    // included, via `account_stream` — so the counters cannot miss the streaming
-    // path the way the non-streaming header builder would.
+    // The observability half. Buffered replies pass here; streamed ones reach
+    // the same observation through `UsageTee::observe` on the last poll, so
+    // neither arm is counted twice and neither is missed.
     state.metrics.work.observe(&ar_obs::Request {
         provider,
         // The price/latency class of the model that served the request. Derived
@@ -870,6 +869,9 @@ struct UsageTee {
     provider: String,
     model: String,
     dialect: Dialect,
+    /// Carried so the observation reports what the router actually spent, the
+    /// same figure `ar_upstream_attempts_total` counts.
+    attempts: u16,
 }
 
 impl Stream for UsageTee {
@@ -909,12 +911,41 @@ impl UsageTee {
         }
     }
 
+    /// The same observation [`read_and_record`] makes for a buffered reply.
+    ///
+    /// Split out so the streaming arm reaches `metrics.work` too: `record` runs
+    /// on the last poll, which is the only moment a stream's usage is knowable,
+    /// and the headers carrying the counts are already gone by then.
+    fn observe(&self, usage: &serde_json::Value) {
+        let meta = ResponseMeta::from_upstream(
+            &self.state.config.prices,
+            &self.provider,
+            &self.model,
+            usage,
+        );
+        self.state.metrics.work.observe(&ar_obs::Request {
+            provider: &self.provider,
+            family: price_family(&meta),
+            decision: ar_obs::Decision::Primary,
+            cache: ar_obs::Cache::Miss,
+            queue: ar_obs::Queue::Direct,
+            queue_pos: 0,
+            attempts: self.attempts,
+            tokens_in: u64::from(meta.tokens_in()),
+            tokens_out: u64::from(meta.tokens_out()),
+            cost_micros: meta.cost().usd.micros,
+            duration_us: meta.latency_ms().saturating_mul(1_000),
+            queue_wait_us: 0,
+        });
+    }
+
     /// Parses what was kept and records it — the only place this tee reads
     /// frame content, on the last poll, after every byte has been relayed.
     fn record(&self) {
         let Some(usage) = usage_from_frames(self.dialect, self.head.as_ref(), &self.tail) else {
             return;
         };
+        self.observe(&usage);
         let Some(ledger) = self.state.ledger.as_ref() else {
             return;
         };
@@ -945,15 +976,19 @@ fn account_stream(
     key_id: Option<&str>,
     model: &str,
 ) {
+    // Before the destructure below, which holds the outcome's borrow.
+    let attempts = outcome.attempts();
     let AttemptOutcome::Succeeded {
         provider, upstream, ..
     } = outcome
     else {
         return;
     };
-    if state.ledger.is_none() {
-        return;
-    }
+    // No guard: /metrics is unconditional, so a streamed reply always needs
+    // observing, and gating the tee on the (optional) ledger meant a no-ledger
+    // config recorded no streamed usage at all. The ledger write inside
+    // `record` stays conditional, which is where "no ledger" actually means
+    // something.
     let inner = std::mem::replace(&mut upstream.stream, Box::pin(futures::stream::empty()));
     upstream.stream = Box::pin(UsageTee {
         inner,
@@ -964,6 +999,7 @@ fn account_stream(
         provider: provider.as_str().to_owned(),
         model: model.to_owned(),
         dialect,
+        attempts,
     });
 }
 
@@ -3792,6 +3828,77 @@ mod tests {
         assert!(usage_from_frames(Dialect::OpenAi, None, &frames).is_none());
     }
 
+    /// Polls a stream to its terminal `None`, which is when `UsageTee` records.
+    ///
+    /// The tee does its accounting on the last poll, so a test that reads the
+    /// metrics has to drive it there rather than stopping after the first frame.
+    #[cfg(test)]
+    fn block_on_stream<S: futures::Stream<Item = Bytes> + Unpin>(stream: &mut S) -> Vec<Bytes> {
+        use std::task::Context;
+
+        let mut out = Vec::new();
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        loop {
+            match std::pin::Pin::new(&mut *stream).poll_next(&mut cx) {
+                std::task::Poll::Ready(Some(chunk)) => out.push(chunk),
+                std::task::Poll::Ready(None) => return out,
+                std::task::Poll::Pending => panic!("stream stalled in a test"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_streamed_reply_reaches_the_routing_metrics() {
+        // The tee used to be armed only when a ledger was configured, so a
+        // streamed request reached neither the ledger nor `metrics.work` and
+        // `ar_requests_total` silently under-counted every stream. Pin the half
+        // that was missing: with no ledger at all, the observation still lands.
+        let state = routed_with_ledger(
+            Arc::new(CannedExec(vec![])),
+            Arc::new(Mutex::new(
+                ar_tokens::Ledger::open_in_memory().expect("in-memory ledger"),
+            )),
+        );
+        let mut tee = UsageTee {
+            inner: Box::pin(futures::stream::iter([
+                // The first chunk becomes `head`; OpenAI usage rides in a
+                // later frame, so a single-chunk stream carries none and the
+                // tee correctly records nothing.
+                Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"),
+                Bytes::from_static(
+                    b"data: {\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\n",
+                ),
+            ])),
+            head: None,
+            tail: Vec::new(),
+            state,
+            key_id: "anonymous".to_owned(),
+            provider: "soak-stub".to_owned(),
+            model: "m".to_owned(),
+            dialect: Dialect::OpenAi,
+            attempts: 2,
+        };
+        // Drain to the terminal poll, which is when `record` runs.
+        block_on_stream(&mut tee);
+
+        let rendered = tee.state.metrics.render();
+        assert!(
+            rendered.contains(r#"ar_requests_total{provider="soak-stub""#),
+            "a streamed reply must be observed; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                r#"ar_tokens_in_total{provider="soak-stub",family="unpriced",decision="primary"} 7"#
+            ),
+            "streamed input tokens must be counted; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"ar_tokens_out_total{provider="soak-stub",family="unpriced",decision="primary"} 3"#),
+            "streamed output tokens must be counted; got:\n{rendered}"
+        );
+    }
+
     #[test]
     fn a_frame_over_the_cap_is_not_kept_for_accounting() {
         // The cap is what keeps the tee's retention bounded against an
@@ -3816,6 +3923,7 @@ mod tests {
             provider: "p".to_owned(),
             model: "m".to_owned(),
             dialect: Dialect::OpenAi,
+            attempts: 1,
         };
         tee.retain(&huge);
         assert!(tee.head.is_none(), "an over-cap frame was kept");

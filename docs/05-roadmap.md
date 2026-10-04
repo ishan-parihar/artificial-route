@@ -2,12 +2,14 @@
 
 **Status (2026-10-04):** P0–P4 shipped in v0.1.0/v0.1.1; P5's guard/obs
 shipped as crates — `ar-guard` is wired into the request path
-(`ar-server/src/text.rs:32`), and `ar-obs` now has an in-tree consumer:
-it is the **routing half** of `/metrics`, observed in `read_and_record`
-(the one function every completed request passes through, streams included),
-while `ar-server/src/metrics.rs` keeps the five transport counters the
-`ar_obs` outcome taxonomy cannot express (throttled, failover, upstream
-attempts, catalog refresh). Two renderers, one document.
+(`ar-server/src/text.rs:32`), and `ar-obs`'s `Metrics` now has an in-tree
+consumer: it is the **routing half** of `/metrics`, observed from both reply
+arms — `read_and_record` for buffered replies, `UsageTee::observe` for streamed
+ones, which previously reached only the ledger. `ar-server/src/metrics.rs`
+keeps the five transport counters the `ar_obs` outcome taxonomy cannot express
+(throttled, failover, upstream attempts, catalog refresh). Two renderers, one
+document. `ar-obs`'s `TraceWriter` and `AuditLedger` remain unconsumed: they are
+the write path, not the scrape, and P6's accept line does not require them.
 P6's media family landed under
 the parity closeout (`docs/07-parity-closeout.md`, wave C: embeddings,
 transcriptions, image-generations, OCR) and `/v1/audio/translations` landed
