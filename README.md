@@ -1,15 +1,33 @@
 # Artificial Route
 
-**One OpenAI-compatible endpoint over 276 providers — a 16 MB static binary idling at ~21 MiB RSS (allocator default tuned 2026-10-03: the ~120 MiB the closeout first measured was jemalloc's 4-arenas-per-CPU default, not request state).**
+**One OpenAI-compatible endpoint over 276 providers — a static binary that idles at ~28 MiB serving the full catalog.**
 
-[![release](https://img.shields.io/github/v/release/ishan-parihar/artificial-route)](https://github.com/ishan-parihar/artificial-route/releases) [![license](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE) [![musl](https://img.shields.io/badge/binary-static--musl-lightgrey)](https://github.com/ishan-parihar/artificial-route/releases) ![tests](https://img.shields.io/badge/tests-800%2B_passing-green)
+[![release](https://img.shields.io/github/v/release/ishan-parihar/artificial-route)](https://github.com/ishan-parihar/artificial-route/releases) [![license](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE) [![musl](https://img.shields.io/badge/binary-static--musl-lightgrey)](https://github.com/ishan-parihar/artificial-route/releases) ![tests](https://img.shields.io/badge/tests-1760_passing-brightgreen)
 
-A minimal-RAM Rust port of the [OmniRoute](https://github.com/ishan-parihar/OmniRoute) gateway core: same combos, strategies and dialects, none of the desktop. File YAML in, SSE out — no control plane, no UI, no runtime deps.
+A minimal-RAM Rust port of the [OmniRoute](https://github.com/ishan-parihar/OmniRoute) gateway core: same combos, strategies and dialects, none of the desktop. File YAML in, SSE out — no control plane, no UI, no runtime dependencies.
+
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ishan-parihar/artificial-route/main/install.sh | sh
+```
+
+That one command installs the newest release, writes a working `~/.config/ar/config.yaml`, writes a `600` credential env file, installs and starts a **systemd unit**, and adds a **weekly update timer** that re-runs the same checksum-verified installer unattended. Then:
+
+```sh
+export OPENAI_API_KEY=sk-... ANTHROPIC_API_KEY=sk-ant-...
+ar doctor     # per-check report, never prints secret values
+ar serve      # loopback :20128
+curl -s localhost:20128/healthz && curl -s localhost:20128/v1/models
+```
+
+Full flag table, service details and `--uninstall` are further down under
+[Installation](#installation).
 
 ## Features
 
 - **21 routing strategies + `auto/*`** — priority, least-used, quota-weighted/fair, cost-optimized, expiry-first, reset-aware, fusion, pipeline… plus an 8-variant auto factory scored over 16 factors, with `simulate`/`explain` in the library
-- **276 providers, 1559 models** compiled in — same provider set as OmniRoute's registry, verified byte-identical
+- **276 providers, 1559 models** compiled in — the same provider set as OmniRoute's registry, regenerated from it by `ar import --from omniroute`
 - **6 wire dialects** — OpenAI, Anthropic, OpenAI-Responses, Gemini, Ollama inbound, OpenAI render; 18 further pairs named loudly instead of half-ported
 - **3 compression engines** (lite, rtk, caveman) with honor-and-echo semantics, per-combo in `config.yaml` and per-request via header, on an intensity dial (`rtk` minimal/standard/aggressive, `caveman` lite/full/ultra) rather than a dozen half-wired engine ids
 - **OAuth dispatch** — codex, cline, claude, gemini-cli, cursor and grok-cli: token injection, refresh on expiry, one rotation retry on 401, per-connection single-flight so a concurrent burst cannot trip `refresh_token_reused`. Two login mechanisms, both with every endpoint operator-supplied: PKCE browser redirect, and RFC 8628 **device flow** for providers that publish no redirect endpoint
@@ -20,17 +38,22 @@ A minimal-RAM Rust port of the [OmniRoute](https://github.com/ishan-parihar/Omni
 
 ## Benchmarks
 
-Measured on this machine (24-core x86_64, `/proc/PID/status` VmRSS, release build):
+Measured on this machine (24-core x86_64, `/proc/PID/status` VmRSS, release build). The `ar` figure below is the installed systemd service running the full 276-provider / 1559-combo catalog, re-measured 2026-10-04 and flat over 10s; the OmniRoute figure is from its running process on the same box.
 
 | State | RSS |
 |---|---|
-| idle, sample config, 10 boots | **11.1 – 11.4 MiB** (budget <35 MB) |
-| idle, full 276-provider catalog | **11.7 – 11.9 MiB** (budget <50 MB) |
-| first dispatched completion | **+2.0 MiB** one-time warmup (TLS, pool, first-translate) |
-| each further dispatch | **~+0.07 MiB** marginal |
-| same 3 live combos as OmniRoute | **2.2 MiB** vs OmniRoute's ~994 MiB process |
+| idle, sample config (2 providers) | **11.1 – 11.4 MiB** (budget <35 MB) |
+| idle, full 276-provider / 1559-combo catalog | **28.3 MiB** (budget <50 MB) |
+| OmniRoute v16.3.1, same box, same purpose | **1003 MiB** |
+| first dispatched completion | +2.0 MiB one-time warmup (TLS, pool, first-translate) |
+| each further dispatch | ~+0.07 MiB marginal |
 
-The OmniRoute figure is its full Next.js desktop/PWA server, not just its proxy path — but that *is* the point: to serve these three combos you run either ~1 GB of Node or one 10 MB static binary. Traffic figures cover the dispatch path against a localhost upstream (no SSE frames relayed); the SSE relay itself is proven by `tests/e2e.rs` against a mock upstream.
+The OmniRoute number is its full Next.js desktop/PWA server, not just its proxy
+path — but that *is* the point: to serve these combos you run either ~1 GB of
+Node or one static binary. Both figures are the same measurement, same machine,
+same moment, rather than numbers from two different benches. Traffic figures
+cover the dispatch path against a localhost upstream (no SSE frames relayed);
+the SSE relay itself is proven by `tests/e2e.rs` against a mock upstream.
 
 ## Parity
 
@@ -44,6 +67,33 @@ The OmniRoute figure is its full Next.js desktop/PWA server, not just its proxy 
 | key storage | encrypted local sqlite + `$VAR` fallback | encrypted DB | env/file/`ate-secret://` |
 | model refresh | snapshot + import | sync + overlays | catalog + refresh API |
 | routes | 14 (`chat`, `messages`, `responses`, `api/chat`, `/v1/completions` legacy alias, `embeddings`, `audio/transcriptions`, `audio/translations`, `images/generations`, `ocr`, `models`, `healthz`, `metrics`) | full gateway + UI | 22 data-plane |
+
+## Known gaps
+
+Stated plainly, because the alternative is a reader discovering them. The full
+explanation is [AUDIT-REPORT.md](AUDIT-REPORT.md).
+
+- **2 of 276 providers cannot route.** `bedrock` resolves its endpoint per AWS
+  region at request time behind SigV4, and `gitlab-duo` builds its URL at
+  runtime from environment variables through a function call. Both are named on
+  stderr by the importer rather than given an invented base URL. The other 274
+  carry a usable one.
+- **The 12-hour soak is not claimed.** The harness (`scripts/soak.sh`) exists and
+  has run four times — longest partial 51 samples, +996 KB, zero failures — but
+  no 12-hour run has completed against a released binary. P6's accept line is
+  therefore open.
+- **`grok-cli` authenticates but does not dispatch** — its Responses body and
+  `x-grok-*` headers are not transcribed.
+- **`kilocode` has neither mechanism declared**, so its `oauth/` row is a `fail`
+  whose fix names the YAML for either one. Its device flow and anonymous dispatch
+  are both ported; the dispatch wire is not.
+- **Multi-provider `auto` pools fall back to config order.** Single-provider
+  pools score identically; the auto scoring engages for literal `auto/*` names.
+- **Custom providers dispatch the OpenAI wire only.** An `anthropic-compatible`
+  node is accepted and named by `ar doctor`, then refused at dispatch.
+- **The MCP control plane is stdio-only** and ships behind `--features mcp`.
+- **The registry snapshot lags OmniRoute's model rotation.** `ar doctor` reports
+  its age and warns past 7 days; `ar import --from omniroute` regenerates it.
 
 ## Artificial Route vs OmniRoute v16.3.1
 
@@ -98,28 +148,37 @@ Static musl binary, checksum-verified, no runtime deps. Lands in `~/.local/bin/a
 | `--dir <path>` | install somewhere else (default `~/.local/bin`) |
 | `--service <scope>` | `system` \| `user` \| `none`; defaults to `system` under root, else `user` |
 | `--check` | installed vs newest, config presence, service state — changes nothing |
-| `--uninstall` | remove binary and unit; **keeps** the config |
+| `--uninstall` | remove binary, unit and timer; **keeps** config and credentials |
 
-Re-running it *is* the update path: it replaces the binary, leaves your config and credentials untouched, and refreshes the unit. `--check` before you do is the honest way to know whether an update exists.
+Re-running it *is* the update path: it replaces the binary, leaves your config
+and credentials untouched, and refreshes the unit. `--check` tells you honestly
+whether an update exists.
 
-The unit is `ar.service`, `Restart=on-failure`, loopback-only by default, reading credentials from an `EnvironmentFile` so secrets stay out of the process table. A user unit enables `loginctl enable-linger`, without which "starts on boot" is false for any session that logs out first.
+Unattended updates are a systemd timer (`ar.update.timer`, weekly, with a first
+re-check 15 minutes after boot). It runs a **saved copy of the installer**
+rather than a URL, so the audited script is what runs, and an updated binary
+restarts the service so the live proxy changes too.
 
-Nothing is claimed that is not checked: a failed start is reported as such, and the usual cause on a first run is empty credentials in the env file, not a broken unit.
+The unit is `ar.service`, `Restart=on-failure`, reading credentials from an
+`EnvironmentFile` so secrets stay out of the process table. It does **not**
+override the bind address: loopback comes from `server.host` in the config, so
+the sample config binds `127.0.0.1` and an operator who edits that line changes
+where it listens. A user unit enables `loginctl enable-linger`, without which
+"starts on boot" is false for any session that logs out first.
 
-## Cold start
+Nothing is claimed that is not checked: a failed start is reported as such, and
+the usual cause on a first run is empty credentials in the env file, not a
+broken unit.
 
-```sh
-export OPENAI_API_KEY=sk-... ANTHROPIC_API_KEY=sk-ant-...
-ar doctor     # per-check report, never prints secret values
-ar serve      # loopback :20128
-curl -s localhost:20128/healthz && curl -s localhost:20128/v1/models
-```
+## Running it
 
-One-shot without the server: `ar run -m cheap -p 'hello'`.
+The install already puts `ar` on a systemd unit, so on a box with systemd the
+proxy is already running — `curl -s localhost:20128/healthz` answers before you
+type anything. The commands above are for the no-systemd case, or for running a
+second instance in the foreground. One-shot without a server at all:
+`ar run -m cheap -p 'hello'`.
 
 Keys can also live encrypted at rest in a gitignored `credentials.db` beside the config (`$AR_CRED_STORE` moves it; `$AR_MASTER_KEY` holds the 32-byte master). Resolution order is store → `$VAR`, so an install with no store behaves as before, and `ar doctor` reports the `store` row and which source each key resolved from.
-
-Config defaults to `./config.yaml` (see the repo's for the shape: `keys` → `providers` → `combos`). Mirror your OmniRoute combos 1:1 with `config.omni-mirror.yaml` as the template — same ids, strategies, target order. Point any OpenAI client at `http://127.0.0.1:20128/v1` with `model` set to a combo id.
 
 ## Configuration
 
@@ -130,6 +189,17 @@ providers: [{ id: openai, key: openai }]   # id must be in the registry
 combos:                                    # clients request the combo id as `model`
   - { id: cheap, strategy: cost-optimized, targets: [openai/gpt-5.4-nano] }
 ```
+
+Three keys, and every one is load-bearing: without `combos` no model is
+routable and `ar doctor` says so, because providers are addresses and only a
+combo is something a client can ask for.
+
+To adopt an OmniRoute provider tree wholesale, `ar import --from omniroute
+--path <OmniRoute/open-sse/config/providers> --out-dir <dir>` regenerates the
+config and the registry from OmniRoute's own source. It reports every provider
+it could not give a base URL rather than inventing one. (`config.omni-mirror.yaml`
+in this repo is a hand-written template and is **stale** — it describes an
+OmniRoute state that no longer exists on disk.)
 
 An OAuth session adds one block. The **access** token is the provider's existing `keys:` entry, the **refresh** token is a second credential row, and the block carries no secret, so a committed `config.yaml` cannot leak one through it.
 
