@@ -16,8 +16,12 @@ transcriptions, image-generations, OCR) and `/v1/audio/translations` landed
 afterwards, closing the modality scope; `import --from omniroute|litellm` shipped
 in v0.1.0 (`5cccd13`). The parity-closeout waves A–O are
 complete. **One row is still open: the 12-hour soak run itself** — the harness is
-`scripts/soak.sh`, a 3-minute proof is recorded, and a 12h run is in flight, but 12
-hours is not yet claimed. Landed since the last register update (`6a55836`):
+`scripts/soak.sh`, a 3-minute proof is recorded, and a 12h run is in flight
+(relaunched post-`6fde400`, CSV `/tmp/ar-soak4.csv`, harness pid 293551), but 12
+hours is not yet claimed. Two prior attempts died before acceptance and are
+recorded in `docs/02`'s soak row, not as acceptance: one operator-killed at
+54 min, one host-wide SIGBUS at 1h52m that also felled unrelated processes.
+Landed since the last register update (`6a55836`):
 server-side live discovery (`DiscoveredCatalog` as a `ModelCatalog` impl, unioned
 over config, opt-in via `AR_MODEL_DISCOVERY`, default off — the scheduler is a TTL
 tick, **not** the reference's recorded 24h sweep, so that drop is only partially
