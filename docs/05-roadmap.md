@@ -41,8 +41,7 @@ AXI gates in `06-axi-mcp.md` apply from P0 (`TOON`, `--fields`, `--version` fast
 * **P3 compress (wk6):** `lite+rtk+caveman` + `planResolution` + `hardBudget` dial. Accept: `eval:compression` fidelity vs savings reported.
 * **P4 cli+mcp-essential (wk7):** `serve|models|providers|combo|doctor|run|configure` AXI-clean + `ar-mcp --features mcp` 12-tool catalog wrapping same fns + `tool_search` + scopes + hashed audit. Accept: `cargo tree` default has no rmcp; agent `health->best_combo->route` loop works.
 * **P5 guard+obs (wk8):** PII+injection 2-stage, secrets redact bidi, redacted audit, BigQuery off. Accept: red-team corpus + p95 guard <5ms.
-* **P6 modality+import (wk9+):** embeddings landed; transcriptions/image-gen/`/v1/ocr` landed (wave C); remaining in scope: live discovery (`modelDiscovery.ts+reactiveModelSync.ts`,
-P1), `import --from omniroute|litellm`. The earlier "vector P1 `usearch`" phrase
+* **P6 modality+import (wk9+):** embeddings landed; transcriptions/image-gen/`/v1/ocr` landed (wave C); live discovery landed too (`DiscoveredCatalog` unions over the configured cards, `AR_MODEL_DISCOVERY` to arm, 60s tick — see the cadence decision at `crates/ar-registry/src/discovery.rs:5`). Remaining in scope: `import --from omniroute|litellm`. The earlier "vector P1 `usearch`" phrase
 is dropped: no reference surface carries it. Accept: 12h soak RSS flat —
 harness is `scripts/soak.sh` with its stub upstream and config alongside
 (proof run recorded: 3 minutes, healthz clean, RSS flat ~26MB); the 12-hour
