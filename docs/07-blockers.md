@@ -21,35 +21,62 @@ a doc.
 `nvidia/nemotron-3.5-content-safety:free` replies `"User Safety: safe"` to
 everything. It is a real entry in the KiloCode catalog, described there as
 *"a compact 4B-parameter multimodal guardrail model … moderates both inputs to
-and responses from LLMs"*. So it is a moderation model exposed as a chat model,
-and it is answerable — asking for it directly returns 200 with that text.
+and responses from LLMs"* — a moderation model exposed as a chat model, and
+answerable: asked for directly it returns 200 with that text.
 
-**My first explanation was wrong and is retracted.** I claimed Cline and
-KiloCode pick the served model themselves. Measured, they do not: asked for a
-valid id, each echoes the request exactly — KiloCode 8/8, Cline 6/6, OpenRouter
-10/10. The guardrail answer appears only under sustained load, so whatever
-substitutes it is load-dependent. **The mechanism is not yet established** and
-B1 is therefore an isolation task, not a fix task.
+**Retraction.** An earlier draft of this file claimed Cline and KiloCode pick the
+served model themselves. Measured, neither does: asked for a valid id each echoes
+the request exactly — KiloCode 8/8, Cline 6/6, OpenRouter 10/10 — and a fabricated
+id is rejected rather than silently substituted.
 
-### Steps
+### Isolation (run 2026-10-05)
 
-1. **Isolate.** Replay the load test with the served-model field captured per
-   request *and* the requested target, so the substitution is visible at the
-   moment it happens rather than reconstructed after. Add the ar decision header
-   (`x-ar-decision` carries `provider=`) alongside the body's `model`, so a
-   substitution can be attributed to a target instead of guessed at.
-2. **Test the retry hypothesis first.** If a guardrail answer is
-   load-correlated, a single request at low concurrency should not produce one.
-   Run 10 requests at concurrency 1 and 10 at concurrency 4 against the same
-   combo and compare rates. If concurrency-1 is clean, this is a rate/fallback
-   path upstream and B1 is not a routing bug at all.
-3. **Only then choose a fix**, in preference order:
-   - a. Filter: treat an answer that is recognisably a guardrail string as a
-     failure and fail over. Cheap, local, and honest — but it is a heuristic on
-     output text and needs a narrow match.
-   - b. Pin: stop asking for `*/stealth/space-bunny-alpha` on the providers that
-     advertise it as a routing alias, and name a concrete model instead.
-   - c. Drop the alias targets. Loses capacity, so it is last.
+| condition | result |
+|---|---|
+| small-stack, concurrency 1, 12 requests | **12/12 correct**, zero guardrail |
+| small-stack, concurrency 4, 12 requests | 10/12 correct, **2 guardrail** |
+| small-stack, concurrency 4, 56 requests | 4 guardrail + 3 empty, **all `provider=kilocode`, `attempts=1`** |
+| KiloCode direct, concurrency 4, 72 requests | **72/72 clean** |
+
+So the substitution is **load-correlated and needs `ar` in the loop**. KiloCode
+under the same concurrency, called directly, never substitutes — which is why the
+isolation in this section only reproduces through the proxy.
+
+Every occurrence is `outcome=ok; attempts=1`: the chain's first dispatchable
+target is the one that answers wrongly, so nothing downstream ever sees it. That
+is the shape B2 fixes, and it is why B2 is ranked first — it turns this failure
+mode into failover rather than requiring the router to behave.
+
+One occurrence is informative on its own: asked for `stealth/space-bunny-alpha`,
+the upstream returned `poolside/laguna-s-2.1:free` with empty content. The
+substitution swaps models, not just answers.
+
+### Can the choice be pinned? No
+
+Every OpenRouter-style routing field was tried at the concurrency where
+substitution occurs, 24 requests each, all three clean:
+
+| variant | result |
+|---|---|
+| plain | 24/24 OK |
+| `provider: {sort: "throughput"}` | 24/24 OK |
+| `provider: {allow_fallbacks: false}` | 24/24 OK |
+| `models: [...]`, `route: "fallback"` | 24/24 OK at concurrency 1 |
+
+None changes behaviour, and none is distinguishable from the baseline because the
+baseline is already clean at that concurrency. **No request-side pin was found**,
+so option (b) below — stop asking for the alias — is the only config-level lever.
+
+### Fix options
+
+1. **Filter** (preferred, and it is B2): treat a guardrail string as a failed
+   attempt so it fails over. Local, honest, and it also catches the empty case.
+2. **Pin by name**: drop `*/stealth/space-bunny-alpha` targets and name concrete
+   models (`kilocode/poolside/laguna-s-2.1:free` was clean throughout). Loses the
+   alias's capacity, so it is second.
+3. **Drop kilocode** from small-stack. Cline served 6/6 at concurrency 1 and never
+   appeared as a failure source, so this is a viable simplification — at the cost
+   of half the free-tier capacity.
 
 ## B2 — kimi-k3 returns empty content about half the time
 
