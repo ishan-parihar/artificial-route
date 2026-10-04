@@ -220,6 +220,14 @@ pub fn is_stale(now: u64) -> bool {
 pub enum AuthClass {
     /// A single bearer-style secret supplied by the user.
     ApiKey,
+    /// A single secret supplied in `x-goog-api-key`.
+    ///
+    /// Google's generative-language API rejects `Authorization: Bearer` outright:
+    /// the same member URL answers `200` with this header and `401` with that
+    /// one, so a provider that is present, keyed and reachable otherwise reports
+    /// as an auth failure. It is still one user-supplied secret — what differs is
+    /// the header name, not the shape of the credential.
+    GoogApiKey,
 }
 
 /// The wire dialect a provider speaks, as a lookup label only.

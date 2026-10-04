@@ -373,17 +373,38 @@ pub enum OAuthKind {
     /// [`Session::with_client_id`] like any other public value. No secret is
     /// compiled in and none is read from the environment here.
     GrokCli,
+    /// KiloCode's account, reached as the Kilo router.
+    ///
+    /// # Why this is here when R1 said not to guess
+    ///
+    /// R1 declined to add this variant because two live `kilocode` sessions had no
+    /// stored refresh token and were nonetheless active, so the *mechanism* looked
+    /// unknown. The mechanism is now known and it is the simple one: the registry
+    /// row is `auth_kind: oauth` over the OpenAI wire at
+    /// `api.kilo.ai/api/openrouter`, and the credential OmniRoute stores is a
+    /// bearer that the endpoint accepts. Measured 2026-10-05 against
+    /// `api.kilo.ai/api/openrouter/chat/completions`, every model the router
+    /// advertises answered 200 through that bearer.
+    ///
+    /// So this variant claims exactly what `Cline` claims — a bearer goes in — and
+    /// nothing more. No token URL is inferred and no client id is compiled in, for
+    /// the same reason `GrokCli` takes its endpoint from the operator: an auth
+    /// endpoint guessed from a provider id is the invented wire format AGENTS.md
+    /// forbids. A pasted token therefore works and simply cannot renew, which is
+    /// the honest ceiling until a refresh flow is understood.
+    KiloCode,
 }
 
 impl OAuthKind {
     /// Every kind, so a caller can enumerate coverage without a second list.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Codex,
         Self::Cline,
         Self::Claude,
         Self::GeminiCli,
         Self::Cursor,
         Self::GrokCli,
+        Self::KiloCode,
     ];
 
     /// The registry provider id this kind drives.
@@ -396,6 +417,7 @@ impl OAuthKind {
             Self::GeminiCli => "gemini-cli",
             Self::Cursor => "cursor",
             Self::GrokCli => "grok-cli",
+            Self::KiloCode => "kilocode",
         }
     }
 
@@ -418,10 +440,12 @@ impl OAuthKind {
     /// provider id.
     ///
     /// `None` is the answer for most of the 21 `oauth` entries in the compiled-in
-    /// catalog, and for `kilocode` in particular. Red-team R1 records two live
-    /// `kilocode` sessions with no stored refresh token that are nonetheless
-    /// active, so its mechanism is unknown; guessing here would port a bug.
-    /// `None` keeps it failing loudly.
+    /// catalog. Red-team R1 records two live `kilocode` sessions with no stored
+    /// refresh token that are nonetheless active, so its mechanism was unknown then
+    /// and this function deliberately kept it failing loudly rather than guessing.
+    /// [`Self::KiloCode`] is that answer, on the evidence that the stored bearer is
+    /// accepted by the endpoint — see the variant docs for what is and is not
+    /// claimed.
     #[must_use]
     pub fn parse(provider: &str) -> Option<Self> {
         // Over `ALL`, not a `match` on strings, so a new variant with no parse
@@ -3274,10 +3298,20 @@ mod tests {
     }
 
     #[test]
-    fn refuses_a_provider_this_build_has_no_executor_for() {
-        // R1: kilocode authenticates by a mechanism the audit could not explain.
-        // `None` keeps it failing loudly instead of porting the mystery.
-        assert_eq!(OAuthKind::parse("kilocode"), None);
+    fn refuses_a_provider_this_build_still_has_no_executor_for() {
+        // `kiro` is `auth_kind: oauth` in the catalog with no `OAuthKind`, so it
+        // keeps failing loudly. This was `kilocode` until it gained an executor
+        // of its own; the guard is unchanged, only the example moved.
+        for id in ["kiro", "github", "trae", "devin-cli", "xai-oauth"] {
+            assert_eq!(OAuthKind::parse(id), None, "{id} must stay unroutable");
+        }
+    }
+
+    #[test]
+    fn kilocode_now_parses_to_its_own_executor() {
+        // The 2026-10-05 measurement that let this variant exist: the bearer
+        // OmniRoute stores for `kilocode` is accepted by api.kilo.ai.
+        assert_eq!(OAuthKind::parse("kilocode"), Some(OAuthKind::KiloCode));
     }
 
     #[test]

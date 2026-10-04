@@ -1747,12 +1747,16 @@ mod tests {
 
     /// A provider the catalog labels `oauth` and this build has no executor for.
     /// Red-team R1's `kilocode`: two live sessions whose mechanism is unknown.
+    /// A session for a provider this build has no `OAuthKind` for.
+    ///
+    /// `kiro` rather than `kilocode`: both are `auth_kind: oauth` in the catalog,
+    /// but kilocode has an executor of its own, so it exercises the *armed* path.
     const OAUTH_NO_EXECUTOR: &str = concat!(
-        "keys:\n  kilocode: $KILO_ACCESS\nproviders:\n  - id: kilocode\n    key: kilocode\n",
-        "oauth:\n  - provider: kilocode\n    refresh_key: kilocode_refresh\n",
+        "keys:\n  kiro: $KIRO_ACCESS\nproviders:\n  - id: kiro\n    key: kiro\n",
+        "oauth:\n  - provider: kiro\n    refresh_key: kiro_refresh\n",
         "    token_url: https://auth.example.invalid/token\n",
         "    authorization_url: https://auth.example.invalid/authorize\n",
-        "combos:\n  - id: c\n    strategy: priority\n    targets:\n      - kilocode/kilo-1\n",
+        "combos:\n  - id: c\n    strategy: priority\n    targets:\n      - kiro/kilo-1\n",
     );
 
     /// The armed session plus the one endpoint a browser login starts at.
@@ -1877,9 +1881,11 @@ mod tests {
 
     #[test]
     fn fails_an_oauth_provider_this_build_has_no_executor_for() {
-        // R1: kilocode stays loudly unroutable until its mechanism is traced.
-        let rows = checks(OAUTH_NO_EXECUTOR, &probe(&["kilocode", "kilocode_refresh"]));
-        let found = row(&rows, "oauth/kilocode");
+        // `kiro` is oauth-kind with no `OAuthKind`, so it must stay loudly
+        // unroutable. `kilocode` was this test's example until it gained an
+        // executor; the guard itself is unchanged.
+        let rows = checks(OAUTH_NO_EXECUTOR, &probe(&["kiro", "kiro_refresh"]));
+        let found = row(&rows, "oauth/kiro");
         assert_eq!(found[1], "fail", "{rows:?}");
         assert!(found[2].contains("no executor"), "{found:?}");
     }

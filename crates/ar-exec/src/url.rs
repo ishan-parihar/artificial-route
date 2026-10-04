@@ -52,6 +52,38 @@ pub fn chat_url(base: &str) -> String {
     endpoint_url(base, CHAT_PATH)
 }
 
+/// The URL a dispatch actually POSTs to, which is not always a chat-completions
+/// URL.
+///
+/// Every wire but Gemini's addresses a collection of models at one fixed path, so
+/// [`chat_url`] is right for all of them and for the 188 registry entries that
+/// already spell that path out. Gemini is the exception and the reason this
+/// function exists: its `base_url` is the *collection* (`.../v1beta/models`) and
+/// each model is addressed as a **method on a member**,
+/// `.../v1beta/models/{model}:generateContent`. Joining `/chat/completions` onto
+/// that stem asks for a path the API does not have, which it answers `404` — a
+/// model that is present and reachable, reported as missing.
+///
+/// An empty `model` falls back to [`chat_url`] rather than producing a URL ending
+/// in a bare `:generateContent`: dispatch's own `upstream_model` doc allows an
+/// empty value to mean "send the caller's spelling", and a nameless member path
+/// cannot express that.
+#[must_use]
+pub fn dispatch_url(wire: crate::WireFormat, base: &str, model: &str) -> String {
+    let stem = strip_trailing_slashes(base.trim());
+    match wire {
+        crate::WireFormat::Gemini if !model.is_empty() => {
+            let mut url = String::with_capacity(stem.len() + model.len() + 18);
+            url.push_str(stem);
+            url.push('/');
+            url.push_str(model);
+            url.push_str(":generateContent");
+            url
+        }
+        _ => chat_url(base),
+    }
+}
+
 /// Joins `path` onto a provider's base URL under the same rule [`chat_url`] uses.
 ///
 /// The media family adds four more endpoints, and duplicating the trim-and-join
@@ -173,6 +205,59 @@ mod tests {
         assert_eq!(
             endpoint_url("https://api.x.com/chat/completions/v1", "/chat/completions"),
             "https://api.x.com/chat/completions/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn gemini_addresses_a_member_by_method_not_a_fixed_path() {
+        use crate::WireFormat;
+        assert_eq!(
+            dispatch_url(
+                WireFormat::Gemini,
+                "https://generativelanguage.googleapis.com/v1beta/models",
+                "gemini-3.8-flash",
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
+        );
+        // Trailing slashes are trimmed the same way every other join is.
+        assert_eq!(
+            dispatch_url(
+                WireFormat::Gemini,
+                "https://generativelanguage.googleapis.com/v1beta/models///",
+                "gemini-3.8-flash",
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
+        );
+    }
+
+    #[test]
+    fn every_other_wire_still_uses_the_chat_path() {
+        use crate::WireFormat;
+        for wire in [
+            WireFormat::Openai,
+            WireFormat::Anthropic,
+            WireFormat::OpenaiResponses,
+            WireFormat::Antigravity,
+            WireFormat::Cursor,
+        ] {
+            assert_eq!(
+                dispatch_url(wire, "https://api.x.com/v1", "m-1"),
+                "https://api.x.com/v1/chat/completions",
+                "{wire:?} must not take the Gemini member path"
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_without_a_model_falls_back_rather_than_emitting_a_bare_method() {
+        use crate::WireFormat;
+        assert_eq!(
+            dispatch_url(
+                WireFormat::Gemini,
+                "https://generativelanguage.googleapis.com/v1beta/models",
+                ""
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/models/chat/completions"
         );
     }
 }

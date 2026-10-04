@@ -841,10 +841,13 @@ mod tests {
     fn refuses_a_provider_this_build_cannot_authenticate() {
         let cfg = cfg_with_session();
         let declared = cfg.oauth_for("codex").expect("declared");
-        let err = exec_session("kilocode", declared)
+        // `kiro` is an `auth_kind: oauth` registry entry with no `OAuthKind`, so
+        // it is what a build-without-the-executor case looks like. `kilocode` was
+        // that example until it gained an executor of its own.
+        let err = exec_session("kiro", declared)
             .expect_err("no executor")
             .to_string();
-        assert!(err.contains("no oauth executor for kilocode"), "{err}");
+        assert!(err.contains("no oauth executor for kiro"), "{err}");
     }
 
     #[test]
@@ -926,13 +929,13 @@ mod tests {
         assert_eq!(&STATUS_COLUMNS[..3], &toon::DEFAULT_FIELDS[..]);
     }
 
-    /// A kilocode-shaped free-tier block: no key row, no refresh, no endpoint.
+    /// A free-tier block: no key row, no refresh, no endpoint.
     fn cfg_anonymous() -> Config {
         Config::parse(
             concat!(
                 "keys: {}\n",
-                "providers:\n  - id: kilocode\n    key: kilocode\n",
-                "oauth:\n  - provider: kilocode\n    anonymous: true\n",
+                "providers:\n  - id: kiro\n    key: kiro\n",
+                "oauth:\n  - provider: kiro\n    anonymous: true\n",
                 "    anonymous_editor: artificial-route\n",
             ),
             |_| Ok(Some(String::new())),
@@ -943,7 +946,7 @@ mod tests {
     #[test]
     fn reports_an_anonymous_session_as_the_free_tier_when_it_declares_it() {
         let cfg = cfg_anonymous();
-        let declared = cfg.oauth_for("kilocode").expect("declared");
+        let declared = cfg.oauth_for("kiro").expect("declared");
         assert_eq!(mechanism(declared), Mechanism::Anonymous);
     }
 
@@ -1056,7 +1059,7 @@ mod tests {
         // rather than only what does not.
         let cfg = Config::parse("keys: {}\n", |_| Ok(Some(String::new()))).expect("parses");
         let (_, fix) = commands::oauth_row(
-            "kilocode",
+            "kiro",
             &cfg,
             &commands::store_probe(std::path::Path::new("no-such-config.yaml")),
         );

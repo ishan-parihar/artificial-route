@@ -100,7 +100,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::oauth::TerminalReport;
 use crate::sse::{DEFAULT_FRAME_CAP, SseDecoder};
-use crate::url::chat_url;
 
 pub use crate::media::{MediaBody, MediaEndpoint, MediaResponse};
 
@@ -403,8 +402,12 @@ impl ArExec {
     ) -> Result<ChatStream, ExecError> {
         let start = await_start(
             self.client
-                .post(chat_url(d.base_url))
-                .headers(build_headers(d.api_key, d.stream, d.headers))
+                .post(crate::url::dispatch_url(
+                    d.wire_format,
+                    d.base_url,
+                    d.upstream_model,
+                ))
+                .headers(build_headers(d.wire_format, d.api_key, d.stream, d.headers))
                 .body(body),
             abort,
             start_timeout(d.stream),
@@ -790,11 +793,13 @@ impl ChatStream {
 /// `clarifai`'s `Key`. A file-declared provider covers those today by spelling
 /// the header out; the catalog still cannot.
 fn build_headers(
+    wire: crate::WireFormat,
     api_key: &str,
     stream: bool,
     extra: &BTreeMap<String, String>,
 ) -> reqwest::header::HeaderMap {
-    headers_for(
+    headers_for_class(
+        auth_class(wire),
         api_key,
         "application/json",
         if stream {
@@ -806,6 +811,30 @@ fn build_headers(
     )
 }
 
+/// The credential header this wire accepts.
+///
+/// The Gemini API takes its key in `x-goog-api-key` and rejects a bearer: the
+/// same member URL answers `200` with that header and `401` with
+/// `Authorization: Bearer`, so a provider that is present, keyed and reachable
+/// reports as an auth failure when the wrong header name is used. Antigravity is
+/// deliberately *not* in this arm — it is a different host with its own
+/// credential, and treating it as Gemini would be the invented wire format
+/// AGENTS.md forbids.
+#[must_use]
+const fn auth_class(wire: crate::WireFormat) -> AuthClass {
+    match wire {
+        crate::WireFormat::Gemini => AuthClass::GoogApiKey,
+        crate::WireFormat::Openai
+        | crate::WireFormat::Anthropic
+        | crate::WireFormat::OpenaiResponses
+        | crate::WireFormat::Antigravity
+        | crate::WireFormat::Cursor
+        | crate::WireFormat::Clova
+        | crate::WireFormat::Custom
+        | crate::WireFormat::Kiro => AuthClass::ApiKey,
+    }
+}
+
 /// The shared header merge, parameterised by content type and accept.
 ///
 /// [`build_headers`] is the chat spelling of this; the media family needs the
@@ -813,6 +842,20 @@ fn build_headers(
 /// endpoints), and a second implementation would be a second place for the auth
 /// precedence to drift.
 pub(crate) fn headers_for(
+    api_key: &str,
+    content_type: &str,
+    accept: &str,
+    extra: &BTreeMap<String, String>,
+) -> reqwest::header::HeaderMap {
+    headers_for_class(AuthClass::ApiKey, api_key, content_type, accept, extra)
+}
+
+/// [`headers_for`] with the credential class named rather than fixed.
+///
+/// The merge is one function so the layer order cannot drift between the chat
+/// path and the media family; only the auth class differs.
+fn headers_for_class(
+    auth: AuthClass,
     api_key: &str,
     content_type: &str,
     accept: &str,
@@ -837,8 +880,9 @@ pub(crate) fn headers_for(
 
     // Exhaustive, not `_`: adding an `AuthClass` variant must fail to compile
     // here rather than silently ship an unauthenticated request.
-    match AuthClass::ApiKey {
+    match auth {
         AuthClass::ApiKey => attach_bearer(&mut headers, api_key),
+        AuthClass::GoogApiKey => attach_header(&mut headers, "x-goog-api-key", api_key),
     }
 
     // Set after auth so it wins, matching `default.ts:672`.
@@ -857,6 +901,19 @@ pub(crate) fn headers_for(
 fn attach_bearer(headers: &mut reqwest::header::HeaderMap, secret: &str) {
     if let Ok(value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {secret}")) {
         headers.insert(reqwest::header::AUTHORIZATION, value);
+    }
+}
+
+/// Sets `name: <secret>`, skipping an unencodable secret.
+///
+/// The same trade as [`attach_bearer`], for a provider that names its own header:
+/// a secret reqwest cannot encode is not going to authenticate, so it is dropped
+/// and the upstream's 401 is the signal.
+fn attach_header(headers: &mut reqwest::header::HeaderMap, name: &'static str, secret: &str) {
+    // `name` is a compile-time constant at every call site, so `from_static`'s
+    // panic-on-invalid cannot be reached; only the secret needs a runtime check.
+    if let Ok(value) = reqwest::header::HeaderValue::from_str(secret) {
+        headers.insert(reqwest::header::HeaderName::from_static(name), value);
     }
 }
 
@@ -946,31 +1003,31 @@ mod tests {
 
     #[test]
     fn sets_accept_sse_when_streaming() {
-        let headers = build_headers("sk-x", true, &BTreeMap::new());
+        let headers = build_headers(WireFormat::Openai, "sk-x", true, &BTreeMap::new());
         assert_eq!(headers[reqwest::header::ACCEPT], "text/event-stream");
     }
 
     #[test]
     fn sets_accept_json_when_not_streaming() {
-        let headers = build_headers("sk-x", false, &BTreeMap::new());
+        let headers = build_headers(WireFormat::Openai, "sk-x", false, &BTreeMap::new());
         assert_eq!(headers[reqwest::header::ACCEPT], "application/json");
     }
 
     #[test]
     fn sets_bearer_when_api_key_present() {
-        let headers = build_headers("sk-abc", false, &BTreeMap::new());
+        let headers = build_headers(WireFormat::Openai, "sk-abc", false, &BTreeMap::new());
         assert_eq!(headers[reqwest::header::AUTHORIZATION], "Bearer sk-abc");
     }
 
     #[test]
     fn skips_bearer_when_secret_has_illegal_header_byte() {
-        let headers = build_headers("sk\ninjected", false, &BTreeMap::new());
+        let headers = build_headers(WireFormat::Openai, "sk\ninjected", false, &BTreeMap::new());
         assert!(!headers.contains_key(reqwest::header::AUTHORIZATION));
     }
 
     #[test]
     fn sends_a_provider_declared_header_when_one_is_configured() {
-        let headers = build_headers("sk-x", false, &extra(&[("x-api-key", "abc")]));
+        let headers = build_headers(WireFormat::Openai, "sk-x", false, &extra(&[("x-api-key", "abc")]));
         assert_eq!(headers["x-api-key"], "abc");
     }
 
@@ -978,13 +1035,13 @@ mod tests {
     fn keeps_accept_when_a_provider_declares_its_own() {
         // The precedence contract: a provider config overrides the content type
         // but cannot claim to be something other than SSE.
-        let headers = build_headers("sk-x", true, &extra(&[("accept", "application/json")]));
+        let headers = build_headers(WireFormat::Openai, "sk-x", true, &extra(&[("accept", "application/json")]));
         assert_eq!(headers[reqwest::header::ACCEPT], "text/event-stream");
     }
 
     #[test]
     fn skips_a_provider_header_when_its_name_is_invalid() {
-        let headers = build_headers("sk-x", false, &extra(&[("bad header", "v")]));
+        let headers = build_headers(WireFormat::Openai, "sk-x", false, &extra(&[("bad header", "v")]));
         assert!(
             !format!("{headers:?}").contains("bad header"),
             "{headers:?}"
