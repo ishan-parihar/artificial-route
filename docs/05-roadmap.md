@@ -48,4 +48,17 @@ harness is `scripts/soak.sh` with its stub upstream and config alongside
 (proof run recorded: 3 minutes, healthz clean, RSS flat ~26MB); the 12-hour
 run itself is one command and is not yet claimed.
 
+Four runs of the harness have been started against the final tree family, and
+none is the 12-hour acceptance. Three partials are kept as
+`/tmp/ar-soak4-stale-tree.csv` (51 samples, +996KB, 0 failures) and the two
+preceding discarded ones; the last was stopped at 46 samples (2707s,
+17556→20720KB, 0 failures) rather than left running unattended. What they show
+is that the harness works and the server stays healthy under a real request
+loop, not that P6 is accepted. To claim P6: run `scripts/soak.sh
+scripts/soak-fixtures` with `SOAK_DURATION=43200` against a released binary
+and leave it alone. One acceptance rule learned the hard way — **kill by PID,
+never `pkill -f`**: the harness's own server matches a bare `pkill -f
+'release/ar serve'`, and the result is a CSV that keeps sampling `rss_kb=0`
+and accumulating failures against a dead process.
+
 Out: full 110-tool MCP, xDS, HBONE, UI, ONNX, cloud sync. Each needs proposal + RAM budget to re-enter.
