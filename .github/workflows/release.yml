@@ -119,7 +119,11 @@ jobs:
           # different number than its download URL — the failure is invisible
           # until a user sees `ar 0.1.2` installed from a v0.1.3 release.
           GOT="$("$BIN" --version | sed -n 's/^ar //p')"
-          WANT="${GITHUB_REF_NAME#v}"
+          # `inputs.tag` wins over the ref for the same reason it does below:
+          # a dispatch arrives with GITHUB_REF_NAME=main, so reading the ref
+          # compares the binary against a branch name.
+          WANT="${{ inputs.tag || github.ref_name }}"
+          WANT="${WANT#v}"
           echo "version:  built $GOT, tag wants $WANT"
           [ -n "$WANT" ] || { echo "::error::could not derive a version from the ref"; exit 1; }
           [ "$GOT" = "$WANT" ] || { echo "::error::binary reports $GOT but the release tag is $WANT"; exit 1; }
