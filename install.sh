@@ -54,7 +54,10 @@ SERVICE="${AR_SERVICE:-auto}"
 CHECK_ONLY=0
 UNINSTALL=0
 
-TARGET="$DIR/ar"
+# Not set here: --dir rewrites $DIR below, and a TARGET computed before the flag
+# loop silently points at the default dir, so --check reports the wrong install.
+TARGET=""
+
 usage() { sed -n '2,/^set -eu$/p' "$0" | sed '$d' | sed 's/^#\{0,1\} \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
@@ -69,6 +72,7 @@ while [ $# -gt 0 ]; do
     *) echo "error: unknown flag '$1' (see --help)" >&2; exit 2 ;;
   esac
 done
+TARGET="$DIR/ar"
 
 case "$SERVICE" in
   auto) if [ "$(id -u)" -eq 0 ]; then SERVICE=system; else SERVICE=user; fi ;;
@@ -225,7 +229,10 @@ fi
 # Without this the binary is inert: `ar doctor` and `ar serve` both refuse to
 # start when no config.yaml is reachable, so "installed" would mean "present but
 # unable to run". Never overwritten — an existing config is the operator's work.
-CONFIG_DIR="$(dirname "$CONFIG")"
+# Parent directory via parameter expansion rather than `dirname`: one fewer
+# subprocess, and no dependency on a coreutils name being present.
+CONFIG_DIR="${CONFIG%/*}"
+[ "$CONFIG_DIR" = "$CONFIG" ] && CONFIG_DIR="."
 mkdir -p "$CONFIG_DIR"
 if [ -f "$CONFIG" ]; then
   echo "config:    kept existing $CONFIG"
@@ -274,7 +281,9 @@ if [ "$SERVICE" = system ]; then
 else
   ENV_FILE="$HOME/.config/ar/ar.env"
 fi
-mkdir -p "$(dirname "$ENV_FILE")"
+ENV_DIR="${ENV_FILE%/*}"
+[ "$ENV_DIR" = "$ENV_FILE" ] && ENV_DIR="."
+mkdir -p "$ENV_DIR"
 if [ ! -f "$ENV_FILE" ]; then
   cat > "$ENV_FILE" <<ENVEOF
 # Credentials for ar. chmod 600 this file before filling it in.
@@ -291,7 +300,14 @@ SERVICE_STATE="not requested"
 if [ "$SERVICE" != none ]; then
   if have_systemd; then
     UNIT="$(unit_path)"
-    mkdir -p "$(dirname "$UNIT")"
+    UNIT_DIR="${UNIT%/*}"
+    [ "$UNIT_DIR" = "$UNIT" ] && UNIT_DIR="."
+    # A user unit wants default.target; a system unit wants multi-user. Chosen
+    # here rather than fixed afterwards with `sed -i`: in-place editing is
+    # GNU-only, it forks for something a variable already decides, and the
+    # draft-then-rewrite shape hid which target was actually wanted.
+    if [ "$SERVICE" = system ]; then WANTED_BY="multi-user.target"; else WANTED_BY="default.target"; fi
+    mkdir -p "$UNIT_DIR"
     cat > "$UNIT" <<UNITEOF
 [Unit]
 Description=artificial-route (ar) — OpenAI-compatible LLM proxy
@@ -315,21 +331,15 @@ StandardOutput=journal
 StandardError=journal
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=$WANTED_BY
 UNITEOF
-
-    if [ "$SERVICE" = system ]; then
-      sed -i 's/^WantedBy=.*/WantedBy=multi-user.target/' "$UNIT"
-    else
-      # A user unit stops at logout unless lingering is enabled; without this
-      # "starts on boot" is false for every session that logs out first.
-      sed -i 's/^WantedBy=.*/WantedBy=default.target/' "$UNIT"
-    fi
 
     systemctl_cmd daemon-reload
     systemctl_cmd enable "$SERVICE_NAME.service" >/dev/null 2>&1 \
       || echo "warning: could not enable $SERVICE_NAME (continuing)" >&2
     if command -v loginctl >/dev/null 2>&1 && [ "$SERVICE" = user ]; then
+      # Without lingering a user unit dies at logout, which makes "starts on
+      # boot" false for every session that logs out first.
       loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || true
     fi
     # A missing key makes `ar serve` exit immediately, so a failed start here
