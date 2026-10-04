@@ -90,7 +90,21 @@ Known gaps, stated plainly: OAuth login works via `ar auth login` — a PKCE bro
 curl -fsSL https://raw.githubusercontent.com/ishan-parihar/artificial-route/main/install.sh | sh
 ```
 
-Static musl binary, checksum-verified, no runtime deps. Lands in `~/.local/bin/ar` (`--dir` to change, `--version` to pin).
+Static musl binary, checksum-verified, no runtime deps. Lands in `~/.local/bin/ar` and does the whole job in one command: installs the newest release, writes a working `config.yaml` under `~/.config/ar/` (never overwriting an existing one), writes a `600` env file for credentials, installs a **systemd unit** so the proxy starts on boot, and finishes by running `ar doctor` so the result is proved rather than asserted.
+
+| flag | effect |
+| --- | --- |
+| `--version <tag>` | pin an exact tag instead of the newest release |
+| `--dir <path>` | install somewhere else (default `~/.local/bin`) |
+| `--service <scope>` | `system` \| `user` \| `none`; defaults to `system` under root, else `user` |
+| `--check` | installed vs newest, config presence, service state — changes nothing |
+| `--uninstall` | remove binary and unit; **keeps** the config |
+
+Re-running it *is* the update path: it replaces the binary, leaves your config and credentials untouched, and refreshes the unit. `--check` before you do is the honest way to know whether an update exists.
+
+The unit is `ar.service`, `Restart=on-failure`, loopback-only by default, reading credentials from an `EnvironmentFile` so secrets stay out of the process table. A user unit enables `loginctl enable-linger`, without which "starts on boot" is false for any session that logs out first.
+
+Nothing is claimed that is not checked: a failed start is reported as such, and the usual cause on a first run is empty credentials in the env file, not a broken unit.
 
 ## Cold start
 
