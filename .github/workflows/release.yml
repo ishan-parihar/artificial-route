@@ -55,6 +55,39 @@ jobs:
       # Same flags the local release build used. `--locked` matters most: without
       # it CI silently resolves fresh dependency versions and ships a binary
       # nobody has run the test suite against.
+      # install.sh is the single entry point every user reaches via `curl | sh`,
+      # and it has no Rust test to run. It shipped four real defects that only
+      # manual runs caught — a dollar-sign in a generated comment, a variable
+      # read before assignment (three times), and a relative $0 that stopped
+      # existing after the script cd'd to its temp dir. Each aborted or
+      # silently disabled the installer, and none would have failed a build.
+      - name: Lint the installer
+        run: |
+          sh -n install.sh
+          # shellcheck's own binary, not a package manager: the runner is
+          # ephemeral and this is the only step that needs it.
+          curl -fsSL -o /tmp/sc.tar.xz \
+            https://github.com/koalaman/shellcheck/releases/download/stable/shellcheck-stable.linux.x86_64.tar.xz
+          tar -xJf /tmp/sc.tar.xz -C /tmp
+          /tmp/shellcheck-stable/shellcheck -s sh install.sh
+
+      - name: Smoke the installer
+        run: |
+          SCRATCH="$(mktemp -d)"
+          # Every branch the summary prints, each in a scratch HOME so a real
+          # config is never touched. The point is the paths that abort under
+          # `set -u` when a variable is read before it is assigned: those exit
+          # non-zero and must fail here rather than on a user's machine.
+          sh install.sh --help >/dev/null
+          sh install.sh --check --dir "$SCRATCH/bin" | grep -q 'not installed'
+          sh install.sh --version v0.0.0-nonexistent --dir "$SCRATCH/bin" \
+            && { echo "::error::a bogus tag should not install"; exit 1; }
+          # --service none must reach the summary, which prints state variables
+          # only the service branch assigns.
+          sh install.sh --service none --dir "$SCRATCH/bin" >/dev/null
+          sh install.sh --uninstall --service none --dir "$SCRATCH/bin" >/dev/null
+          rm -rf "$SCRATCH"
+
       - name: Build static binary
         run: |
           cargo build \

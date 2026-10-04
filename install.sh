@@ -54,6 +54,24 @@ SERVICE="${AR_SERVICE:-auto}"
 CHECK_ONLY=0
 UNINSTALL=0
 
+# Absolute, resolved before anything cd's away from the caller's directory.
+# A relative $0 stops existing the moment the script does `cd "$TMP"`, which
+# silently turned the update timer into "skipped" on every install run from a
+# file — the one case it was written for.
+SCRIPT_SRC=""
+if [ -f "${0:-}" ]; then
+  SCRIPT_SRC="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")" || SCRIPT_SRC="$0"
+fi
+
+# Defaults for every path the summary prints. Each of these is assigned only
+# inside the service branch, and the summary is printed unconditionally, so
+# `--service none` aborted on an unbound variable without one.
+SERVICE_STATE="not requested"
+UPDATE_STATE="not requested"
+UNIT=""
+WANTED_BY=""
+TIMER=""
+
 # Not set here: --dir rewrites $DIR below, and a TARGET computed before the flag
 # loop silently points at the default dir, so --check reports the wrong install.
 TARGET=""
@@ -79,6 +97,20 @@ case "$SERVICE" in
   system|user|none) ;;
   *) echo "error: --service takes system|user|none (got '$SERVICE')" >&2; exit 2 ;;
 esac
+
+# Resolved here — after --service is parsed and `auto` is settled, before
+# anything can read it. --uninstall and the summary both need it, and neither
+# runs the service branch that used to assign it, so a variable assigned there
+# was unbound on exactly those paths. (Five `set -u` aborts in this file traced
+# back to this one habit: assigning a value only inside the branch that happens
+# to be taken.)
+if [ "$SERVICE" = system ]; then
+  ENV_FILE="/etc/ar/ar.env"
+else
+  ENV_FILE="$HOME/.config/ar/ar.env"
+fi
+ENV_DIR="${ENV_FILE%/*}"
+[ "$ENV_DIR" = "$ENV_FILE" ] && ENV_DIR="."
 
 die() { echo "error: $*" >&2; exit 1; }
 
@@ -134,10 +166,13 @@ if [ "$UNINSTALL" -eq 1 ]; then
     systemctl_cmd daemon-reload >/dev/null 2>&1 || true
   fi
   rm -f "$TARGET" "$DIR/.ar.new"
-  # The config and any keys stay: uninstalling a binary should not destroy the
-  # operator's routing setup, which is the expensive part to rebuild.
-  echo "removed binary and unit. config kept at $CONFIG"
-  echo "(delete it by hand if you really want it gone)"
+  # The config and the credentials stay: uninstalling a binary should not
+  # destroy the operator's routing setup, which is the expensive part to
+  # rebuild. Named explicitly, because an env file full of real keys outliving
+  # the binary silently is the kind of thing nobody remembers later.
+  echo "removed binary, service unit and update timer."
+  echo "kept: $CONFIG"
+  echo "kept: $ENV_FILE   (credentials; delete by hand if unwanted)"
   exit 0
 fi
 
@@ -274,21 +309,24 @@ fi
 
 # ----------------------------------------------------------------- service ---
 # An env file the unit sources, so credentials can be added after install
-# without touching the unit or the config.
-ENV_FILE=""
-if [ "$SERVICE" = system ]; then
-  ENV_FILE="/etc/ar/ar.env"
-else
-  ENV_FILE="$HOME/.config/ar/ar.env"
-fi
-ENV_DIR="${ENV_FILE%/*}"
-[ "$ENV_DIR" = "$ENV_FILE" ] && ENV_DIR="."
+# without touching the unit or the config. ENV_FILE and ENV_DIR are resolved up
+# with the other early defaults, because --uninstall and the summary both read
+# them before this branch would have run.
+# A saved copy of this installer, so the update timer below runs the audited
+# artifact rather than re-fetching a URL that could change under it.
+SCRIPT_COPY="$HOME/.config/ar/install.sh"
 mkdir -p "$ENV_DIR"
 if [ ! -f "$ENV_FILE" ]; then
   cat > "$ENV_FILE" <<ENVEOF
 # Credentials for ar. chmod 600 this file before filling it in.
-OPENAI_API_KEY=
-ANTHROPIC_API_KEY=
+#
+# These are COMMENTED OUT on purpose, and the distinction matters: a line
+# reading KEY= sets the variable to the empty string, ar expands it happily,
+# doctor reports every check green and the unit sits active — while every
+# upstream request 401s. Left unset, ar refuses to start and says why.
+# Uncomment and fill one line per key the config references.
+#OPENAI_API_KEY=sk-...
+#ANTHROPIC_API_KEY=sk-ant-...
 ENVEOF
   chmod 600 "$ENV_FILE"
   echo "env file:  wrote $ENV_FILE"
@@ -296,7 +334,6 @@ else
   echo "env file:  kept existing $ENV_FILE"
 fi
 
-SERVICE_STATE="not requested"
 if [ "$SERVICE" != none ]; then
   if have_systemd; then
     UNIT="$(unit_path)"
@@ -318,7 +355,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=$TARGET --config $CONFIG serve
-EnvironmentFile=-$ENV_FILE
+EnvironmentFile=$ENV_FILE
 # Secrets are in the environment; keep them out of the process table.
 Environment=HOME=$HOME
 Restart=on-failure
@@ -359,6 +396,53 @@ UNITEOF
   else
     SERVICE_STATE="skipped — no systemd on this host"
   fi
+
+  # ---------------------------------------------------------------- updater --
+  # "Automatically update" is only true if something runs the installer, so a
+  # timer does. It re-runs a saved copy of this very script: same checksum
+  # verification, same tag resolution, no second download path to keep in sync.
+  # Installing a new binary restarts the service, so the running proxy changes
+  # too rather than serving the old build until someone notices.
+  TIMER="${UNIT%.service}.update.timer"
+  TIMER_SVC="${TIMER%.timer}.service"
+  # Only writable when this script is a real file. `curl | sh` has no $0 on disk,
+  # and silently installing a timer that cannot run is worse than not having one.
+  if [ -n "$SCRIPT_SRC" ]; then
+    [ -f "$SCRIPT_COPY" ] || { cp "$SCRIPT_SRC" "$SCRIPT_COPY"; chmod +x "$SCRIPT_COPY"; }
+    cat > "$TIMER_SVC" <<TIMERSVC
+[Unit]
+Description=Check for an artificial-route release and install it
+Documentation=https://github.com/$REPO
+
+[Service]
+Type=oneshot
+# The saved installer, not a URL: this is the audited script, and it verifies
+# the release checksum before it replaces the binary.
+ExecStart=$SCRIPT_COPY --dir $DIR --service none
+TIMERSVC
+    cat > "$TIMER" <<TIMEREOF
+[Unit]
+Description=Weekly artificial-route update check
+
+[Timer]
+# A fresh install gets its first re-check shortly after boot rather than waiting
+# out the full interval. Randomized delay so many machines do not all poll the
+# release API in the same minute.
+OnBootSec=15min
+OnUnitActiveSec=7d
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=$WANTED_BY
+TIMEREOF
+    systemctl_cmd daemon-reload >/dev/null 2>&1 || true
+    systemctl_cmd enable --now "$(basename "$TIMER")" >/dev/null 2>&1 \
+      || echo "warning: could not enable the update timer (continuing)" >&2
+    UPDATE_STATE="enabled ($(basename "$TIMER"), weekly)"
+  else
+    UPDATE_STATE="skipped (run from a file, not a pipe, to enable unattended updates)"
+  fi
 fi
 
 # ---------------------------------------------------------------- verify -----
@@ -367,8 +451,15 @@ fi
 # never gates the install.
 DOCTOR_OUT="$("$TARGET" --config "$CONFIG" doctor 2>&1 || true)"
 if printf '%s' "$DOCTOR_OUT" | grep -q '^count:'; then
-  VERIFY="$(printf '%s' "$DOCTOR_OUT" | sed -n '1p')"
-  echo "verify:    doctor -> $VERIFY"
+  echo "verify:    doctor -> $(printf '%s' "$DOCTOR_OUT" | sed -n '1p')"
+elif printf '%s' "$DOCTOR_OUT" | grep -q 'cannot expand'; then
+  # The overwhelmingly common first-run case, and it reads like a crash if left
+  # as a raw error line. It is not: ar refuses to start when a credential the
+  # config references is unset, which is the designed behaviour.
+  MISSING="$(printf '%s' "$DOCTOR_OUT" | sed -n "s/.*looking key '\\([A-Z0-9_]*\\)'.*/\\1/p" | head -1)"
+  echo "verify:    doctor -> not run (no credentials in this shell; set $MISSING)"
+  echo "            this is expected on a fresh install — the service reads them"
+  echo "            from $ENV_FILE instead. Put real keys there."
 else
   echo "verify:    doctor -> $(printf '%s' "$DOCTOR_OUT" | head -1)"
 fi
@@ -380,6 +471,7 @@ installed to $TARGET
   config:    $CONFIG
   env file:  $ENV_FILE   (chmod 600; put keys here)
   service:   $SERVICE_STATE
+  updater:   $UPDATE_STATE
 
   $TARGET doctor      # re-check at any time
   $TARGET serve       # foreground; the unit already runs it as a service
