@@ -1,6 +1,6 @@
 [package]
 name = "ar-config"
-version = "0.1.1"
+version.workspace = true
 edition = "2024"
 rust-version = "1.90"
 description = "File-mode configuration: YAML + $VAR injection, hot reload, live ArcSwap snapshot"

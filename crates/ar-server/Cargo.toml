@@ -1,6 +1,6 @@
 [package]
 name = "ar-server"
-version = "0.1.1"
+version.workspace = true
 edition = "2024"
 rust-version = "1.90"
 description = "axum spine: /v1/chat/completions, /v1/models, /healthz, /metrics (Artificial Route P0)"

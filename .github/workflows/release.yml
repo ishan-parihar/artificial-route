@@ -1,0 +1,97 @@
+# Publishes a GitHub release when a `v*` tag is pushed.
+#
+# Exists because the releases were being uploaded by hand: v0.1.1 sat four days
+# behind `main` with no workflow to notice. A hand-uploaded asset also drifts
+# from the source it claims to be, which is the one thing a checksum cannot
+# catch. Everything below is built from the tag's own commit, so the asset and
+# the tag name the same tree.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)publish"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      # The toolchain file is pinned, so CI builds with the same rustc the
+      # release candidate was tested against rather than whatever is newest.
+      - name: Install pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Test the tagged commit
+        # The release job is the only thing standing between a tag and every
+        # machine that runs `install.sh`, so a tag that does not pass the suite
+        # must not produce an asset. Costs one step; buys not shipping a
+        # regression to people who never run this repository's CI.
+        run: cargo test --workspace --release --locked
+
+      - name: Install musl target
+        run: rustup target add x86_64-unknown-linux-musl
+
+      # Same flags the local release build used. `--locked` matters most: without
+      # it CI silently resolves fresh dependency versions and ships a binary
+      # nobody has run the test suite against.
+      - name: Build static binary
+        run: |
+          cargo build \
+            --release \
+            --locked \
+            --target x86_64-unknown-linux-musl \
+            --bin ar
+          strip target/x86_64-unknown-linux-musl/release/ar || true
+
+      - name: Smoke the artifact
+        # A release that cannot print its own version is not worth uploading.
+        # `--version` is the one invocation with no config or network needs, so
+        # it is the only honest gate available before publishing.
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/ar
+          chmod +x "$BIN"
+          "$BIN" --version
+          file "$BIN" | tee /dev/stderr | grep -q "statically linked" \
+            || { echo "::error::binary is not static; install.sh promises no runtime deps"; exit 1; }
+
+      - name: Package
+        id: pkg
+        run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/ar dist/ar-x86_64-unknown-linux-musl
+          cd dist
+          sha256sum ar-x86_64-unknown-linux-musl > SHA256SUMS
+          cat SHA256SUMS
+          echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.pkg.outputs.tag }}
+          name: ar ${{ steps.pkg.outputs.tag }}
+          # Replace rather than fail when the tag is re-pushed: a re-run after a
+          # transient build failure should repair the release, not require a
+          # version bump.
+          fail_on_unmatched_files: false
+          files: |
+            dist/ar-x86_64-unknown-linux-musl
+            dist/SHA256SUMS
+          body: |
+            Static musl binary, no runtime dependencies.
+
+            ```sh
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh
+            ```
+
+            Verify with `sha256sum -c SHA256SUMS`.

@@ -1,6 +1,6 @@
 [package]
 name = "ar-core"
-version = "0.1.1"
+version.workspace = true
 edition = "2024"
 rust-version = "1.90"
 description = "Shared vocabulary: interned name type, cross-crate trait seams, P0 errors"

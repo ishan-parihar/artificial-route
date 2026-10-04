@@ -1,6 +1,6 @@
 [package]
 name = "ar-route"
-version = "0.1.1"
+version.workspace = true
 edition = "2024"
 rust-version = "1.90"
 description = "Routing: 21 strategies, attempt loop, per-key backoff (Artificial Route)"

@@ -1,6 +1,6 @@
 [package]
 name = "ar-cli"
-version = "0.1.1"
+version.workspace = true
 edition = "2024"
 rust-version = "1.90"
 description = "The `ar` binary: AXI/TOON command surface over ar-config + ar-registry + ar-server"

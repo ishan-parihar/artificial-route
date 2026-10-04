@@ -65,7 +65,11 @@ fn exits_fast_when_version() {
         .expect("the ar binary runs");
 
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
-    assert_eq!(stdout(&out), "ar 0.1.1\n");
+    // The contract is that the banner agrees with the crate's own version and
+    // prints it on one line — not that it equals some literal. Pinning the
+    // number here meant the test failed on every release bump, which trains a
+    // reader to ignore it instead of reading it as a real check.
+    assert_eq!(stdout(&out), format!("ar {}\n", env!("CARGO_PKG_VERSION")));
     assert_eq!(stderr(&out), "", "the fast path must not emit diagnostics");
 }
 

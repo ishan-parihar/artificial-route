@@ -1,6 +1,6 @@
 [package]
 name = "ar-cache"
-version = "0.1.1"
+version.workspace = true
 edition = "2024"
 rust-version = "1.90"
 description = "Exact response cache: quick_cache 32MB + redb disk + Idempotency-Key + prefix-pin (Artificial Route P1)"

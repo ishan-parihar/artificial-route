@@ -1,6 +1,6 @@
 [package]
 name = "ar-compress"
-version = "0.1.1"
+version.workspace = true
 edition = "2024"
 rust-version = "1.90"
 description = "Compression plan resolution, hard token budget, and the compression eval corpus (Artificial Route P1)"

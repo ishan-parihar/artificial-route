@@ -1,6 +1,6 @@
 [package]
 name = "ar-tokens"
-version = "0.1.1"
+version.workspace = true
 edition = "2024"
 rust-version = "1.90"
 description = "Token counting, usage normalization, cost ledger and per-key caps (Artificial Route P1)"
