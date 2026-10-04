@@ -114,6 +114,15 @@ jobs:
             *ELF*static*) ;;
             *) echo "::error::not a static ELF; install.sh promises no runtime deps"; exit 1 ;;
           esac
+          # The artifact must agree with the tag it is published under. Without
+          # this, a release can ship a binary whose own `--version` reports a
+          # different number than its download URL — the failure is invisible
+          # until a user sees `ar 0.1.2` installed from a v0.1.3 release.
+          GOT="$("$BIN" --version | sed -n 's/^ar //p')"
+          WANT="${GITHUB_REF_NAME#v}"
+          echo "version:  built $GOT, tag wants $WANT"
+          [ -n "$WANT" ] || { echo "::error::could not derive a version from the ref"; exit 1; }
+          [ "$GOT" = "$WANT" ] || { echo "::error::binary reports $GOT but the release tag is $WANT"; exit 1; }
 
       - name: Package
         id: pkg
