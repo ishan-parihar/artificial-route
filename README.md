@@ -12,7 +12,16 @@ A minimal-RAM Rust port of the [OmniRoute](https://github.com/ishan-parihar/Omni
 curl -fsSL https://raw.githubusercontent.com/ishan-parihar/artificial-route/main/install.sh | sh
 ```
 
-That one command installs the newest release, writes a working `~/.config/ar/config.yaml`, writes a `600` credential env file, installs and starts a **systemd unit**, and adds a **weekly update timer** that re-runs the same checksum-verified installer unattended. Then:
+That one command installs the newest release, writes a working `~/.config/ar/config.yaml`, writes a `600` credential env file, and installs and starts a **systemd unit** so the proxy comes up on boot.
+
+It does **not** add the weekly update timer when piped. The timer runs a saved copy of the installer, and a piped `curl | sh` has no file to copy — `$0` is `sh`. For unattended updates, save it first:
+
+```sh
+curl -fsSL -o install.sh https://raw.githubusercontent.com/ishan-parihar/artificial-route/main/install.sh
+sh install.sh
+```
+
+Then:
 
 ```sh
 export OPENAI_API_KEY=sk-... ANTHROPIC_API_KEY=sk-ant-...
