@@ -98,6 +98,35 @@ pub const CORS_HEADERS: &str = "Content-Type, Authorization, x-api-key, x-goog-a
 /// Shared server state. `Arc`-ed once by `app()` and cloned per request by
 /// axum's `State`, so handlers never re-allocate the routing tables.
 ///
+/// The two halves of the observability write path, started together because
+/// neither is useful half-armed: trace lines without the audit rows they
+/// describe are grep fodder, and audit rows without the trace lines that
+/// explain them are a ledger nobody can debug from.
+#[derive(Debug)]
+pub struct ObsWriter {
+    trace: ar_obs::TraceWriter,
+    audit: ar_obs::AuditLedger,
+}
+
+impl ObsWriter {
+    /// Starts both halves against one directory, or bails with the reason so
+    /// `ar serve` can demote to metrics-only and name the directory.
+    fn start(dir: &std::path::Path) -> Result<Self, ar_obs::ObsError> {
+        Ok(Self {
+            trace: ar_obs::TraceWriter::start(dir)?,
+            audit: ar_obs::AuditLedger::open(&dir.join("audit.redb"))?,
+        })
+    }
+
+    /// Queues one line and appends one row. Neither blocks and neither panics:
+    /// a full trace buffer is dropped by design, and an audit error returns so
+    /// the caller can warn once rather than fail the request it just served.
+    pub fn record(&self, line: &str, audit: &ar_keys::AuditLine) -> Result<u64, ar_obs::ObsError> {
+        self.trace.emit(line);
+        self.audit.append(audit)
+    }
+}
+///
 /// `Clone` rather than an `Arc`-of-`Arc`: axum's `State` extractor wants an owned
 /// handle per request and a second `Arc` layer would buy nothing.
 #[derive(Clone)]
@@ -140,6 +169,15 @@ pub struct AppState {
     /// and this state is shared across tasks, and a serialized write is what
     /// sqlite does to us anyway.
     pub ledger: Option<Arc<std::sync::Mutex<ar_tokens::Ledger>>>,
+    /// The observability write path: trace lines and the audit ledger, when
+    /// `Components::obs_dir` armed them.
+    ///
+    /// `None` in the default configuration, same as the ledger: the transport
+    /// and routing counters in `/metrics` are unaffected, because those are
+    /// the scrape half and render unconditionally. `AuditLedger` owns its own
+    /// `redb` file (`ar_obs` needs `redb` regardless — it was already in the
+    /// dependency graph — so no new store arrives with this field).
+    pub obs: Option<Arc<ObsWriter>>,
     /// Bearer gate, when one is configured.
     ///
     /// `None` is the default and means every request is anonymous — which is only
@@ -194,6 +232,17 @@ pub struct Components {
     /// The usage ledger handle. `None` disables persistence only — the
     /// response headers still carry the computed counts.
     pub ledger: Option<Arc<std::sync::Mutex<ar_tokens::Ledger>>>,
+    /// Directory for the observability write path: trace files (`TraceWriter`)
+    /// and the audit ledger (`AuditLedger`), side by side in one directory.
+    ///
+    /// `None` keeps the whole write path off. `Metrics` is unaffected — it is
+    /// the scrape half and always renders, ledger or trace or neither. The
+    /// per-request cost of `Some` is one lock-free `try_send` for the trace
+    /// line plus one redacted `append` from `ar_keys::AuditLine`, which is
+    /// already redacted by type; the lossy channel drops under backpressure
+    /// rather than slowing the request, and `ar serve` names the directory on
+    /// stderr when it arms.
+    pub obs_dir: Option<std::path::PathBuf>,
     /// Master key bytes for the bearer gate. `None` disables the gate.
     ///
     /// Overrides [`ServerConfig::http_master_key`] when set, which is what makes
@@ -221,6 +270,7 @@ impl Components {
             extra_models: Vec::new(),
             cache_bytes: Some(Some(0)),
             ledger: None,
+            obs_dir: None,
             master_key: None,
         }
     }
@@ -309,6 +359,24 @@ impl Components {
             discovery,
             cache: build_cache(self.cache_bytes),
             ledger: self.ledger,
+            obs: self
+                .obs_dir
+                .as_deref()
+                .and_then(|dir| match ObsWriter::start(dir) {
+                    Ok(w) => Some(Arc::new(w)),
+                    Err(e) => {
+                        // Same demotion the usage ledger makes: a proxy that refuses
+                        // to boot because a bookkeeping directory is unwritable is a
+                        // worse failure than one that warns and keeps routing. The
+                        // scrape half (`/metrics`) is unaffected either way.
+                        tracing::warn!(
+                            error = %e,
+                            dir = %dir.display(),
+                            "observability write path off; trace and audit disabled"
+                        );
+                        None
+                    }
+                }),
             auth_mode,
             // `Secret` has no `Deref`, so the gate takes the bytes rather than the
             // wrapper; the wrapper stays in `master` so it is zeroized on drop.
@@ -737,6 +805,26 @@ impl Server {
     /// Starts the discovery refresh loop, when discovery is armed.
     ///
     /// Spawned rather than awaited: the listener must bind whether or not
+    /// Runs one fetch per TTL tick rather than the reference's 24-hour sync, and
+    /// deliberately omits the reference's 404-triggered reactive half.
+    ///
+    /// The reference (`modelsDevSync.ts` + `reactiveModelSync.ts`) has three
+    /// parts: a settings-gated periodic sync (default 86400s, operator-tunable
+    /// 1h–168h, env-forced on for recovery), a 404-triggered reactive sync with
+    /// a 10-minute per-connection cooldown, and a SQLite write path both parts
+    /// share. This proxy keeps only the idea of the first: a 60s tick against
+    /// models.dev, unioned over config, offline-first (a failed refresh keeps
+    /// the previous catalog). Three parts were considered and dropped:
+    /// 60s instead of 24h because a proxy's answer to "which models exist" is
+    /// live routing data, and a 60s stale-while-revalidate costs one document
+    /// GET per minute against an endpoint the operator opted into; no reactive
+    /// trigger because `Candidate` has no connection id to cool down per — see
+    /// `DeficitMap`'s own doc for the same deliberate flattening — so a 404
+    /// retry would re-fetch the whole catalog for every provider on every miss;
+    /// and no SQLite path because the credential model is "a key name in the
+    /// environment", not a database. Revisit the cadence, not the union, if
+    /// models.dev starts rate-limiting the tick.
+    ///
     /// models.dev is reachable, and a proxy that will not start is harder to
     /// diagnose than one that reports which layer came up. The loop's own
     /// failures are logged and the previous catalog keeps serving, which is the

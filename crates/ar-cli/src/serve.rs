@@ -21,6 +21,10 @@ use crate::cli::{Cli, RunArgs, ServeArgs};
 use crate::commands;
 use crate::toon;
 
+/// Names the directory the observability write path uses: `ar-trace-*.jsonl`
+/// and `audit.redb`, side by side.
+pub const OBS_DIR_VAR: &str = "AR_OBS_DIR";
+
 /// Builds the server components from File-mode config.
 ///
 /// `want = None` serves every configured combo; the listener resolves the
@@ -98,8 +102,15 @@ fn components(
         }
     };
 
+    // The observability write path: trace files plus the audit ledger, in one
+    // directory the operator names. Off unless asked, like every other
+    // persistence surface here — `/metrics` needs no directory and keeps
+    // rendering either way.
+    let obs_dir = std::env::var_os(OBS_DIR_VAR).map(std::path::PathBuf::from);
+
     Ok(Components {
         ledger,
+        obs_dir,
         ..Components::with_exec(config, exec)
     })
 }
@@ -140,6 +151,10 @@ pub async fn serve(cli: &Cli, args: &ServeArgs) -> anyhow::Result<()> {
     let discovery_task = server.spawn_discovery_refresh();
     if discovery_task.is_some() {
         eprintln!("model discovery armed ({})", ar_server::DISCOVERY_VAR);
+    }
+    if server.state.obs.is_some() {
+        let dir = std::env::var(OBS_DIR_VAR).unwrap_or_default();
+        eprintln!("observability write path armed ({OBS_DIR_VAR}={dir})");
     }
 
     axum::serve(listener, server.router)

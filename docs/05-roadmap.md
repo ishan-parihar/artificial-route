@@ -8,8 +8,11 @@ arms — `read_and_record` for buffered replies, `UsageTee::observe` for streame
 ones, which previously reached only the ledger. `ar-server/src/metrics.rs`
 keeps the five transport counters the `ar_obs` outcome taxonomy cannot express
 (throttled, failover, upstream attempts, catalog refresh). Two renderers, one
-document. `ar-obs`'s `TraceWriter` and `AuditLedger` remain unconsumed: they are
-the write path, not the scrape, and P6's accept line does not require them.
+document. `ar-obs`'s `TraceWriter` and `AuditLedger` are now consumed too
+(`Components::obs_dir`, armed by `AR_OBS_DIR`): the trace line carries the full
+request figure, the audit row only the bounded tuple `ar_keys::AuditLine` can
+type. Both halves start together and the trace channel is lossy by contract, so
+the write path never slows a request; `/metrics` still renders with obs off.
 P6's media family landed under
 the parity closeout (`docs/07-parity-closeout.md`, wave C: embeddings,
 transcriptions, image-generations, OCR) and `/v1/audio/translations` landed

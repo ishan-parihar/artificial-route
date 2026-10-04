@@ -23,7 +23,40 @@ pub use traits::{ArError, ArExec, ArRoute, ArTranslate, RouteTarget};
 /// name set matters.
 pub type Strng = Arc<str>;
 
+/// Borrows a [`Strng`] as `&str`.
+///
+/// The only spellings that used to exist were `&**s` (inscrutable) and
+/// `(*s).to_owned()` (a read with an allocation in it). `Display` is not
+/// implemented for `Arc<str>`, so there was no obvious third choice — now
+/// there is one. Prefer this everywhere a [`Strng`] is compared, hashed, or
+/// passed to a `&str` parameter; keep `.to_owned()` callers on the owned side.
+#[must_use]
+#[inline]
+pub fn as_str(s: &Strng) -> &str {
+    s
+}
+
 /// Interns `s` into a [`Strng`].
 pub fn intern(s: &str) -> Strng {
     Strng::from(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Strng, as_str, intern};
+
+    #[test]
+    fn as_str_borrows_without_allocating() {
+        // The helper exists because the only other spellings were `&**s` and a
+        // `.to_owned()` that allocates. One case proves the borrow outlives the
+        // call and shares the `Arc`'s buffer rather than copying it.
+        let s = intern("openai");
+        let borrowed: &str = as_str(&s);
+        assert_eq!(borrowed, "openai");
+        assert!(std::ptr::eq(
+            borrowed.as_ptr(),
+            &*s as *const str as *const u8
+        ));
+        assert_eq!(as_str(&Strng::from("")), "");
+    }
 }

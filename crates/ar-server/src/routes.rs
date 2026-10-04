@@ -817,7 +817,52 @@ fn read_and_record(
         // problem to be told about.
         tracing::warn!(error = %e, "usage ledger write failed");
     }
+    record_obs(state, key_id, provider, model, &meta, attempts);
     Some(meta)
+}
+
+/// Writes the observability write path's half of one served request.
+///
+/// The trace line carries the full figure — provider, model, tokens, cost,
+/// attempts, latency — because a `String` will hold it. The audit row carries
+/// only what `ar_keys::AuditLine` can: a key id, two bounded enums and a
+/// `&'static str`, so the row is the same width on disk whatever a provider
+/// answers. That split is the crate's own design (`ar-obs/src/lib.rs`), not a
+/// narrowing imposed here: the bounded row is what a reviewer can read without
+/// trusting the trace.
+fn record_obs(
+    state: &AppState,
+    key_id: Option<&str>,
+    provider: &str,
+    model: &str,
+    meta: &ResponseMeta,
+    attempts: u16,
+) {
+    let Some(obs) = state.obs.as_ref() else {
+        return;
+    };
+    let line = format!(
+        r#"{{"provider":{},"model":{},"tokens_in":{},"tokens_out":{},"cost_micros":{},"attempts":{attempts},"latency_ms":{}}}"#,
+        serde_json::Value::from(provider),
+        serde_json::Value::from(model),
+        meta.tokens_in(),
+        meta.tokens_out(),
+        meta.cost().usd.micros,
+        meta.latency_ms(),
+    );
+    let audit = ar_keys::AuditLine {
+        at: epoch_now(),
+        key_id: Strng::from(key_id.unwrap_or("anonymous")),
+        action: ar_keys::Action::Admit,
+        outcome: ar_keys::Outcome::Ok,
+        // `Admit` is the action `ar-keys`' own lane controller records
+        // (`admit.rs:621`), so this row joins the same vocabulary rather than
+        // inventing a second action for "a request was routed".
+        detail: "routed",
+    };
+    if let Err(e) = obs.record(&line, &audit) {
+        tracing::warn!(error = %e, "audit row not written");
+    }
 }
 
 /// A frame kept for accounting is capped at this many bytes: usage frames are
@@ -929,6 +974,7 @@ impl UsageTee {
             &self.model,
             usage,
         );
+        self.record_obs(usage);
         self.state.metrics.work.observe(&ar_obs::Request {
             provider: &self.provider,
             family: price_family(&meta),
@@ -943,6 +989,30 @@ impl UsageTee {
             duration_us: u64::try_from(self.dispatched.elapsed().as_micros()).unwrap_or(u64::MAX),
             queue_wait_us: 0,
         });
+        self.record_obs(usage);
+    }
+
+    /// The streamed arm's half of [`record_obs`], with the same split: full
+    /// figure in the trace line, bounded tuple in the audit row. Takes the
+    /// already-parsed usage rather than re-reading the retained frames.
+    fn record_obs(&self, usage: &serde_json::Value) {
+        if self.state.obs.is_none() {
+            return;
+        }
+        let meta = ResponseMeta::from_upstream(
+            &self.state.config.prices,
+            &self.provider,
+            &self.model,
+            usage,
+        );
+        record_obs(
+            &self.state,
+            Some(&self.key_id),
+            &self.provider,
+            &self.model,
+            &meta,
+            self.attempts,
+        );
     }
 
     /// Parses what was kept and records it — the only place this tee reads
@@ -952,6 +1022,7 @@ impl UsageTee {
             return;
         };
         self.observe(&usage);
+        self.record_obs(&usage);
         let Some(ledger) = self.state.ledger.as_ref() else {
             return;
         };
@@ -3854,6 +3925,74 @@ mod tests {
                 std::task::Poll::Pending => panic!("stream stalled in a test"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_served_request_reaches_the_trace_and_the_audit_ledger() {
+        // The write path's whole claim: `ar-obs`'s trace and audit halves are no
+        // longer library-only. Both are armed by `Components::obs_dir`, and one
+        // served request must leave a trace line naming its provider AND a
+        // bounded audit row — the split, where the row is the same width on disk
+        // whatever the provider answered.
+        let dir = std::env::temp_dir().join(format!("ar-obs-rs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let exec = Arc::new(CannedExec(vec![
+            r#"{"id":"r1","usage":{"prompt_tokens":11,"completion_tokens":7}}"#,
+        ]));
+        let state = Components {
+            exec,
+            ledger: Some(Arc::new(Mutex::new(
+                ar_tokens::Ledger::open_in_memory().expect("in-memory ledger"),
+            ))),
+            obs_dir: Some(dir.clone()),
+            ..Components::unconfigured(one_provider_config())
+        }
+        .into_state();
+        let router = crate::app::app(state);
+        let resp = drive(
+            &router,
+            chat(
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Dropped before reading: `AuditLedger` takes redb's exclusive file
+        // lock, so the writer and any reader cannot coexist in one process. That
+        // is redb's contract rather than a choice here, and it is the same
+        // property that makes two proxies sharing one obs dir impossible.
+        drop(router);
+
+        let audit = ar_obs::AuditLedger::open(&dir.join("audit.redb")).expect("audit open");
+        let rows = audit.query(0, u64::MAX).expect("audit query");
+        assert_eq!(rows.len(), 1, "one served request, one row: {rows:?}");
+        assert!(
+            rows[0].contains("admit ok routed"),
+            "the row is the bounded tuple, not the trace line: {rows:?}"
+        );
+        drop(audit);
+
+        // Any `ar-trace-<day>.jsonl` in the directory: the day index moves with
+        // the wall clock, so pinning `0` would make this test pass for a few
+        // hours every day and fail for the rest.
+        let trace_file = std::fs::read_dir(&dir)
+            .expect("trace dir")
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("ar-trace-"))
+            })
+            .expect("a trace file was written");
+        let trace = std::fs::read_to_string(&trace_file).expect("trace body");
+        assert!(
+            trace.contains(r#""tokens_in":11"#) && trace.contains(r#""tokens_out":7"#),
+            "the trace line carries the full figure: {trace}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
