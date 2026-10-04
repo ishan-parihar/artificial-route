@@ -13,6 +13,20 @@
 //! The last point is why [`chat_url`] appends the path itself instead of
 //! accepting one: at P0 there is one path, so taking it as an argument would
 //! only add a way to get this wrong.
+//!
+//! ## The join is idempotent on an endpoint
+//!
+//! `ar_registry`'s `base_url` is OmniRoute's `baseUrl` verbatim, and there
+//! `baseUrl` is the **full endpoint**, not a stem: `providers/poe/index.ts`
+//! assigns `baseUrl: POE_CHAT_COMPLETIONS_URL`, a value already ending in
+//! `/chat/completions`. 188 of the 276 registry entries are shaped that way
+//! (`nvidia` -> `.../v1/chat/completions`, `openrouter` -> `.../v1/chat/completions`),
+//! and the other 88 are stems (`gemini` -> `.../v1beta/models`).
+//!
+//! So both conventions occur in one catalog and appending unconditionally
+//! requests `.../v1/chat/completions/chat/completions`, which every one of those
+//! 188 hosts answers `404`. Appending only when the stem does not already end in
+//! the path is the one rule that is right for both.
 
 /// Path appended to a provider's base URL for chat completions.
 const CHAT_PATH: &str = "/chat/completions";
@@ -28,6 +42,11 @@ const CHAT_PATH: &str = "/chat/completions";
 ///
 /// assert_eq!(chat_url("https://api.x.com/v1"), "https://api.x.com/v1/chat/completions");
 /// assert_eq!(chat_url("https://api.x.com/v1//"), "https://api.x.com/v1/chat/completions");
+/// // An entry that already names the endpoint is used as-is, not doubled.
+/// assert_eq!(
+///     chat_url("https://integrate.api.nvidia.com/v1/chat/completions"),
+///     "https://integrate.api.nvidia.com/v1/chat/completions",
+/// );
 /// ```
 pub fn chat_url(base: &str) -> String {
     endpoint_url(base, CHAT_PATH)
@@ -44,10 +63,21 @@ pub fn chat_url(base: &str) -> String {
 /// use ar_exec::url::endpoint_url;
 ///
 /// assert_eq!(endpoint_url("https://api.x.com/v1/", "/embeddings"), "https://api.x.com/v1/embeddings");
+/// // Already an endpoint: returned unchanged.
+/// assert_eq!(
+///     endpoint_url("https://agentrouter.org/v1/messages", "/v1/messages"),
+///     "https://agentrouter.org/v1/messages",
+/// );
 /// ```
 #[must_use]
 pub fn endpoint_url(base: &str, path: &str) -> String {
     let stem = strip_trailing_slashes(base.trim());
+    // Both conventions live in one catalog (see the module docs), so the join is
+    // a no-op on a stem that already names this endpoint. Compared after the
+    // trailing-slash strip, so `.../chat/completions//` still matches.
+    if stem.ends_with(path) {
+        return stem.to_owned();
+    }
     let mut url = String::with_capacity(stem.len() + path.len());
     url.push_str(stem);
     url.push_str(path);
@@ -105,6 +135,44 @@ mod tests {
         assert_eq!(
             endpoint_url("https://api.x.com/v1///", "/ocr"),
             "https://api.x.com/v1/ocr"
+        );
+    }
+
+    #[test]
+    fn leaves_a_base_that_already_names_the_endpoint_alone() {
+        // The registry carries both conventions; joining unconditionally asks
+        // nvidia for /v1/chat/completions/chat/completions, which it 404s.
+        for (base, path) in [
+            (
+                "https://integrate.api.nvidia.com/v1/chat/completions",
+                "/chat/completions",
+            ),
+            ("https://agentrouter.org/v1/messages", "/v1/messages"),
+            ("https://api.z.ai/api/anthropic/v1/messages", "/v1/messages"),
+        ] {
+            assert_eq!(endpoint_url(base, path), base, "{base} was doubled");
+        }
+    }
+
+    #[test]
+    fn matches_an_endpoint_base_through_trailing_slashes() {
+        assert_eq!(
+            chat_url("https://integrate.api.nvidia.com/v1/chat/completions///"),
+            "https://integrate.api.nvidia.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn still_appends_when_the_stem_is_a_genuine_prefix() {
+        // Not a prefix test: `.../chat/completions` must not swallow a real stem
+        // that merely contains the path earlier on.
+        assert_eq!(
+            chat_url("https://api.x.com/v1"),
+            "https://api.x.com/v1/chat/completions"
+        );
+        assert_eq!(
+            endpoint_url("https://api.x.com/chat/completions/v1", "/chat/completions"),
+            "https://api.x.com/chat/completions/v1/chat/completions"
         );
     }
 }
