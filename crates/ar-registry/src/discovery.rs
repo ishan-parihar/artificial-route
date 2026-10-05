@@ -167,6 +167,20 @@ pub(crate) fn publish(catalog: std::sync::Arc<Catalog>) {
     }
 }
 
+/// Empties [`latest`], so one test's catalog cannot answer another's lookup.
+///
+/// The global is process-wide and the test binary is a single process, so
+/// without this the catalog a test publishes is still there for whichever test
+/// runs next — which makes a precedence assertion pass or fail on ordering alone.
+/// A test that depends on the global says so by calling this first, so "it
+/// resolved because the code is right" stays a thing a reader can check.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn reset_latest() {
+    if let Ok(mut slot) = LATEST.write() {
+        *slot = None;
+    }
+}
+
 /// The last successfully parsed catalog, when this process has fetched one.
 #[must_use]
 pub fn latest() -> Option<std::sync::Arc<Catalog>> {

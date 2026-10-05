@@ -20,6 +20,12 @@ default = []
 # <35 MB idle budget (docs/00), so it is off unless asked for.
 usearch = []
 
+# Exposes the process-global discovery hooks a dependent crate's tests need.
+# `#[cfg(test)]` would scope `reset_latest` to this crate's own test binary, and
+# the catalog it clears is read from `ar-server` — so a test there could not
+# isolate itself from a catalog an earlier test published.
+test-hooks = []
+
 [dependencies]
 ar-core = { workspace = true }
 # `rc` is compile-time only: it is what makes `Arc<str>` implement

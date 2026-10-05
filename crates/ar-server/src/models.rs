@@ -832,6 +832,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_discovered_window_still_reaches_a_routable_card() {
+        // Reads the process-wide discovery catalog, so it starts from empty: a
+        // catalog an earlier test published is still there, and the precedence
+        // this asserts must not depend on which test ran first.
+        ar_registry::discovery::reset_latest();
         // Gating the overlay must not gate its metadata: this is the property that
         // makes it worth fetching. A configured combo whose target resolves only
         // through models.dev (nvidia declares no ceiling in providerMeta.json)

@@ -55,6 +55,11 @@ async-stream = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }
 
 [dev-dependencies]
+# `test-hooks` exposes `discovery::reset_latest`, which the catalog tests here
+# need: the discovery catalog is process-global, so a test that reads it must be
+# able to clear it or its result depends on which test ran first. A dev-dependency
+# is the right place — the feature is on for test builds and off for `cargo build`.
+ar-registry = { path = "../ar-registry", features = ["test-hooks"] }
 axum = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
