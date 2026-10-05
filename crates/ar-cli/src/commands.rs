@@ -1518,6 +1518,7 @@ mod tests {
                 pool: vec![],
                 compression: None,
                 judge_model: None,
+                context_length: None,
             }],
             &registry().clone(),
         );

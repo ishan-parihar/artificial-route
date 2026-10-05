@@ -43,11 +43,61 @@ pub enum DiscoveryError {
     Decode(#[from] serde_json::Error),
 }
 
+/// One model as models.dev describes it.
+///
+/// The three figures kept are the ones a client cannot infer and cannot recover
+/// elsewhere: how large a prompt this model accepts, how much it can answer, and
+/// whether it accepts images. `cost` is deliberately absent — `ar-route` sorts
+/// unpriced last by design and prices come from `registry.json`, so a second
+/// price table here would be a second answer to the same question.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct DiscoveredModel {
+    /// Context window in tokens; `0` when the document names none.
+    #[serde(default)]
+    pub context_length: u32,
+    /// Largest completion this model will emit, in tokens; `0` when unstated.
+    #[serde(default)]
+    pub max_output_tokens: u32,
+    /// Whether the model accepts image input.
+    #[serde(default)]
+    pub input_image: bool,
+}
+
+impl DiscoveredModel {
+    /// Reads the figures out of one raw models.dev model object.
+    ///
+    /// Every field is optional upstream and absent keys must not fail the whole
+    /// catalog: models.dev omits `limit` for models that declare no ceiling, and
+    /// one such model must not cost the other three thousand their metadata. So
+    /// each figure falls back to `0`/`false` independently rather than failing.
+    fn from_raw(raw: &serde_json::Value) -> Self {
+        let limit = raw.get("limit");
+        Self {
+            context_length: limit
+                .and_then(|l| l.get("context"))
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .unwrap_or(0),
+            max_output_tokens: limit
+                .and_then(|l| l.get("output"))
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .unwrap_or(0),
+            input_image: raw
+                .get("modalities")
+                .and_then(|m| m.get("input"))
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|inputs| inputs.iter().any(|m| m.as_str() == Some("image"))),
+        }
+    }
+}
+
 /// One provider as models.dev describes it, reduced to what routing needs.
 ///
-/// Prices and capability flags are deliberately not carried: `ar-route` sorts
-/// unpriced last by design (README) and reads no capability field, so storing
-/// them here would be RAM spent on nothing.
+/// Prices are deliberately not carried: `ar-route` sorts unpriced last by design
+/// (README) and reads no capability flag, so storing them here would be RAM
+/// spent on nothing. Per-model metadata IS carried, because `/v1/models` is the
+/// only place a client learns how large a prompt a model accepts.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct Discovered {
     /// Upstream API root, when the provider published one.
@@ -56,9 +106,9 @@ pub struct Discovered {
     /// First documented environment variable holding the credential.
     #[serde(default)]
     pub env_hint: Option<String>,
-    /// Model ids this provider serves, in document order.
+    /// This provider's models and their declared metadata, in document order.
     #[serde(default)]
-    pub models: Vec<Strng>,
+    pub models: Vec<(Strng, DiscoveredModel)>,
 }
 
 /// The raw models.dev provider object. Three fields are read; the rest of the
@@ -80,7 +130,16 @@ impl From<RawProvider> for Discovered {
         Self {
             base_url: raw.api,
             env_hint: raw.env.and_then(|e| e.into_iter().next()),
-            models: raw.models.into_keys().map(Strng::from).collect(),
+            // The per-model bodies are already materialised as
+            // `serde_json::Value`; reading the three figures out of them here is
+            // what makes a 1M-context model advertise 1M instead of a guessed
+            // default. Reducing to `into_keys()` would discard exactly the data
+            // a client cannot recover anywhere else.
+            models: raw
+                .models
+                .into_iter()
+                .map(|(id, body)| (Strng::from(id.as_str()), DiscoveredModel::from_raw(&body)))
+                .collect(),
         }
     }
 }
@@ -216,12 +275,16 @@ impl LiveCatalog {
 mod tests {
     use super::*;
 
-    /// Two providers, three models between them.
+    /// Two providers, three models between them. The model bodies carry the
+    /// figures models.dev actually publishes, because the parse is required to
+    /// keep them rather than reduce each object to its key.
     const UPSTREAM: &str = r#"{
       "openai": {"api":"https://api.openai.com/v1","env":["OPENAI_API_KEY"],
-        "models":{"gpt-4o":{},"gpt-4o-mini":{}}},
+        "models":{
+          "gpt-4o":{"limit":{"context":128000,"output":16384},"modalities":{"input":["text","image"]}},
+          "gpt-4o-mini":{"limit":{"context":128000,"output":16384},"modalities":{"input":["text"]}}}},
       "anthropic": {"api":"https://api.anthropic.com/v1","env":["ANTHROPIC_API_KEY"],
-        "models":{"claude-sonnet-4":{}}}
+        "models":{"claude-sonnet-4":{"limit":{"context":200000,"output":64000},"modalities":{"input":["text","image"]}}}}
     }"#;
 
     #[test]
@@ -231,7 +294,11 @@ mod tests {
         assert_eq!(c.refresh(100, || Ok(UPSTREAM.to_owned())).unwrap(), 2);
         assert_eq!(c.providers(), 2);
         assert_eq!(
-            c.catalog()["openai"].models,
+            c.catalog()["openai"]
+                .models
+                .iter()
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>(),
             vec![Strng::from("gpt-4o"), Strng::from("gpt-4o-mini")],
             "BTreeMap keys come out sorted, so the model list is deterministic"
         );
@@ -279,5 +346,49 @@ mod tests {
             "and past the ttl it is served only as stale"
         );
         assert!(c.last_error().unwrap().contains("dns"));
+    }
+
+    #[test]
+    fn keeps_the_per_model_figures_the_document_published() {
+        // The bug this pins: the parse materialised every model body as a
+        // `serde_json::Value` and then reduced the map to its keys, so a 1M model
+        // and a 128K model were indistinguishable here — and `/v1/models`, whose
+        // only per-model input is this, reported one number for both.
+        let c = LiveCatalog::default();
+        c.refresh(100, || Ok(UPSTREAM.to_owned())).unwrap();
+
+        let models = &c.catalog()["openai"].models;
+        let gpt4o = models
+            .iter()
+            .find(|(id, _)| &**id == "gpt-4o")
+            .map(|(_, m)| m.clone())
+            .expect("gpt-4o is in the document");
+        assert_eq!(gpt4o.context_length, 128_000);
+        assert_eq!(gpt4o.max_output_tokens, 16_384);
+        assert!(gpt4o.input_image, "gpt-4o declares image input");
+
+        let mini = models
+            .iter()
+            .find(|(id, _)| &**id == "gpt-4o-mini")
+            .map(|(_, m)| m.clone())
+            .expect("gpt-4o-mini is in the document");
+        assert!(!mini.input_image, "gpt-4o-mini declares text only");
+
+        assert_eq!(c.catalog()["anthropic"].models[0].1.context_length, 200_000);
+    }
+
+    #[test]
+    fn a_model_without_declared_limits_reports_zero_rather_than_failing() {
+        // models.dev omits `limit` for a model that declares no ceiling. One
+        // such model must not cost the rest of the catalog its metadata, so the
+        // figure defaults independently rather than the parse erroring.
+        let body = r#"{"p":{"api":"https://x/v1","env":["K"],
+            "models":{"z-with":{},"a-limit":{"limit":{"context":64000}}}}}"#;
+        let cat = parse_catalog(body).unwrap();
+        let models = &cat["p"].models;
+        // Sorted, not document order: `a-limit` precedes `z-with`, which is what
+        // makes each row's own value the thing under test.
+        assert_eq!(models[0].1.context_length, 64_000);
+        assert_eq!(models[1].1, DiscoveredModel::default());
     }
 }

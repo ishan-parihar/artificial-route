@@ -38,23 +38,53 @@ pub struct ModelCard {
     /// — so a card missing this field does not degrade the listing, it deletes
     /// the model from it.
     ///
-    /// The value is the provider's declared ceiling from [`ar_registry::meta`],
-    /// which is the largest window any of its models offers. `openai` spans
-    /// 128K to 1M upstream, so this is an upper bound rather than a per-model
-    /// figure — the same caveat the registry already documents on the field.
+    /// Resolved by [`Self::new`] from the first source that names a figure, in
+    /// the order documented on that function. It is a per-model number wherever
+    /// one exists, not a provider-wide guess: reporting 128K for a 1M model
+    /// makes a client truncate a conversation it was entitled to keep.
     pub context_length: u32,
+    /// Largest completion the model will emit; `0` when nothing states it.
+    ///
+    /// Reported so a client can size its own answer budget. Omitted from the
+    /// JSON when `0`, because a zero maximum is a claim, and no model has one.
+    pub max_output_tokens: u32,
+    /// Whether the model accepts image input.
+    pub input_image: bool,
 }
 
 impl ModelCard {
     /// Builds a card from a provider-local model name.
     ///
-    /// The context window comes from the registry's per-provider ceiling, falling
-    /// back to [`Self::UNKNOWN_CONTEXT`] for a provider the catalog does not
-    /// describe. The fallback is deliberately small: a client that trusts an
-    /// inflated figure sizes a request the provider will reject, while one that
-    /// trusts a conservative figure only truncates its own context.
+    /// The context window is the first figure any source names, in this order:
+    ///
+    /// 1. the per-model figure models.dev published for it (see
+    ///    [`Self::with_discovered`]),
+    /// 2. the per-provider ceiling in [`ar_registry::meta`],
+    /// 3. [`Self::UNKNOWN_CONTEXT`], stated as a floor rather than a claim.
+    ///
+    /// The per-provider figure is the *largest* window any of a provider's
+    /// models offers — `openai` spans 128K to 1M — so using it per-model
+    /// over-reports the small ones by an order of magnitude, and a client sizing
+    /// a request off it gets refused. `registry.json` is not consulted: it
+    /// carries prices and model names, and no context figure for any model.
     #[must_use]
     pub fn new(provider: impl Into<String>, upstream_model: impl Into<String>) -> Self {
+        Self::with_discovered(provider, upstream_model, None)
+    }
+
+    /// Builds a card carrying the metadata models.dev published for this model.
+    ///
+    /// The discovery figure wins outright when it is present, because it is the
+    /// only source here that describes *this* model rather than a provider or a
+    /// family. A `0` in it means models.dev declared no ceiling, so it falls
+    /// through to the same lookups [`Self::new`] uses rather than reporting zero
+    /// — a client treats `0` as "no context" and refuses the model.
+    #[must_use]
+    pub fn with_discovered(
+        provider: impl Into<String>,
+        upstream_model: impl Into<String>,
+        discovered: Option<ar_registry::discovery::DiscoveredModel>,
+    ) -> Self {
         let provider = provider.into();
         let upstream_model = upstream_model.into();
         // OpenAI clients echo the id back verbatim, so the routable id has to
@@ -65,30 +95,36 @@ impl ModelCard {
         } else {
             format!("{provider}/{upstream_model}")
         };
-        let context_length =
-            ar_registry::meta::global()
-                .get(&provider)
-                .map_or(Self::UNKNOWN_CONTEXT, |m| {
-                    if m.context_length == 0 {
-                        Self::UNKNOWN_CONTEXT
-                    } else {
-                        m.context_length
-                    }
-                });
+        let known = discovered.filter(|d| d.context_length > 0);
+        let context_length = known.as_ref().map_or_else(
+            || {
+                ar_registry::meta::global()
+                    .get(&provider)
+                    .map(|m| m.context_length)
+                    .filter(|c| *c > 0)
+                    .unwrap_or(Self::UNKNOWN_CONTEXT)
+            },
+            |d| d.context_length,
+        );
+        let known = known.unwrap_or_default();
         Self {
             id,
             provider,
             upstream_model,
             context_length,
+            max_output_tokens: known.max_output_tokens,
+            input_image: known.input_image,
         }
     }
 
-    /// Reported window for a model the registry does not describe.
+    /// Reported window for a model no source describes.
     ///
     /// 128K is the smallest window that still holds a real agent prompt, and it
     /// is what an OpenAI-compatible provider is assumed to offer when it says
     /// nothing. Any value below this would make a client discard history it
     /// could have kept; any value above risks a request the upstream rejects.
+    /// It is a floor, not a claim: `providerMeta.json` documents the same
+    /// honesty rule for the field this one falls back from.
     pub const UNKNOWN_CONTEXT: u32 = 128_000;
 }
 
@@ -302,14 +338,21 @@ impl DiscoveredCatalog {
             .catalog()
             .into_iter()
             .flat_map(|(provider, entry)| {
-                entry
-                    .models
-                    .into_iter()
-                    .map(move |m| ModelCard::new((*provider).to_owned(), (*m).to_owned()))
+                entry.models.into_iter().map(move |(m, meta)| {
+                    ModelCard::with_discovered((*provider).to_owned(), (*m).to_owned(), Some(meta))
+                })
             });
+        // Configured cards come FIRST so a discovery card can never overwrite
+        // one: an operator who declared a model locally knows more about it than
+        // an upstream catalog does, and the discovered fallback exists to fill
+        // gaps, not to restate what is already declared. Chaining discovered
+        // first (as this did) let a discovery card win every id collision, which
+        // is the opposite of what the offline-first contract above promises.
         let mut seen = std::collections::HashSet::new();
-        discovered
-            .chain(self.configured.iter().cloned())
+        self.configured
+            .iter()
+            .cloned()
+            .chain(discovered)
             .filter(|c| seen.insert(c.id.clone()))
             .collect()
     }

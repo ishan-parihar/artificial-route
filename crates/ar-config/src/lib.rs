@@ -458,6 +458,23 @@ pub struct Combo {
     /// second dispatch on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judge_model: Option<String>,
+    /// The context window this combo advertises on `/v1/models`, in tokens.
+    ///
+    /// A combo id is not a provider id, so the registry cannot look one up, and
+    /// the reduced-over-targets answer (`min` of what each target's provider
+    /// declares) is frequently far below what the combo actually serves: a
+    /// priority chain naming six 1M targets and one 128K bench entry reduces to
+    /// 128K, because a request must fit whichever target is reached.
+    ///
+    /// That reduction is the safe default and stays in force when this is
+    /// absent. Naming the real window here is how an operator states the figure
+    /// their targets genuinely support, which is a fact about their deployment
+    /// that no table in this repository can know.
+    ///
+    /// `0` and absent mean the same thing — say nothing — because a zero window
+    /// is a claim no model makes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u32>,
 }
 
 impl<'de> Deserialize<'de> for Combo {
@@ -483,6 +500,8 @@ impl<'de> Deserialize<'de> for Combo {
             compression: Option<Compression>,
             #[serde(default)]
             judge_model: Option<String>,
+            #[serde(default)]
+            context_length: Option<u32>,
         }
 
         let wire = Wire::deserialize(d)?;
@@ -506,6 +525,7 @@ impl<'de> Deserialize<'de> for Combo {
             pool: wire.pool,
             compression: wire.compression,
             judge_model: wire.judge_model,
+            context_length: wire.context_length,
         })
     }
 }

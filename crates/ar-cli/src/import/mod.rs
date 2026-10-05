@@ -152,7 +152,7 @@ fn from_omniroute(body: &str) -> anyhow::Result<Vec<Row>> {
         .flat_map(|(id, d)| {
             let (provider, base_url, env) =
                 (id.to_string(), d.base_url.clone(), d.env_hint.clone());
-            d.models.into_iter().map(move |m| Row {
+            d.models.into_iter().map(move |(m, _meta)| Row {
                 alias: format!("{provider}/{m}"),
                 provider: provider.clone(),
                 model: m.to_string(),
@@ -273,6 +273,10 @@ fn assemble(rows: Vec<Row>) -> anyhow::Result<Imported> {
                 pool: Vec::new(),
                 compression: None,
                 judge_model: None,
+                // A LiteLLM export declares no per-combo window, so none is
+                // invented: the reduction over this combo's targets resolves one
+                // at serve time.
+                context_length: None,
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;

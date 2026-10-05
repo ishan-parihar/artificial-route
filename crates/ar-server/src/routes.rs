@@ -2556,16 +2556,24 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
 /// would delete the model from every `/v1/models`-driven picker rather than
 /// merely under-report it.
 fn card_json(c: &crate::models::ModelCard) -> serde_json::Value {
-    serde_json::json!({
+    // A zero output ceiling is an absent figure, not a claim: no model emits
+    // nothing. Serialised only when known, so a client reading the field can
+    // trust that a number there is a real one.
+    let mut card = serde_json::json!({
         "id": c.id,
         "object": "model",
         "created": ar_registry::BUILT_AT,
         "owned_by": c.provider,
         "context_length": c.context_length,
+        "input_image": c.input_image,
         "permission": Vec::<String>::new(),
         "root": c.id,
         "ar_upstream_model": c.upstream_model,
-    })
+    });
+    if c.max_output_tokens > 0 {
+        card["max_output_tokens"] = serde_json::json!(c.max_output_tokens);
+    }
+    card
 }
 
 /// Reads the catalog, counting a revalidation when this read triggered one.
@@ -3205,6 +3213,65 @@ mod tests {
         assert_eq!(card.context_length, ModelCard::UNKNOWN_CONTEXT);
         let got = card_json(&card);
         assert_eq!(got["context_length"], ModelCard::UNKNOWN_CONTEXT);
+    }
+
+    #[test]
+    fn a_discovered_figure_wins_over_the_provider_ceiling() {
+        // The 128K complaint, pinned at its source. `openai`'s provider ceiling
+        // is 1.05M, which is the *largest* window any of its models offers, so a
+        // per-model card built from it over-reports every smaller model. The
+        // figure models.dev published for this one model is the answer.
+        let discovered = ar_registry::discovery::DiscoveredModel {
+            context_length: 128_000,
+            max_output_tokens: 16_384,
+            input_image: true,
+        };
+        let card = ModelCard::with_discovered("openai", "gpt-4o", Some(discovered));
+        assert_eq!(
+            card.context_length, 128_000,
+            "not the 1.05M provider ceiling"
+        );
+        assert_eq!(card.max_output_tokens, 16_384);
+        assert!(card.input_image);
+    }
+
+    #[test]
+    fn a_discovered_zero_falls_through_rather_than_reporting_zero() {
+        // models.dev omits `limit` for a model declaring no ceiling. Reporting
+        // that 0 verbatim reads as "no context" and makes a client drop the
+        // model — the same failure as omitting the field, so it must fall
+        // through to the same lookups the non-discovered path uses.
+        let card = ModelCard::with_discovered(
+            "openai",
+            "gpt-4o",
+            Some(ar_registry::discovery::DiscoveredModel::default()),
+        );
+        assert!(card.context_length > 0, "a client would refuse a 0 window");
+    }
+
+    #[test]
+    fn a_discovered_output_ceiling_reaches_the_wire() {
+        // A card that knows how much a model can answer should say so; the field
+        // is omitted rather than zeroed when nothing declares it, because a zero
+        // maximum is a claim and no model has one.
+        let with_out = ModelCard::with_discovered(
+            "p",
+            "m",
+            Some(ar_registry::discovery::DiscoveredModel {
+                context_length: 1000,
+                max_output_tokens: 999,
+                input_image: false,
+            }),
+        );
+        assert_eq!(card_json(&with_out)["max_output_tokens"], 999);
+        assert_eq!(card_json(&with_out)["input_image"], false);
+
+        let bare = ModelCard::new("no-such-provider", "m");
+        let got = card_json(&bare);
+        assert!(
+            got.get("max_output_tokens").is_none(),
+            "an unknown ceiling must be omitted, not reported as 0: {got}"
+        );
     }
 
     #[test]

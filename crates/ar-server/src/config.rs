@@ -311,9 +311,28 @@ pub struct RouteCombo {
     /// single answer through a judge is a degradation, not fusion. Naming a
     /// judge turns on the synthesis half (`fusion.ts::handleFusionChat`).
     pub judge_model: Option<String>,
+    /// The window this combo advertises, when the config named one.
+    ///
+    /// `None` leaves the reduction over this combo's own targets in charge — see
+    /// [`RouteCombo::context_length`] for why that is the default and what it
+    /// costs.
+    pub context_length: Option<u32>,
 }
 
 impl RouteCombo {
+    /// The window to advertise for this combo: the declared figure when the
+    /// config named one, else the smallest window among its targets' providers.
+    ///
+    /// The reduction is a bound, not a measurement: a request the combo accepts
+    /// must fit whichever target is reached, so the smallest is what holds. It
+    /// also under-reports a priority chain whose slowest target is a rare bench
+    /// entry — which is why an operator can name the real figure instead, and
+    /// why this never guesses upward on its own.
+    #[must_use]
+    pub fn context_length(&self) -> Option<u32> {
+        self.context_length.filter(|w| *w > 0)
+    }
+
     /// Builds a combo from ordered targets. `Strategy::Priority` order is the
     /// declaration order, which is why the vector is the order.
     #[must_use]
@@ -325,7 +344,18 @@ impl RouteCombo {
             pool: Vec::new(),
             compression: None,
             judge_model: None,
+            context_length: None,
         }
+    }
+
+    /// Sets the window `/v1/models` advertises for this combo.
+    ///
+    /// Takes a count rather than a `Duration`-shaped type because it is a token
+    /// budget, and a caller that has one should not have to convert.
+    #[must_use]
+    pub fn with_context_length(mut self, tokens: u32) -> Self {
+        self.context_length = Some(tokens);
+        self
     }
 
     /// Sets the bench that feeds failover after `targets` is exhausted.
@@ -666,6 +696,11 @@ impl ServerConfig {
                 targets,
             )
             .with_pool(pool);
+            // Carried verbatim: an operator naming the window their combo serves
+            // is stating a fact about their own targets that no table here can
+            // derive, and it is the only way a combo advertises above the
+            // smallest window its chain happens to touch.
+            route.context_length = combo.context_length;
             if let Some(compression) = combo.compression {
                 route.compression = Some(compression.step());
             }
@@ -815,6 +850,16 @@ impl ServerConfig {
     /// passes back as `model`. A bare `provider/model` id would not route: with a
     /// combo table present, the router resolves `model` against combo ids and
     /// 400s anything else.
+    ///
+    /// A combo's window is reduced over the models it can actually serve — the
+    /// smallest of them — unless the combo declares its own. It is not looked up
+    /// as if the combo id were a provider: `providerMeta.json` is keyed by
+    /// provider, so a combo id misses every lookup and falls to the unknown-model
+    /// floor, which is how a 1M stack came to advertise 128K. `min` is the
+    /// honest default reduction: a request this combo accepts must fit *every*
+    /// target it might reach, and the smallest is what bounds it. A declared
+    /// `context_length:` overrides it, because the reduced figure is a bound over
+    /// providers rather than a measurement of the models.
     #[must_use]
     pub fn model_cards(&self) -> Vec<ModelCard> {
         if self.combos.is_empty() {
@@ -827,8 +872,38 @@ impl ServerConfig {
         }
         self.combos
             .iter()
-            .map(|c| ModelCard::new(&c.id, &c.id))
+            .map(|c| {
+                let mut card = ModelCard::new(&c.id, &c.id);
+                card.context_length = c
+                    .context_length()
+                    .or_else(|| self.combo_context(c))
+                    .unwrap_or(card.context_length);
+                card
+            })
             .collect()
+    }
+
+    /// The window that bounds every request this combo can serve.
+    ///
+    /// `None` when no target names a window, so the caller keeps whatever the
+    /// card already resolved rather than replacing a known figure with a guess.
+    /// The pool counts: a pool entry can serve the request on failover, so a
+    /// target larger than the bench does not make the combo larger.
+    fn combo_context(&self, combo: &RouteCombo) -> Option<u32> {
+        combo
+            .targets
+            .iter()
+            .chain(combo.pool.iter())
+            .filter_map(|t| {
+                // A target naming one model of a provider gets that provider's
+                // ceiling; there is no per-model figure outside discovery. A
+                // target with no `/` is a bare provider and still resolves on
+                // the provider half.
+                let provider = t.provider.as_ref();
+                let meta = ar_registry::meta::global().get(provider)?;
+                (meta.context_length > 0).then_some(meta.context_length)
+            })
+            .min()
     }
 
     /// Whether any provider chain is configured at all.
@@ -1566,6 +1641,73 @@ combos:
     fn derives_model_cards() {
         let cards = flat().model_cards();
         assert_eq!(cards[0].id, "openai/gpt-4o-mini");
+    }
+
+    #[test]
+    fn a_combo_advertises_the_smallest_window_it_can_be_dispatched_to() {
+        // A combo id is not a provider id, so the registry cannot resolve one
+        // and every combo used to fall to the unknown-model floor. This is the
+        // reduction that replaced that: any request the combo accepts must fit
+        // whichever target it reaches, so the smallest bounds it.
+        let cfg = parse(
+            "keys:\n  cline: k\n  nlpcloud: k\nproviders:\n  - id: cline\n    key: cline\n  - id: nlpcloud\n    key: nlpcloud\ncombos:\n  - id: stack\n    strategy: priority\n    targets: [cline/big, nlpcloud/small]\n",
+        )
+        .expect("config parses");
+        let cards = ServerConfig::from_ar_config(&cfg, None, None, false, None)
+            .expect("combos build")
+            .model_cards();
+        let stack = cards.iter().find(|c| c.id == "stack").expect("combo card");
+        assert_eq!(
+            stack.context_length,
+            ar_registry::meta::global()
+                .get("nlpcloud")
+                .expect("provider b is in the registry")
+                .context_length,
+            "the reduction takes the minimum over the combo's targets"
+        );
+        assert_ne!(
+            stack.context_length,
+            crate::models::ModelCard::UNKNOWN_CONTEXT,
+            "a combo whose targets declare windows must not read as unknown"
+        );
+    }
+
+    #[test]
+    fn a_declared_combo_window_overrides_the_reduction() {
+        // The reduction is a bound over providers, not a measurement of the
+        // models: a priority chain naming six 1M targets and one 128K bench entry
+        // reduces to 128K. Naming the real figure is how the operator states it.
+        let cfg = parse(
+            "keys:\n  cline: k\n  nlpcloud: k\nproviders:\n  - id: cline\n    key: cline\n  - id: nlpcloud\n    key: nlpcloud\ncombos:\n  - id: stack\n    strategy: priority\n    targets: [cline/big, nlpcloud/small]\n    context_length: 1000000\n",
+        )
+        .expect("config parses");
+        let stack = ServerConfig::from_ar_config(&cfg, None, None, false, None)
+            .expect("combos build")
+            .model_cards()
+            .into_iter()
+            .find(|c| c.id == "stack")
+            .expect("combo card");
+        assert_eq!(stack.context_length, 1_000_000);
+    }
+
+    #[test]
+    fn a_combo_with_no_decidable_target_keeps_whatever_the_card_resolved() {
+        // No target names a window, so the reduction yields nothing and the card
+        // keeps its own answer rather than being overwritten with a guess.
+        let cfg = parse(
+            "keys:\n  adapta-web: k\nproviders:\n  - id: adapta-web\n    key: adapta-web\ncombos:\n  - id: stack\n    strategy: priority\n    targets: [adapta-web/m]\n",
+        )
+        .expect("config parses");
+        let stack = ServerConfig::from_ar_config(&cfg, None, None, false, None)
+            .expect("combos build")
+            .model_cards()
+            .into_iter()
+            .find(|c| c.id == "stack")
+            .expect("combo card");
+        assert_eq!(
+            stack.context_length,
+            crate::models::ModelCard::UNKNOWN_CONTEXT
+        );
     }
 
     #[test]

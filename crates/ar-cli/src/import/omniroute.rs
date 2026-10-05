@@ -1662,6 +1662,10 @@ fn combos(defs: &BTreeMap<Strng, ProviderDef>) -> Vec<Combo> {
                 pool: Vec::new(),
                 compression: None,
                 judge_model: None,
+                // This importer folds a provider catalog rather than reading a
+                // combo file, so it has no per-combo window to carry — the
+                // reduction over the single target resolves one at serve time.
+                context_length: None,
             });
         }
     }
