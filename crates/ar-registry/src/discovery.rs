@@ -147,6 +147,49 @@ impl From<RawProvider> for Discovered {
 /// A provider map keyed by provider id, sorted for deterministic output.
 pub type Catalog = BTreeMap<Strng, Discovered>;
 
+/// The most recent successfully parsed catalog, process-wide.
+///
+/// A combo's context window is reduced over its targets inside `ar-server`, which
+/// is built before any `LiveCatalog` exists and holds no handle to one. This is
+/// the seam that lets the reduction consult the overlay anyway: a window published
+/// for one fetch is a fact about the provider that does not go stale with the next
+/// request, so every later reader sees it without re-fetching.
+///
+/// A `RwLock` over an `Arc` rather than a `OnceLock` because a refresh replaces
+/// the catalog and a `OnceLock` cannot: only the first fetch would ever be seen,
+/// so a stale first answer would outlive every correct one.
+static LATEST: std::sync::RwLock<Option<std::sync::Arc<Catalog>>> = std::sync::RwLock::new(None);
+
+/// Publishes a freshly parsed catalog for [`latest`].
+pub(crate) fn publish(catalog: std::sync::Arc<Catalog>) {
+    if let Ok(mut slot) = LATEST.write() {
+        *slot = Some(catalog);
+    }
+}
+
+/// The last successfully parsed catalog, when this process has fetched one.
+#[must_use]
+pub fn latest() -> Option<std::sync::Arc<Catalog>> {
+    LATEST.read().ok().and_then(|slot| slot.clone())
+}
+
+/// One model window as models.dev published it, for a `provider` and `model`.
+///
+/// `model` may be spelled bare (`glm-5.3`) or already qualified
+/// (`nvidia/z-ai/glm-5.3`), because a config target and a catalog id spell the
+/// same model differently and the caller should not have to know which it holds.
+/// `None` when this fetch declared no window, so the caller can fall through to
+/// the next source rather than report zero.
+#[must_use]
+pub fn published_window(view: &Catalog, provider: &str, model: &str) -> Option<u32> {
+    let entry = view.get(provider)?;
+    let (_, meta) = entry
+        .models
+        .iter()
+        .find(|(id, _)| &**id == model || model.ends_with(&format!("/{id}")))?;
+    (meta.context_length > 0).then_some(meta.context_length)
+}
+
 /// Parses a models.dev `api.json` document into a [`Catalog`].
 pub fn parse_catalog(body: &str) -> Result<Catalog, DiscoveryError> {
     let raw: BTreeMap<String, RawProvider> = serde_json::from_str(body)?;
@@ -170,7 +213,10 @@ pub struct LiveCatalog {
 
 #[derive(Debug, Default)]
 struct Snapshot {
-    catalog: Catalog,
+    /// Shared so a reader can keep a snapshot past the lock guard that vouched
+    /// for it: `install` replaces this whole value, so a borrowed reference would
+    /// dangle the moment a refresh lands on another task.
+    catalog: std::sync::Arc<Catalog>,
     body: Option<String>,
     fetched_at: Option<u64>,
     last_error: Option<String>,
@@ -180,7 +226,7 @@ struct Snapshot {
 impl LiveCatalog {
     /// The catalog as of the last successful refresh, fresh or stale.
     pub fn catalog(&self) -> Catalog {
-        self.lock().catalog.clone()
+        self.lock().catalog.as_ref().clone()
     }
 
     /// Number of providers currently held.
@@ -196,6 +242,23 @@ impl LiveCatalog {
     /// The upstream body behind the current catalog.
     pub fn body(&self) -> Option<String> {
         self.lock().body.clone()
+    }
+
+    /// The parsed catalog, as a shareable snapshot.
+    ///
+    /// Cloned out rather than borrowed: `install` replaces the whole value under
+    /// the write lock, so handing a caller a reference would outlive the guard
+    /// that vouches for it. An `Arc` snapshot is the one shape that is safe to
+    /// keep — and cheap, because the catalog is replaced wholesale rather than
+    /// edited in place.
+    #[must_use]
+    pub fn catalog_snapshot(&self) -> Option<std::sync::Arc<Catalog>> {
+        // `None` means "never fetched", which is what an empty default `Arc` is
+        // for. A fetch that returned no providers is a real answer, not an absent
+        // one, and collapsing the two would make an empty upstream look like an
+        // unwarmed proxy.
+        let guard = self.lock();
+        (!guard.catalog.is_empty()).then(|| std::sync::Arc::clone(&guard.catalog))
     }
 
     /// Whether the cache holds nothing, or holds something older than `ttl_secs`.
@@ -248,6 +311,8 @@ impl LiveCatalog {
         match fetched.and_then(|body| parse_catalog(&body).map(|catalog| (catalog, body))) {
             Ok((catalog, body)) => {
                 let providers = catalog.len();
+                let catalog = std::sync::Arc::new(catalog);
+                publish(std::sync::Arc::clone(&catalog));
                 snap.catalog = catalog;
                 snap.body = Some(body);
                 snap.fetched_at = Some(now);

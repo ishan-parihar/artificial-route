@@ -332,7 +332,22 @@ impl Components {
             });
         let auth_mode = self.config.auth_mode;
         let config = Arc::new(self.config);
-        let mut cards = config.model_cards();
+        // A combo's window is reduced over its targets, which means it can only
+        // reduce what a lookup can resolve — and `providerMeta.json` has no
+        // ceiling for `nvidia` or `kilocode`, the two providers both stacks route
+        // through. The models.dev overlay knows those windows per model, so the
+        // reduction reads it as a fallback here, where the overlay exists, rather
+        // than leaving 811 combos to report the unknown-model floor.
+        //
+        // The closure reads `discovery::latest()` per call rather than a snapshot
+        // taken here, because this runs before the refresh loop's first fetch: a
+        // closure bound to a snapshot would freeze every combo at the boot-time
+        // figures and keep it there for the life of the process.
+        let discovered_window = |provider: &str, model: &str| -> Option<u32> {
+            let view = ar_registry::discovery::latest()?;
+            ar_registry::discovery::published_window(&view, provider, model)
+        };
+        let mut cards = config.model_cards_with(Some(&discovered_window));
         cards.extend(self.extra_models);
         let mut discovery = None;
         // The discovery overlay, when armed, unions the models.dev catalog *over*
@@ -341,7 +356,19 @@ impl Components {
         // static one because the cache owns an `Arc` rather than borrowing — the
         // lifetime that used to force a `Box::leak` here is gone.
         let catalog: Arc<dyn ModelCatalog> = if config.model_discovery {
-            let discovered = Arc::new(DiscoveredCatalog::new(cards));
+            // The configured cards are re-derived on every read, so a combo's
+            // window improves as soon as discovery publishes the figures behind
+            // it rather than being frozen at whatever was known at boot.
+            let builder = {
+                let config = Arc::clone(&config);
+                Box::new(move || config.model_cards_with(Some(&discovered_window)))
+                    as Box<dyn Fn() -> Vec<crate::models::ModelCard> + Send + Sync>
+            };
+            let discovered = Arc::new(DiscoveredCatalog::with_builder(
+                builder,
+                crate::models::DISCOVERY_TTL,
+                crate::models::DISCOVERY_WAIT_SECS,
+            ));
             discovery = Some(discovered.clone());
             discovered
         } else {

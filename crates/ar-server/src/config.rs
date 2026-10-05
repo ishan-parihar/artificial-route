@@ -373,6 +373,14 @@ impl RouteCombo {
     }
 }
 
+/// Looks up the window models.dev published for one `provider`/`model`.
+///
+/// A callback rather than the catalog itself so the combo reduction does not
+/// depend on `ar-registry`'s cache type, and `None` carries the whole point: a
+/// source that knows nothing leaves the next rung to answer, and never supplies a
+/// zero the reduction would treat as a figure.
+pub type ModelWindow = dyn Fn(&str, &str) -> Option<u32>;
+
 /// Resolved server configuration: the combo table plus the flat provider table
 /// the executor dispatches against.
 ///
@@ -855,13 +863,24 @@ impl ServerConfig {
     /// smallest of them — unless the combo declares its own. It is not looked up
     /// as if the combo id were a provider: `providerMeta.json` is keyed by
     /// provider, so a combo id misses every lookup and falls to the unknown-model
-    /// floor, which is how a 1M stack came to advertise 128K. `min` is the
-    /// honest default reduction: a request this combo accepts must fit *every*
-    /// target it might reach, and the smallest is what bounds it. A declared
-    /// `context_length:` overrides it, because the reduced figure is a bound over
-    /// providers rather than a measurement of the models.
+    /// floor, which is how a 1M stack came to advertise 128K.
+    ///
+    /// A declared `context_length:` overrides the reduction, because the reduced
+    /// figure is a bound over providers rather than a measurement of the models.
     #[must_use]
     pub fn model_cards(&self) -> Vec<ModelCard> {
+        self.model_cards_with(None)
+    }
+
+    /// [`Self::model_cards`], with per-model windows from a discovered catalog.
+    ///
+    /// `discovered` maps `provider/model` to the window models.dev published for
+    /// it. It is a fallback for the reduction, never an override: `providerMeta.json`
+    /// is the operator-curated table and leads, while discovery fills the gaps —
+    /// which is how a combo targeting `nvidia` (absent from `providerMeta.json`)
+    /// resolves at all.
+    #[must_use]
+    pub fn model_cards_with(&self, discovered: Option<&ModelWindow>) -> Vec<ModelCard> {
         if self.combos.is_empty() {
             return self
                 .providers
@@ -876,7 +895,7 @@ impl ServerConfig {
                 let mut card = ModelCard::new(&c.id, &c.id);
                 card.context_length = c
                     .context_length()
-                    .or_else(|| self.combo_context(c))
+                    .or_else(|| self.combo_context(c, discovered))
                     .unwrap_or(card.context_length);
                 card
             })
@@ -897,7 +916,11 @@ impl ServerConfig {
     ///
     /// The pool counts: a pool entry serves the request on failover, so a target
     /// larger than the bench does not raise what the combo can accept.
-    fn combo_context(&self, combo: &RouteCombo) -> Option<u32> {
+    ///
+    /// `discovered` supplies a per-model window when `providerMeta.json` has no
+    /// ceiling for the target's provider, which is the case for `nvidia` and
+    /// `kilocode` — the two providers both stacks actually route through.
+    fn combo_context(&self, combo: &RouteCombo, discovered: Option<&ModelWindow>) -> Option<u32> {
         let mut bound: Option<u32> = None;
         for t in combo.targets.iter().chain(combo.pool.iter()) {
             if !self.dispatchable(t) {
@@ -905,11 +928,13 @@ impl ServerConfig {
                 // nothing. Counting it would let a typo shrink every figure.
                 continue;
             }
-            let meta = ar_registry::meta::global().get(t.provider.as_ref())?;
-            if meta.context_length == 0 {
-                return None;
-            }
-            bound = Some(bound.map_or(meta.context_length, |b: u32| b.min(meta.context_length)));
+            let declared = ar_registry::meta::global()
+                .get(t.provider.as_ref())
+                .filter(|m| m.context_length > 0)
+                .map(|m| m.context_length)
+                .or_else(|| discovered.and_then(|f| f(t.provider.as_ref(), &t.model)));
+            let window = declared?;
+            bound = Some(bound.map_or(window, |b: u32| b.min(window)));
         }
         bound
     }
@@ -1744,6 +1769,65 @@ combos:
             stack.context_length,
             crate::models::ModelCard::UNKNOWN_CONTEXT,
             "a partial reduction must not be reported as a bound"
+        );
+    }
+
+    #[test]
+    fn a_discovered_window_resolves_a_provider_the_registry_omits() {
+        // The gap this closes, measured on the live config: `providerMeta.json`
+        // declares no ceiling for `nvidia` or `kilocode` — the two providers both
+        // stacks route through — so 811 combos serving larger models derived
+        // nothing and advertised the floor. The models.dev overlay publishes a
+        // per-model window for them, and that is the fallback the reduction reads
+        // when the curated table is silent.
+        let body = r#"{"nvidia":{"api":"https://integrate.api.nvidia.com/v1",
+            "models":{"z-ai/glm-5.3":{"limit":{"context":1048576}}}}}"#;
+        let view = std::sync::Arc::new(
+            ar_registry::discovery::parse_catalog(body).expect("catalog parses"),
+        );
+        let cfg = parse(
+            "keys:\n  nvidia: k\nproviders:\n  - id: nvidia\n    key: nvidia\ncombos:\n  - id: stack\n    strategy: priority\n    targets: [nvidia/z-ai/glm-5.3]\n",
+        )
+        .expect("config parses");
+        let server =
+            ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
+        let lookup = move |provider: &str, model: &str| {
+            ar_registry::discovery::published_window(&view, provider, model)
+        };
+        let stack = server
+            .model_cards_with(Some(&lookup))
+            .into_iter()
+            .find(|c| c.id == "stack")
+            .expect("combo card");
+        assert_eq!(
+            stack.context_length, 1_048_576,
+            "a provider absent from providerMeta.json must still resolve"
+        );
+        // Without the fallback the same combo reads the floor, which is the
+        // whole of the bug this closes.
+        assert_ne!(
+            stack.context_length,
+            crate::models::ModelCard::UNKNOWN_CONTEXT
+        );
+    }
+
+    #[test]
+    fn a_combo_keeps_the_floor_when_neither_source_resolves() {
+        // Both sources silent is a real answer and must not be papered over with a
+        // partial figure: the reduction stays all-or-nothing.
+        let cfg = parse(
+            "keys:\n  adapta-web: k\nproviders:\n  - id: adapta-web\n    key: adapta-web\ncombos:\n  - id: stack\n    strategy: priority\n    targets: [adapta-web/m]\n",
+        )
+        .expect("config parses");
+        let stack = ServerConfig::from_ar_config(&cfg, None, None, false, None)
+            .expect("combos build")
+            .model_cards_with(Some(&(|_: &str, _: &str| None)))
+            .into_iter()
+            .find(|c| c.id == "stack")
+            .expect("combo card");
+        assert_eq!(
+            stack.context_length,
+            crate::models::ModelCard::UNKNOWN_CONTEXT
         );
     }
 

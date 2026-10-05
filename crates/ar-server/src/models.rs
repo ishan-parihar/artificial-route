@@ -197,7 +197,15 @@ pub struct DiscoveredCatalog {
     inner: LiveCatalog,
     /// Cards the config declares. Merged in after the discovered set so a
     /// discovered model never shadows an operator's own.
-    configured: Vec<ModelCard>,
+    ///
+    /// Held as a closure rather than a fixed list because a card's context
+    /// window is derived from what the *catalog knows*, and the catalog learns
+    /// something on its first refresh — long after the server builds this. A
+    /// fixed list froze every combo at the figures available at boot, so the 811
+    /// combos resolving through `nvidia` (absent from `providerMeta.json`) kept
+    /// the unknown-model floor for the life of the process even after discovery
+    /// had published the real windows.
+    configured: Box<dyn Fn() -> Vec<ModelCard> + Send + Sync>,
     ttl: Duration,
     /// Upper bound on one upstream fetch, in seconds.
     ///
@@ -225,7 +233,7 @@ impl std::fmt::Debug for DiscoveredCatalog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DiscoveredCatalog")
             .field("providers", &self.inner.providers())
-            .field("configured", &self.configured.len())
+            .field("configured", &(self.configured)().len())
             .field("ttl", &self.ttl)
             .field("wait_secs", &self.wait_secs)
             .finish_non_exhaustive()
@@ -236,7 +244,42 @@ impl DiscoveredCatalog {
     /// Builds a catalog that discovers from models.dev over `configured` cards.
     #[must_use]
     pub fn new(configured: Vec<ModelCard>) -> Self {
-        Self::with_bounds(configured, DISCOVERY_TTL, DISCOVERY_WAIT_SECS)
+        Self::with_builder(
+            Box::new(move || configured.clone()),
+            DISCOVERY_TTL,
+            DISCOVERY_WAIT_SECS,
+        )
+    }
+
+    /// Builds a catalog whose configured cards are derived on every read.
+    ///
+    /// The seam that lets a combo's window improve once discovery has published
+    /// the per-model figures, without rebuilding the server: the closure reads
+    /// whatever the catalog currently knows.
+    #[must_use]
+    pub fn with_builder(
+        configured: Box<dyn Fn() -> Vec<ModelCard> + Send + Sync>,
+        ttl: Duration,
+        wait_secs: u64,
+    ) -> Self {
+        // Built exactly as `with_bounds` builds it. Omitting it looks harmless —
+        // `client: None` compiles — and then every refresh fails with
+        // "discovery client unavailable", so the catalog is permanently empty and
+        // the configured cards keep whatever figures were known at boot. A
+        // builder that cannot fetch is a builder that silently serves stale
+        // metadata for the life of the process.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(wait_secs))
+            .user_agent(concat!("artificial-route/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .ok();
+        Self {
+            inner: LiveCatalog::default(),
+            configured,
+            ttl,
+            wait_secs,
+            client,
+        }
     }
 
     /// Replaces both bounds, for tests and for a config that wants its own.
@@ -244,7 +287,7 @@ impl DiscoveredCatalog {
     pub fn with_bounds(configured: Vec<ModelCard>, ttl: Duration, wait_secs: u64) -> Self {
         Self {
             inner: LiveCatalog::default(),
-            configured,
+            configured: Box::new(move || configured.clone()),
             ttl,
             wait_secs,
             // A client that cannot be built is the same unreachable-upstream
@@ -349,9 +392,8 @@ impl DiscoveredCatalog {
         // first (as this did) let a discovery card win every id collision, which
         // is the opposite of what the offline-first contract above promises.
         let mut seen = std::collections::HashSet::new();
-        self.configured
-            .iter()
-            .cloned()
+        (self.configured)()
+            .into_iter()
             .chain(discovered)
             .filter(|c| seen.insert(c.id.clone()))
             .collect()
