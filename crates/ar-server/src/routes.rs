@@ -263,6 +263,22 @@ const RESPONSES_IN_PROGRESS: &str = concat!(
     "\"output\":[],\"error\":null,\"background\":false}}\n\n"
 );
 
+/// The OpenAI chat keepalive: a real, inert `chat.completion.chunk`.
+///
+/// Recorded from the reference gateway's heartbeat, which picks its frame per
+/// client format and answers `openai` with this chunk shape
+/// (`open-sse/utils/sseHeartbeat.ts:62-70`,
+/// `open-sse/utils/earlyStreamKeepalive.ts:44`).
+///
+/// The empty `delta` is what keeps it inert: it contributes no `content` and no
+/// `role`, so a client that concatenates deltas appends nothing, and
+/// `finish_reason: null` means it is never mistaken for a terminated stream.
+const OPENAI_KEEPALIVE: &str = concat!(
+    "data: {\"id\":\"chatcmpl-keepalive\",\"object\":\"chat.completion.chunk\",",
+    "\"created\":0,\"model\":\"keepalive\",",
+    "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":null}]}\n\n"
+);
+
 /// The inbound wire dialect, which decides the keepalive frame and the
 /// `Accept`-forces-stream rule.
 ///
@@ -311,16 +327,23 @@ impl Dialect {
     /// its clients already parse
     /// (`open-sse/translator/response/openai-responses.ts:272-285`).
     ///
-    /// Only the OpenAI chat arm is a comment. Its stream has no event names at
-    /// all, and a line-based parser can drop an unrecognised `event:` line and
-    /// desync on the `data:` line after it — which loses the error the client
-    /// needed to see. A comment is skipped by every SSE parser by definition, so
-    /// it costs nothing and cannot desync anything.
+    /// The OpenAI chat arm is a real chunk, not a comment. A comment is skipped
+    /// by every SSE parser by definition, so it survives desync — but a client
+    /// that resets a first-token watchdog on *decoded frames* never sees it, and
+    /// the slow-first-token abort it was meant to prevent still happens. This is
+    /// the arm every OpenAI-compatible client (opencode, omO, oh-my-pi) lands on,
+    /// and the reference gateway ships precisely this shape for it
+    /// (`open-sse/utils/earlyStreamKeepalive.ts:62-70`), so matching it is what
+    /// makes a stream ar holds open look alive to them.
+    ///
+    /// `delta: {}` is what makes the frame inert: an empty delta has no `content`
+    /// and no `role`, so it cannot be concatenated into an answer, and
+    /// `finish_reason: null` keeps it from being read as the end of the stream.
     fn keepalive(self) -> Option<&'static str> {
         match self {
             Self::Anthropic => Some("event: ping\ndata: {\"type\":\"ping\"}\n\n"),
             Self::Responses => Some(RESPONSES_IN_PROGRESS),
-            Self::OpenAi => Some(": keepalive\n\n"),
+            Self::OpenAi => Some(OPENAI_KEEPALIVE),
             Self::Ollama => None,
         }
     }
@@ -3504,13 +3527,32 @@ mod tests {
     }
 
     #[test]
-    fn the_openai_keepalive_is_a_comment() {
-        // Every SSE parser skips a comment by definition, so this is the one frame
-        // shape that is safe for a client with no event names.
+    fn the_openai_keepalive_is_an_inert_chunk() {
+        // A comment is invisible to a client that resets its first-token
+        // watchdog on decoded frames, which is every OpenAI-compatible client
+        // ar is the front door for. So the frame is a real chunk — but one that
+        // cannot be mistaken for answer text.
         let frame = Dialect::OpenAi.keepalive().expect("openai has a keepalive");
         assert!(
-            frame.starts_with(':'),
-            "an OpenAI keepalive must be a comment: {frame}"
+            frame.starts_with("data: "),
+            "an OpenAI keepalive must be a decodable frame: {frame}"
+        );
+        let payload = frame
+            .trim_start_matches("data: ")
+            .trim_end()
+            .trim_end_matches('\n');
+        let chunk: serde_json::Value = serde_json::from_str(payload)
+            .unwrap_or_else(|e| panic!("keepalive is not a decodable chunk: {e}"));
+        assert_eq!(chunk["object"], "chat.completion.chunk");
+        let choice = &chunk["choices"][0];
+        assert_eq!(
+            choice["delta"],
+            serde_json::json!({}),
+            "a keepalive that carries a delta would be concatenated into the answer"
+        );
+        assert!(
+            choice["finish_reason"].is_null(),
+            "a non-null finish_reason reads as a terminated stream: {frame}"
         );
     }
 
@@ -4387,6 +4429,26 @@ mod tests {
             })
             .collect()
             .await
+    }
+
+    #[tokio::test]
+    async fn an_idle_openai_stream_emits_a_decodable_keepalive() {
+        // The hang this guards: a client that resets its first-token watchdog on
+        // decoded frames gets nothing at all from a comment, so a long thinking
+        // phase looks like a dead socket. OpenAI is the arm that every
+        // OpenAI-compatible client lands on, and it had no idle test at all.
+        let frames = idle_frames(Keepalive::new(Dialect::OpenAi, Duration::from_millis(20))).await;
+        assert_eq!(
+            frames.len(),
+            2,
+            "an idle stream was not kept alive: {frames:?}"
+        );
+        for frame in &frames {
+            assert!(
+                frame.starts_with("data: "),
+                "an idle OpenAI stream needs a decodable frame, not a comment: {frame}"
+            );
+        }
     }
 
     #[tokio::test]
