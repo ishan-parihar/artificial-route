@@ -29,10 +29,30 @@ pub struct ModelCard {
     pub provider: String,
     /// Model id as the provider spells it.
     pub upstream_model: String,
+    /// Context window in tokens, as `/v1/models` reports it.
+    ///
+    /// Not optional and not omitted: a client that discovers models from
+    /// `/v1/models` needs a size before it will register the model at all.
+    /// OmniRoute's catalog carries `context_length` on 3081 of 3270 cards and
+    /// omp's `openai-models-list` provider silently drops every card without one
+    /// — so a card missing this field does not degrade the listing, it deletes
+    /// the model from it.
+    ///
+    /// The value is the provider's declared ceiling from [`ar_registry::meta`],
+    /// which is the largest window any of its models offers. `openai` spans
+    /// 128K to 1M upstream, so this is an upper bound rather than a per-model
+    /// figure — the same caveat the registry already documents on the field.
+    pub context_length: u32,
 }
 
 impl ModelCard {
     /// Builds a card from a provider-local model name.
+    ///
+    /// The context window comes from the registry's per-provider ceiling, falling
+    /// back to [`Self::UNKNOWN_CONTEXT`] for a provider the catalog does not
+    /// describe. The fallback is deliberately small: a client that trusts an
+    /// inflated figure sizes a request the provider will reject, while one that
+    /// trusts a conservative figure only truncates its own context.
     #[must_use]
     pub fn new(provider: impl Into<String>, upstream_model: impl Into<String>) -> Self {
         let provider = provider.into();
@@ -45,12 +65,31 @@ impl ModelCard {
         } else {
             format!("{provider}/{upstream_model}")
         };
+        let context_length =
+            ar_registry::meta::global()
+                .get(&provider)
+                .map_or(Self::UNKNOWN_CONTEXT, |m| {
+                    if m.context_length == 0 {
+                        Self::UNKNOWN_CONTEXT
+                    } else {
+                        m.context_length
+                    }
+                });
         Self {
             id,
             provider,
             upstream_model,
+            context_length,
         }
     }
+
+    /// Reported window for a model the registry does not describe.
+    ///
+    /// 128K is the smallest window that still holds a real agent prompt, and it
+    /// is what an OpenAI-compatible provider is assumed to offer when it says
+    /// nothing. Any value below this would make a client discard history it
+    /// could have kept; any value above risks a request the upstream rejects.
+    pub const UNKNOWN_CONTEXT: u32 = 128_000;
 }
 
 /// Source of the model list.

@@ -2551,13 +2551,17 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
 /// exists to report. `permission` is empty because nothing here grants a
 /// per-model scope — auth is one gate for the whole server, and a card that
 /// claimed a narrower scope would be describing a capability this crate does not
-/// have.
+/// have. `context_length` is the provider's declared ceiling, and it is always
+/// emitted: a discovery client drops a card that omits it, so leaving it out
+/// would delete the model from every `/v1/models`-driven picker rather than
+/// merely under-report it.
 fn card_json(c: &crate::models::ModelCard) -> serde_json::Value {
     serde_json::json!({
         "id": c.id,
         "object": "model",
         "created": ar_registry::BUILT_AT,
         "owned_by": c.provider,
+        "context_length": c.context_length,
         "permission": Vec::<String>::new(),
         "root": c.id,
         "ar_upstream_model": c.upstream_model,
@@ -3173,6 +3177,34 @@ mod tests {
         assert_eq!(got["object"], "model");
         assert_eq!(got["owned_by"], "openai");
         assert_eq!(got["ar_upstream_model"], "gpt-4o-mini");
+    }
+
+    #[test]
+    fn a_card_carries_a_context_window_a_discovery_client_can_use() {
+        // The bug this pins: `/v1/models` cards shipped without
+        // `context_length`, and omp's `openai-models-list` provider drops every
+        // card that omits one. ar answered 9715 models and omp registered
+        // none of them — the provider appeared empty. A missing field does not
+        // under-report a model here, it deletes it.
+        let got = card_json(&ModelCard::new("openai", "gpt-4o-mini"));
+        let ctx = got["context_length"]
+            .as_u64()
+            .expect("context_length must be a number a client can size a request with");
+        assert!(
+            ctx >= 128_000,
+            "a card reporting {ctx} tokens is smaller than any real agent prompt"
+        );
+    }
+
+    #[test]
+    fn an_unknown_provider_still_reports_the_conservative_window() {
+        // Never zero and never omitted: `0` reads as "no context" to a client
+        // that then refuses the model, which is the same failure as the field
+        // being absent, one step further from the cause.
+        let card = ModelCard::new("no-such-provider", "m");
+        assert_eq!(card.context_length, ModelCard::UNKNOWN_CONTEXT);
+        let got = card_json(&card);
+        assert_eq!(got["context_length"], ModelCard::UNKNOWN_CONTEXT);
     }
 
     #[test]
