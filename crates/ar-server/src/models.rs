@@ -259,16 +259,13 @@ impl std::fmt::Debug for DiscoveredCatalog {
 /// rather than swallowed for the same reason — a silent `None` is how the
 /// omission went unnoticed.
 fn client(wait_secs: u64) -> Option<reqwest::Client> {
-    let built = reqwest::Client::builder()
+    reqwest::Client::builder()
         .timeout(Duration::from_secs(wait_secs))
-        .build();
-    match &built {
-        Ok(_) => Some(built.expect("just matched Ok")),
-        Err(e) => {
+        .build()
+        .map_err(|e| {
             tracing::warn!("discovery client could not be built; every refresh will fail: {e}");
-            None
-        }
-    }
+        })
+        .ok()
 }
 
 impl DiscoveredCatalog {

@@ -162,6 +162,11 @@ static LATEST: std::sync::RwLock<Option<std::sync::Arc<Catalog>>> = std::sync::R
 
 /// Publishes a freshly parsed catalog for [`latest`].
 pub(crate) fn publish(catalog: std::sync::Arc<Catalog>) {
+    // A poisoned lock means some other holder panicked, which has already been
+    // reported where it happened; the next successful refresh republishes, so
+    // dropping this update is recoverable rather than a lost cause. `ar-registry`
+    // logs nowhere, and taking a logging dependency for this one line would make
+    // every consumer of the registry pay for it.
     if let Ok(mut slot) = LATEST.write() {
         *slot = Some(catalog);
     }
