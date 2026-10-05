@@ -885,25 +885,33 @@ impl ServerConfig {
 
     /// The window that bounds every request this combo can serve.
     ///
-    /// `None` when no target names a window, so the caller keeps whatever the
-    /// card already resolved rather than replacing a known figure with a guess.
-    /// The pool counts: a pool entry can serve the request on failover, so a
-    /// target larger than the bench does not make the combo larger.
+    /// All-or-nothing by construction. A `min` over the targets that happen to
+    /// declare a window reports a bound the combo never established: in the live
+    /// config 899 of 1833 combos name at least one target whose provider has no
+    /// declared ceiling, and dropping those silently left 811 combos serving
+    /// models larger than 128K advertising the floor. The same honesty rule
+    /// `providerMeta.json` states for its own field applies here — an unresolved
+    /// target means the reduction cannot bound the combo, so it derives nothing
+    /// and the caller falls back to a declared `context_length:` or the
+    /// unknown-model floor.
+    ///
+    /// The pool counts: a pool entry serves the request on failover, so a target
+    /// larger than the bench does not raise what the combo can accept.
     fn combo_context(&self, combo: &RouteCombo) -> Option<u32> {
-        combo
-            .targets
-            .iter()
-            .chain(combo.pool.iter())
-            .filter_map(|t| {
-                // A target naming one model of a provider gets that provider's
-                // ceiling; there is no per-model figure outside discovery. A
-                // target with no `/` is a bare provider and still resolves on
-                // the provider half.
-                let provider = t.provider.as_ref();
-                let meta = ar_registry::meta::global().get(provider)?;
-                (meta.context_length > 0).then_some(meta.context_length)
-            })
-            .min()
+        let mut bound: Option<u32> = None;
+        for t in combo.targets.iter().chain(combo.pool.iter()) {
+            if !self.dispatchable(t) {
+                // An undispatchable target cannot serve a request, so it bounds
+                // nothing. Counting it would let a typo shrink every figure.
+                continue;
+            }
+            let meta = ar_registry::meta::global().get(t.provider.as_ref())?;
+            if meta.context_length == 0 {
+                return None;
+            }
+            bound = Some(bound.map_or(meta.context_length, |b: u32| b.min(meta.context_length)));
+        }
+        bound
     }
 
     /// Whether any provider chain is configured at all.
@@ -1708,6 +1716,53 @@ combos:
             stack.context_length,
             crate::models::ModelCard::UNKNOWN_CONTEXT
         );
+    }
+
+    #[test]
+    fn one_unresolved_target_stops_the_reduction_rather_than_shrinking_it() {
+        // The honesty bug, measured on the live config: 899 of 1833 combos name
+        // at least one target whose provider declares no window, and reducing
+        // over the rest reported a bound those combos never established — 811 of
+        // them served models larger than the figure they advertised. An
+        // unresolved target must yield no derived figure at all, so the caller
+        // falls back to the declared value or the floor.
+        //
+        // `cline` declares 1050000 and `adapta-web` declares none: a minimum over
+        // the resolved targets alone would be 1050000, a claim about a combo
+        // that can also reach a provider with no ceiling.
+        let cfg = parse(
+            "keys:\n  cline: k\n  adapta-web: k\nproviders:\n  - id: cline\n    key: cline\n  - id: adapta-web\n    key: adapta-web\ncombos:\n  - id: stack\n    strategy: priority\n    targets: [cline/big, adapta-web/unknown]\n",
+        )
+        .expect("config parses");
+        let stack = ServerConfig::from_ar_config(&cfg, None, None, false, None)
+            .expect("combos build")
+            .model_cards()
+            .into_iter()
+            .find(|c| c.id == "stack")
+            .expect("combo card");
+        assert_eq!(
+            stack.context_length,
+            crate::models::ModelCard::UNKNOWN_CONTEXT,
+            "a partial reduction must not be reported as a bound"
+        );
+    }
+
+    #[test]
+    fn a_declared_window_survives_an_unresolvable_chain() {
+        // The operator's answer is what the combo then reports, and it is the
+        // only way a stack whose targets straddle unknown providers can state
+        // the window it really serves.
+        let cfg = parse(
+            "keys:\n  cline: k\n  adapta-web: k\nproviders:\n  - id: cline\n    key: cline\n  - id: adapta-web\n    key: adapta-web\ncombos:\n  - id: stack\n    strategy: priority\n    targets: [cline/big, adapta-web/unknown]\n    context_length: 1000000\n",
+        )
+        .expect("config parses");
+        let stack = ServerConfig::from_ar_config(&cfg, None, None, false, None)
+            .expect("combos build")
+            .model_cards()
+            .into_iter()
+            .find(|c| c.id == "stack")
+            .expect("combo card");
+        assert_eq!(stack.context_length, 1_000_000);
     }
 
     #[test]
