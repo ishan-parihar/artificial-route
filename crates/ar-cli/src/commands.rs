@@ -1375,14 +1375,76 @@ fn import_config(args: &ImportArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How many previous versions of a generated file are kept.
+///
+/// Three rather than one: a bad import is usually only noticed on the *second*
+/// run after it, when the symptom is a model that vanished, and the version that
+/// caused that is the one worth being able to diff against.
+const BACKUP_DEPTH: usize = 3;
+
 /// Writes one generated file, naming the path rather than the errno alone.
+///
+/// Every overwrite keeps the last [`BACKUP_DEPTH`] versions as `<name>.1` …
+/// `<name>.3`, oldest evicted. This is the only write path `ar import` uses, so
+/// one rotation covers config.yaml, registry.json, freeBudgets.json and
+/// providerMeta.json together — and `registry.json` is `include_str!`d into
+/// `ar-registry`, so a bad regeneration is a rebuild away from being live.
 fn write_file(path: &Path, body: &str) -> anyhow::Result<()> {
+    rotate_backups(path)?;
     std::fs::write(path, body).map_err(|e| {
         fail(
             format!("cannot write {}: {e}", path.display()),
             "pass --out-dir <DIR> at a path you can write",
         )
     })
+}
+
+/// `<name>.1` for `name = /p/config.yaml`, and so on.
+fn backup_path(path: &Path, depth: usize) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(format!(".{depth}"));
+    PathBuf::from(s)
+}
+
+/// Shifts `.<n>` to `.<n+1>`, dropping what falls off the end, then stages the
+/// current file as `.1`.
+///
+/// Shifting oldest-first is what makes it correct: each step reads a slot that
+/// no later step has written, so no version is lost to being overwritten by the
+/// one it was about to become.
+fn rotate_backups(path: &Path) -> anyhow::Result<()> {
+    // Drop the oldest first so the loop below never needs to delete it.
+    let oldest = backup_path(path, BACKUP_DEPTH);
+    if oldest.exists() {
+        std::fs::remove_file(&oldest).map_err(|e| {
+            fail(
+                format!("cannot replace {}: {e}", oldest.display()),
+                "check the directory is writable and the backups are yours to remove",
+            )
+        })?;
+    }
+    for depth in (1..BACKUP_DEPTH).rev() {
+        let from = backup_path(path, depth);
+        if !from.exists() {
+            continue;
+        }
+        let to = backup_path(path, depth + 1);
+        std::fs::rename(&from, &to).map_err(|e| {
+            fail(
+                format!("cannot move {} to {}: {e}", from.display(), to.display()),
+                "check the directory is writable",
+            )
+        })?;
+    }
+    if path.exists() {
+        std::fs::copy(path, backup_path(path, 1)).map_err(|e| {
+            fail(
+                format!("cannot back up {}: {e}", path.display()),
+                "check there is room beside the file you are importing over",
+            )
+        })?;
+    }
+    Ok(())
 }
 
 /// Maps a clap parse failure onto the `docs/06` exit-code contract: `2` for
@@ -2095,5 +2157,56 @@ mod tests {
             store_path(Path::new("/etc/ar/config.yaml")),
             PathBuf::from("/etc/ar/credentials.db")
         );
+    }
+
+    /// A temp dir helper for the backup tests; `unwrap` is fine here.
+    fn tmpdir(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("ar-backup-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).expect("temp dir");
+        p
+    }
+
+    #[test]
+    fn keeps_three_prior_versions_and_evicts_the_fourth_oldest() {
+        let dir = tmpdir("depth");
+        let path = dir.join("config.yaml");
+
+        // Four writes plus a first one that has nothing to back up.
+        for i in 0..5 {
+            write_file(&path, &format!("v{i}")).expect("write");
+        }
+
+        // The live file is the newest; .1 the one before it, and so on.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "v4");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("config.yaml.1")).unwrap(),
+            "v3"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("config.yaml.2")).unwrap(),
+            "v2"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("config.yaml.3")).unwrap(),
+            "v1"
+        );
+        // v0 fell off the end rather than being kept as a fourth slot.
+        assert!(!dir.join("config.yaml.4").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_first_write_with_no_existing_file_backs_up_nothing() {
+        let dir = tmpdir("first");
+        let path = dir.join("registry.json");
+
+        write_file(&path, "v0").expect("write");
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "v0");
+        assert!(!dir.join("registry.json.1").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
