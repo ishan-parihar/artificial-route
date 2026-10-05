@@ -240,6 +240,28 @@ impl std::fmt::Debug for DiscoveredCatalog {
     }
 }
 
+/// The HTTP client every discovery refresh uses.
+///
+/// One function, because two call sites once built this independently and one of
+/// them silently omitted it: `client: None` compiles, so a builder that was never
+/// written looks exactly like a builder whose request was rejected, and every
+/// refresh then fails with "discovery client unavailable" while the proxy keeps
+/// serving boot-time metadata and reports nothing wrong. The rejection is logged
+/// rather than swallowed for the same reason — a silent `None` is how the
+/// omission went unnoticed.
+fn client(wait_secs: u64) -> Option<reqwest::Client> {
+    let built = reqwest::Client::builder()
+        .timeout(Duration::from_secs(wait_secs))
+        .build();
+    match &built {
+        Ok(_) => Some(built.expect("just matched Ok")),
+        Err(e) => {
+            tracing::warn!("discovery client could not be built; every refresh will fail: {e}");
+            None
+        }
+    }
+}
+
 impl DiscoveredCatalog {
     /// Builds a catalog that discovers from models.dev over `configured` cards.
     #[must_use]
@@ -262,17 +284,9 @@ impl DiscoveredCatalog {
         ttl: Duration,
         wait_secs: u64,
     ) -> Self {
-        // Built exactly as `with_bounds` builds it. Omitting it looks harmless —
-        // `client: None` compiles — and then every refresh fails with
-        // "discovery client unavailable", so the catalog is permanently empty and
-        // the configured cards keep whatever figures were known at boot. A
-        // builder that cannot fetch is a builder that silently serves stale
-        // metadata for the life of the process.
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(wait_secs))
-            .user_agent(concat!("artificial-route/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .ok();
+        // Built through [`client`] exactly as `with_bounds` builds it, so the two
+        // constructors cannot drift apart again.
+        let client = client(wait_secs);
         Self {
             inner: LiveCatalog::default(),
             configured,
@@ -293,10 +307,7 @@ impl DiscoveredCatalog {
             // A client that cannot be built is the same unreachable-upstream
             // case a fetch failure is, so the proxy still boots and still serves
             // its configured cards; every refresh then reports the failure.
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(wait_secs))
-                .build()
-                .ok(),
+            client: client(wait_secs),
         }
     }
 
@@ -368,35 +379,28 @@ impl DiscoveredCatalog {
         Ok(body)
     }
 
-    /// Discovered cards, merged with the configured ones.
+    /// The routable cards, plus whatever the operator added at boot.
+    ///
+    /// The models.dev overlay contributes metadata, never models. A models.dev id
+    /// is not a thing this proxy can route: with a combo table present
+    /// `resolve()` matches `model` against combo ids and 400s anything else, so
+    /// advertising 8387 overlay ids was advertising 8387 models that 400 on use.
+    ///
+    /// It also broke discovery clients outright. omp's `openai-models-list`
+    /// provider infers a model's class from the tokens in its id, and one overlay
+    /// entry — `amazon-bedrock/global.openai.gpt-5.6-luna`, a Bedrock resale of
+    /// another vendor's model — carries two class names in one id. It ties, the
+    /// provider throws, and **every** model is discarded: ar served 9717 cards and
+    /// omp registered none of them, so the provider appeared not to exist. Serving
+    /// only the routable set is what makes `ar` visible at all.
+    ///
+    /// The windows the overlay publishes are still read, by
+    /// [`crate::config::ServerConfig::model_cards`] through the callback
+    /// [`Self::with_builder`] installs — so a combo sizing itself off a `nvidia`
+    /// model still gets 1048576 rather than the unknown-model floor. Metadata
+    /// flows in; model names do not.
     fn merged(&self) -> Vec<ModelCard> {
-        // Everything the last successful refresh installed is served, however old
-        // it is. Staleness decides whether to *refetch*, never whether to *serve*:
-        // dropping the discovered set once the TTL lapsed would mean a failing
-        // refresh emptied `/v1/models`, which is the exact failure
-        // `LiveCatalog` documents itself as refusing. An empty inner catalog
-        // contributes nothing, so a never-populated one needs no check here.
-        let discovered = self
-            .inner
-            .catalog()
-            .into_iter()
-            .flat_map(|(provider, entry)| {
-                entry.models.into_iter().map(move |(m, meta)| {
-                    ModelCard::with_discovered((*provider).to_owned(), (*m).to_owned(), Some(meta))
-                })
-            });
-        // Configured cards come FIRST so a discovery card can never overwrite
-        // one: an operator who declared a model locally knows more about it than
-        // an upstream catalog does, and the discovered fallback exists to fill
-        // gaps, not to restate what is already declared. Chaining discovered
-        // first (as this did) let a discovery card win every id collision, which
-        // is the opposite of what the offline-first contract above promises.
-        let mut seen = std::collections::HashSet::new();
         (self.configured)()
-            .into_iter()
-            .chain(discovered)
-            .filter(|c| seen.insert(c.id.clone()))
-            .collect()
     }
 }
 
@@ -764,19 +768,48 @@ mod tests {
             .into_iter()
             .map(|c| c.id)
             .collect();
-        assert!(ids.contains(&"openai/gpt-4o".to_owned()), "{ids:?}");
-        assert!(
-            ids.contains(&"anthropic/claude-sonnet-4".to_owned()),
-            "a discovered model is qualified by its provider like any other: {ids:?}"
-        );
+        // Only the routable card survives. The overlay is read for the windows it
+        // publishes, not for its model names: a models.dev id is not dispatchable
+        // on a proxy with a combo table, and advertising it produced ids that 400
+        // on use and crashed omp's discovery outright (see `merged`).
         assert!(
             ids.contains(&"self/llama-3".to_owned()),
             "a configured model must survive discovery: {ids:?}"
         );
+        assert!(
+            !ids.iter()
+                .any(|i| i.starts_with("openai/") || i.starts_with("anthropic/")),
+            "an unroutable overlay id must not be advertised: {ids:?}"
+        );
+        assert_eq!(ids, vec!["self/llama-3".to_owned()], "one routable card");
+    }
+
+    #[tokio::test]
+    async fn a_discovered_window_still_reaches_a_routable_card() {
+        // Gating the overlay must not gate its metadata: this is the property that
+        // makes it worth fetching. A configured combo whose target resolves only
+        // through models.dev (nvidia declares no ceiling in providerMeta.json)
+        // still gets the published window rather than the unknown-model floor.
+        let cat = discovered(&[("openai", "gpt-4o")]);
+        cat.prefetch_with(|| async { Ok(UPSTREAM.to_owned()) })
+            .await
+            .expect("prefetch installs");
+        let cards = ModelCatalog::load(&cat).expect("cards load");
+        let card = cards
+            .iter()
+            .find(|c| c.id == "openai/gpt-4o")
+            .expect("the configured card is served");
+        // `providerMeta.json` leads discovery, so `openai` resolves through its
+        // own ceiling (1050000) rather than the document's 128000. That ordering
+        // is the point: the curated table is authoritative where it speaks.
         assert_eq!(
-            ids.iter().filter(|i| *i == "openai/gpt-4o-mini").count(),
-            1,
-            "a model in both sets is one card, not two: {ids:?}"
+            card.context_length, 1_050_000,
+            "the curated provider ceiling outranks the discovered figure"
+        );
+        assert_ne!(
+            card.context_length,
+            ModelCard::UNKNOWN_CONTEXT,
+            "and neither source falling to the floor is the failure being guarded"
         );
     }
 
@@ -814,7 +847,7 @@ mod tests {
             .await
             .expect("first refresh installs");
         let fresh = ModelCatalog::load(&cat).expect("cards load");
-        assert_eq!(fresh.len(), 4, "1 configured + 3 upstream: {fresh:?}");
+        assert_eq!(fresh.len(), 1, "the 1 routable configured card: {fresh:?}");
 
         // TTL is 1ns, so this prefetch is not short-circuited and really fails.
         let err = cat
