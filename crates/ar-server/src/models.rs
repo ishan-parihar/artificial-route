@@ -95,6 +95,15 @@ impl ModelCard {
         } else {
             format!("{provider}/{upstream_model}")
         };
+        // A per-model figure outranks a provider-wide one, in both directions.
+        //
+        // `providerMeta.json`'s ceiling is the *largest* window any of a
+        // provider's models offers (`openai` spans 128K to 1M), so reporting it
+        // for one model over-reports by up to an order of magnitude: a client
+        // sizing a 200K prompt off `openai`'s 1050000 sends one the model
+        // refuses. models.dev publishes the figure for the model itself, so it
+        // leads. The ceiling is only a fallback for a provider models.dev does
+        // not describe.
         let known = discovered.filter(|d| d.context_length > 0);
         let context_length = known.as_ref().map_or_else(
             || {
@@ -742,16 +751,53 @@ mod tests {
 
     /// A models.dev-shaped document with two providers, as `ar-registry`'s own
     /// discovery tests use.
+    // The models carry the limits models.dev publishes, because the property
+    // under test is which source wins: an empty body would leave the provider
+    // ceiling as the only figure and could not tell the two orders apart.
     const UPSTREAM: &str = r#"{
       "openai": {"api":"https://api.openai.com/v1","env":["OPENAI_API_KEY"],
-        "models":{"gpt-4o":{},"gpt-4o-mini":{}}},
+        "models":{
+          "gpt-4o":{"limit":{"context":128000,"output":16384}},
+          "gpt-4o-mini":{"limit":{"context":128000,"output":16384}}}},
       "anthropic": {"api":"https://api.anthropic.com/v1","env":["ANTHROPIC_API_KEY"],
-        "models":{"claude-sonnet-4":{}}}
+        "models":{"claude-sonnet-4":{"limit":{"context":200000,"output":64000}}}}
     }"#;
 
     /// Two cards for a `(provider, model)` pair list.
     fn discovered(pairs: &[(&str, &str)]) -> DiscoveredCatalog {
-        DiscoveredCatalog::new(pairs.iter().map(|(p, m)| ModelCard::new(*p, *m)).collect())
+        // Built the way the server builds them: each configured card derives its
+        // window from the catalog, so a published per-model figure is available
+        // to it. A bare `ModelCard::new` would freeze the boot-time figures and
+        // make this helper unable to see what discovery learned.
+        DiscoveredCatalog::with_builder(
+            Box::new({
+                let pairs = pairs
+                    .iter()
+                    .map(|(p, m)| ((*p).to_owned(), (*m).to_owned()))
+                    .collect::<Vec<_>>();
+                move || {
+                    let lookup = |provider: &str, model: &str| {
+                        ar_registry::discovery::latest().and_then(|v| {
+                            ar_registry::discovery::published_window(&v, provider, model)
+                        })
+                    };
+                    pairs
+                        .iter()
+                        .map(|(p, m)| {
+                            let known = lookup(p, m).map(|context_length| {
+                                ar_registry::discovery::DiscoveredModel {
+                                    context_length,
+                                    ..ar_registry::discovery::DiscoveredModel::default()
+                                }
+                            });
+                            ModelCard::with_discovered(p, m, known)
+                        })
+                        .collect()
+                }
+            }),
+            crate::models::DISCOVERY_TTL,
+            crate::models::DISCOVERY_WAIT_SECS,
+        )
     }
 
     #[tokio::test]
@@ -799,17 +845,13 @@ mod tests {
             .iter()
             .find(|c| c.id == "openai/gpt-4o")
             .expect("the configured card is served");
-        // `providerMeta.json` leads discovery, so `openai` resolves through its
-        // own ceiling (1050000) rather than the document's 128000. That ordering
-        // is the point: the curated table is authoritative where it speaks.
+        // The published per-model figure, not `openai`'s 1050000 provider ceiling:
+        // that ceiling is the largest window any of its models offers, and
+        // reporting it for one model over-reports by an order of magnitude and
+        // invites a request the model refuses.
         assert_eq!(
-            card.context_length, 1_050_000,
-            "the curated provider ceiling outranks the discovered figure"
-        );
-        assert_ne!(
-            card.context_length,
-            ModelCard::UNKNOWN_CONTEXT,
-            "and neither source falling to the floor is the failure being guarded"
+            card.context_length, 128_000,
+            "a per-model window must outrank a provider-wide ceiling"
         );
     }
 

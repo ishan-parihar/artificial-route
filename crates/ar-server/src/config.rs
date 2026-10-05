@@ -886,7 +886,20 @@ impl ServerConfig {
                 .providers
                 .iter()
                 .filter(|p| p.is_dispatchable() && !p.upstream_model.is_empty())
-                .map(|p| ModelCard::new(p.id.as_str(), &p.upstream_model))
+                .map(|p| {
+                    // The published per-model window leads here too, for the same
+                    // reason it leads in `ModelCard`: a provider-wide ceiling is
+                    // the largest figure any of its models offers, and reporting
+                    // that for one model invites a request it will refuse.
+                    let known = discovered
+                        .and_then(|f| f(p.id.as_ref(), &p.upstream_model))
+                        .filter(|w| *w > 0)
+                        .map(|w| ar_registry::discovery::DiscoveredModel {
+                            context_length: w,
+                            ..ar_registry::discovery::DiscoveredModel::default()
+                        });
+                    ModelCard::with_discovered(p.id.as_str(), &p.upstream_model, known)
+                })
                 .collect();
         }
         self.combos
@@ -928,11 +941,18 @@ impl ServerConfig {
                 // nothing. Counting it would let a typo shrink every figure.
                 continue;
             }
-            let declared = ar_registry::meta::global()
-                .get(t.provider.as_ref())
-                .filter(|m| m.context_length > 0)
-                .map(|m| m.context_length)
-                .or_else(|| discovered.and_then(|f| f(t.provider.as_ref(), &t.model)));
+            // Per-model first, provider-wide second, for the same reason
+            // `ModelCard` prefers them: the provider ceiling is the largest
+            // window any of that provider's models offers, so using it for one
+            // target over-reports it.
+            let declared = discovered
+                .and_then(|f| f(t.provider.as_ref(), &t.model))
+                .or_else(|| {
+                    ar_registry::meta::global()
+                        .get(t.provider.as_ref())
+                        .filter(|m| m.context_length > 0)
+                        .map(|m| m.context_length)
+                });
             let window = declared?;
             bound = Some(bound.map_or(window, |b: u32| b.min(window)));
         }
