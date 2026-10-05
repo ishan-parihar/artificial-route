@@ -24,7 +24,7 @@ WORKERS="${SOAK_CONCURRENCY:-8}"
 SAMPLE_EVERY="${SOAK_SAMPLE_EVERY:-60}"
 GROWTH_LIMIT="${SOAK_RSS_GROWTH_LIMIT_KB:-65536}"
 LOG="${SOAK_LOG:-/tmp/ar-soak.csv}"
-PORT=20128
+PORT="${SOAK_PORT:-20128}"
 
 AR="$DIR/target/release/ar"
 [ -x "$AR" ] || { echo "soak: build first (cargo build --release)"; exit 1; }
@@ -32,11 +32,17 @@ command -v curl >/dev/null || { echo "soak: curl required"; exit 1; }
 
 cd "$CONFIG_DIR" || exit 1
 unset _RJEM_MALLOC_CONF           # measure the binary's own default
-"$AR" serve >/tmp/ar-soak-serve.log 2>&1 &
+"$AR" serve --port "$PORT" >/tmp/ar-soak-serve.log 2>&1 &
 PID=$!
 trap 'kill "$PID" 2>/dev/null; wait "$PID" 2>/dev/null' EXIT
 
+# The point of the run is this binary's own RSS, so refuse to sample anything else:
+# a stale server already holding the port answers /healthz while our child dies of
+# EADDRINUSE, and the CSV silently records rss_kb=0 for twelve hours.
 sleep 4
+kill -0 "$PID" 2>/dev/null || {
+    echo "soak: serve exited; log tail:"; tail -5 /tmp/ar-soak-serve.log; exit 1;
+}
 curl -sf "http://127.0.0.1:$PORT/healthz" >/dev/null || {
     echo "soak: serve did not come up; log tail:"; tail -5 /tmp/ar-soak-serve.log; exit 1;
 }

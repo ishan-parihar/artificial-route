@@ -121,7 +121,7 @@ impl Metrics {
         let counters = [
             (
                 "ar_http_requests_total",
-                "Requests served, by outcome class.",
+                "Requests served. Unlabelled; per-outcome classes live in ar_requests_total below.",
                 self.requests.load(Ordering::Relaxed),
             ),
             (
@@ -131,7 +131,7 @@ impl Metrics {
             ),
             (
                 "ar_route_failovers_total",
-                "Provider-to-provider failovers.",
+                "Requests whose whole chain exhausted with non-rate-limit failures; intra-chain retries count as upstream attempts, not here.",
                 self.failed_over.load(Ordering::Relaxed),
             ),
             (
