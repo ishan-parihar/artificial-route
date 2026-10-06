@@ -1,6 +1,6 @@
 //! Reads OmniRoute's real combos out of its SQLite store.
 //!
-//! `ar import --from omniroute` used to synthesise one one-target combo per
+//! `aroute import --from omniroute` used to synthesise one one-target combo per
 //! `provider/model`, which reproduced the *catalog* and none of the routing an
 //! OmniRoute operator actually configured: their failover chains, their weights,
 //! their per-combo window. This module reads the `combos` table instead
@@ -240,10 +240,15 @@ fn build(
                 // (`steps.ts:22`), and ar reads an absent entry as that same
                 // default — so 0 is not recorded, or every unweighted step would
                 // be pinned to zero share.
-                if let Some(w) = weight.filter(|w| *w > 0.0)
+                //
+                // The cast is saturating and a saturated 0 would be read back as
+                // `weight.max(1)` and silently promoted to a share the operator
+                // never wrote. Clamp to 1 instead: a positive weight means "this
+                // step has a share", and 1 is the smallest share that says so.
+                if let Some(w) = weight.filter(|w| w.is_finite() && *w > 0.0)
                     && let Some(t) = targets.last()
                 {
-                    weights.insert(t.clone(), w.round() as u32);
+                    weights.insert(t.clone(), w.round().clamp(1.0, u32::MAX as f64) as u32);
                 }
             }
         }
@@ -300,7 +305,7 @@ fn full_model_str(model: &str, provider_id: Option<&str>) -> Option<String> {
 ///
 /// Upstream resolves the wildcard at dispatch time against the provider's live
 /// model list. The import has the catalog it just built, so it expands here and
-/// the result is a plain target list — the same shape `ar import --from litellm`
+/// the result is a plain target list — the same shape `aroute import --from litellm`
 /// already produces for its alias chains (`import/mod.rs:209-212`).
 fn expand_wildcard(
     combo: &str,
@@ -470,6 +475,30 @@ mod tests {
         let combos = read(&path, &catalog());
         assert_eq!(combos[0].weights.get("groq/llama-3.3-70b"), Some(&70));
         assert_eq!(combos[0].weights.get("groq/llama-3.1-8b"), Some(&30));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn should_clamp_a_sub_one_weight_to_one_rather_than_zero() {
+        // A positive upstream weight means "this step has a share". `round()`
+        // sends 0.4 to 0, and `weight.max(1)` downstream would promote a
+        // *saturated* 0 back to 1 anyway — indistinguishable, until the
+        // saturation case, where the cast would silently invent the share.
+        let dir = scratch("weight-clamp");
+        let path = db(
+            &dir,
+            &[(
+                "weighted",
+                r#"{"strategy":"weighted","models":[
+                    {"providerId":"groq","model":"llama-3.3-70b","weight":0.4},
+                    {"providerId":"groq","model":"llama-3.1-8b","weight":1e30},
+                    {"providerId":"groq","model":"llama-3.2-90b","weight":0}]}"#,
+            )],
+        );
+        let combos = read(&path, &catalog());
+        assert_eq!(combos[0].weights.get("groq/llama-3.3-70b"), Some(&1));
+        assert_eq!(combos[0].weights.get("groq/llama-3.1-8b"), Some(&u32::MAX));
+        assert_eq!(combos[0].weights.get("groq/llama-3.2-90b"), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

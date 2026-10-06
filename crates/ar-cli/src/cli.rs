@@ -1,6 +1,6 @@
 //! clap command surface.
 //!
-//! Per `docs/06-axi-mcp.md`: a content-first bare `ar`, per-command `--help`
+//! Per `docs/06-axi-mcp.md`: a content-first bare `aroute`, per-command `--help`
 //! with two worked examples, and no interactive prompts anywhere. Missing
 //! required input fails with usage rather than blocking on a prompt, because a
 //! prompt is a deadlock for an agent driving the binary non-interactively.
@@ -17,7 +17,7 @@ pub const DEFAULT_CONFIG: &str = "config.yaml";
 /// One OpenAI-compatible LLM proxy over many providers.
 #[derive(Debug, Parser)]
 #[command(
-    name = "ar",
+    name = "aroute",
     version,
     about = "One OpenAI-compatible LLM endpoint over many providers",
     long_about = None,
@@ -117,7 +117,7 @@ pub enum Command {
     ///
     /// config.yaml is picked up live (ar-config watches it). registry.json is
     /// the compile-time baseline, so it only changes after a rebuild — the live
-    /// catalog from the same fetch is what `ar models` reflects meanwhile.
+    /// catalog from the same fetch is what `aroute models` reflects meanwhile.
     ///
     /// Examples:
     ///   ar import --from litellm --path ./litellm.yaml
@@ -129,7 +129,7 @@ pub enum Command {
     ///
     /// Needs `--features mcp`; without it this verb does not exist, so a host
     /// cannot discover a transport that was never linked in. Point an MCP client
-    /// at `ar mcp`; `--list` prints the catalog without touching the config.
+    /// at `aroute mcp`; `--list` prints the catalog without touching the config.
     ///
     /// `AR_MCP_SCOPE` narrows what this process may call (`read:*`,
     /// `write:combos`, …); unset means everything.
@@ -142,7 +142,7 @@ pub enum Command {
     Mcp(McpArgs),
 }
 
-/// Options for `ar serve`.
+/// Options for `aroute serve`.
 #[derive(Debug, Args)]
 pub struct ServeArgs {
     /// Listen port, overriding `server.port` from the config.
@@ -162,7 +162,7 @@ pub struct ListArgs {
     pub full: bool,
 }
 
-/// Options for `ar run`.
+/// Options for `aroute run`.
 #[derive(Debug, Args)]
 pub struct RunArgs {
     /// Combo to route through. Defaults to the first configured combo.
@@ -178,7 +178,7 @@ pub struct RunArgs {
     pub full: bool,
 }
 
-/// Options for `ar configure`.
+/// Options for `aroute configure`.
 #[derive(Debug, Args)]
 pub struct ConfigureArgs {
     /// Exit 1 when any check fails, instead of only reporting.
@@ -186,7 +186,7 @@ pub struct ConfigureArgs {
     pub check: bool,
 }
 
-/// Options for `ar mcp`.
+/// Options for `aroute mcp`.
 #[cfg(feature = "mcp")]
 #[derive(Debug, Args)]
 pub struct McpArgs {
@@ -195,7 +195,7 @@ pub struct McpArgs {
     pub list: bool,
 }
 
-/// Subcommands of `ar auth`.
+/// Subcommands of `aroute auth`.
 #[derive(Debug, Subcommand)]
 pub enum AuthCommand {
     /// Authorise a provider in a browser and store the resulting tokens.
@@ -233,8 +233,8 @@ pub enum AuthCommand {
     /// Report whether each OAuth session is armed, and why not when it is not.
     ///
     /// Read-only and redacted: rows come from the same `oauth_row` verdict
-    /// `ar doctor` prints, so the two can never disagree. `unarmed` details name
-    /// the exact `ar auth login --provider <id>` that fixes them.
+    /// `aroute doctor` prints, so the two can never disagree. `unarmed` details name
+    /// the exact `aroute auth login --provider <id>` that fixes them.
     ///
     /// Examples:
     ///   ar auth status
@@ -243,7 +243,7 @@ pub enum AuthCommand {
     Status(AuthProviderArgs),
 }
 
-/// Options for `ar auth login`.
+/// Options for `aroute auth login`.
 #[derive(Debug, Args)]
 pub struct AuthLoginArgs {
     /// Registry provider id to authorise, e.g. `codex`.
@@ -274,7 +274,7 @@ pub struct AuthLoginArgs {
     pub scope: Option<String>,
 }
 
-/// Options for the `ar auth` verbs that name one provider.
+/// Options for the `aroute auth` verbs that name one provider.
 #[derive(Debug, Args)]
 pub struct AuthProviderArgs {
     /// Registry provider id, e.g. `codex`. Omit on `status` for every session.
@@ -282,7 +282,7 @@ pub struct AuthProviderArgs {
     pub provider: Option<String>,
 }
 
-/// Options for `ar auth`.
+/// Options for `aroute auth`.
 #[derive(Debug, Args)]
 pub struct AuthArgs {
     /// Which half of the login lifecycle to run.
@@ -290,7 +290,7 @@ pub struct AuthArgs {
     pub command: AuthCommand,
 }
 
-/// Options for `ar import`.
+/// Options for `aroute import`.
 #[derive(Debug, Args)]
 pub struct ImportArgs {
     /// The upstream config shape to read.

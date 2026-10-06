@@ -43,7 +43,7 @@ already models OAuth availability; the executor could not consume it.
 expiry, one rotation retry on 401, and a per-connection single-flight so a
 concurrent burst cannot trip `refresh_token_reused`. `doctor` fails loudly on
 any `oauth` provider that has no executor instead of listing it as known.
-**Browser login also landed:** `ar auth login --provider <id>` prints the PKCE authorize URL (openable on any device), catches the redirect on a single-use `127.0.0.1` listener or reads one pasted redirect line for remote logins, exchanges the code, and persists both rows; `ar auth status|logout` and four MCP tools (`ar_auth_login_url|complete|status|logout`) drive the same flow. AGENTS.md
+**Browser login also landed:** `aroute auth login --provider <id>` prints the PKCE authorize URL (openable on any device), catches the redirect on a single-use `127.0.0.1` listener or reads one pasted redirect line for remote logins, exchanges the code, and persists both rows; `aroute auth status|logout` and four MCP tools (`ar_auth_login_url|complete|status|logout`) drive the same flow. AGENTS.md
 forbids inventing provider wire formats, so no refresh endpoint is hardcoded —
 `token_url` is operator-supplied and a session without one reports itself as
 unrenewable rather than guessing.
@@ -102,9 +102,9 @@ discipline, not its static-salt derivation. Never commit; never log values.
 `rusqlite`, `open_with_env_key` / `open_with_material` (a `$VAR` master key,
 because `config.yaml` has no config entry for it), every value sealed before it
 touches disk, and the refresh row written compare-and-swap so a sibling writer
-that rotated first is not clobbered. `ar serve` opens it through
+that rotated first is not clobbered. `aroute serve` opens it through
 `commands::credential_store(cli)` (`serve.rs:59`) and the resolution path prefers
-the store over `$VAR` (`config.rs:1337`), so `ar auth login` writes rows the
+the store over `$VAR` (`config.rs:1337`), so `aroute auth login` writes rows the
 server then reads. The usage ledger sits beside the same file (`serve.rs:87`).
 Tests: `crates/ar-keys/tests/{store,keys,admit}.rs`.
 
@@ -118,8 +118,8 @@ validated by `doctor`, no recompile. Highest capability-per-line item here.
 **Shipped:** `custom_providers:` in `config.yaml`
 (`id` / `protocol` / `base_url` / `key_ref` / optional `headers`), merged into
 the catalog by `ar_registry::Registry::merge` at load. A custom id resolves
-through `split_target_known` like any catalog id, so `ar serve`, `ar doctor`,
-`ar models`, `ar providers` and `ar combo` all see it. `key_ref` is a name under
+through `split_target_known` like any catalog id, so `aroute serve`, `aroute doctor`,
+`aroute models`, `aroute providers` and `aroute combo` all see it. `key_ref` is a name under
 `keys:`, never a value. An id colliding with a compiled-in entry is refused
 loudly — `doctor` reports it as a `fail` row and `serve` refuses to start —
 because shadowing a real catalog entry would make the catalog stop describing
@@ -151,18 +151,18 @@ and excluded from `pick`, so pool feeds failover without touching strategy
 scoring. Spec in `docs/04-subsystems.md` §route.
 
 ### F-HIGH-3: No model discovery/sync — PARTIAL (staleness warning landed)
-Registry is snapshot + `ar import`. OmniRoute syncs upstream catalogs with
+Registry is snapshot + `aroute import`. OmniRoute syncs upstream catalogs with
 capability/intelligence overlays; agentgateway refreshes its catalog over
 `POST /api/costs/refresh-base` with file-watch hot reload.
-**Fix:** scheduled `ar import` + `doctor` staleness warning (registry age vs
+**Fix:** scheduled `aroute import` + `doctor` staleness warning (registry age vs
 newest live model). Don't build a sync daemon before the store exists.
 **Done:** `ar-registry` stamps the build (`build.rs` → `BUILT_AT`), and the
-`registry` row of `ar doctor` reports the snapshot's age, going `warn` past
-`SNAPSHOT_TTL_DAYS` (7) and naming the `ar import` fix plus the count of
+`registry` row of `aroute doctor` reports the snapshot's age, going `warn` past
+`SNAPSHOT_TTL_DAYS` (7) and naming the `aroute import` fix plus the count of
 configured targets the build cannot route — each named by its existing
 `target/<id>` `fail` row. `warn`, not `fail`, so a week-old build does not train
 operators to ignore the exit code.
-**Still open:** the *scheduled* `ar import` (a cron entry, not a daemon) and any
+**Still open:** the *scheduled* `aroute import` (a cron entry, not a daemon) and any
 live-catalog comparison — `doctor` stays offline by design, so "newest known
 live model" means the config's own targets, not models.dev.
 
@@ -184,12 +184,12 @@ supplies; nothing snapshots, rolls over or persists it per connection.
 agentgateway acts as an MCP OAuth server (DCR + refresh_token).
 **Fix:** `ar-mcp` behind the `mcp` feature on `ar`, or cut the crate until
 it's wired. Dead code that advertises capability is a trust bug.
-**Done (option a):** `ar mcp` behind the same default-off `mcp` feature, serving
+**Done (option a):** `aroute mcp` behind the same default-off `mcp` feature, serving
 the essential-12 (`ar-mcp/src/lib.rs:147`) + `ar_tool_search` over stdio through
 `rmcp/transport-io`; the catalog is 12 + `tool_search` = 13, pinned by
 `ar-cli/src/mcp.rs:428`. Every
 call goes through `guard()`, so the scope check and the audit row cannot be
-skipped; `ar mcp --list` prints the catalog as TOON with no config; `AR_MCP_SCOPE`
+skipped; `aroute mcp --list` prints the catalog as TOON with no config; `AR_MCP_SCOPE`
 is the grant and is default-deny for whatever it does not name. The seven
 `expect(dead_code)` suppressions on the tool bodies are gone, which is the
 mechanical proof the crate is no longer orphaned.
@@ -219,7 +219,7 @@ and both Class C detection gaps are closed: A1/A2/A4 demoted to transient, C1 cl
 by verbatim phrase aliases, C2 closed by demotion. Per-finding verdicts and the three
 accepted divergences are in `docs/audit-notes.md` § Fix record.
 **Now:** `ar_exec::oauth::TERMINAL_REFRESH_STATUS` is the only copy. The
-classifier reads it, `ar doctor` reports its size and the carve-outs from it, and
+classifier reads it, `aroute doctor` reports its size and the carve-outs from it, and
 `terminal_check_constraint()` *generates* the store's CHECK clause from it so the
 fourth copy cannot drift. All three carve-outs are honoured by
 `OAuthKind::carve_out`, which runs **before** the list — the only way to become
@@ -284,7 +284,7 @@ nothing. `Retry` carries `tried` now. Name and exposition unchanged.
   broken, and there was no second mechanism to find. Nothing about kilocode's
   *dispatch* wire is transcribed, so the accounting is unchanged where it matters:
   `OAuthKind::parse("kilocode")` is still `None` (pinned by
-  `refuses_a_provider_this_build_has_no_executor_for`), `ar doctor` still fails it
+  `refuses_a_provider_this_build_has_no_executor_for`), `aroute doctor` still fails it
   loudly, and `ProviderConfig::is_dispatchable` keeps it out of every candidate
   list. What changed is the *reason*: the mechanism is understood and ported where
   it belongs — `initiate_device` / `poll_device` in `ar-exec`, the two device

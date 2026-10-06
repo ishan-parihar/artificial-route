@@ -118,7 +118,7 @@ dependency in the ported config.
 1. Watch for the successor id in the catalog on the next discovery tick
    (60s, already running) rather than discovering it during an outage.
 2. Add a standing check that every configured target still appears in its
-   provider's live `/models`, reported by `ar doctor`. The per-target probe I ran
+   provider's live `/models`, reported by `aroute doctor`. The per-target probe I ran
    by hand is exactly this and is not automated today.
 3. When the successor appears, add it as a target and keep the old one in `pool:`
    until it starts failing, so the swap is a config change rather than an
@@ -149,7 +149,10 @@ layer, not routing, and it is the one defect I fixed only halfway.
   cooling down`. That is ar working. It is also a real operational note: a burst
   of failures escalates the cooldown, so a genuinely dead provider costs a
   long recovery. Worth watching under real load.
-- **`~/bin/ar` shadowing `/usr/bin/ar`**, which breaks every Rust build on the box
-  until `AR=/usr/bin/ar` is exported. Separate from these blockers.
+- **`~/bin/ar` shadowing `/usr/bin/ar`**, which broke every Rust build on the
+  box until `AR=/usr/bin/ar` was exported. **Resolved**: the binary is now
+  `aroute` (`crates/ar-cli/Cargo.toml` `[[bin]]`), so nothing of ours can shadow
+  the archiver again. The config directory keeps `~/.config/ar/` — a data path
+  was never on $PATH and costs nothing to leave.
 - **Discovery's memory cost**: 34 MiB config-only → 120 MiB with 9,715
   discovered models. Documented in the unit, not a defect.

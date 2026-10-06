@@ -1,4 +1,4 @@
-//! `ar mcp` — the MCP control plane, and the state it serves.
+//! `aroute mcp` — the MCP control plane, and the state it serves.
 //!
 //! # Why this file exists
 //!
@@ -54,10 +54,10 @@ const LEDGER_FILE: &str = "usage.sqlite";
 /// be told it is over a rate limit it does not have a reason to respect.
 const CONTROL_PLANE_RPM: u32 = 600;
 
-/// Columns of the `ar mcp --list` table.
+/// Columns of the `aroute mcp --list` table.
 const TOOL_COLUMNS: [&str; 3] = ["id", "scope", "description"];
 
-/// Runs `ar mcp`: lists the catalog, or serves it.
+/// Runs `aroute mcp`: lists the catalog, or serves it.
 pub async fn run(cli: &Cli, args: &McpArgs) -> anyhow::Result<()> {
     if args.list {
         return list();
@@ -72,7 +72,7 @@ pub async fn run(cli: &Cli, args: &McpArgs) -> anyhow::Result<()> {
     let built = build(cli, &cfg, scope).map_err(|e| {
         commands::fail(
             e,
-            "run `ar doctor`; a target whose provider is not in the compiled-in registry cannot be served",
+            "run `aroute doctor`; a target whose provider is not in the compiled-in registry cannot be served",
         )
     })?;
     ar_mcp::serve_stdio(built).await.map_err(|e| {
@@ -131,11 +131,11 @@ fn build(cli: &Cli, cfg: &Config, scope: Scope) -> Result<Host, anyhow::Error> {
         "{}",
         commands::fail(
             "no combo is configured, so there is nothing to serve",
-            "add a `combos:` entry with at least one target, then run `ar doctor`"
+            "add a `combos:` entry with at least one target, then run `aroute doctor`"
         )
     );
 
-    // The same resolution `ar serve` does, so the control plane routes over
+    // The same resolution `aroute serve` does, so the control plane routes over
     // exactly the candidates the data plane would and prices them identically.
     let config = ar_server::ServerConfig::from_ar_config(
         cfg,
@@ -149,7 +149,7 @@ fn build(cli: &Cli, cfg: &Config, scope: Scope) -> Result<Host, anyhow::Error> {
         .iter()
         .map(|c| {
             // Targets and bench are read through the same `ar-server` accessors
-            // `ar serve` uses, so an undispatchable provider is dropped in both
+            // `aroute serve` uses, so an undispatchable provider is dropped in both
             // places and a combo's two halves cannot disagree.
             let pool: Vec<ar_route::Candidate> = config
                 .pool(c)
@@ -194,8 +194,8 @@ fn build(cli: &Cli, cfg: &Config, scope: Scope) -> Result<Host, anyhow::Error> {
         combos,
         admission,
         ledger_path: dir.join(LEDGER_FILE),
-        // `commands::store_path` rather than a second guess: `ar serve` and
-        // `ar mcp` must agree on where a credential lives or a login writes rows
+        // `commands::store_path` rather than a second guess: `aroute serve` and
+        // `aroute mcp` must agree on where a credential lives or a login writes rows
         // nothing will read.
         store_path: commands::store_path(&cli.config),
         exec,
@@ -224,12 +224,12 @@ fn build(cli: &Cli, cfg: &Config, scope: Scope) -> Result<Host, anyhow::Error> {
 /// dispatches with a key it was given — this is a login surface, not a
 /// requirement — so the omission costs nothing.
 ///
-/// The [`Session`] is built exactly as `ar auth login` builds it, because it is
+/// The [`Session`] is built exactly as `aroute auth login` builds it, because it is
 /// the type `authorize_url` and `exchange_code` read: a second construction here
 /// would be a second answer to "which endpoints does this provider authorize
 /// against". The row *names* are what `Session` cannot know; the access token's
 /// row is the provider's own `keys:` entry, resolved through [`Config::key_name`],
-/// so a login writes where `ar serve` reads and no second credential name is
+/// so a login writes where `aroute serve` reads and no second credential name is
 /// invented for it.
 fn auth_targets(cfg: &Config) -> Vec<AuthTarget> {
     cfg.oauth
@@ -359,7 +359,7 @@ mod tests {
 
     #[test]
     fn prices_candidates_from_the_compiled_in_registry() {
-        // Same table `ar serve` uses: an unpriced target would sort last under
+        // Same table `aroute serve` uses: an unpriced target would sort last under
         // `cost-optimized` here and there alike.
         let host = build(&cli("prices"), &config(YAML), Scope::ALL).expect("built");
         assert!(
@@ -470,7 +470,7 @@ mod tests {
 
     #[test]
     fn the_login_session_carries_the_configured_endpoints() {
-        // One builder, shared with `ar auth login`: the executor's `authorize_url`
+        // One builder, shared with `aroute auth login`: the executor's `authorize_url`
         // reads `Session`, so a login row must not re-spell them.
         let target = &auth_targets(&config(LOGIN_YAML))[0];
         assert_eq!(

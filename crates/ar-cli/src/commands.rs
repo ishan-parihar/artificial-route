@@ -27,14 +27,14 @@ use crate::toon;
 /// One TOON row: positional cells, matching the command's `*_COLUMNS`.
 type Row = Vec<String>;
 
-/// Columns available from `ar providers`.
+/// Columns available from `aroute providers`.
 ///
 /// `id,provider,status` must stay first: `toon::DEFAULT_FIELDS` is applied
 /// positionally, and `default_columns_lead` below is what keeps that honest.
 const PROVIDER_COLUMNS: [&str; 5] = ["id", "provider", "status", "base_url", "key"];
-/// Columns available from `ar models`.
+/// Columns available from `aroute models`.
 const MODEL_COLUMNS: [&str; 4] = ["id", "provider", "status", "combo"];
-/// Columns available from `ar combo`. `provider` is the combo's distinct
+/// Columns available from `aroute combo`. `provider` is the combo's distinct
 /// provider set: a combo is not owned by one provider, but that set is the fact
 /// an agent asks for next.
 const COMBO_COLUMNS: [&str; 5] = ["id", "provider", "status", "strategy", "targets"];
@@ -58,7 +58,7 @@ fn columns(requested: &[String], all: &[&str], cmd: &str) -> anyhow::Result<Vec<
             all.contains(&f.as_str()),
             "{}",
             fail(
-                format!("unknown field {f:?} for `ar {cmd}`"),
+                format!("unknown field {f:?} for `aroute {cmd}`"),
                 format!("use --fields with any of: {}", all.join(", ")),
             )
         );
@@ -123,7 +123,7 @@ pub fn open_store(path: &Path) -> Result<CredentialStore, KeyError> {
 /// not open is an operator problem, so it says so once on stderr -- stdout is the
 /// data channel -- rather than dispatching as if it had never been populated.
 ///
-/// Shared by `ar serve` and `ar mcp`: both resolve credentials the same way, and
+/// Shared by `aroute serve` and `aroute mcp`: both resolve credentials the same way, and
 /// two copies of this fallback is two chances for them to disagree.
 pub fn credential_store(cli: &Cli) -> Option<CredentialStore> {
     let path = store_path(&cli.config);
@@ -142,7 +142,7 @@ pub fn credential_store(cli: &Cli) -> Option<CredentialStore> {
 
 /// What `ar` found at the credential-store path.
 ///
-/// Public because `ar auth` resolves the same probe `ar doctor` prints, and two
+/// Public because `aroute auth` resolves the same probe `aroute doctor` prints, and two
 /// implementations of "which credentials can this config see" is two chances for
 /// a login to write a row a dispatch will not read.
 ///
@@ -206,7 +206,7 @@ impl StoreProbe<'_> {
     /// The `(status, detail)` cell for the `store` row.
     ///
     /// Absent is `skip`, not `fail`: env-only is the configuration every install
-    /// before this feature had, and failing it would make `ar doctor` exit 1 on
+    /// before this feature had, and failing it would make `aroute doctor` exit 1 on
     /// every host that has not opted in.
     fn row(&self) -> (String, String) {
         match self {
@@ -259,7 +259,7 @@ impl StoreProbe<'_> {
 /// `custom_providers:` nodes.
 ///
 /// A collision is fatal rather than skipped — shadowing a compiled-in id would
-/// make the catalog stop describing the world, and `ar doctor` says which one.
+/// make the catalog stop describing the world, and `aroute doctor` says which one.
 fn catalog(cfg: &Config) -> anyhow::Result<Registry> {
     registry().merge(&cfg.custom_providers).map_err(|e| {
         fail(
@@ -279,7 +279,7 @@ pub fn block_on<F: std::future::Future<Output = anyhow::Result<()>>>(
     block_on_value(future)
 }
 
-/// [`block_on`] for a verb that needs the result — `ar import`'s single fetch.
+/// [`block_on`] for a verb that needs the result — `aroute import`'s single fetch.
 pub fn block_on_value<F, T>(future: F) -> anyhow::Result<T>
 where
     F: std::future::Future<Output = anyhow::Result<T>>,
@@ -296,10 +296,10 @@ where
     rt.block_on(future)
 }
 
-/// The `ar auth status` probe for a caller that already holds a store.
+/// The `aroute auth status` probe for a caller that already holds a store.
 ///
 /// Names over values, so a status listing never decrypts a row it does not need
-/// — the same discipline [`StoreProbe::resolve`] keeps for `ar doctor`.
+/// — the same discipline [`StoreProbe::resolve`] keeps for `aroute doctor`.
 pub fn store_probe(config_path: &Path) -> StoreProbe<'static> {
     StoreProbe::resolve(config_path)
 }
@@ -317,7 +317,7 @@ pub fn live_store_probe<'a>(path: &Path, store: &'a CredentialStore) -> StorePro
     }
 }
 
-/// The `ar auth status` spelling of a doctor row's status, as a borrowed
+/// The `aroute auth status` spelling of a doctor row's status, as a borrowed
 /// `&'static str`.
 ///
 /// The doctor vocabulary is `ok`/`fail` because a `fail` there exits 1; a status
@@ -356,7 +356,7 @@ fn home(cli: &Cli) -> anyhow::Result<()> {
     let catalog = catalog(&cfg)?;
     println!("bin: {}", self_path());
     println!(
-        "ar {} — one OpenAI-compatible endpoint, many providers",
+        "aroute {} — one OpenAI-compatible endpoint, many providers",
         crate::version::VERSION
     );
     println!("config: {}", cli.config.display());
@@ -374,9 +374,9 @@ fn home(cli: &Cli) -> anyhow::Result<()> {
         )
     );
     println!("next:");
-    println!("  ar serve      start the proxy");
-    println!("  ar run -p     one completion through the router");
-    println!("  ar doctor     check config, credentials, registry");
+    println!("  aroute serve  start the proxy");
+    println!("  aroute run -p one completion through the router");
+    println!("  aroute doctor check config, credentials, registry");
     Ok(())
 }
 
@@ -386,7 +386,7 @@ fn home(cli: &Cli) -> anyhow::Result<()> {
 /// error: the caller still wants the rest of the view.
 fn self_path() -> String {
     std::env::current_exe().map_or_else(
-        |_| "ar (path unavailable)".to_owned(),
+        |_| "aroute (path unavailable)".to_owned(),
         |p| p.display().to_string(),
     )
 }
@@ -416,7 +416,7 @@ fn models(cli: &Cli, args: &ListArgs) -> anyhow::Result<()> {
 /// Routable models: every combo target, plus anything the catalog declares.
 ///
 /// Combo targets come first because those are what this config can actually
-/// route; the catalog's own model list is appended so `ar models` also answers
+/// route; the catalog's own model list is appended so `aroute models` also answers
 /// "what else could I route to". A target's status names the half that failed.
 fn model_rows(cfg: &Config, catalog: &Registry) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
@@ -465,9 +465,9 @@ fn model_rows(cfg: &Config, catalog: &Registry) -> Vec<Row> {
 }
 
 /// The provider half of a `provider/model` target, under the same grammar
-/// `ar serve` routes with (see `ar_server::config::split_target_known`).
+/// `aroute serve` routes with (see `ar_server::config::split_target_known`).
 ///
-/// Compiled-in catalog only: `ar import` builds a combo list from a registry it
+/// Compiled-in catalog only: `aroute import` builds a combo list from a registry it
 /// just generated, so there is no config to widen it with.
 pub fn target_provider(target: &str) -> &str {
     split_target_known(target, |id| registry().get(id).is_some()).0
@@ -621,7 +621,7 @@ fn doctor(cli: &Cli) -> anyhow::Result<()> {
     if failed > 0 {
         return Err(fail(
             format!("{failed} check(s) failed"),
-            "fix the `fail` rows above; `ar configure --check` prints the resolved settings",
+            "fix the `fail` rows above; `aroute configure --check` prints the resolved settings",
         ));
     }
     Ok(())
@@ -631,7 +631,7 @@ fn doctor(cli: &Cli) -> anyhow::Result<()> {
 ///
 /// Shared by `doctor` (prints them) and `configure --check` (reads them), so the
 /// two can never disagree about whether a config is valid. `store` is the same
-/// [`StoreProbe`] `ar serve` resolves, so a credential the server would take
+/// [`StoreProbe`] `aroute serve` resolves, so a credential the server would take
 /// from the store and one this calls `$VAR` cannot be two different claims.
 fn findings(cfg: &Config, path: &str, store: &StoreProbe<'_>) -> Vec<Row> {
     // A collision makes every merged lookup ambiguous, so it becomes one `fail`
@@ -719,7 +719,7 @@ fn findings(cfg: &Config, path: &str, store: &StoreProbe<'_>) -> Vec<Row> {
 
         // F-CRIT-1: a provider the catalog labels `oauth` is not "known" to this
         // build just because it is in the registry. Without this row `doctor`
-        // would report `codex` as a healthy provider while `ar serve` cannot
+        // would report `codex` as a healthy provider while `aroute serve` cannot
         // dispatch to it — the silent known-listing the audit names.
         if def.auth_kind.as_ref() == "oauth" {
             let (status, detail) = oauth_row(&p.id, cfg, store);
@@ -820,7 +820,7 @@ fn pool_rows(cfg: &Config) -> BTreeSet<&str> {
 /// Whether one `provider/model` string routes, and what to say when it does not.
 ///
 /// Shared by the `target/` and `pool/` rows: an operator who mistypes a model in
-/// the bench must be told the same thing `ar serve` will do about it.
+/// the bench must be told the same thing `aroute serve` will do about it.
 fn target_verdict(target: &str, cfg: &Config, catalog: &Registry) -> (&'static str, &'static str) {
     let (provider, model) = split_target_known(target, |id| catalog.get(id).is_some());
     if catalog.get(provider).is_none() {
@@ -835,7 +835,7 @@ fn target_verdict(target: &str, cfg: &Config, catalog: &Registry) -> (&'static s
         // upstream, which reads as "the proxy is broken".
         (
             "fail",
-            "model not in registry; run `ar import --from omniroute --path <OmniRoute/open-sse/config/providers>` or `ar models`",
+            "model not in registry; run `aroute import --from omniroute --path <OmniRoute/open-sse/config/providers>` or `aroute models`",
         )
     } else {
         ("ok", "routable")
@@ -845,7 +845,7 @@ fn target_verdict(target: &str, cfg: &Config, catalog: &Registry) -> (&'static s
 /// The `registry` row: the compiled-in catalog's age, and `warn` once it is past
 /// [`ar_registry::SNAPSHOT_TTL_DAYS`].
 ///
-/// F-HIGH-3. The registry is a snapshot plus `ar import`, so nothing about a
+/// F-HIGH-3. The registry is a snapshot plus `aroute import`, so nothing about a
 /// stale one is visible until a request 404s against a model a provider has since
 /// rotated. This is the signal that costs nothing: the build's own date, which
 /// `ar-registry` stamps, is a floor on the snapshot's age, and the count of
@@ -855,7 +855,7 @@ fn target_verdict(target: &str, cfg: &Config, catalog: &Registry) -> (&'static s
 /// `warn`, not `fail`: a stale snapshot degrades a routing decision, it does not
 /// make the config invalid, and `doctor` exiting 1 on a week-old build would
 /// train operators to ignore it. The models themselves are named by the
-/// `target/<id>` `fail` rows below, which already carry this same `ar import`
+/// `target/<id>` `fail` rows below, which already carry this same `aroute import`
 /// fix -- this row counts them and points at them rather than listing twice.
 ///
 /// The detail is joined with `+` and never `,`: a TOON row is comma-delimited, so
@@ -878,7 +878,7 @@ fn registry_row_at(unroutable: usize, now: u64) -> Row {
             "registry".to_owned(),
             "warn".to_owned(),
             format!(
-                "{compiled} (ttl {}d); {unroutable} configured model(s) below are not in it; run `ar import --from omniroute --path <OmniRoute/open-sse/config/providers>`",
+                "{compiled} (ttl {}d); {unroutable} configured model(s) below are not in it; run `aroute import --from omniroute --path <OmniRoute/open-sse/config/providers>`",
                 ar_registry::SNAPSHOT_TTL_DAYS
             ),
         ];
@@ -886,7 +886,7 @@ fn registry_row_at(unroutable: usize, now: u64) -> Row {
     vec!["registry".to_owned(), "ok".to_owned(), compiled]
 }
 
-/// The `(status, detail)` cell of an `oauth/<provider>` row, public for `ar auth`.
+/// The `(status, detail)` cell of an `oauth/<provider>` row, public for `aroute auth`.
 ///
 /// Five states, each a different operator action, so they cannot share a status:
 ///
@@ -1032,7 +1032,7 @@ fn no_executor_fix(cfg: &Config, provider: &str) -> String {
     }
 }
 
-/// Login readiness for one declared session: whether `ar auth login` can run it.
+/// Login readiness for one declared session: whether `aroute auth login` can run it.
 ///
 /// Separate from [`oauth_row`] on purpose. `oauth_row` answers "does this session
 /// dispatch", which is a question about what is *already stored*; this answers
@@ -1042,7 +1042,7 @@ fn no_executor_fix(cfg: &Config, provider: &str) -> String {
 /// lie in the direction that costs an operator the most: the session works, and
 /// the only thing missing is the ability to renew it by hand.
 ///
-/// The fix therefore names two commands: `ar auth login` for the endpoint the
+/// The fix therefore names two commands: `aroute auth login` for the endpoint the
 /// operator has to add, and the login itself for the tokens a re-auth mints.
 pub fn login_readiness(provider: &str, cfg: &Config, store: &StoreProbe<'_>) -> (String, String) {
     let Some(declared) = cfg.oauth_for(provider) else {
@@ -1117,7 +1117,7 @@ pub fn login_readiness(provider: &str, cfg: &Config, store: &StoreProbe<'_>) -> 
 /// one row and a different one on the next has two commands to learn, and the
 /// whole point of the row is that the next command is on it.
 fn relogin(provider: &str) -> String {
-    format!("; run `ar auth login --provider {provider}`")
+    format!("; run `aroute auth login --provider {provider}`")
 }
 
 /// The canonical spelling of a terminal reason, read from the lists the executor
@@ -1125,7 +1125,7 @@ fn relogin(provider: &str) -> String {
 ///
 /// The union of [`ar_server::TERMINAL_REFRESH_STATUS`] and the carve-out-only
 /// rows, because that union is what `terminal_check_constraint` generates the
-/// store's CHECK from: reading the shared table alone would make `ar doctor` unable
+/// store's CHECK from: reading the shared table alone would make `aroute doctor` unable
 /// to name a reason the store would accept, which is the fourth-copy drift F-MED-2
 /// describes. Ordered shared-first so a listed row keeps precedence, exactly as
 /// `reason_in` scans them.
@@ -1141,7 +1141,7 @@ fn terminal_reason(status: u16, reason: &str) -> Option<&'static str> {
         .map(|(_, r)| *r)
 }
 
-/// Whether a credential name resolves, in the order `ar serve` resolves it: the
+/// Whether a credential name resolves, in the order `aroute serve` resolves it: the
 /// store first, then `keys:`.
 fn resolves(name: &str, cfg: &Config, store: &StoreProbe<'_>) -> bool {
     store.holds(name) || cfg.key(name).is_some_and(|s| !s.expose().trim().is_empty())
@@ -1259,7 +1259,7 @@ fn configure(cli: &Cli, args: &ConfigureArgs) -> anyhow::Result<()> {
     if args.check && failed > 0 {
         return Err(fail(
             format!("{failed} check(s) failed"),
-            "run `ar doctor` for the per-check detail",
+            "run `aroute doctor` for the per-check detail",
         ));
     }
     Ok(())
@@ -1394,7 +1394,7 @@ const BACKUP_DEPTH: usize = 3;
 /// Writes one generated file, naming the path rather than the errno alone.
 ///
 /// Every overwrite keeps the last [`BACKUP_DEPTH`] versions as `<name>.1` …
-/// `<name>.3`, oldest evicted. This is the only write path `ar import` uses, so
+/// `<name>.3`, oldest evicted. This is the only write path `aroute import` uses, so
 /// one rotation covers config.yaml, registry.json, freeBudgets.json and
 /// providerMeta.json together — and `registry.json` is `include_str!`d into
 /// `ar-registry`, so a bad regeneration is a rebuild away from being live.
@@ -1489,7 +1489,7 @@ pub fn check_fields(cli: &Cli) -> Option<String> {
 /// the flags that command actually accepts.
 ///
 /// The subcommand is found by walking the command graph as deep as the arguments
-/// go, by *name* rather than by position: `ar --config path auth login --nope`
+/// go, by *name* rather than by position: `aroute --config path auth login --nope`
 /// has four tokens before the flag, and a positional read of "the first non-flag
 /// token" would land on `path` and list the root's flags instead of the login
 /// verb's. The deepest level reached wins, so a sub-subcommand's flags are on
@@ -1498,7 +1498,7 @@ pub fn unknown_flag_hint(args: &[OsString], invalid: &str) -> String {
     let root = Cli::command();
     let mut deepest = None;
     let mut current = &root;
-    // Two levels is the deepest this surface goes (`ar auth login`), so a fixed
+    // Two levels is the deepest this surface goes (`aroute auth login`), so a fixed
     // walk beats a recursive descent that would have nothing left to descend into.
     for _ in 0..2 {
         let Some(found) = args
@@ -1561,7 +1561,7 @@ mod tests {
 
     #[test]
     fn splits_nested_model_paths_at_the_registered_provider() {
-        // Same grammar `ar serve` routes with: longest registered prefix wins.
+        // Same grammar `aroute serve` routes with: longest registered prefix wins.
         assert_eq!(target_provider("nvidia/moonshotai/kimi-k3"), "nvidia");
         assert_eq!(
             target_provider("aihorde/aphrodite/TheDrummer/Cydonia-24B-v4.3"),
@@ -1671,7 +1671,7 @@ mod tests {
         assert_eq!(row[1], "fail");
         assert!(row[2].contains("model not in registry"), "{row:?}");
         assert!(
-            row[2].contains("ar import"),
+            row[2].contains("aroute import"),
             "the help names the fix: {row:?}"
         );
     }
@@ -1859,7 +1859,7 @@ mod tests {
         );
         let detail = &row(&rows, "auth/codex")[2];
         assert!(
-            detail.contains("ar auth login --provider codex"),
+            detail.contains("aroute auth login --provider codex"),
             "the row names the fix: {detail}"
         );
     }
@@ -2137,7 +2137,10 @@ mod tests {
         // The fix belongs on the row that has something to fix; printing it on
         // every run is noise an agent has to parse past.
         let rows = checks(ONE_PROVIDER, &probe(&["k"]));
-        assert!(!row(&rows, "registry")[2].contains("ar import"), "{rows:?}");
+        assert!(
+            !row(&rows, "registry")[2].contains("aroute import"),
+            "{rows:?}"
+        );
     }
 
     #[test]
@@ -2149,7 +2152,7 @@ mod tests {
             ar_registry::discovery::unix_now() + (ar_registry::SNAPSHOT_TTL_DAYS + 1) * 86_400,
         );
         assert_eq!(row[1], "warn", "{row:?}");
-        assert!(row[2].contains("ar import --from omniroute"), "{row:?}");
+        assert!(row[2].contains("aroute import --from omniroute"), "{row:?}");
         assert!(
             row[2].contains('3'),
             "it counts the models it cannot route: {row:?}"

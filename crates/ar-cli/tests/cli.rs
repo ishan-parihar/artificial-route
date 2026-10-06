@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 /// The binary under test, as built by cargo for this integration test.
-const BIN: &str = env!("CARGO_BIN_EXE_ar");
+const BIN: &str = env!("CARGO_BIN_EXE_aroute");
 
 fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -47,7 +47,7 @@ fn prints_home_when_no_args() {
     assert!(text.contains("one OpenAI-compatible endpoint"), "{text}");
     assert!(text.contains("listen: 127.0.0.1:20128"), "{text}");
     assert!(text.contains("combos[2]{id,provider,status}:"), "{text}");
-    assert!(text.contains("ar doctor"), "{text}");
+    assert!(text.contains("aroute doctor"), "{text}");
 }
 
 #[test]
@@ -69,7 +69,10 @@ fn exits_fast_when_version() {
     // prints it on one line — not that it equals some literal. Pinning the
     // number here meant the test failed on every release bump, which trains a
     // reader to ignore it instead of reading it as a real check.
-    assert_eq!(stdout(&out), format!("ar {}\n", env!("CARGO_PKG_VERSION")));
+    assert_eq!(
+        stdout(&out),
+        format!("aroute {}\n", env!("CARGO_PKG_VERSION"))
+    );
     assert_eq!(stderr(&out), "", "the fast path must not emit diagnostics");
 }
 
@@ -674,7 +677,7 @@ fn names_login_readiness_in_the_doctor_rows() {
     let text = stdout(&out);
     assert!(text.contains("auth/codex,armed,"), "{text}");
     assert!(
-        text.contains("ar auth login --provider codex"),
+        text.contains("aroute auth login --provider codex"),
         "the row names the fix: {text}"
     );
 }

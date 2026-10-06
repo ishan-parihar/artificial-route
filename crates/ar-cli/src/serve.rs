@@ -1,7 +1,7 @@
-//! The two verbs that touch the network: `ar serve` and `ar run`.
+//! The two verbs that touch the network: `aroute serve` and `aroute run`.
 //!
 //! Both build the *same* `ar_server::Components` from the File-mode config and
-//! hand it to `ar_server::server()`. `ar run` then drives that router in-process
+//! hand it to `ar_server::server()`. `aroute run` then drives that router in-process
 //! through `oneshot` rather than opening a socket, which is what makes it a
 //! genuine single-shot completion: identical translation, identical attempt
 //! loop, identical `x-ar-*` decision headers, no second code path to drift.
@@ -42,13 +42,13 @@ fn components(
     {
         return Err(commands::fail(
             format!("no combo named {id:?} is configured"),
-            "use --model with one of: `ar combo --fields id` lists them",
+            "use --model with one of: `aroute combo --fields id` lists them",
         ));
     }
     if cfg.combos.is_empty() {
         return Err(commands::fail(
             "no combo is configured, so there is nothing to serve",
-            "add a `combos:` entry with at least one target, then run `ar doctor`",
+            "add a `combos:` entry with at least one target, then run `aroute doctor`",
         ));
     }
 
@@ -65,7 +65,7 @@ fn components(
     .map_err(|e| {
         commands::fail(
             e,
-            "run `ar doctor`; a target whose provider is not in the compiled-in registry cannot be dispatched to",
+            "run `aroute doctor`; a target whose provider is not in the compiled-in registry cannot be dispatched to",
         )
     })?;
 
@@ -82,7 +82,7 @@ fn components(
         .map(|e| std::sync::Arc::new(e) as std::sync::Arc<dyn ArExec>)?;
 
     // The usage ledger lives next to the credential store by construction, so
-    // `serve` writing rows and `ar mcp`'s `cost_report`/`check_quota` reading
+    // `serve` writing rows and `aroute mcp`'s `cost_report`/`check_quota` reading
     // them describe the same file without two derivations agreeing on a path.
     // An open failure demotes to header-only accounting: the response headers
     // are computed either way, and a proxy that refuses to boot because
@@ -138,7 +138,8 @@ pub async fn serve(cli: &Cli, args: &ServeArgs) -> anyhow::Result<()> {
     // stderr, not stdout: stdout is the data channel (`docs/06`), and a banner
     // there would sit in front of whatever a caller pipes out of this proxy.
     eprintln!(
-        "ar {} listening on http://{addr} ({count} provider(s), {} combo(s))",
+        "{} {} listening on http://{addr} ({count} provider(s), {} combo(s))",
+        crate::version::BIN,
         crate::version::VERSION,
         server.state.config.combos.len()
     );
@@ -208,7 +209,7 @@ pub async fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<()> {
                 "{}",
                 commands::fail(
                     format!("no combo named {id:?} is configured"),
-                    "use --model with one of: `ar combo --fields id` lists them",
+                    "use --model with one of: `aroute combo --fields id` lists them",
                 )
             );
             id.to_owned()
@@ -235,12 +236,12 @@ pub async fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<()> {
         .map_err(|e| {
             commands::fail(
                 format!("cannot build the request: {e}"),
-                "this is a bug in `ar run`",
+                "this is a bug in `aroute run`",
             )
         })?;
 
     let response = tower::ServiceExt::oneshot(server.router, request).await.map_err(|e| {
-        commands::fail(e, "the router failed mid-request; `ar serve` on a port will show the same failure with logs")
+        commands::fail(e, "the router failed mid-request; `aroute serve` on a port will show the same failure with logs")
     })?;
     let status = response.status();
     let decision = response
@@ -261,7 +262,7 @@ pub async fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<()> {
     if !status.is_success() {
         return Err(commands::fail(
             format!("upstream returned {status}"),
-            "the body above is the provider's own answer; `ar doctor` checks config, keys and registry",
+            "the body above is the provider's own answer; `aroute doctor` checks config, keys and registry",
         ));
     }
     Ok(())

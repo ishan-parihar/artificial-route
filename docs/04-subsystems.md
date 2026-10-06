@@ -16,7 +16,7 @@ header-selected pipeline and a config-selected step in the same list. Echo names
 level `engine@level` so a default dial is invisible and a real one is not.
 Precedence `header > combo > off`. A wrong engine or a level the engine does not offer is a
 **load** error naming the fix, never a silent no-op that reads as "this combo is not configured
-to compress". `ar doctor` refuses the file; the reference accepts and ignores it.
+to compress". `aroute doctor` refuses the file; the reference accepts and ignores it.
 Accept: `cargo test -p ar-compress` shows the 3 rungs of each ladder differ; `live_path` shows
 `combo;engines=rtk@aggressive` on the wire with no client header, and a header outranking it.
 
@@ -34,7 +34,7 @@ file, `$AR_CRED_STORE` overrides) holding `enc:v2:` envelopes, one row per `keys
 over a per-install salt persisted in the store's own `store_meta` row, so a store reopens with the
 key it was written with. Master key material comes from `$AR_MASTER_KEY` (hex/base64/raw), never a
 file in the repo. Resolution order is `store -> keys: ($VAR) -> error`: a store that is present and
-will not decrypt is an error, never a silent downgrade to `$VAR`. `ar doctor` adds a `store` row
+will not decrypt is an error, never a silent downgrade to `$VAR`. `aroute doctor` adds a `store` row
 (`skip` when absent — env-only is a supported install) and names the source per `key/<name>`.
 Accept: close-and-reopen reads back; a wrong master refuses; no value reaches stdout, `Debug`, or
 `Display`.
@@ -83,7 +83,7 @@ two cannot be logged together.
 Neither mechanism needs an `OAuthKind`: a device session logs in and a free tier
 never does, so the provider id is the only thing that would want one, and the
 provider named by R1 has no transcribed dispatch wire to attach it to. What that
-costs is `ar doctor`'s vocabulary, and it is paid in the fix rather than the
+costs is `aroute doctor`'s vocabulary, and it is paid in the fix rather than the
 status: an `oauth/<id>` row for a provider with no kind reads *mechanism-aware*, so
 a block declaring `anonymous: true` gets an `ok` row (the free tier needs no
 credential, so it is **armed by design**, not merely usable) and a block declaring
@@ -101,7 +101,7 @@ dispatches anonymously sends a free-tier request while holding a refresh token i
 never uses, and every one of those fields reads as a working config in YAML while
 behaving as something else on the wire. `anonymous_editor` is required alongside it
 (the gateway rejects the request without that header) and is never printed — a value
-in a config file is no licence for a log line, and `ar doctor` names the field, not
+in a config file is no licence for a log line, and `aroute doctor` names the field, not
 its contents.
 
 `SessionKind` in `ar-keys` is the store's `kind` column vocabulary —
@@ -142,7 +142,7 @@ keep in sync with the targets.
 
 Pool entries resolve through the same `split_target_known` -> catalog ->
 credential path a target does, at load: a bench that validated at request time
-would fail one provider at a time, at 3am. `ar doctor` prints `pool/<id>` rows
+would fail one provider at a time, at 3am. `aroute doctor` prints `pool/<id>` rows
 alongside `target/<id>` so an operator can see which half of the 7 is the 2.
 `MAX_ATTEMPTS` still caps the whole request, pool included — a pool widens *what
 is tried*, never *how long a request may spend being failed over*.
@@ -184,7 +184,7 @@ Bodies are `pub(crate)`; `guard()` is the sole public entry, so no host can reac
 Scopes `read:*|write:*|execute:*|*:health|*:combos|*:quota|*:usage|*:models|*:completions` enforced per tool. A *grant* is a subset of those ten bits (`AR_MCP_SCOPE=read:*,write:combos` is invalid; `AR_MCP_SCOPE='read:*'` is not), default-deny for whatever is not named; unset means everything, which is the honest reading for a stdio child the operator launched. A tool's *need* is a mask, and `Tool::scope_doc()` renders it in `06`'s per-tool spelling (`read:health+read:usage`) so the catalog and a host config read the same words. `ar_route_request` keeps `execute:*` even though its body is a pure pick: the pick is the only observable difference between a routed and an unrouted completion, and it is what a caller would address a provider with.
 Audit `blake3(prompt)+truncate(200)+tool|duration|key-id` in `redb`, extended to `tool|duration|key-id|input_hash|outcome|out_len|truncated|output` — a scope denial writes a `denied` row before the `Err` returns, and `truncated:true`+`out_len` mark a cut output so it cannot be read as the whole one. `open()` resumes the sequence from the stored max so a restart appends instead of overwriting.
 `tool_search` one-line signatures from day one, as a function over `Tool::ALL` (wire names + one-liners) rather than a ninth `Tool` variant, so the catalog count hosts report stays 8. CCR/oneproxy/web_search/skills deferred — each needs RAM budget to re-enter.
-Wired, not orphaned (F-HIGH-5): `ar mcp` behind the same default-off `mcp` feature, serving over stdio through `rmcp/transport-io`. `Host` is the binary's half — a plain struct of public fields `ar` fills from the config it already resolved (`ar_server::ServerConfig` for the combos and candidates, `ar-keys` for lane state), so this crate still owns no config loader and no second routing. `ar mcp --list` prints the catalog as TOON and needs no config at all.
+Wired, not orphaned (F-HIGH-5): `aroute mcp` behind the same default-off `mcp` feature, serving over stdio through `rmcp/transport-io`. `Host` is the binary's half — a plain struct of public fields `ar` fills from the config it already resolved (`ar_server::ServerConfig` for the combos and candidates, `ar-keys` for lane state), so this crate still owns no config loader and no second routing. `aroute mcp --list` prints the catalog as TOON and needs no config at all.
 `ar_tool_search` is registered by the transport (9 registered, 8 in `Tool::ALL`) and needs no scope — it reads no host state — but still writes an audit row, so "every tool leaves one" has no exception.
 `ar_route_request` passes **no** `LkgpPins`: a pin is recorded on a dispatched success that a pure pick never has, so `lkgp` honestly falls back to priority rather than advertising stickiness it cannot honour. The ledger is opened per call because `ar_tokens::Ledger` wraps a `rusqlite::Connection`, which is neither `Send` nor `Sync` and would make the whole server unspawnable.
 Accept: default build has zero `rmcp` in tree (`cargo tree -e no-dev | grep rmcp` empty); `+mcp` idle +<25MB; an MCP host can `health -> list_combos -> route -> cost` over stdio.

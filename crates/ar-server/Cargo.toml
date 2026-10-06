@@ -9,10 +9,10 @@ license = "Apache-2.0"
 [lints]
 workspace = true
 
-# No `[[bin]]`. `ar` belongs to `ar-cli`, which already depends on this crate
+# No `[[bin]]`. `aroute` belongs to `ar-cli`, which already depends on this crate
 # and delegates `serve` to `ar_server::server()`. Two crates producing a binary
-# of the same name made `target/release/ar` whichever linked last and made
-# `cargo run --bin ar` ambiguous; see the root README's "Open seams".
+# of the same name made `target/release/aroute` whichever linked last and made
+# `cargo run --bin aroute` ambiguous; see the root README's "Open seams".
 
 [dependencies]
 ar-route = { workspace = true }

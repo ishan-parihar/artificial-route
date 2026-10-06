@@ -25,8 +25,8 @@ Then:
 
 ```sh
 export OPENAI_API_KEY=sk-... ANTHROPIC_API_KEY=sk-ant-...
-ar doctor     # per-check report, never prints secret values
-ar serve      # loopback :20128
+aroute doctor     # per-check report, never prints secret values
+aroute serve      # loopback :20128
 curl -s localhost:20128/healthz && curl -s localhost:20128/v1/models
 ```
 
@@ -36,7 +36,7 @@ Full flag table, service details and `--uninstall` are further down under
 ## Features
 
 - **21 routing strategies + `auto/*`** — priority, least-used, quota-weighted/fair, cost-optimized, expiry-first, reset-aware, fusion, pipeline… plus an 8-variant auto factory scored over 16 factors, with `simulate`/`explain` in the library
-- **276 providers, 1559 models** compiled in — the same provider set as OmniRoute's registry, regenerated from it by `ar import --from omniroute`
+- **276 providers, 1559 models** compiled in — the same provider set as OmniRoute's registry, regenerated from it by `aroute import --from omniroute`
 - **6 wire dialects** — OpenAI, Anthropic, OpenAI-Responses, Gemini, Ollama inbound, OpenAI render; 18 further pairs named loudly instead of half-ported
 - **3 compression engines** (lite, rtk, caveman) with honor-and-echo semantics, per-combo in `config.yaml` and per-request via header, on an intensity dial (`rtk` minimal/standard/aggressive, `caveman` lite/full/ultra) rather than a dozen half-wired engine ids
 - **OAuth dispatch** — codex, cline, claude, gemini-cli, cursor and grok-cli: token injection, refresh on expiry, one rotation retry on 401, per-connection single-flight so a concurrent burst cannot trip `refresh_token_reused`. Two login mechanisms, both with every endpoint operator-supplied: PKCE browser redirect, and RFC 8628 **device flow** for providers that publish no redirect endpoint
@@ -47,7 +47,7 @@ Full flag table, service details and `--uninstall` are further down under
 
 ## Benchmarks
 
-Measured on this machine (24-core x86_64, `/proc/PID/status` VmRSS, release build). The `ar` figure below is the installed systemd service running the full 276-provider / 1559-combo catalog, re-measured 2026-10-04 and flat over 10s; the OmniRoute figure is from its running process on the same box.
+Measured on this machine (24-core x86_64, `/proc/PID/status` VmRSS, release build). The `aroute` figure below is the installed systemd service running the full 276-provider / 1559-combo catalog, re-measured 2026-10-04 and flat over 10s; the OmniRoute figure is from its running process on the same box.
 
 | State | RSS |
 |---|---|
@@ -99,14 +99,14 @@ explanation is [AUDIT-REPORT.md](AUDIT-REPORT.md).
 - **Multi-provider `auto` pools fall back to config order.** Single-provider
   pools score identically; the auto scoring engages for literal `auto/*` names.
 - **Custom providers dispatch the OpenAI wire only.** An `anthropic-compatible`
-  node is accepted and named by `ar doctor`, then refused at dispatch.
+  node is accepted and named by `aroute doctor`, then refused at dispatch.
 - **The MCP control plane is stdio-only** and ships behind `--features mcp`.
-- **The registry snapshot lags OmniRoute's model rotation.** `ar doctor` reports
-  its age and warns past 7 days; `ar import --from omniroute` regenerates it.
+- **The registry snapshot lags OmniRoute's model rotation.** `aroute doctor` reports
+  its age and warns past 7 days; `aroute import --from omniroute` regenerates it.
 
 ## Artificial Route vs OmniRoute v16.3.1
 
-Measured 2026-10-01, `ar` 0.1.1 against a live OmniRoute v16.3.1, both on loopback. Every cell is an observation from that one session.
+Measured 2026-10-01, `aroute` 0.1.1 against a live OmniRoute v16.3.1, both on loopback. Every cell is an observation from that one session.
 
 | Surface | Artificial Route 0.1.1 | OmniRoute v16.3.1 |
 |---|---|---|
@@ -130,18 +130,18 @@ owned divergence, first-sighting timing on `(401, token_revoked)`: we retire on
 the first sighting, OmniRoute on the third (fix record:
 [docs/audit-notes.md](docs/audit-notes.md)). The footprint row is the trade:
 those ~723 extra routes, 110 MCP tools and dashboard are real capability and
-cost ~823MB, while `ar` covers the routing core in ~14.6MB. The ~823MB figure
+cost ~823MB, while `aroute` covers the routing core in ~14.6MB. The ~823MB figure
 is a different OmniRoute process state than the ~994 MiB above.
 
 > [!WARNING]
-> `ar serve` listens unauthenticated. `ar-server` has a bearer gate, but it reads
+> `aroute serve` listens unauthenticated. `ar-server` has a bearer gate, but it reads
 > `Components.master_key` and no shipped command sets that field, so the
 > listener is open whatever `AR_MASTER_KEY` holds (that arms the credential
 > store, not HTTP auth). Keep it on loopback or front it with an authenticating proxy.
 
 Full depth, OAuth mechanics, refresh triggers, quota tables, engine-catalog divergences and every gap with its fix: [AUDIT-REPORT.md](AUDIT-REPORT.md).
 
-Known gaps, stated plainly: OAuth login works via `ar auth login` — a PKCE browser redirect (loopback catch locally, or carry the URL to any device and paste the redirect back) or, for a session that declares `device_initiate_url`/`device_poll_url`, an RFC 8628 device code you approve on another device — plus four MCP tools, and no refresh/authorize/device endpoint is hardcoded, because an auth endpoint guessed from a provider id would be an invented wire format; `grok-cli` has an executor but only for authentication, its Responses body and `x-grok-*` headers are not transcribed, so it builds a session and still does not dispatch; `kilocode` is an RFC 8628 device-flow provider that also serves a free tier, and both mechanisms are ported — a device code, and `anonymous: true` dispatch that needs no credential row at all — but neither is an OAuth *executor*, because its dispatch wire is not transcribed, so with neither mechanism declared its `oauth/` row is still a `fail` whose fix names the YAML for either one; the full explanation is [AUDIT-REPORT.md](AUDIT-REPORT.md) R1; the local credential store holds API keys plus a non-secret `oauth_sessions` table (which credential name a provider's session lives behind, and whether a refresh retired it — never a token), so the generated terminal-status CHECK has a home, but a `config.yaml` must still *declare* each OAuth key name (a `$VAR` there has to be exported, empty is fine); custom providers are file-declared (`custom_providers:`), so a new endpoint needs no rebuild — but only the OpenAI wire dispatches, and an `id` that collides with a compiled-in one is refused; multi-provider `auto` pools fall back to config order (single-provider pools score identically); the MCP control plane is stdio-only (StreamableHTTP deferred) and ships behind `--features mcp`; the registry snapshot lags OmniRoute's model rotation — `ar doctor` reports the snapshot's age, warns past 7 days, names each stale model and the `ar import` fix; an unknown path returns a bare 404 with no body, where OmniRoute returns a JSON envelope carrying the path, so a client that parses every error as JSON gets nothing to parse on a typo'd route; `ar serve` listens unauthenticated, because the `ar-server` bearer gate is driven by a `Components.master_key` that no shipped command sets (`AR_MASTER_KEY` arms the credential store, not HTTP auth), so loopback or a reverse proxy is the only thing between a caller and the provider keys; and the non-routing surface is deliberately narrow, with no dashboard, embeddings, media, audio, rerank, search, OCR, files, batches, WebSocket or A2A, which is where OmniRoute's other ~723 routes and 110 MCP tools live; and only `x-ar-compression` is read, so a client sending OmniRoute's `x-omniroute-compression` header, or its standard/aggressive/ultra plan modes, is silently ignored.
+Known gaps, stated plainly: OAuth login works via `aroute auth login` — a PKCE browser redirect (loopback catch locally, or carry the URL to any device and paste the redirect back) or, for a session that declares `device_initiate_url`/`device_poll_url`, an RFC 8628 device code you approve on another device — plus four MCP tools, and no refresh/authorize/device endpoint is hardcoded, because an auth endpoint guessed from a provider id would be an invented wire format; `grok-cli` has an executor but only for authentication, its Responses body and `x-grok-*` headers are not transcribed, so it builds a session and still does not dispatch; `kilocode` is an RFC 8628 device-flow provider that also serves a free tier, and both mechanisms are ported — a device code, and `anonymous: true` dispatch that needs no credential row at all — but neither is an OAuth *executor*, because its dispatch wire is not transcribed, so with neither mechanism declared its `oauth/` row is still a `fail` whose fix names the YAML for either one; the full explanation is [AUDIT-REPORT.md](AUDIT-REPORT.md) R1; the local credential store holds API keys plus a non-secret `oauth_sessions` table (which credential name a provider's session lives behind, and whether a refresh retired it — never a token), so the generated terminal-status CHECK has a home, but a `config.yaml` must still *declare* each OAuth key name (a `$VAR` there has to be exported, empty is fine); custom providers are file-declared (`custom_providers:`), so a new endpoint needs no rebuild — but only the OpenAI wire dispatches, and an `id` that collides with a compiled-in one is refused; multi-provider `auto` pools fall back to config order (single-provider pools score identically); the MCP control plane is stdio-only (StreamableHTTP deferred) and ships behind `--features mcp`; the registry snapshot lags OmniRoute's model rotation — `aroute doctor` reports the snapshot's age, warns past 7 days, names each stale model and the `aroute import` fix; an unknown path returns a bare 404 with no body, where OmniRoute returns a JSON envelope carrying the path, so a client that parses every error as JSON gets nothing to parse on a typo'd route; `aroute serve` listens unauthenticated, because the `ar-server` bearer gate is driven by a `Components.master_key` that no shipped command sets (`AR_MASTER_KEY` arms the credential store, not HTTP auth), so loopback or a reverse proxy is the only thing between a caller and the provider keys; and the non-routing surface is deliberately narrow, with no dashboard, embeddings, media, audio, rerank, search, OCR, files, batches, WebSocket or A2A, which is where OmniRoute's other ~723 routes and 110 MCP tools live; and only `x-ar-compression` is read, so a client sending OmniRoute's `x-omniroute-compression` header, or its standard/aggressive/ultra plan modes, is silently ignored.
 
 ## Installation
 
@@ -149,7 +149,7 @@ Known gaps, stated plainly: OAuth login works via `ar auth login` — a PKCE bro
 curl -fsSL https://raw.githubusercontent.com/ishan-parihar/artificial-route/main/install.sh | sh
 ```
 
-Static musl binary, checksum-verified, no runtime deps. Lands in `~/.local/bin/ar` and does the whole job in one command: installs the newest release, writes a working `config.yaml` under `~/.config/ar/` (never overwriting an existing one), writes a `600` env file for credentials, installs a **systemd unit** so the proxy starts on boot, and finishes by running `ar doctor` so the result is proved rather than asserted.
+Static musl binary, checksum-verified, no runtime deps. Lands in `~/.local/bin/aroute` and does the whole job in one command: installs the newest release, writes a working `config.yaml` under `~/.config/ar/` (never overwriting an existing one), writes a `600` env file for credentials, installs a **systemd unit** so the proxy starts on boot, and finishes by running `aroute doctor` so the result is proved rather than asserted.
 
 | flag | effect |
 | --- | --- |
@@ -181,13 +181,13 @@ broken unit.
 
 ## Running it
 
-The install already puts `ar` on a systemd unit, so on a box with systemd the
+The install already puts `aroute` on a systemd unit, so on a box with systemd the
 proxy is already running — `curl -s localhost:20128/healthz` answers before you
 type anything. The commands above are for the no-systemd case, or for running a
 second instance in the foreground. One-shot without a server at all:
-`ar run -m cheap -p 'hello'`.
+`aroute run -m cheap -p 'hello'`.
 
-Keys can also live encrypted at rest in a gitignored `credentials.db` beside the config (`$AR_CRED_STORE` moves it; `$AR_MASTER_KEY` holds the 32-byte master). Resolution order is store → `$VAR`, so an install with no store behaves as before, and `ar doctor` reports the `store` row and which source each key resolved from.
+Keys can also live encrypted at rest in a gitignored `credentials.db` beside the config (`$AR_CRED_STORE` moves it; `$AR_MASTER_KEY` holds the 32-byte master). Resolution order is store → `$VAR`, so an install with no store behaves as before, and `aroute doctor` reports the `store` row and which source each key resolved from.
 
 ## Configuration
 
@@ -200,10 +200,10 @@ combos:                                    # clients request the combo id as `mo
 ```
 
 Three keys, and every one is load-bearing: without `combos` no model is
-routable and `ar doctor` says so, because providers are addresses and only a
+routable and `aroute doctor` says so, because providers are addresses and only a
 combo is something a client can ask for.
 
-To adopt an OmniRoute provider tree wholesale, `ar import --from omniroute
+To adopt an OmniRoute provider tree wholesale, `aroute import --from omniroute
 --path <OmniRoute/open-sse/config/providers> --out-dir <dir>` regenerates the
 config and the registry from OmniRoute's own source. It reports every provider
 it could not give a base URL rather than inventing one. (`config.omni-mirror.yaml`
@@ -222,7 +222,7 @@ oauth:
     client_id: <your public OAuth client id>
 ```
 
-`token_url` is mandatory and deliberately not hardcoded: an auth endpoint inferred from a provider id would be an invented wire format. Without it the session still dispatches, and `ar doctor` says its first 401 will be terminal.
+`token_url` is mandatory and deliberately not hardcoded: an auth endpoint inferred from a provider id would be an invented wire format. Without it the session still dispatches, and `aroute doctor` says its first 401 will be terminal.
 
 An endpoint the registry lacks is declared in the same file, no rebuild, and `id` resolves exactly like a catalog provider's:
 
@@ -232,10 +232,10 @@ custom_providers:
       base_url: https://gateway.internal.example/v1, key_ref: my_gateway }
 ```
 
-`protocol` is `openai-compatible` or `anthropic-compatible`; only the OpenAI wire dispatches today, and `headers:` adds outbound headers for a gateway that wants something other than a bearer token. `ar doctor` checks the base URL shape, the credential binding, and refuses an `id` that collides with a compiled-in one.
+`protocol` is `openai-compatible` or `anthropic-compatible`; only the OpenAI wire dispatches today, and `headers:` adds outbound headers for a gateway that wants something other than a bearer token. `aroute doctor` checks the base URL shape, the credential binding, and refuses an `id` that collides with a compiled-in one.
 
 > [!WARNING]
-> `ar doctor` and `ar serve` share one target grammar: a config one accepts, the other accepts. If `serve` refuses a file, `doctor` says why.
+> `aroute doctor` and `aroute serve` share one target grammar: a config one accepts, the other accepts. If `serve` refuses a file, `doctor` says why.
 
 ## Documentation
 

@@ -1,7 +1,7 @@
 # 06 — AXI CLI gates + MCP catalog (normative)
 
 Twelve tools today: the original eight plus four browser-login tools. The count
-is `ar_mcp::Tool::ALL.len()`; `ar mcp --list` prints it.
+is `ar_mcp::Tool::ALL.len()`; `aroute mcp --list` prints it.
 
 Source: `~/.agents/skills/axi` (TOON spec). Applies from P0. CI must enforce.
 
@@ -13,13 +13,13 @@ Source: `~/.agents/skills/axi` (TOON spec). Applies from P0. CI must enforce.
 * Errors structured on stdout with `help: <exact fix command>`, translated (no stack/API leak). No interactive prompts — missing flag fails with usage. Fail loud on unknown flag: name it, list valid flags inline (or `--help` block), per-subcommand sets, `--status renamed; use --state` hints. `--help` always passes.
 * Content-first: bare `ar` prints `bin: ~/.../ar + one-line description + live combos/quota`, not manual. Per-command `--help` concise + 2-3 examples.
 * `--version` fast path: `-v|-V|--version` bare exits 0 before command graph loads. `VERSION` in leaf builtins-only module, heavy CLI behind dynamic load. Test vs process floor, not absolute ms.
-* Session: `ar setup claude|codex|opencode` installs `SessionStart` hook (explicit opt-in, idempotent, path-repair, dir-scoped, token-minimal) + generated `SKILL.md` from home view with `--check` CI stale-fail. Hook primary, skill secondary.
+* Session: `aroute setup claude|codex|opencode` installs `SessionStart` hook (explicit opt-in, idempotent, path-repair, dir-scoped, token-minimal) + generated `SKILL.md` from home view with `--check` CI stale-fail. Hook primary, skill secondary.
 
 ## MCP catalog (P1, `--features mcp`, default off)
 
 Thin wrappers over same `ar-route|ar-tokens|ar-obs|ar-exec` fns. Transports stdio + StreamableHTTP via `rmcp`. `schemars+serde_json` schemas.
 
-**Status:** stdio is wired (`ar mcp`, `--features mcp`); StreamableHTTP is deferred, and the
+**Status:** stdio is wired (`aroute mcp`, `--features mcp`); StreamableHTTP is deferred, and the
 `Scope` column below is each tool's *need* — a *grant* is a subset of the ten scope bits
 (`read:*`, `write:*`, `execute:*`, `*:health`, `*:combos`, `*:quota`, `*:usage`, `*:models`,
 `*:completions`, `*`), set per process in `AR_MCP_SCOPE`. Those spellings are compositions of
@@ -45,7 +45,7 @@ Deferred: `simulate_route, test_combo, best_combo_for_task, session_snapshot, ca
 
 ### The four login tools (9–12)
 
-The remote half of `ar auth login|status|logout`, over OmniRoute's
+The remote half of `aroute auth login|status|logout`, over OmniRoute's
 `inAppLoginService` order — **url → complete → persist → verify** — with Playwright replaced by
 a person on another device and stdin replaced by a second tool call. Splitting at exactly one
 point is what makes it work from a headless VPS; what crosses the gap is the PKCE verifier,

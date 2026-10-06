@@ -143,7 +143,12 @@ pub fn scan(providers_dir: &Path, storage: Option<&Path>) -> anyhow::Result<Impo
             combos(&defs)
         }
     };
-    let config_yaml = render_yaml(&defs, &combos);
+    // Ad-hoc nodes the combos name. Read before rendering because a combo step
+    // carries the provider id this table stores, and a generated config whose
+    // combo names a provider it does not define refuses to start.
+    let custom_providers = storage.map(crate::import::custom::read).unwrap_or_default();
+
+    let config_yaml = render_yaml(&defs, &combos, &custom_providers);
     Ok(Imported {
         registry: defs,
         combos,
@@ -1326,7 +1331,7 @@ fn collect_models(
 
 /// The conventional env var for a provider id.
 ///
-/// A convention, not a fact, and the same one `ar import --from litellm` uses: the
+/// A convention, not a fact, and the same one `aroute import --from litellm` uses: the
 /// generated config is a starting point the user edits, and a wrong guess is a
 /// one-line fix rather than a secret this process has to hold.
 fn env_hint(id: &str) -> String {

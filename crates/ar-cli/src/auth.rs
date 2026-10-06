@@ -1,4 +1,4 @@
-//! `ar auth login|logout|status` — browser-session OAuth from the terminal.
+//! `aroute auth login|logout|status` — browser-session OAuth from the terminal.
 //!
 //! The step order is OmniRoute's `inAppLoginService` (`url → complete → persist
 //! → verify`) with Playwright replaced by a person on another device, which is
@@ -17,7 +17,7 @@
 //! * **exchange** — [`ar_exec::oauth::exchange_code`], with the `client_secret`
 //!   read from the `client_secret_key` row when the session declares one.
 //! * **persist** — access and refresh rows into `ar-keys`' store, then
-//!   **verify** — the same `ar doctor` verdict, printed as the success row.
+//!   **verify** — the same `aroute doctor` verdict, printed as the success row.
 //!
 //! # Three mechanisms, one step order
 //!
@@ -45,7 +45,7 @@
 //! The device half holds the one genuinely new secret, `device_code`, inside
 //! `ar_exec`'s `DevicePending` for the whole of the login and never reads it
 //! here. Every success row names a *row*, not a value — the same discipline
-//! `ar doctor`'s `key/<name>` rows already keep.
+//! `aroute doctor`'s `key/<name>` rows already keep.
 //!
 //! # Exactly one interaction
 //!
@@ -70,14 +70,14 @@ use crate::cli::{AuthArgs, AuthCommand, AuthLoginArgs, AuthProviderArgs};
 use crate::commands::{self, fail, load};
 use crate::toon;
 
-/// Columns of the `ar auth status` table.
+/// Columns of the `aroute auth status` table.
 ///
 /// `id,provider,status` leads so `toon::DEFAULT_FIELDS` applies positionally, and
 /// `provider` repeats the id because a TOON row read in isolation by an agent
 /// should say which session it is about without a second lookup.
 ///
 /// `status` and `login` are separate verdicts on separate questions and are never
-/// merged: `status` is the `ar doctor` `oauth/` row (does this session dispatch)
+/// merged: `status` is the `aroute doctor` `oauth/` row (does this session dispatch)
 /// and `login` is login readiness (can it be re-authorised). A session holding
 /// both tokens but declaring no `authorization_url` is `armed` and `unavailable`
 /// at the same time, and one cell could not say both.
@@ -91,10 +91,10 @@ const STATUS_COLUMNS: [&str; 7] = [
     "login_reason",
 ];
 
-/// Columns of the `ar auth login` result.
+/// Columns of the `aroute auth login` result.
 const LOGIN_COLUMNS: [&str; 3] = ["id", "status", "detail"];
 
-/// Columns of the `ar auth logout` result.
+/// Columns of the `aroute auth logout` result.
 const LOGOUT_COLUMNS: [&str; 3] = ["id", "status", "removed"];
 
 /// Longest stdin line [`read_pasted_redirect`] will hold.
@@ -104,7 +104,7 @@ const LOGOUT_COLUMNS: [&str; 3] = ["id", "status", "removed"];
 /// become an unbounded allocation. Past it the line is a mistake, not a redirect.
 const PASTE_MAX: usize = 8 * 1024;
 
-/// Dispatches `ar auth`.
+/// Dispatches `aroute auth`.
 pub fn run(cli: &crate::cli::Cli, args: &AuthArgs) -> anyhow::Result<()> {
     match &args.command {
         AuthCommand::Login(a) => commands::block_on(login(cli, a)),
@@ -150,8 +150,8 @@ fn exec_session(provider: &str, declared: &OAuthSession) -> anyhow::Result<Sessi
             format!("this build has no oauth executor for {provider}"),
             if declared.anonymous {
                 format!(
-                    "`ar auth login --provider {provider}` needs no executor on an anonymous session, \
-                     so this must be a dispatch problem rather than a login one; `ar doctor` reports it"
+                    "`aroute auth login --provider {provider}` needs no executor on an anonymous session, \
+                     so this must be a dispatch problem rather than a login one; `aroute doctor` reports it"
                 )
             } else if declares_device(declared) {
                 format!(
@@ -159,7 +159,8 @@ fn exec_session(provider: &str, declared: &OAuthSession) -> anyhow::Result<Sessi
                      add `anonymous: true` to its `oauth:` block to use the free tier instead"
                 )
             } else {
-                "`ar doctor` lists the providers it can authenticate; use one of those".to_owned()
+                "`aroute doctor` lists the providers it can authenticate; use one of those"
+                    .to_owned()
             },
         ));
     };
@@ -237,7 +238,7 @@ fn access_key(cfg: &Config, provider: &str) -> String {
 /// failed on a missing master key has sent an operator to a browser for a
 /// session it could never have completed, and `credential_store` treats an
 /// absent store as the supported `$VAR`-only install — which is right for
-/// `ar serve` and wrong here, because a first-ever login is exactly the case
+/// `aroute serve` and wrong here, because a first-ever login is exactly the case
 /// where the store has to be created.
 fn open_login_store(
     cli: &crate::cli::Cli,
@@ -246,7 +247,7 @@ fn open_login_store(
     let store = commands::open_store(&path).map_err(|e| {
         fail(
             format!("cannot open the credential store at {}: {e}", path.display()),
-            "set $AR_MASTER_KEY to 32 bytes and $AR_CRED_STORE to a writable path; `ar doctor` reports the store row",
+            "set $AR_MASTER_KEY to 32 bytes and $AR_CRED_STORE to a writable path; `aroute doctor` reports the store row",
         )
     })?;
     Ok((path, store))
@@ -256,11 +257,11 @@ fn open_login_store(
 ///
 /// One function for both mechanisms: the store layout is the store's, not the
 /// flow's, and a device token that landed under a different set of names than a
-/// PKCE one would leave `ar doctor` reporting a session it cannot find.
+/// PKCE one would leave `aroute doctor` reporting a session it cannot find.
 ///
 /// A provider that returned a refresh token but declared no `refresh_key` is
 /// refused rather than stored under a guessed name: without the declaration the
-/// session dies on its first 401, which is exactly what `ar doctor` is for.
+/// session dies on its first 401, which is exactly what `aroute doctor` is for.
 fn persist_token(
     store: &ar_keys::CredentialStore,
     cfg: &Config,
@@ -286,11 +287,11 @@ fn persist_token(
     Ok(())
 }
 
-/// The `ar auth login` success row, verified through `ar doctor`'s own verdict.
+/// The `aroute auth login` success row, verified through `aroute doctor`'s own verdict.
 ///
 /// Persist first: a login that printed success and lost the token would be the
-/// one failure an operator cannot detect. Reporting second means `ar auth login`
-/// and `ar doctor` can never disagree about whether the login worked.
+/// one failure an operator cannot detect. Reporting second means `aroute auth login`
+/// and `aroute doctor` can never disagree about whether the login worked.
 fn report_login(
     provider: &str,
     cfg: &Config,
@@ -316,7 +317,7 @@ fn report_login(
     );
 }
 
-/// `ar auth login` for a session on the provider's anonymous free tier.
+/// `aroute auth login` for a session on the provider's anonymous free tier.
 ///
 /// The whole verb, and the reason a login command can have nothing to do: there
 /// is no account, so there is no code, no redirect and no row. Reads a probe
@@ -343,7 +344,7 @@ fn anonymous_login(cfg: &Config, cli: &crate::cli::Cli, provider: &str) -> anyho
     Ok(())
 }
 
-/// `ar auth login` over an RFC 8628 device grant.
+/// `aroute auth login` over an RFC 8628 device grant.
 ///
 /// The step order is the same five as the redirect half — initiate, present,
 /// poll, persist, verify — because it is the same command to an operator. Only
@@ -644,8 +645,8 @@ fn logout(cli: &crate::cli::Cli, args: &AuthProviderArgs) -> anyhow::Result<()> 
     let cfg = load(cli)?;
     let provider = args.provider.as_deref().ok_or_else(|| {
         fail(
-            "`ar auth logout` needs a provider",
-            "run `ar auth logout --provider <id>`; `ar auth status` lists the ids",
+            "`aroute auth logout` needs a provider",
+            "run `aroute auth logout --provider <id>`; `aroute auth status` lists the ids",
         )
     })?;
     let declared = session_for(&cfg, provider)?;
@@ -717,9 +718,9 @@ fn status(cli: &crate::cli::Cli, args: &AuthProviderArgs) -> anyhow::Result<()> 
             continue;
         }
         // Two verdicts, two questions: `status` is whether the session dispatches
-        // (the `ar doctor` `oauth/` row) and `login` is whether it can be
+        // (the `aroute doctor` `oauth/` row) and `login` is whether it can be
         // re-authorised. A session can be armed on the first and unavailable on
-        // the second, which is exactly the case an operator running `ar auth
+        // the second, which is exactly the case an operator running `aroute auth
         // login` is trying to find out about.
         let (status, reason) = commands::oauth_row(&declared.provider, &cfg, &store);
         let (login, why) = commands::login_readiness(&declared.provider, &cfg, &store);
@@ -742,7 +743,7 @@ fn status(cli: &crate::cli::Cli, args: &AuthProviderArgs) -> anyhow::Result<()> 
         return Err(fail(
             format!("no `oauth:` block declares {id}"),
             format!(
-                "add an `oauth:` block for {id}, or run `ar auth status` to see the sessions that exist"
+                "add an `oauth:` block for {id}, or run `aroute auth status` to see the sessions that exist"
             ),
         ));
     }
@@ -775,7 +776,7 @@ fn store_write_error(name: &str, e: ar_keys::KeyError) -> anyhow::Error {
 /// so the fix names the mode rather than the mechanism.
 fn login_help(provider: &str) -> String {
     format!(
-        "re-run `ar auth login --provider {provider} --no-browser` and paste the redirected url on one line"
+        "re-run `aroute auth login --provider {provider} --no-browser` and paste the redirected url on one line"
     )
 }
 
@@ -786,7 +787,7 @@ fn login_help(provider: &str) -> String {
 /// what to retry, rather than anything about pasting a redirect.
 fn device_help(provider: &str) -> String {
     format!(
-        "re-run `ar auth login --provider {provider}` and enter the new code on any device before it expires"
+        "re-run `aroute auth login --provider {provider}` and enter the new code on any device before it expires"
     )
 }
 

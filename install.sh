@@ -6,7 +6,7 @@
 #
 # One command does the whole job: installs the newest release, writes a working
 # config, installs and starts a systemd unit so the proxy comes up on boot, and
-# proves the result with `ar doctor`. Re-running it over an existing install
+# proves the result with `aroute doctor`. Re-running it over an existing install
 # updates the binary and leaves your config alone. There is no separate updater
 # to drift out of sync with this one.
 #
@@ -27,8 +27,8 @@ set -eu
 
 REPO="ishan-parihar/artificial-route"
 API="https://api.github.com/repos/$REPO/releases/latest"
-ASSET="ar-x86_64-unknown-linux-musl"
-SERVICE_NAME="ar"
+ASSET="aroute-x86_64-unknown-linux-musl"
+SERVICE_NAME="aroute"
 
 # A bare `curl | sh` inherits whatever HOME the caller's shell had, which is not
 # a safe thing to assume: some CI images and some `su -c` invocations unset it,
@@ -90,7 +90,7 @@ while [ $# -gt 0 ]; do
     *) echo "error: unknown flag '$1' (see --help)" >&2; exit 2 ;;
   esac
 done
-TARGET="$DIR/ar"
+TARGET="$DIR/aroute"
 
 case "$SERVICE" in
   auto) if [ "$(id -u)" -eq 0 ]; then SERVICE=system; else SERVICE=user; fi ;;
@@ -153,7 +153,7 @@ LATEST="$(latest_tag || true)"
 
 installed_tag() {
   [ -x "$TARGET" ] || return 1
-  "$TARGET" --version 2>/dev/null | sed -n 's/^ar //p'
+  "$TARGET" --version 2>/dev/null | sed -n 's/^aroute //p'
 }
 
 # ---------------------------------------------------------------- uninstall --
@@ -165,7 +165,7 @@ if [ "$UNINSTALL" -eq 1 ]; then
             /etc/systemd/system/$SERVICE_NAME.service 2>/dev/null || true
     systemctl_cmd daemon-reload >/dev/null 2>&1 || true
   fi
-  rm -f "$TARGET" "$DIR/.ar.new"
+  rm -f "$TARGET" "$DIR/.aroute.new"
   # The config and the credentials stay: uninstalling a binary should not
   # destroy the operator's routing setup, which is the expensive part to
   # rebuild. Named explicitly, because an env file full of real keys outliving
@@ -226,7 +226,7 @@ else
 fi
 
 cd "$TMP"
-echo "downloading ar $VERSION ..."
+echo "downloading aroute $VERSION ..."
 curl -fsSL -o "$ASSET" "$BASE/$ASSET"
 curl -fsSL -o SHA256SUMS "$BASE/SHA256SUMS"
 
@@ -249,9 +249,9 @@ chmod +x "$ASSET"
 mkdir -p "$DIR"
 # Written beside the target and renamed in: an `ar` starting during the swap sees
 # the old binary or the new one, never a truncated file that cannot exec.
-cp "$ASSET" "$DIR/.ar.new"
-chmod +x "$DIR/.ar.new"
-mv "$DIR/.ar.new" "$TARGET"
+cp "$ASSET" "$DIR/.aroute.new"
+chmod +x "$DIR/.aroute.new"
+mv "$DIR/.aroute.new" "$TARGET"
 INSTALLED="$("$TARGET" --version)"
 
 if [ -n "$CURRENT" ] && [ "$CURRENT_NUM" != "${VERSION#v}" ]; then
@@ -261,7 +261,7 @@ else
 fi
 
 # --------------------------------------------------------------- config ------
-# Without this the binary is inert: `ar doctor` and `ar serve` both refuse to
+# Without this the binary is inert: `aroute doctor` and `aroute serve` both refuse to
 # start when no config.yaml is reachable, so "installed" would mean "present but
 # unable to run". Never overwritten — an existing config is the operator's work.
 # Parent directory via parameter expansion rather than `dirname`: one fewer
@@ -295,8 +295,8 @@ providers:
     key: anthropic
 
 # A combo is a routable model name: providers alone are never addressable, so an
-# install without one leaves `ar doctor` reporting "no model is routable" and
-# `ar serve` with nothing to dispatch. Targets are `<provider>/<model>`.
+# install without one leaves `aroute doctor` reporting "no model is routable" and
+# `aroute serve` with nothing to dispatch. Targets are `<provider>/<model>`.
 combos:
   - id: default
     strategy: lkgp
@@ -379,7 +379,7 @@ UNITEOF
       # boot" false for every session that logs out first.
       loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || true
     fi
-    # A missing key makes `ar serve` exit immediately, so a failed start here
+    # A missing key makes `aroute serve` exit immediately, so a failed start here
     # usually means empty credentials rather than a broken unit. Reported, not
     # hidden, and not treated as a failed install.
     if systemctl_cmd restart "$SERVICE_NAME.service" >/dev/null 2>&1; then

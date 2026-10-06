@@ -15,9 +15,11 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Name the binary is invoked as in help and version output.
 ///
 /// Hardcoded rather than `CARGO_PKG_NAME`: the crate is `ar-cli` but the binary
-/// is `ar`, and `env!("CARGO_PKG_NAME")` would print `ar-cli 0.1.0` in version
-/// output and in usage strings.
-pub const BIN: &str = "ar";
+/// is `aroute`, and `env!("CARGO_PKG_NAME")` would print `ar-cli 0.1.4` in
+/// version output and in usage strings. Not `ar` — the Rust `ar` crate (the .a
+/// archiver, `cargo install ar`) owns that on $PATH, and an LLM proxy and an
+/// archiver with one name is a coin flip for whoever is in a hurry.
+pub const BIN: &str = "aroute";
 
 /// Answers a bare version query without building the command graph.
 ///

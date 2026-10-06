@@ -235,7 +235,7 @@ Derived estimates (`[INFERENCE]`):
   from source size, not measured.
 
 Embedded into the binary (`rust-embed`/`include_str!`), the whole output becomes
-**part of the executable** — the `ar` binary grows by the full asset size and each
+**part of the executable** — the `aroute` binary grows by the full asset size and each
 rebuild of the UI forces a full Rust relink. Shipped beside the binary, it stays
 a separate artifact but the release is no longer "one file".
 

@@ -3,18 +3,20 @@ name = "ar-cli"
 version.workspace = true
 edition = "2024"
 rust-version = "1.90"
-description = "The `ar` binary: AXI/TOON command surface over ar-config + ar-registry + ar-server"
+description = "The `aroute` binary: AXI/TOON command surface over ar-config + ar-registry + ar-server"
 license = "Apache-2.0"
 
+# Not `ar`: the Rust `ar` crate (cargo install ar) owns that name, and an LLM
+# proxy and a .a archiver sharing a name on $PATH is a coin flip for the operator.
 [[bin]]
-name = "ar"
+name = "aroute"
 path = "src/main.rs"
 
 [lints]
 workspace = true
 
-# `ar mcp` is the only surface that needs the MCP protocol SDK, so the SDK and
-# the `ar mcp` subcommand are behind one default-off feature together. A default
+# `aroute mcp` is the only surface that needs the MCP protocol SDK, so the SDK and
+# the `aroute mcp` subcommand are behind one default-off feature together. A default
 # `cargo tree -e no-dev` must contain no `rmcp` (docs/06 accept gate), and this is
 # what keeps that true: `ar-mcp` itself compiles SDK-free, and only its `mcp`
 # feature pulls the tree in.
@@ -30,21 +32,21 @@ ar-route = { workspace = true }
 
 # Not hoisted into `[workspace.dependencies]`: this task's write scope is
 # `crates/ar-cli`, and a path here resolves inside the workspace all the same.
-# It is also the fix for the "two `ar` binaries" seam in the root README — from
-# here on `ar serve` delegates to `ar_server::server()` instead of
+# It is also the fix for the "two `aroute` binaries" seam in the root README — from
+# here on `aroute serve` delegates to `ar_server::server()` instead of
 # re-implementing a listener, so `ar-server`'s own `[[bin]] ar` is redundant.
 ar-server = { path = "../ar-server" }
-# For the local encrypted credential store `ar doctor` probes and `ar serve`
+# For the local encrypted credential store `aroute doctor` probes and `aroute serve`
 # resolves against. Already in the workspace and in `Cargo.lock` via `ar-server`,
 # so this names a second consumer rather than a new dependency.
 ar-keys = { path = "../ar-keys" }
-# `ar auth login` drives the browser-session flow: `new_authorize_request`,
+# `aroute auth login` drives the browser-session flow: `new_authorize_request`,
 # `authorize_url`, `CallbackListener`, `parse_callback_url` and `exchange_code`
 # all live in `ar_exec::oauth`, and the PKCE pair is the contract's. Already a
 # transitive dep via `ar-server` and in `Cargo.lock`, so this names a consumer
 # rather than adding a crate to the build.
 ar-exec = { path = "../ar-exec" }
-# `ar mcp`'s control plane. Optional, and only its `mcp` feature turns on the
+# `aroute mcp`'s control plane. Optional, and only its `mcp` feature turns on the
 # transport, so the default build links the catalog and nothing else.
 ar-mcp = { path = "../ar-mcp", optional = true }
 # For the price table `ServerConfig::from_ar_config` takes, loaded from the
@@ -56,11 +58,11 @@ axum = { workspace = true }
 clap = { workspace = true }
 http-body-util = { workspace = true }
 jemallocator = { workspace = true }
-# For the one `ar import --from omniroute` GET against models.dev. Already in the
+# For the one `aroute import --from omniroute` GET against models.dev. Already in the
 # workspace and in `Cargo.lock` via `ar-exec` / `ar-server`, so naming it here
 # adds no new dependency, only a new consumer of one that is already vetted.
 reqwest = { workspace = true }
-# `ar import --from omniroute --combos <storage.sqlite>` reads OmniRoute's
+# `aroute import --from omniroute --combos <storage.sqlite>` reads OmniRoute's
 # `combos` table. Already in the workspace and in `Cargo.lock` via `ar-keys` /
 # `ar-tokens`, so this names a consumer rather than a new dependency: the build
 # graph and the lockfile are unchanged.
@@ -72,7 +74,7 @@ serde_json = { workspace = true }
 # LiteLLM configs are YAML in every config people actually have.
 serde_yaml = { workspace = true }
 tokio = { workspace = true }
-# `util` for `ServiceExt::oneshot`, which lets `ar run` drive the real router
+# `util` for `ServiceExt::oneshot`, which lets `aroute run` drive the real router
 # in-process instead of re-implementing the request path.
 tower = { workspace = true, features = ["util"] }
 tracing = { workspace = true }
@@ -80,7 +82,7 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }
-# `ar auth` round-trip tests seed a real credential store and read it back, which
+# `aroute auth` round-trip tests seed a real credential store and read it back, which
 # is the only way to prove a logout removed the right rows. Already a normal
 # dependency of this crate, so this names a dev consumer rather than a new crate.
 ar-keys = { path = "../ar-keys" }

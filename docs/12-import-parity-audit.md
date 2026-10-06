@@ -1,14 +1,14 @@
-# 12 — Import parity audit: OmniRoute "visible and enabled" vs `ar import`
+# 12 — Import parity audit: OmniRoute "visible and enabled" vs `aroute import`
 
 Read-only investigation. Every claim below carries a `file:line` into
 `../OmniRoute` (TypeScript) or this repo (Rust). Nothing here is implemented.
 
 The question this doc answers: **OmniRoute shows a curated subset of its static
-registry on `/v1/models`. What does `ar import` reproduce, and what does it drop?**
+registry on `/v1/models`. What does `aroute import` reproduce, and what does it drop?**
 
 Headline: OmniRoute has **no per-provider or per-model `enabled` field anywhere in
 its provider tree**. Visibility is entirely a *runtime* concept layered on top of a
-static registry that is uniformly "enabled". `ar import` reads only the static
+static registry that is uniformly "enabled". `aroute import` reads only the static
 registry — so it reproduces the catalog faithfully and reproduces **none** of the
 six runtime filters that decide what a user actually sees.
 
@@ -298,7 +298,7 @@ The env var names in `.env.example` are for the *server's own* configuration
 
 ## 5. Gap vs artificial-route
 
-### 5.1 What `ar import` does today
+### 5.1 What `aroute import` does today
 
 Entry point: `crates/ar-cli/src/commands.rs:1321-1325`
 (`import_config` → `import::omniroute::scan(import::upstream_tree(path))`;
@@ -348,7 +348,7 @@ usable and is there a matching executor (`:338-349`).
 
 ### 5.3 Point-by-point
 
-| OmniRoute behaviour | `ar import` / `ar serve` | Evidence |
+| OmniRoute behaviour | `aroute import` / `aroute serve` | Evidence |
 |---|---|---|
 | Static provider catalog (276 providers, ~1569 models) | **Reproduced** | `omniroute.rs:55-116`; `registry.json` = 276/1559 |
 | Per-model static metadata (context, caps, executor, auth header) | **Reproduced** | `to_def` `:766`, `to_meta` `:816`, `model_fields` `:884` |
@@ -424,7 +424,7 @@ and shutdown ids, reading records from
 `commands.rs:1349-1352`, and a filter in `model_cards_with`.
 
 ### G5 — Combo import (`combos` table)
-**Missing.** `ar import` synthesises one one-target combo per `provider/model`
+**Missing.** `aroute import` synthesises one one-target combo per `provider/model`
 (`omniroute.rs:1650-1673`) instead of reading OmniRoute's real combos. The
 deliberate reason is recorded in-code (`:1659-1661`) and is sound — but the
 consequence is that an OmniRoute operator's hand-built failover chains,
@@ -433,7 +433,7 @@ consequence is that an OmniRoute operator's hand-built failover chains,
 read of `combos.data` + `sort_order` (`sqliteComboRepository.ts:122`), and a
 replacement for `combos()` that emits real rows instead of the fold.
 **Also:** the LiteLLM path *does* build alias-failover combos (`mod.rs:209-212`,
-`targets: BTreeMap<String, BTreeSet<String>>`) — so `ar import --from litellm`
+`targets: BTreeMap<String, BTreeSet<String>>`) — so `aroute import --from litellm`
 already has the multi-target shape the OmniRoute path lacks. Worth unifying.
 
 ### G6 — Catalog ordering
@@ -479,6 +479,36 @@ one source of truth instead of two. **Consequence:** G1's connection-scoped half
 and G8's per-connection scoping have no home, which is why neither is claimed
 complete above. Revisit only if per-connection credentials are actually needed;
 that is a design decision, not a port.
+
+### G10 — Ad-hoc `openai-compatible-*` nodes (was missing; the import did not boot)
+**Found by running the generated file, not by reading the code.** A combo step
+names its provider by the id `provider_connections.provider` stores, and every
+ad-hoc node lives in that table and nowhere else — the `open-sse/config/providers`
+tree has no row for it. The importer read combos but not connections, so a config
+generated from an operator who had one refused to start:
+`combo target "openai-compatible-chat-f63e4c1e-…/glm-5.3-flash-abliterated"
+names provider …, which is not in the registry`.
+**Fixed** by `crates/ar-cli/src/import/custom.rs`: one `CustomProvider` per
+distinct `provider` id, base URL read from
+`provider_specific_data->baseUrl`, several keys on one node collapsing to one
+entry (a node with eight keys is one endpoint, not eight providers).
+`render_yaml` now writes the `custom_providers:` block **and** a `keys:` entry for
+each node's `key_ref` — without the second, the loader refuses with
+`references undeclared key`. Both are pinned by
+`should_render_a_config_the_loader_actually_accepts`, which parses the generated
+YAML back through `ar_config::Config`.
+
+Three bugs in this one feature, all found by the same live test, all of which a
+code reading had passed:
+1. **The generated key had no `AR_KEY_` prefix** while every other generated key
+   carried it, so the loader looked up a name the operator's `ar.env` could not
+   contain. Now `env_name()` folds the id the same way, and the test pins the
+   prefix.
+2. **`baseUrl` was read as `base_url`.** Silent: serde matched nothing, every node
+   read as base-URL-less, and the only symptom was an unroutable combo step.
+   `should_read_the_camel_case_base_url_the_store_actually_spells` pins it.
+3. **`is_active = 0` rows are excluded**, matching OmniRoute's own reachability
+   rule; an inactive connection cannot dispatch upstream either.
 
 ### What is already correct and should not change
 - The 1:1 static-catalog reproduction (276/1559) is exact and well defended.

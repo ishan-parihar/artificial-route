@@ -279,7 +279,7 @@ this belongs.
 complete and tested (`crates/ar-obs/tests/p5.rs` drives `Metrics`,
 `TraceWriter` and `AuditLedger`), and `docs/05-roadmap.md` lists P5's obs half as
 shipped. Nothing calls it: no crate's `Cargo.toml` depends on `ar-obs`, and
-`ar serve` exposes its own four Prometheus counters from
+`aroute serve` exposes its own four Prometheus counters from
 `ar-server/src/metrics.rs`, which its own doc explains is a deliberate
 hand-rolled substitute for the `prometheus` client crate. So the JSON trace
 writer, the 7-day-rotating trace file and the `AuditLedger` are capabilities

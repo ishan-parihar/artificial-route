@@ -6,8 +6,8 @@ ledger's index; `docs/audit-notes.md` carries the divergence rows themselves.
 
 Reference: `../OmniRoute` v16.3.1, read-only. Baseline for every wave: commit
 `d24ea9a`, gates green (clippy `-D warnings` 0, `cargo test --release` 0,
-`ar doctor` exit 0 on the same config as baseline — its row count is
-config-derived, not a constant — and `ar serve` boot to `/healthz`).
+`aroute doctor` exit 0 on the same config as baseline — its row count is
+config-derived, not a constant — and `aroute serve` boot to `/healthz`).
 
 ## Ground rules
 
