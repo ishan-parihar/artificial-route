@@ -42,10 +42,20 @@ use crate::metrics::{Metrics, Outcome};
 use crate::models::{DiscoveredCatalog, ModelCatalog, ModelsCache, StaticCatalog};
 use crate::routes;
 
-/// Request body ceiling. A chat request is kilobytes; 2MB is a client's runaway
-/// loop, and refusing it at the edge is cheaper than buffering it. Checked here
-/// rather than by the handler because a handler has already paid the allocation.
-pub const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+/// Request body ceiling.
+///
+/// 50MB, matching the reference platform's own hard cap
+/// (`OMNIROUTE_CHART_HARD_MAX_BODY_BYTES` — spelled correctly there as
+/// `OMNIROUTE_CHAT_HARD_MAX_BODY_BYTES`, default 52428800). This project is a
+/// port of that platform, and the previous 2MB was *not* the reference's number:
+/// it was this proxy's own invention, and it rejected requests the platform it
+/// ports accepts. A coding agent routinely carries a large tool result or a
+/// pasted file into one request, and 2MB turned that into a 413 the client could
+/// not explain.
+///
+/// The ceiling is still worth having, and it is still checked here rather than by
+/// a handler because a handler has already paid the allocation.
+pub const MAX_BODY_BYTES: usize = 50 * 1024 * 1024;
 
 /// Request body ceiling on the media routes. Audio uploads are the whole point
 /// of `/v1/audio/transcriptions` and run megabytes by nature, so the chat cap
@@ -488,6 +498,7 @@ impl ArExec for NullExec {
     fn post_media<'a>(
         &'a self,
         provider: &'a ar_route::ProviderId,
+        _model: Option<&'a str>,
         _endpoint: &'a str,
         _content_type: &'a str,
         _body: &'a [u8],
@@ -903,8 +914,10 @@ mod tests {
     use crate::metrics::Outcome;
 
     #[test]
-    fn body_limit_is_2mb() {
-        assert_eq!(MAX_BODY_BYTES, 2 * 1024 * 1024);
+    fn body_limit_matches_the_reference_platforms_hard_cap() {
+        // Not this proxy's own number: the ported platform documents 50MB for the
+        // same ceiling, and a client that works against it must work against this.
+        assert_eq!(MAX_BODY_BYTES, 50 * 1024 * 1024);
     }
 
     /// The fallback deadline, not the layer's: a model with a reason to take
@@ -1412,6 +1425,7 @@ mod tests {
         fn post_media<'a>(
             &'a self,
             _provider: &'a ar_route::ProviderId,
+            _model: Option<&'a str>,
             _endpoint: &'a str,
             _content_type: &'a str,
             _body: &'a [u8],

@@ -25,6 +25,7 @@ use crate::error::RouteError;
 use crate::resilience::{
     BreakerClass, LOCKOUT_BASE_COOLDOWN, LockReason, Resilience, quota_cooldown,
 };
+use crate::simulate::ChainTarget;
 
 /// Upper bound on providers tried for one request.
 ///
@@ -415,9 +416,17 @@ fn is_stop_400(body: &str) -> bool {
 /// Runs `canonical` against `fallback_chain` until one provider answers.
 ///
 /// `fallback_chain[0]` is where [`crate::pick`] put the winner; the rest are
-/// fallbacks. A provider whose key or model is already cooling is skipped
+/// fallbacks. A target whose key or model is already cooling is skipped
 /// without spending an attempt, as is one behind an open breaker, and no
 /// provider is tried twice.
+///
+/// Each entry carries the *model* that target serves, and that model is what
+/// the attempt asks for: the request is re-pointed at `target.model` before
+/// every dispatch, and the cooldown, the breaker and the retirement it records
+/// are keyed on the same string. A chain of bare providers would send the
+/// client's combo id three times and cool that id three times, so a dead model
+/// in the pool would keep being re-picked instead of the model that is actually
+/// down being taken out of rotation.
 ///
 /// # Errors
 /// Never in P0: the loop has no fallible setup. It returns `Result` because
@@ -425,7 +434,7 @@ fn is_stop_400(body: &str) -> bool {
 /// consults a `Router` (P2, `auto/*`) will need it.
 pub async fn attempt_loop<E: Executor + ?Sized>(
     canonical: &CanonicalRequest,
-    fallback_chain: &[ProviderId],
+    fallback_chain: &[ChainTarget],
     exec: &E,
     resilience: &Resilience,
 ) -> Result<AttemptOutcome, RouteError> {
@@ -452,18 +461,23 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
     // p2 is still "come back in 30s", not "the gateway is broken".
     let mut throttled_by: Option<ProviderId> = None;
 
-    for provider in fallback_chain {
+    for target in fallback_chain {
         if tried as usize >= MAX_ATTEMPTS {
             break;
         }
+        let provider = &target.provider;
+        let model = target.model.as_ref();
         // A key or model already cooling is a known-dead target: skipping it
         // costs one loop iteration, spending an attempt on it costs a round
         // trip and a second 429. `is_cooling_for` also sweeps, so this is the
         // self-cleaning path. It runs *before* `is_usable` deliberately:
         // `is_usable` spends a half-open probe, and a provider already known to
-        // be cooling must not burn one.
-        if resilience.is_cooling_for(provider.as_str(), &canonical.model) {
-            tracing::debug!(provider = %provider, "skipping cooling provider");
+        // be cooling must not burn one. The key is the *target's* model, not
+        // the combo the client asked for: the same provider serves several
+        // models, and cooling the combo id would cool a model nothing ever
+        // asked for while the dead one stays in the pool.
+        if resilience.is_cooling_for(provider.as_str(), model) {
+            tracing::debug!(provider = %provider, model, "skipping cooling target");
             continue;
         }
         // The breaker is the whole-provider layer: many targets on one provider
@@ -479,7 +493,11 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
         }
 
         tried += 1;
-        let verdict = match exec.call(provider, canonical).await {
+        // The per-attempt request: same body, same session, this target's model.
+        // One clone per attempt (at most [`MAX_ATTEMPTS`]) is cheaper than
+        // teaching the executor that a request can disagree with its own body.
+        let attempt = canonical.clone().with_model(model);
+        let verdict = match exec.call(provider, &attempt).await {
             Ok(upstream) => {
                 match classify_status(upstream.status.as_u16(), &body_text(&upstream)) {
                     Step::Success => {
@@ -507,7 +525,7 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
                         let (cooldown, throttled) = charge_failure(
                             resilience,
                             provider,
-                            &canonical.model,
+                            model,
                             status,
                             &body_text(&upstream),
                             upstream.retry_after,
@@ -533,8 +551,7 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
                 // No verdict from the provider at all: charge a cooldown so the
                 // next request does not walk into the same dead socket, and a
                 // breaker tick so enough dead sockets take the provider out.
-                let (cooldown, _) =
-                    charge_failure(resilience, provider, &canonical.model, 502, "", None);
+                let (cooldown, _) = charge_failure(resilience, provider, model, 502, "", None);
                 tracing::warn!(provider = %provider, error = %msg, "transport failure, failing over");
                 (502, provider.clone(), cooldown, false, Bytes::new(), None)
             }
@@ -628,10 +645,11 @@ mod tests {
         Fault, MAX_ATTEMPTS, Step, Terminal, attempt_loop, classify_fault, classify_status,
     };
     use crate::AttemptOutcome;
-    use crate::contract::{CanonicalRequest, ExecError, Executor, ProviderId, Upstream};
+    use crate::contract::{CanonicalRequest, ExecError, Executor, ProviderId, Strng, Upstream};
     use crate::resilience::BreakerClass;
     use crate::resilience::QuotaClockGuard;
     use crate::resilience::Resilience;
+    use crate::simulate::ChainTarget;
 
     /// Noon UTC: half a day of allowance left. Both quota tests below assert a
     /// day-lockout is *long*, and `attempt_loop` calls `quota_cooldown()`
@@ -674,6 +692,7 @@ mod tests {
         script: Vec<Verdict>,
         calls: AtomicUsize,
         seen: Mutex<Vec<String>>,
+        models: Mutex<Vec<String>>,
     }
 
     impl Scripted {
@@ -682,11 +701,17 @@ mod tests {
                 script,
                 calls: AtomicUsize::new(0),
                 seen: Mutex::new(Vec::new()),
+                models: Mutex::new(Vec::new()),
             }
         }
 
         fn seen(&self) -> Vec<String> {
             self.seen.lock().map(|s| s.clone()).unwrap_or_default()
+        }
+
+        /// The model each dispatch asked for, in call order.
+        fn models(&self) -> Vec<String> {
+            self.models.lock().map(|s| s.clone()).unwrap_or_default()
         }
     }
 
@@ -694,10 +719,13 @@ mod tests {
         fn call<'a>(
             &'a self,
             provider: &'a ProviderId,
-            _canonical: &'a CanonicalRequest,
+            canonical: &'a CanonicalRequest,
         ) -> Pin<Box<dyn Future<Output = Result<Upstream, ExecError>> + Send + 'a>> {
             if let Ok(mut s) = self.seen.lock() {
                 s.push(provider.as_str().to_owned());
+            }
+            if let Ok(mut m) = self.models.lock() {
+                m.push(canonical.model.as_ref().to_owned());
             }
             let idx = self.calls.fetch_add(1, Ordering::Relaxed);
             let verdict = self.script.get(idx).cloned().unwrap_or(Verdict::Ok);
@@ -754,8 +782,23 @@ mod tests {
         CanonicalRequest::new("m", Bytes::from_static(b"{}"))
     }
 
-    fn chain(names: &[&str]) -> Vec<ProviderId> {
-        names.iter().map(|n| ProviderId::new(*n)).collect()
+    /// A chain of targets that all serve `m`, which is the model
+    /// [`CanonicalRequest::new`] builds in [`req`]. Model-per-target behaviour is
+    /// [`targets`]'s business.
+    fn chain(names: &[&str]) -> Vec<ChainTarget> {
+        names
+            .iter()
+            .map(|n| ChainTarget::new(ProviderId::new(*n), Strng::from("m")))
+            .collect()
+    }
+
+    /// A chain of `(provider, model)` pairs — the shape a real pool resolves to,
+    /// where one provider serves several models.
+    fn targets(pairs: &[(&str, &str)]) -> Vec<ChainTarget> {
+        pairs
+            .iter()
+            .map(|(p, m)| ChainTarget::new(ProviderId::new(*p), Strng::from(*m)))
+            .collect()
     }
 
     /// The loop only awaits ready futures, and the crate has no async runtime
@@ -932,7 +975,10 @@ mod tests {
             Verdict::Transport("c"),
         ]);
         let names: Vec<String> = (0..10).map(|i| format!("p{i}")).collect();
-        let chain: Vec<ProviderId> = names.iter().map(ProviderId::new).collect();
+        let chain: Vec<ChainTarget> = names
+            .iter()
+            .map(|n| ChainTarget::new(ProviderId::new(n), Strng::from("m")))
+            .collect();
         let got = block(attempt_loop(&req(), &chain, &exec, &Resilience::new()));
         assert_eq!(exec.seen().len(), MAX_ATTEMPTS);
         assert!(
@@ -1177,5 +1223,76 @@ mod tests {
         }
         assert_eq!(exec.seen().len() as u32, rounds, "every round dispatched");
         assert!(r.is_usable("p1"), "an oversized prompt is not an outage");
+    }
+
+    #[test]
+    fn dispatches_each_pool_target_with_its_own_model() {
+        // A pool of three distinct models on three providers: every attempt must
+        // ask for the model its target names, not the combo id the client sent.
+        // The executor records the model it saw per call, so a fallback to the
+        // combo name (the pre-fix behaviour) fails the middle assertion.
+        let exec = Scripted::new(vec![
+            Verdict::Status(500, "down"),
+            Verdict::Status(500, "down"),
+            Verdict::Ok,
+        ]);
+        let r = Resilience::new();
+        let got = block(attempt_loop(
+            &req(),
+            &targets(&[("p1", "alpha"), ("p2", "beta"), ("p3", "gamma")]),
+            &exec,
+            &r,
+        ));
+        assert!(matches!(got, Ok(AttemptOutcome::Succeeded { .. })));
+        assert_eq!(exec.seen(), ["p1", "p2", "p3"]);
+        assert_eq!(exec.models(), ["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn a_model_gone_on_target_a_does_not_cool_target_bs_model() {
+        // A 404 "no longer available" retires `p1:alpha` — the *target's* model,
+        // not the combo id — and failover walks on to p2, whose model `beta` is
+        // unrelated and must still dispatch. Keying the retirement on the combo
+        // name would have skipped every later target in the same combo.
+        let r = Resilience::new();
+        let exec = Scripted::new(vec![
+            Verdict::Status(404, "this model is no longer available"),
+            Verdict::Ok,
+        ]);
+        let got = block(attempt_loop(
+            &req(),
+            &targets(&[("p1", "alpha"), ("p2", "beta")]),
+            &exec,
+            &r,
+        ));
+        assert!(matches!(got, Ok(AttemptOutcome::Succeeded { .. })));
+        assert_eq!(
+            exec.seen(),
+            ["p1", "p2"],
+            "the second target still dispatched"
+        );
+        // The retirement landed on the pair that failed, scoped to its own model.
+        assert!(
+            r.is_retired_model("p1", "alpha"),
+            "the dead model is retired"
+        );
+        assert!(
+            !r.is_retired_model("p2", "beta"),
+            "the healthy model is untouched"
+        );
+        // A later request through the same combo still reaches p2: only p1's
+        // model is dead.
+        let exec2 = Scripted::new(vec![Verdict::Ok]);
+        let _ = block(attempt_loop(
+            &req(),
+            &targets(&[("p1", "alpha"), ("p2", "beta")]),
+            &exec2,
+            &r,
+        ));
+        assert_eq!(
+            exec2.seen(),
+            ["p2"],
+            "only the dead model is skipped on retry"
+        );
     }
 }

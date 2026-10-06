@@ -102,7 +102,7 @@ pub use pipeline::{
     build_pipeline_config, execute_pipeline, parse_reflect_json,
 };
 pub use resilience::{DEFAULT_BASE_BACKOFF, DEFAULT_MAX_BACKOFF, Resilience};
-pub use simulate::{RoutePlan, simulate_route};
+pub use simulate::{ChainTarget, RoutePlan, simulate_route};
 pub use strategy::{
     FusionOutcome, PanelVerdict, PipelineOutcome, StageVerdict, Strategy, dispatch_fusion,
     dispatch_pipeline, pick, pick_filtered, pick_for_model,

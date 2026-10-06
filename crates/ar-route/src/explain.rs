@@ -74,7 +74,15 @@ where
         model: winner.model.clone(),
         score: winner.score,
         factors: winner.factors,
-        fallbacks: chain.get(1..).unwrap_or_default().to_vec(),
+        // The trace's public shape stays provider-only: the model each fallback
+        // would ask for is the plan's, not the trace's, and the MCP consumer of
+        // this struct reads providers.
+        fallbacks: chain
+            .get(1..)
+            .unwrap_or_default()
+            .iter()
+            .map(|t| t.provider.clone())
+            .collect(),
         variant: combo.variant.as_str(),
         reason,
     })

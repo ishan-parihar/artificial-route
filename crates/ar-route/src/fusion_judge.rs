@@ -283,7 +283,11 @@ pub async fn synthesize<E: Executor + ?Sized>(
             };
         }
     };
-    let canonical = CanonicalRequest::new(judge.provider_id().as_str(), Bytes::from(body));
+    // A judge target names a *provider*, not a model, so the request carries no
+    // model of its own and the executor sends the model that provider is
+    // configured with. The body's own `model` is a placeholder either way —
+    // `render_request` rewrites it from the dispatch bundle.
+    let canonical = CanonicalRequest::new("", Bytes::from(body));
     let upstream = match exec.call(judge.provider_id(), &canonical).await {
         Ok(upstream) => upstream,
         Err(ExecError(e)) => {

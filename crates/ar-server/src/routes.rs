@@ -57,9 +57,9 @@ use std::time::{Duration, Instant};
 use ar_cache::{Cache, CacheKey, CacheState};
 use ar_compress::Step;
 use ar_route::{
-    AttemptOutcome, AutoCandidate, AutoSelector, Candidate, CanonicalRequest, JudgeOutcome,
-    JudgePanel, JudgeTarget, ProviderId, RouteError, Strategy, Strng, attempt_loop, pick,
-    simulate_route, synthesize, virtual_combo,
+    AttemptOutcome, AutoCandidate, AutoSelector, Candidate, CanonicalRequest, ChainTarget,
+    JudgeOutcome, JudgePanel, JudgeTarget, ProviderId, RouteError, Strategy, Strng, attempt_loop,
+    pick, simulate_route, synthesize, virtual_combo,
 };
 use ar_tokens::ResponseMeta;
 use axum::body::Body;
@@ -1509,10 +1509,14 @@ pub(crate) enum RouteReject {
 /// another combo's.
 /// `Clone` rather than a borrow so the caller can hold the plan while the `&state`
 /// it was resolved from is also on the stack; the struct is three fields, one of
-/// them a `Vec` of small `ProviderId`s.
+/// them a `Vec` of small targets.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RoutePlan {
-    pub(crate) chain: Vec<ProviderId>,
+    /// Targets to try, winner first. Each carries the model that target
+    /// serves, because a pool entry like `kilocode/deepseek-v4-flash` is a
+    /// provider *and* a model: a chain of bare providers sends the combo id
+    /// three times and never reaches the provider's own spelling.
+    pub(crate) chain: Vec<ChainTarget>,
     pub(crate) strategy: Strategy,
     /// The resolved combo's compression setting, if it declared one.
     compression: Option<Step>,
@@ -1728,11 +1732,14 @@ fn judge(state: &AppState, combo: &RouteCombo) -> Option<ProviderId> {
 ///
 /// A pool provider already in the chain is skipped: the loop must not spend two
 /// of its three attempt slots on one endpoint.
-fn chain(state: &AppState, combo: &RouteCombo) -> Vec<ProviderId> {
+fn chain(state: &AppState, combo: &RouteCombo) -> Vec<ChainTarget> {
     let mut chain = order(state, state.config.candidates(Some(combo)));
     for target in state.config.pool(combo) {
-        if !chain.contains(&target.provider) {
-            chain.push(target.provider.clone());
+        if !chain.iter().any(|t| t.provider == target.provider) {
+            chain.push(ChainTarget::new(
+                target.provider.clone(),
+                Strng::from(target.model.as_str()),
+            ));
         }
     }
     chain
@@ -1744,7 +1751,7 @@ fn chain(state: &AppState, combo: &RouteCombo) -> Vec<ProviderId> {
 /// deduplicated: attempting the same provider twice with a different model
 /// spelling is a second round trip to an endpoint that already refused this
 /// request shape.
-fn order(state: &AppState, candidates: Vec<Candidate>) -> Vec<ProviderId> {
+fn order(state: &AppState, candidates: Vec<Candidate>) -> Vec<ChainTarget> {
     if candidates.is_empty() {
         return Vec::new();
     }
@@ -1761,24 +1768,39 @@ fn order(state: &AppState, candidates: Vec<Candidate>) -> Vec<ProviderId> {
             // is a strategy this build has not implemented yet. Config order is
             // the documented fallback rather than a 500.
             tracing::warn!(error = %e, "no strategy winner; falling back to config order");
-            candidates.iter().map(|c| c.provider.clone()).collect()
+            candidates.iter().map(target_of).collect()
         }
     }
 }
 
 /// Winner-first fallback chain.
 /// Winner-first fallback chain.
-fn build_chain(picked: &ProviderId, candidates: &[Candidate]) -> Vec<ProviderId> {
-    let mut chain = vec![picked.clone()];
-    chain.extend(
+fn build_chain(picked: &ProviderId, candidates: &[Candidate]) -> Vec<ChainTarget> {
+    let mut chain = candidates
+        .iter()
+        .filter(|c| c.provider != *picked)
+        .map(target_of)
+        .collect::<Vec<_>>();
+    // The winner leads even when no candidate matches it (`pick` only ever
+    // returns one of them, so this is the empty-list guard rather than a branch).
+    chain.insert(
+        0,
         candidates
             .iter()
-            .map(|c| &c.provider)
-            .filter(|p| **p != *picked)
-            .cloned(),
+            .find(|c| c.provider == *picked)
+            .map_or_else(
+                || ChainTarget::new(picked.clone(), Strng::from(picked.as_str())),
+                target_of,
+            ),
     );
-    chain.dedup();
+    chain.dedup_by(|a, b| a.provider == b.provider);
     chain
+}
+
+/// One candidate as a chain entry: the provider, and the model that provider
+/// serves it under.
+fn target_of(c: &Candidate) -> ChainTarget {
+    ChainTarget::new(c.provider.clone(), c.model.clone())
 }
 
 /// Resolves an `auto/*` alias into a scored chain, or `None` for a concrete name.
@@ -1789,7 +1811,7 @@ fn build_chain(picked: &ProviderId, candidates: &[Candidate]) -> Vec<ProviderId>
 /// module — the same resolver is reached through the crate's public factory
 /// [`virtual_combo`], which is what `ar_route`'s own `VirtualFactory` calls. When
 /// the engine-level spelling lands, this function is the only thing that changes.
-fn auto_chain(state: &AppState, model: &str) -> Option<Vec<ProviderId>> {
+fn auto_chain(state: &AppState, model: &str) -> Option<Vec<ChainTarget>> {
     let combo = virtual_combo(model).ok()?;
     let candidates = state.config.candidates(match state.config.default_combo() {
         DefaultChain::Combo(c) => Some(c),
@@ -1849,7 +1871,7 @@ fn unknown_model(model: &str, known: &[&str]) -> String {
 fn cache_hit(
     cache: &Cache,
     key: &CacheKey,
-    provider: Option<&ProviderId>,
+    planned_winner: Option<&ChainTarget>,
     strategy: Strategy,
 ) -> Option<Response> {
     let lookup = cache.get(key);
@@ -1870,9 +1892,20 @@ fn cache_hit(
         .header(USAGE_HEADER, "attempts=0;cache=hit")
         .header(
             DECISION_HEADER,
+            // `planned=`, not `provider=`. The body came from whichever target
+            // won when the entry was written, and the entry does not record it —
+            // it is a fixed-layout binary record on disk, so adding a field would
+            // invalidate every cached file. Naming the current plan's winner as
+            // if it had served the response would be a false claim on exactly
+            // the header an operator reads when a failover surprises them, so the
+            // header says which target *this* request would have used instead.
+            // The answer itself is still correct to serve: a combo is one logical
+            // model to a client, and weighted/DRR strategies choose a different
+            // winner per request by design.
             format!(
-                "strategy={strategy};outcome=cache;provider={};attempts=0",
-                provider.map_or("-", ProviderId::as_str)
+                "strategy={strategy};outcome=cache;planned={}:{};attempts=0",
+                planned_winner.map_or("-", |t| t.provider.as_str()),
+                planned_winner.map_or("-", |t| t.model.as_ref()),
             ),
         )
         .body(Body::from(body))
@@ -2576,6 +2609,70 @@ fn card_json(c: &crate::models::ModelCard) -> serde_json::Value {
     card
 }
 
+/// The catalog in the order OmniRoute serves it.
+///
+/// Port of `sortCatalogModelsProviderGrouped`
+/// (`src/app/api/v1/models/catalogOrder.ts:56-77`): the combo block first, then
+/// providers in registry precedence, then unknown providers in code-unit order,
+/// with input order preserved inside every group.
+///
+/// The stable sort is `sort_by` plus an input index, not `sort_by_key` alone —
+/// Rust's slice sort is already stable, so the index is what carries *which* group
+/// each card came from through the comparison. Without it two cards in one group
+/// would compare equal and fall back to whichever the unstable comparison
+/// happened to leave first.
+///
+/// A combo card is one whose id equals its `owned_by`, which is how
+/// [`crate::config::ServerConfig::model_cards_with`] builds them: a combo's
+/// targets are private to the router, so the card is named after the combo
+/// itself.
+fn catalog_order(cards: &[crate::models::ModelCard]) -> Vec<&crate::models::ModelCard> {
+    let annotated: Vec<(i64, &str, usize, &crate::models::ModelCard)> = cards
+        .iter()
+        .enumerate()
+        .map(|(index, c)| {
+            let group = group_key(c);
+            (
+                ar_registry::order::group_sort_priority(group),
+                group,
+                index,
+                c,
+            )
+        })
+        .collect();
+    let mut annotated = annotated;
+    annotated.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            // Both unknown: the code-unit tiebreak upstream applies to two
+            // `Infinity` priorities. `&str`'s `Ord` is byte order, which is the
+            // same thing for the ASCII ids a provider prefix is.
+            .then_with(|| {
+                if a.0 == i64::MAX {
+                    a.1.cmp(b.1)
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    annotated.into_iter().map(|(_, _, _, c)| c).collect()
+}
+
+/// The group one card sorts in: the combo bucket, else its `owned_by`.
+///
+/// Port of `modelGroupKey` (`catalogOrder.ts:42-50`). The id-prefix fallback is
+/// kept for a card whose `provider` is empty — upstream calls that path
+/// defensive, and a card built here always has one.
+fn group_key(c: &crate::models::ModelCard) -> &str {
+    if c.id == c.provider {
+        return ar_registry::order::COMBO_GROUP;
+    }
+    if c.provider.is_empty() {
+        return c.id.split_once('/').map_or(c.id.as_str(), |(p, _)| p);
+    }
+    &c.provider
+}
+
 /// Reads the catalog, counting a revalidation when this read triggered one.
 ///
 /// Both catalog routes go through it so `ar_models_refresh_total` follows the
@@ -2596,7 +2693,7 @@ pub async fn models(State(state): State<AppState>) -> Response {
     let cached = cached_models(&state);
     let payload = serde_json::json!({
         "object": "list",
-        "data": cached.cards.iter().map(card_json).collect::<Vec<_>>(),
+        "data": catalog_order(&cached.cards).into_iter().map(card_json).collect::<Vec<_>>(),
     });
     let age = state.models.age().map_or(0, |a| a.as_secs());
     Response::builder()
@@ -2770,6 +2867,7 @@ mod tests {
         fn post_media<'a>(
             &'a self,
             _provider: &'a ProviderId,
+            _model: Option<&'a str>,
             _endpoint: &'a str,
             _content_type: &'a str,
             _body: &'a [u8],
@@ -2867,6 +2965,7 @@ mod tests {
         fn post_media<'a>(
             &'a self,
             _provider: &'a ProviderId,
+            _model: Option<&'a str>,
             _endpoint: &'a str,
             _content_type: &'a str,
             _body: &'a [u8],
@@ -2896,6 +2995,7 @@ mod tests {
         fn post_media<'a>(
             &'a self,
             _provider: &'a ProviderId,
+            _model: Option<&'a str>,
             _endpoint: &'a str,
             _content_type: &'a str,
             _body: &'a [u8],
@@ -2949,7 +3049,7 @@ mod tests {
     fn puts_the_picked_provider_first() {
         let cands = [candidate("a"), candidate("b")];
         let chain = build_chain(&ProviderId::new("b"), &cands);
-        assert_eq!(chain[0].as_str(), "b");
+        assert_eq!(chain[0].provider.as_str(), "b");
     }
 
     #[test]
@@ -4297,6 +4397,7 @@ mod tests {
         fn post_media<'a>(
             &'a self,
             _provider: &'a ProviderId,
+            _model: Option<&'a str>,
             _endpoint: &'a str,
             _content_type: &'a str,
             _body: &'a [u8],
@@ -4482,6 +4583,7 @@ mod tests {
         fn post_media<'a>(
             &'a self,
             _provider: &'a ProviderId,
+            _model: Option<&'a str>,
             _endpoint: &'a str,
             _content_type: &'a str,
             _body: &'a [u8],
@@ -4946,6 +5048,7 @@ mod tests {
             fn post_media<'a>(
                 &'a self,
                 _provider: &'a ProviderId,
+                _model: Option<&'a str>,
                 _endpoint: &'a str,
                 _content_type: &'a str,
                 _body: &'a [u8],

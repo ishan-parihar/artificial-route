@@ -247,15 +247,21 @@ async fn respond_media(
     let mut last_error: Option<String> = None;
     let mut tried: u16 = 0;
     let mut winner: Option<ar_route::ProviderId> = None;
-    for provider in &plan.chain {
+    for target in &plan.chain {
         tried += 1;
         match state
             .exec
-            .post_media(provider, endpoint, content_type, &body)
+            .post_media(
+                &target.provider,
+                Some(target.model.as_ref()),
+                endpoint,
+                content_type,
+                &body,
+            )
             .await
         {
             Ok(reply) if reply.status.is_success() => {
-                winner = Some(provider.clone());
+                winner = Some(target.provider.clone());
                 last_reply = Some(reply);
                 break;
             }
@@ -361,6 +367,7 @@ mod tests {
         fn post_media<'a>(
             &'a self,
             _provider: &'a ProviderId,
+            _model: Option<&'a str>,
             endpoint: &'a str,
             content_type: &'a str,
             body: &'a [u8],

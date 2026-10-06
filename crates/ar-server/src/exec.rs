@@ -356,11 +356,28 @@ impl ProviderConfig {
     /// fields would be a second place to forget a field, and a test that rebuilt
     /// it would pass even if this one dropped the model or the wire.
     pub(crate) fn dispatch(&self, stream: bool) -> Dispatch<'_> {
+        self.dispatch_for(stream, &self.upstream_model)
+    }
+
+    /// The same bundle, asking for `upstream_model` instead of the provider's
+    /// configured default.
+    ///
+    /// The router resolves a *target* out of a pool, and a target is a
+    /// provider plus the model that provider serves it under. Dispatching on the
+    /// configured model alone would send every entry of a three-model pool to
+    /// whichever one the config names, so the override is the request's own
+    /// model — empty meaning "the caller named none", which falls back to the
+    /// configured default so a provider-addressed dispatch still works.
+    pub(crate) fn dispatch_for<'a>(
+        &'a self,
+        stream: bool,
+        upstream_model: &'a str,
+    ) -> Dispatch<'a> {
         Dispatch {
             base_url: &self.base_url,
             wire_format: self.wire_format,
             api_key: &self.api_key,
-            upstream_model: &self.upstream_model,
+            upstream_model,
             stream,
             headers: &self.headers,
         }
@@ -544,7 +561,16 @@ impl ArRouteExec for HttpExec {
             // client disconnect aborts the upstream read instead of waiting for
             // the response-start budget.
             let abort = CancellationToken::new();
-            let shape = cfg.dispatch(canonical.stream);
+            // The model the router picked for *this* attempt, not the provider's
+            // configured one: a chain entry names its own model, and every
+            // attempt that fell back to the config asked for a model the pool
+            // never selected.
+            let requested = if canonical.model.is_empty() {
+                cfg.upstream_model.as_str()
+            } else {
+                canonical.model.as_ref()
+            };
+            let shape = cfg.dispatch_for(canonical.stream, requested);
             // The provider's wire is rendered by `ar-exec`, not by the caller: the canonical
             // body is a provider-neutral shape, and translating it into the
             // registry's declared dialect is the executor's job. The OpenAI arm is
@@ -639,6 +665,7 @@ impl ArRouteExec for HttpExec {
     fn post_media<'a>(
         &'a self,
         provider: &'a ProviderId,
+        model: Option<&'a str>,
         endpoint: &'a str,
         content_type: &'a str,
         body: &'a [u8],
@@ -664,6 +691,16 @@ impl ArRouteExec for HttpExec {
                 .ok_or_else(|| ExecError(format!("unknown media endpoint path: {endpoint}")))?;
 
             let shape = cfg.dispatch(false);
+            // The caller's model wins over the provider's configured one. The
+            // media path reaches here the same way the chat path does — a chain
+            // entry names a provider *and* a model — and dropping it here is what
+            // made `/v1/embeddings` ask every target for the provider's default
+            // instead of the one its chain entry named. `None` (a direct
+            // provider-keyed request with no chain) keeps the configured model.
+            let shape = match model {
+                Some(m) => shape.with_upstream_model(m),
+                None => shape,
+            };
             let bytes = rewrite_json_model(body, content_type, shape.upstream_model);
 
             let abort = CancellationToken::new();

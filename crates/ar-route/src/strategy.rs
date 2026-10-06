@@ -1503,9 +1503,15 @@ pub async fn dispatch_fusion<E: Executor + ?Sized>(
         body: non_streaming_body(&canonical.body),
         ..canonical.clone()
     };
-    let settled =
-        futures::future::join_all(panel.iter().map(|c| exec.call(&c.provider, &panel_request)))
-            .await;
+    let settled = futures::future::join_all(panel.iter().map(|c| {
+        // Each member is asked for the model *it* serves. A panel is a pool, and
+        // the combo id the client sent is not a name any provider knows; the
+        // executor sends whatever model the request carries.
+        let request = panel_request.clone().with_model(c.model.as_ref());
+        let provider = &c.provider;
+        async move { exec.call(provider, &request).await }
+    }))
+    .await;
 
     let mut trace = Vec::with_capacity(panel.len());
     let mut answers: Vec<(ProviderId, String)> = Vec::with_capacity(panel.len());
@@ -1698,7 +1704,10 @@ pub async fn dispatch_pipeline<E: Executor + ?Sized>(
                     };
                 }
             },
-        };
+        }
+        // A stage is a provider *and* the model it serves, so the stage's own
+        // model rides the request rather than the combo the client named.
+        .with_model(stage.model.as_ref());
 
         let response = match exec.call(&stage.provider, &request).await {
             Ok(response) => response,

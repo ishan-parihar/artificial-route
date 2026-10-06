@@ -258,7 +258,13 @@ impl Candidate {
 /// must not be able to change the request it is routing.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CanonicalRequest {
-    /// Requested model, possibly a combo alias resolved upstream of the router.
+    /// The model this request is dispatched as.
+    ///
+    /// A client-facing name on the way in (a combo alias, `auto/*`, or a bare
+    /// `provider/model`), and the *target's own* model once a dispatcher has
+    /// picked one — the attempt loop rewrites it per chain entry, so what
+    /// reaches the executor is what that target serves. Empty means the caller
+    /// named no model of its own and the executor's configured model serves it.
     pub model: Strng,
     /// Canonical JSON request body.
     pub body: Bytes,
@@ -279,6 +285,18 @@ impl CanonicalRequest {
             stream: false,
             session: None,
         }
+    }
+
+    /// The same request, asked for as `model`.
+    ///
+    /// The attempt loop builds one of these per chain entry: the body is a
+    /// `Bytes` (a refcount bump) and the only field that changes is the model,
+    /// so rewriting it per attempt costs one allocation and leaves every other
+    /// byte the router was handed untouched.
+    #[must_use]
+    pub fn with_model(mut self, model: impl AsRef<str>) -> Self {
+        self.model = Strng::from(model.as_ref());
+        self
     }
 
     /// Marks the request as an SSE stream.
@@ -394,6 +412,14 @@ pub trait ArTranslate {
 /// Canonical request → provider wire, and the POST itself.
 ///
 /// Implemented by `ar-exec`.
+///
+/// Both entry points take the model to ask for rather than reading it from the
+/// provider's configuration. A chain entry names a provider *and* a model, and a
+/// provider serving three models from one endpoint is the ordinary case: reading
+/// the model off the provider would make every target in a pool ask for the same
+/// one, which is the defect `ChainTarget` exists to prevent. `post_chat` gets it
+/// already applied to `canonical`; `post_media` takes it separately because a
+/// media body carries the caller's spelling, not the chain's.
 pub trait ArExec: Send + Sync {
     /// POSTs `canonical` to `provider` and returns the raw exchange.
     ///
@@ -428,6 +454,7 @@ pub trait ArExec: Send + Sync {
     fn post_media<'a>(
         &'a self,
         provider: &'a ProviderId,
+        model: Option<&'a str>,
         endpoint: &'a str,
         content_type: &'a str,
         body: &'a [u8],

@@ -10,8 +10,33 @@
 
 use crate::auto::selection::{AutoSelector, rank};
 use crate::auto::{AutoCandidate, AutoCombo, Scored};
-use crate::contract::ProviderId;
+use crate::contract::{ProviderId, Strng};
 use crate::error::RouteError;
+
+/// One entry of an attempt chain: the provider *and the model to ask it for*.
+///
+/// This type exists because a chain of bare [`ProviderId`]s cannot express a
+/// pool entry like `kilocode/deepseek-v4-flash`: the model was dropped when the
+/// plan was built, so every attempt reached the provider with the *combo's* name
+/// instead of the target's, and a pool of three distinct models collapsed to
+/// three attempts at the same wrong model. The provider still dedups — one
+/// provider is one endpoint — but the model is what the provider is asked for, so
+/// it rides along.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChainTarget {
+    /// Provider that serves [`Self::model`].
+    pub provider: ProviderId,
+    /// Provider-local model name to request.
+    pub model: Strng,
+}
+
+impl ChainTarget {
+    /// Builds one target from its two halves.
+    #[must_use]
+    pub fn new(provider: ProviderId, model: Strng) -> Self {
+        Self { provider, model }
+    }
+}
 
 /// The attempt chain a request *would* take, with nothing dispatched.
 ///
@@ -21,8 +46,8 @@ use crate::error::RouteError;
 /// follows, and reporting it would overstate the blast radius of a failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoutePlan {
-    /// Ordered providers to try, winner first. Never empty when `Ok`.
-    chain: Vec<ProviderId>,
+    /// Ordered targets to try, winner first. Never empty when `Ok`.
+    chain: Vec<ChainTarget>,
 }
 
 impl RoutePlan {
@@ -30,14 +55,14 @@ impl RoutePlan {
     /// [`crate::attempt_loop`], which is the point: a dry run and the request
     /// that follows it share one chain producer.
     #[must_use]
-    pub fn chain(&self) -> &[ProviderId] {
+    pub fn chain(&self) -> &[ChainTarget] {
         &self.chain
     }
 
     /// The fallbacks, i.e. everything after the winner. Empty when the plan is
-    /// a single provider.
+    /// a single target.
     #[must_use]
-    pub fn fallbacks(&self) -> &[ProviderId] {
+    pub fn fallbacks(&self) -> &[ChainTarget] {
         self.chain.get(1..).unwrap_or_default()
     }
 
@@ -49,6 +74,12 @@ impl RoutePlan {
     /// be able to abort on a type invariant.
     #[must_use]
     pub fn winner(&self) -> Option<&ProviderId> {
+        self.chain.first().map(|t| &t.provider)
+    }
+
+    /// The winner's provider *and* model, which is what a dispatch needs.
+    #[must_use]
+    pub fn winner_target(&self) -> Option<&ChainTarget> {
         self.chain.first()
     }
 }
@@ -81,21 +112,27 @@ where
 
 /// The shared "winner first, rest by score" ordering.
 ///
-/// Deduplicated by provider: two candidates on one provider would otherwise
-/// burn two of the three attempt slots on a second round trip to the same
-/// upstream, which tells us nothing the first one did not. A provider that
-/// already appears in the chain is skipped, not just the winner — two
-/// *losing* models on one provider is the common case, not the rare one.
-pub(crate) fn chain_from(ranked: &[Scored], winner: &Scored) -> Vec<ProviderId> {
-    let mut chain = vec![winner.provider.clone()];
+/// Deduplicated by **provider**, not by `(provider, model)`: two entries on one
+/// provider would otherwise burn two of the three attempt slots on a second
+/// round trip to the same upstream, which tells us nothing the first one did
+/// not. A provider that already appears in the chain is skipped, not just the
+/// winner — two *losing* models on one provider is the common case, not the rare
+/// one. The model is still carried per entry, because that is what the entry is
+/// *for*: each target is dispatched with its own model, not with the combo's
+/// name.
+pub(crate) fn chain_from(ranked: &[Scored], winner: &Scored) -> Vec<ChainTarget> {
+    let mut chain = vec![ChainTarget::new(
+        winner.provider.clone(),
+        winner.model.clone(),
+    )];
     for c in ranked {
         if chain.len() == crate::MAX_ATTEMPTS {
             break;
         }
-        if chain.contains(&c.provider) {
+        if chain.iter().any(|t| t.provider == c.provider) {
             continue;
         }
-        chain.push(c.provider.clone());
+        chain.push(ChainTarget::new(c.provider.clone(), c.model.clone()));
     }
     chain
 }
@@ -179,7 +216,7 @@ mod tests {
         dup.push(AutoCandidate::new(ProviderId::new("groq"), "llama-3.1-8b").with_price(0.40));
         let plan = simulate_route(&combo("auto"), &dup, &AutoSelector::new(), |_| 0.5)
             .expect("pool present");
-        let mut seen: Vec<&str> = plan.chain().iter().map(ProviderId::as_str).collect();
+        let mut seen: Vec<&str> = plan.chain().iter().map(|t| t.provider.as_str()).collect();
         seen.sort_unstable();
         let before = seen.len();
         seen.dedup();
