@@ -39,55 +39,55 @@ pub enum Command {
     /// Run the proxy listener until interrupted.
     ///
     /// Examples:
-    ///   ar serve
-    ///   ar serve --port 20129
+    ///   aroute serve
+    ///   aroute serve --port 20129
     #[command(verbatim_doc_comment)]
     Serve(ServeArgs),
 
     /// List routable models: every combo target, plus registry-declared models.
     ///
     /// Examples:
-    ///   ar models
-    ///   ar models --fields id,combo
+    ///   aroute models
+    ///   aroute models --fields id,combo
     #[command(verbatim_doc_comment)]
     Models(ListArgs),
 
     /// List configured providers, their wire dialect, and their key binding.
     ///
     /// Examples:
-    ///   ar providers
-    ///   ar providers --fields id,base_url
+    ///   aroute providers
+    ///   aroute providers --fields id,base_url
     #[command(verbatim_doc_comment)]
     Providers(ListArgs),
 
     /// List routing combos and their distinct provider sets.
     ///
     /// Examples:
-    ///   ar combo
-    ///   ar combo --fields id,strategy
+    ///   aroute combo
+    ///   aroute combo --fields id,strategy
     #[command(verbatim_doc_comment)]
     Combo(ListArgs),
 
     /// Check config, credentials and registry; exits 1 on any failure.
     ///
     /// Examples:
-    ///   ar doctor
-    ///   ar doctor --config ./config.yaml
+    ///   aroute doctor
+    ///   aroute doctor --config ./config.yaml
     #[command(verbatim_doc_comment)]
     Doctor,
 
     /// One completion through the real router, printed to stdout.
     ///
     /// Examples:
-    ///   ar run -p 'hello'
-    ///   ar run --model cheap --full -p 'hello'
+    ///   aroute run -p 'hello'
+    ///   aroute run --model cheap --full -p 'hello'
     #[command(verbatim_doc_comment)]
     Run(RunArgs),
     /// Show the effective configuration, after environment-variable resolution.
     ///
     /// Examples:
-    ///   ar configure
-    ///   ar configure --check
+    ///   aroute configure
+    ///   aroute configure --check
     #[command(verbatim_doc_comment)]
     Configure(ConfigureArgs),
 
@@ -104,9 +104,9 @@ pub enum Command {
     /// and redacted; `logout` deletes the session's credential rows.
     ///
     /// Examples:
-    ///   ar auth status
-    ///   ar auth login --provider codex
-    ///   ar auth login --provider claude --no-browser < redirect.txt
+    ///   aroute auth status
+    ///   aroute auth login --provider codex
+    ///   aroute auth login --provider claude --no-browser < redirect.txt
     #[command(verbatim_doc_comment)]
     Auth(AuthArgs),
 
@@ -120,8 +120,8 @@ pub enum Command {
     /// catalog from the same fetch is what `aroute models` reflects meanwhile.
     ///
     /// Examples:
-    ///   ar import --from litellm --path ./litellm.yaml
-    ///   ar import --from omniroute --out-dir ./config
+    ///   aroute import --from litellm --path ./litellm.yaml
+    ///   aroute import --from omniroute --out-dir ./config
     #[command(verbatim_doc_comment)]
     Import(ImportArgs),
 
@@ -135,12 +135,44 @@ pub enum Command {
     /// `write:combos`, …); unset means everything.
     ///
     /// Examples:
-    ///   ar mcp --list
+    ///   aroute mcp --list
     ///   AR_MCP_SCOPE='read:*' ar mcp
     #[cfg(feature = "mcp")]
     #[command(verbatim_doc_comment)]
     Mcp(McpArgs),
+
+    /// Run the bundled web UI server until interrupted.
+    ///
+    /// Spawns the compiled dashboard — a self-contained Node server (`server.js`
+    /// plus its runtime, built by `dashboard/rebrand-dist.sh`) — on its own port;
+    /// `aroute serve` keeps the `/v1` proxy API on `server.port`. The dist
+    /// directory comes from `--path`, else `$AR_DASHBOARD_DIR`, else a
+    /// `dashboard/dist` beside the binary.
+    ///
+    /// The child binds loopback only, and its data lives under `$DATA_DIR`
+    /// (default `~/.config/ar/dashboard-data`), never inside aroute's config.
+    ///
+    /// Examples:
+    ///   aroute dashboard
+    ///   aroute dashboard --port 20150 --path ./dashboard/dist
+    #[command(verbatim_doc_comment)]
+    Dashboard(DashboardArgs),
 }
+
+/// Options for `aroute dashboard`.
+#[derive(Debug, Args)]
+pub struct DashboardArgs {
+    /// Port for the dashboard server.
+    #[arg(long, value_name = "PORT", default_value_t = DEFAULT_DASHBOARD_PORT)]
+    pub port: u16,
+
+    /// The compiled dashboard dist directory (the one containing `server.js`).
+    #[arg(long, value_name = "DIR")]
+    pub path: Option<PathBuf>,
+}
+
+/// Dashboard default port; `aroute serve` keeps `server.port` (20128).
+pub const DEFAULT_DASHBOARD_PORT: u16 = 20149;
 
 /// Options for `aroute serve`.
 #[derive(Debug, Args)]
@@ -211,9 +243,9 @@ pub enum AuthCommand {
     /// retry.
     ///
     /// Examples:
-    ///   ar auth login --provider codex
-    ///   ar auth login --provider codex --no-browser --timeout 600
-    ///   ar auth login --provider claude --scope "openid profile"
+    ///   aroute auth login --provider codex
+    ///   aroute auth login --provider codex --no-browser --timeout 600
+    ///   aroute auth login --provider claude --scope "openid profile"
     #[command(verbatim_doc_comment)]
     Login(AuthLoginArgs),
 
@@ -225,8 +257,8 @@ pub enum AuthCommand {
     /// rows is a no-op that exits 0.
     ///
     /// Examples:
-    ///   ar auth logout --provider codex
-    ///   ar auth logout --provider claude --config ./prod/config.yaml
+    ///   aroute auth logout --provider codex
+    ///   aroute auth logout --provider claude --config ./prod/config.yaml
     #[command(verbatim_doc_comment)]
     Logout(AuthProviderArgs),
 
@@ -237,8 +269,8 @@ pub enum AuthCommand {
     /// the exact `aroute auth login --provider <id>` that fixes them.
     ///
     /// Examples:
-    ///   ar auth status
-    ///   ar auth status --provider codex
+    ///   aroute auth status
+    ///   aroute auth status --provider codex
     #[command(verbatim_doc_comment)]
     Status(AuthProviderArgs),
 }

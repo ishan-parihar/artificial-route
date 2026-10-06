@@ -14,6 +14,7 @@
 mod auth;
 mod cli;
 mod commands;
+mod dashboard;
 mod import;
 #[cfg(feature = "mcp")]
 mod mcp;

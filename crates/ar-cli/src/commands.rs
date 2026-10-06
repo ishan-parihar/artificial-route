@@ -343,6 +343,7 @@ pub fn dispatch(cli: &Cli) -> anyhow::Result<()> {
         Some(Command::Import(a)) => import_config(a),
         #[cfg(feature = "mcp")]
         Some(Command::Mcp(a)) => block_on(crate::mcp::run(cli, a)),
+        Some(Command::Dashboard(a)) => crate::dashboard::run(a),
     }
 }
 

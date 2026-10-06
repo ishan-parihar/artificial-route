@@ -1,4 +1,4 @@
-//! End-to-end contract tests for the `ar` binary.
+//! End-to-end contract tests for the `aroute` binary.
 //!
 //! Each case spawns the real binary so the assertions cover the thing the AXI
 //! gates actually promise — an exit code, a stdout shape, a stderr stream —
@@ -809,4 +809,27 @@ fn never_renders_a_stored_token_value_when_a_session_is_armed() {
     assert!(!text.contains("access-token-value"), "{text}");
     assert!(!text.contains("refresh-token-value"), "{text}");
     assert!(!text.contains("sk-unrelated"), "{text}");
+}
+
+#[test]
+fn dashboard_should_render_help_when_requested() {
+    let out = ar(&["dashboard", "--help"]);
+
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("web UI"), "{text}");
+    assert!(text.contains("aroute dashboard"), "{text}");
+}
+
+#[test]
+fn dashboard_should_name_the_missing_dist_when_path_absent() {
+    // A path that cannot contain `server.js`: the command must name it and
+    // point at the two ways to fix it, without spawning anything.
+    let out = ar(&["dashboard", "--path", "/nonexistent-ar-dist"]);
+
+    assert_eq!(code(&out), 1);
+    let text = stdout(&out);
+    assert!(text.contains("no dashboard at"), "{text}");
+    assert!(text.contains("/nonexistent-ar-dist"), "{text}");
+    assert!(text.contains("AR_DASHBOARD_DIR"), "{text}");
 }

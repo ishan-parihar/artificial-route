@@ -32,3 +32,8 @@ perf.data*
 
 # Release staging (built artifacts, shipped via GitHub Releases)
 /dist/
+
+# The compiled dashboard: a rebranded OmniRoute standalone build (server.js,
+# node_modules, built .next). A release artifact, not source — regenerate with
+# dashboard/rebrand-dist.sh.
+/dashboard/dist/
