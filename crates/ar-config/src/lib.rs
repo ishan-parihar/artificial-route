@@ -441,12 +441,15 @@ pub struct Combo {
     /// happens once the targets refuse, which is the whole of audit F-HIGH-2 —
     /// the live `free-stack` combo lists 2 targets against 7 candidates.
     ///
-    /// A bare `provider` with no `/model` is accepted and means "whatever model
-    /// that provider is configured to serve" — the one case where naming the
-    /// model would add nothing, since a provider with a single configured model
-    /// has exactly one thing it can answer. It is not a wildcard over the whole
-    /// catalog: the provider's own `model:` still decides, so a pool entry can
-    /// never silently dispatch a model the operator did not write down.
+    /// A bare `provider` with no `/model` is accepted and resolves to that
+    /// provider's first model in the registry catalog (`ProviderDef::models`) —
+    /// the one case where naming the model would add nothing, since a provider
+    /// with a single listed model has exactly one thing it can answer. It is not
+    /// a wildcard over the whole catalog, and it is not the `model:` on a
+    /// combo-derived dispatch row (that row is overwritten by the target, see
+    /// `resolve_target`), so a bare entry does dispatch a model the operator
+    /// never spelled out. Deterministic and published in `/v1/models`, but worth
+    /// knowing before writing one.
     ///
     /// Absent or empty means no bench, which is every config written before this
     /// field existed.

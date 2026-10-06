@@ -1430,14 +1430,21 @@ fn resolve_target(
     store: Option<&CredentialStore>,
     providers: &mut Vec<ProviderConfig>,
 ) -> Result<ComboTarget, ComboError> {
-    // A bare `provider` with no `/model` means "whatever model that provider is
-    // configured to serve". `split_target_known` would send that to
-    // `DEFAULT_COMBO_ID` — the flat-provider fallback for a hand-written target
-    // that names no provider at all — which is wrong here, because a *known*
-    // provider was named and the caller meant it. Resolving the model from the
-    // registry's own list is the only reading that cannot dispatch something the
-    // operator did not write down: the provider's declared models are already in
-    // `ProviderDef::models`, and anything else would be a guess.
+    // A bare `provider` with no `/model` resolves to the *registry's* first
+    // listed model for that provider (`ProviderDef::models`). `split_target_known`
+    // would otherwise send the bare string to `DEFAULT_COMBO_ID` — the
+    // flat-provider fallback for a hand-written target that names no provider at
+    // all — which fails as `UnknownProvider { provider: "default" }` for a string
+    // the operator wrote as a provider.
+    //
+    // So the dispatched model is one the operator did not spell out. It is
+    // deterministic and drawn from the same catalog `/v1/models` publishes, which
+    // is what makes it usable at all: a provider listed with no models cannot
+    // resolve at all, and the operator names a provider precisely because they
+    // accept whatever it serves first. Naming a provider *and* a model still wins
+    // — `openai/gpt-4o` is never second-guessed.
+    //
+    // Shared by `pool:` and `targets:`; see `resolve_combo` for the caller.
     let (provider, model) = match split_target_known(target, |id| catalog.get(id).is_some()) {
         (p, m) if p == DEFAULT_COMBO_ID && m == target => match catalog.get(target) {
             Some(def) => match def.models.first() {

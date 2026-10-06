@@ -343,8 +343,11 @@ mod tests {
 
     use super::*;
 
-    /// One recorded media dispatch: endpoint, content type, bytes.
-    type Seen = Arc<Mutex<Vec<(String, String, Vec<u8>)>>>;
+    /// One recorded media dispatch: provider, model, endpoint, content type,
+    /// bytes. The model is recorded because `post_media` receives the routed
+    /// target's model as a separate parameter — there is no `CanonicalRequest` in
+    /// that call for a rebind to ride on, so nothing else observes it.
+    type Seen = Arc<Mutex<Vec<(String, String, String, String, Vec<u8>)>>>;
 
     /// Records each media dispatch and answers with the canned reply, or the
     /// canned refusal when `error` is set.
@@ -353,6 +356,8 @@ mod tests {
         reply: &'static str,
         status: StatusCode,
         error: bool,
+        /// Provider id that refuses, so a chain walks past it to the next target.
+        refuse: Option<&'static str>,
     }
 
     impl ArExec for MediaExec {
@@ -366,20 +371,22 @@ mod tests {
 
         fn post_media<'a>(
             &'a self,
-            _provider: &'a ProviderId,
-            _model: Option<&'a str>,
+            provider: &'a ProviderId,
+            model: Option<&'a str>,
             endpoint: &'a str,
             content_type: &'a str,
             body: &'a [u8],
         ) -> Pin<Box<dyn Future<Output = Result<MediaReply, ExecError>> + Send + 'a>> {
             self.seen.lock().expect("recorder lock").push((
+                provider.as_str().to_owned(),
+                model.unwrap_or_default().to_owned(),
                 endpoint.to_owned(),
                 content_type.to_owned(),
                 body.to_vec(),
             ));
             let status = self.status;
             let reply = self.reply;
-            let error = self.error;
+            let error = self.error || self.refuse == Some(provider.as_str());
             Box::pin(async move {
                 if error {
                     return Err(ExecError("connection refused".to_owned()));
@@ -396,22 +403,33 @@ mod tests {
 
     /// One dispatchable provider serving model `m`, with `exec` swapped in.
     fn routed_under(exec: Arc<dyn ArExec>) -> AppState {
-        let mut config = crate::config::ServerConfig::single(
-            0,
-            Strategy::Priority,
-            vec![
+        routed_over(exec, 1)
+    }
+
+    /// `width` targets on the chain, all sharing the combo alias `m`. Width > 1
+    /// is what makes per-target model dispatch observable: each target carries
+    /// its own model spelling, and the recorder sees exactly what the chain
+    /// asked for.
+    fn routed_over(exec: Arc<dyn ArExec>, width: usize) -> AppState {
+        let providers = (0..width)
+            .map(|i| {
                 crate::exec::ProviderConfig::new(
-                    ProviderId::new("p"),
-                    "http://127.0.0.1:1/v1",
+                    ProviderId::new(format!("p{i}")),
+                    format!("http://127.0.0.1:1/v{i}"),
                     "k",
                 )
-                .with_model("m"),
-            ],
-        );
+                .with_model("row-model")
+            })
+            .collect();
+        let mut config = crate::config::ServerConfig::single(0, Strategy::Priority, providers);
         config.combos = vec![crate::config::RouteCombo::new(
             "m",
             Strategy::Priority,
-            vec![crate::config::ComboTarget::new(ProviderId::new("p"), "m")],
+            (0..width)
+                .map(|i| {
+                    crate::config::ComboTarget::new(ProviderId::new(format!("p{i}")), "t-model")
+                })
+                .collect(),
         )];
         crate::app::Components {
             exec,
@@ -451,6 +469,7 @@ mod tests {
                 "model":"m","usage":{"prompt_tokens":3,"total_tokens":3}}"#,
             status: StatusCode::OK,
             error: false,
+            refuse: None,
         });
         let router = crate::app::app(routed_under(exec));
         let resp = drive(
@@ -465,6 +484,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn each_chain_target_is_dispatched_under_its_own_model() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let exec = Arc::new(MediaExec {
+            seen: Arc::clone(&seen),
+            reply: r#"{"data":[{"embedding":[0.1],"index":0}],"model":"m"}"#,
+            status: StatusCode::OK,
+            error: false,
+            refuse: Some("p0"),
+        });
+        let router = crate::app::app(routed_over(exec, 2));
+        let resp = drive(
+            &router,
+            post("/v1/embeddings", r#"{"model":"m","input":["a"]}"#),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let recorded = seen.lock().expect("recorder");
+        assert_eq!(recorded.len(), 2, "both targets were tried: {recorded:?}");
+        assert_eq!(recorded[0].0, "p0", "first target: {recorded:?}");
+        assert_eq!(recorded[1].0, "p1", "second target: {recorded:?}");
+        assert_eq!(
+            recorded[0].1, "t-model",
+            "target p0 asked under the wrong model: {recorded:?}"
+        );
+        assert_eq!(
+            recorded[1].1, "t-model",
+            "target p1 asked under the wrong model: {recorded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_media_dispatch_never_falls_back_to_the_provider_rows_model() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let exec = Arc::new(MediaExec {
+            seen: Arc::clone(&seen),
+            reply: r#"{"data":[{"embedding":[0.1],"index":0}],"model":"m"}"#,
+            status: StatusCode::OK,
+            error: false,
+            refuse: None,
+        });
+        // `routed_over` gives every provider row the model `row-model`; the chain
+        // target says `t-model`. The chain is authoritative, so the row must never
+        // be what reaches the executor.
+        let router = crate::app::app(routed_over(exec, 1));
+        let resp = drive(
+            &router,
+            post("/v1/embeddings", r#"{"model":"m","input":["a"]}"#),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let recorded = seen.lock().expect("recorder");
+        assert_ne!(
+            recorded[0].1, "row-model",
+            "the dispatch row's model beat the routed target: {recorded:?}"
+        );
+        assert_eq!(recorded[0].1, "t-model", "{recorded:?}");
+    }
+
+    #[tokio::test]
     async fn an_unknown_model_is_a_typed_400_that_never_dispatches() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let exec = Arc::new(MediaExec {
@@ -472,6 +552,7 @@ mod tests {
             reply: "{}",
             status: StatusCode::OK,
             error: false,
+            refuse: None,
         });
         let router = crate::app::app(routed_under(exec));
         let resp = drive(
@@ -494,6 +575,7 @@ mod tests {
             reply: "{}",
             status: StatusCode::OK,
             error: false,
+            refuse: None,
         });
         let router = crate::app::app(routed_under(exec));
         let resp = drive(
@@ -521,6 +603,7 @@ mod tests {
             reply: r#"{"text":"hello"}"#,
             status: StatusCode::OK,
             error: false,
+            refuse: None,
         });
         let router = crate::app::app(routed_under(exec));
         let resp = drive(
@@ -537,12 +620,12 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let recorded = seen.lock().expect("recorder");
         assert_eq!(
-            recorded[0].0, "/audio/transcriptions",
+            recorded[0].2, "/audio/transcriptions",
             "wrong endpoint: {:?}",
             recorded[0]
         );
         assert_eq!(
-            recorded[0].2, b"--b\r\n\r\nfile-bytes",
+            recorded[0].4, b"--b\r\n\r\nfile-bytes",
             "multipart bytes were not forwarded verbatim"
         );
     }
@@ -555,6 +638,7 @@ mod tests {
             reply: "{}",
             status: StatusCode::OK,
             error: false,
+            refuse: None,
         });
         let router = crate::app::app(routed_under(exec));
         let resp = drive(
@@ -582,6 +666,7 @@ mod tests {
             reply: r#"{"text":"bonjour"}"#,
             status: StatusCode::OK,
             error: false,
+            refuse: None,
         });
         let router = crate::app::app(routed_under(exec));
         let resp = drive(
@@ -598,12 +683,12 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let recorded = seen.lock().expect("recorder");
         assert_eq!(
-            recorded[0].0, "/audio/translations",
+            recorded[0].2, "/audio/translations",
             "wrong endpoint: {:?}",
             recorded[0]
         );
         assert_eq!(
-            recorded[0].2, b"--b\r\n\r\nfile-bytes",
+            recorded[0].4, b"--b\r\n\r\nfile-bytes",
             "multipart bytes were not forwarded verbatim"
         );
     }
@@ -616,6 +701,7 @@ mod tests {
             reply: r#"{"data":[{"url":"http://x/i.png"}]}"#,
             status: StatusCode::OK,
             error: false,
+            refuse: None,
         });
         let router = crate::app::app(routed_under(exec));
         let resp = drive(
@@ -640,6 +726,7 @@ mod tests {
             reply: r#"{"error":{"message":"bad document","code":"payload_too_large"}}"#,
             status: StatusCode::UNPROCESSABLE_ENTITY,
             error: false,
+            refuse: None,
         });
         let router = crate::app::app(routed_under(exec));
         let resp = drive(&router, post("/v1/ocr", r#"{"model":"m","document":"x"}"#)).await;
@@ -657,6 +744,7 @@ mod tests {
             reply: "{}",
             status: StatusCode::OK,
             error: true,
+            refuse: None,
         });
         let router = crate::app::app(routed_under(exec));
         let resp = drive(&router, post("/v1/ocr", r#"{"model":"m","document":"x"}"#)).await;

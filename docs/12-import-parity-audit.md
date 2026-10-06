@@ -457,20 +457,28 @@ not resolve.
 (`config.rs:883`) or an alias-resolution step at `resolve()`.
 
 ### G8 — `provider_specific_data.excludedModels`
-**Missing.** Per-connection glob denylist mirrored into the catalog
-(`connectionModelRules.ts:53-82`, applied at `catalog.ts:1097`, `:1244`, `:1696`).
-**Needs:** this presupposes G9 — there is nowhere to put it without a
-per-provider settings block.
+**Partial.** Per-connection glob denylist. What landed: a global `excludeModels`
+denylist (`crates/ar-config/src/glob.rs`, hand-ported from
+`connectionModelRules.ts:53-82`) applied in `model_cards_with`, so imported
+catalogs honour an operator's glob exclusions in `/v1/models`.
+**Still missing:** the *per-connection* scoping. OmniRoute keys these rules to a
+connection row; artificial-route has one credential per provider, so there is
+nothing to scope to — see G9. The global list is the honest analogue, not the
+full feature.
 
 ### G9 — Connection/credential store parity
-**Missing, and the root of G1's half.** artificial-route reads credentials from
-env (`render_yaml` writes `$AR_KEY_*`, `mod.rs:335`) plus the `ar-keys` redb store
-(`crates/ar-keys/src/store.rs`). OmniRoute stores them in
-`provider_connections` (`core.ts:220-265`) and *scopes visibility to what has an
-active row*. artificial-route deliberately has no such table.
-**Needs (only if G1's connection-scoped half is wanted):** a per-provider
-settings block on `ar_config::Config`; this is a design decision, not a port, and
-should be scoped separately from G1.
+**Skipped, deliberately.** artificial-route reads credentials from env
+(`render_yaml` writes `$AR_KEY_*`, `mod.rs:335`) plus the `ar-keys` redb store
+(`crates/ar-keys/src/store.rs`). OmniRoute stores them in `provider_connections`
+(`core.ts:220-265`) and *scopes visibility to what has an active row*.
+**Reason:** a second credential table would duplicate what `ar-keys` already
+owns, and the operator-visible effect of `is_active` is already modelled by
+`CredentialStore::is_dispatchable()` — a provider with no usable key does not
+appear as dispatchable and cannot win a request. That is the same guarantee with
+one source of truth instead of two. **Consequence:** G1's connection-scoped half
+and G8's per-connection scoping have no home, which is why neither is claimed
+complete above. Revisit only if per-connection credentials are actually needed;
+that is a design decision, not a port.
 
 ### What is already correct and should not change
 - The 1:1 static-catalog reproduction (276/1559) is exact and well defended.
