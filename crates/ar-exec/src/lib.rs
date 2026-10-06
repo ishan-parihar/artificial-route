@@ -520,6 +520,24 @@ pub struct Dispatch<'a> {
 }
 
 impl<'a> Dispatch<'a> {
+    /// This dispatch's shape with its model replaced.
+    ///
+    /// The chain decides which model this attempt asks for, so the configured
+    /// `upstream_model` — a property of the provider — is the wrong default on
+    /// any path that walks a chain. Borrowing from `m` for `'b` keeps the shape
+    /// valid only as long as the caller's target string, which is what the
+    /// rewritten body needs anyway.
+    #[must_use]
+    pub fn with_upstream_model<'b>(self, m: &'b str) -> Dispatch<'b>
+    where
+        'a: 'b,
+    {
+        Dispatch {
+            upstream_model: m,
+            ..self
+        }
+    }
+
     /// This dispatch's shape with its bearer replaced.
     ///
     /// The OAuth path's only way to attach a token: `Connection::dispatch`

@@ -164,6 +164,7 @@ dependencies = [
  "insta",
  "jemallocator",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "serde_yaml",

@@ -374,6 +374,44 @@ async fn sends_each_providers_own_model_spelling() {
 }
 
 #[tokio::test]
+async fn sends_each_pool_targets_own_model_when_it_differs_from_the_providers_default() {
+    // The defect this pins: a pool entry names the model it wants
+    // (`a/deepseek-a`), and the executor used to send the provider row's
+    // configured default instead — so the failover below reached the right
+    // provider for the wrong model.
+    let (down, down_seen) = counting_upstream_with(StatusCode::INTERNAL_SERVER_ERROR, "").await;
+    let (up, up_seen) = counting_upstream(StatusCode::OK).await;
+    let mut config = ServerConfig::single(
+        20128,
+        Strategy::Priority,
+        vec![
+            ProviderConfig::new(ProviderId::new("a"), &down, "sk-a").with_model("default-a"),
+            ProviderConfig::new(ProviderId::new("b"), &up, "sk-b").with_model("default-b"),
+        ],
+    );
+    config.combos = vec![RouteCombo::new(
+        "pooled",
+        Strategy::Priority,
+        vec![
+            ComboTarget::new(ProviderId::new("a"), "deepseek-a"),
+            ComboTarget::new(ProviderId::new("b"), "deepseek-b"),
+        ],
+    )];
+    let router = boot(config);
+
+    let body = r#"{"model":"pooled","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let (status, _, text) = call(&router, post("/v1/chat/completions", body, &[])).await;
+
+    assert_eq!(status, 200, "the failover did not answer: {text}");
+    assert_eq!(calls(&down_seen), 1, "the first target was not tried");
+    assert_eq!(calls(&up_seen), 1, "the second target was not tried");
+    assert!(
+        text.contains("deepseek-b"),
+        "the fallback reached the provider as the wrong model: {text}"
+    );
+}
+
+#[tokio::test]
 async fn routes_a_model_to_its_own_combo() {
     // Two combos over two providers: `fast` must reach `a` and `careful` must
     // reach `b`. Before model-based routing, both names landed on one chain.
