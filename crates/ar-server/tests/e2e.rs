@@ -284,11 +284,27 @@ async fn e2e_returns_503_when_no_provider_configured() {
 async fn e2e_rejects_oversized_body() {
     let upstream = mock_upstream().await;
     let (router, _state) = boot(&upstream);
-    // The limit is 2MB; 2MB + 1KB must be refused at the edge, before the
-    // handler allocates or the upstream sees anything.
-    let big = "x".repeat(2 * 1024 * 1024 + 1024);
+    // 50MB, the reference platform's ceiling, plus 1KB. This asserts the real
+    // edge limit rather than the old 2MiB one, and it fails if axum's own
+    // 2MiB `DefaultBodyLimit` is ever left enabled underneath — that is exactly
+    // how a raised MAX_BODY_BYTES silently did nothing.
+    let big = "x".repeat(ar_server::MAX_BODY_BYTES + 1024);
     let (status, _, _) = call(&router, post_chat(&big_body(&big), &[])).await;
     assert_eq!(status, 413);
+}
+
+#[tokio::test]
+async fn e2e_admits_a_body_above_the_old_two_mib_limit() {
+    let upstream = mock_upstream().await;
+    let (router, _state) = boot(&upstream);
+    // The regression this guards: a coding agent's pasted file is a few MB and
+    // used to be refused here. 4MiB is comfortably inside the new ceiling.
+    let big = "x".repeat(4 * 1024 * 1024);
+    let (status, _, _) = call(&router, post_chat(&big_body(&big), &[])).await;
+    assert_ne!(
+        status, 413,
+        "a 4MiB body must reach the handler, not the edge"
+    );
 }
 
 #[tokio::test]

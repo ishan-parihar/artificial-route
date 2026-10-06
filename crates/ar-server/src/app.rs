@@ -585,6 +585,14 @@ pub fn app(state: AppState) -> Router {
             timeout,
         ))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
+        // axum wraps every handler in a 2MiB `DefaultBodyLimit`, and it sits
+        // INSIDE the layer above, so it rejects first: raising MAX_BODY_BYTES
+        // alone changed nothing and the edge still answered 413 at exactly
+        // 2,097,152 bytes. Disabling it is right rather than raising it — the
+        // tower layer is this proxy's own ceiling, applied at the edge before a
+        // handler allocates, and having a second, smaller, invisible one
+        // underneath it is what made the constant a lie.
+        .layer(axum::extract::DefaultBodyLimit::disable())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             trace_id,
