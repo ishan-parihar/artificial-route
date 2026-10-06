@@ -25,6 +25,8 @@ use std::time::Duration;
 
 use ar_compress::{Engine, Intensity, Step};
 use ar_registry::CustomProvider;
+
+pub mod glob;
 use arc_swap::ArcSwap;
 use notify_debouncer_full::notify::{self, RecommendedWatcher, RecursiveMode, Watcher};
 use notify_debouncer_full::{DebouncedEvent, Debouncer, FileIdMap, new_debouncer};
@@ -439,6 +441,13 @@ pub struct Combo {
     /// happens once the targets refuse, which is the whole of audit F-HIGH-2 —
     /// the live `free-stack` combo lists 2 targets against 7 candidates.
     ///
+    /// A bare `provider` with no `/model` is accepted and means "whatever model
+    /// that provider is configured to serve" — the one case where naming the
+    /// model would add nothing, since a provider with a single configured model
+    /// has exactly one thing it can answer. It is not a wildcard over the whole
+    /// catalog: the provider's own `model:` still decides, so a pool entry can
+    /// never silently dispatch a model the operator did not write down.
+    ///
     /// Absent or empty means no bench, which is every config written before this
     /// field existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -802,6 +811,151 @@ pub struct OAuthSession {
     pub anonymous_editor: Option<String>,
 }
 
+/// The operator's catalog-visibility choices: which providers and models
+/// `/v1/models` advertises.
+///
+/// Ported from OmniRoute's runtime switches, which replace the `enabled` flag
+/// its static registry does not have. Every OmniRoute provider and model is
+/// enabled by construction (docs/12 §1.1); what an operator actually sees is a
+/// curated subset decided by these five settings, and none of them existed here
+/// before this block — `ar import` reproduced the catalog faithfully and none of
+/// the filters layered over it.
+///
+/// Every setting defaults off, so an unconfigured server serves the whole
+/// catalog. That is deliberate: these are opt-in curation, and a proxy that
+/// narrowed its own output unasked would be indistinguishable from a broken
+/// install.
+///
+/// ```
+/// use ar_config::ModelVisibility;
+///
+/// let v = ModelVisibility::default();
+/// assert!(v.exposes("openai", "gpt-4o"), "unconfigured serves everything");
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct ModelVisibility {
+    /// Providers dropped from the catalog by id, by `-search`-stripped id, or by
+    /// alias — OmniRoute's `settings.blockedProviders`
+    /// (`noAuthProviders.ts:19-31`).
+    ///
+    /// A blocked provider stays in `registry.json` and in `providers:`; it is
+    /// the listing that drops it. Upstream does the same (`catalog.ts:344`
+    /// filters at build time, the registry entry never leaves the tree), and it
+    /// is what makes the block reversible — there is nothing to re-add.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub blocked_providers: Vec<String>,
+
+    /// Hide models with no documented free tier — OmniRoute's
+    /// `settings.hidePaidModels` (`catalogPaidFilter.ts:10-34`).
+    ///
+    /// The predicate is `ar_registry::free::FreeBudgets::usable`, over the
+    /// free-budget table `ar import` already generates from the same upstream
+    /// tree — the data was imported and only the filter was missing. Combos are
+    /// exempt, matching upstream's own scope caveat (`catalog.ts:345-350`):
+    /// a combo's price is a property of its targets, and upstream has no
+    /// per-entry pricing lookup to answer it with.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub hide_paid_models: bool,
+
+    /// Explicit expose list — OmniRoute's `settings.modelVisibilityAllowlist`.
+    /// When non-empty, only models it matches are advertised.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub model_visibility_allowlist: Vec<String>,
+
+    /// Explicit hide list — OmniRoute's `settings.modelVisibilityDenylist`.
+    /// Checked before the allowlist, so a deny wins an overlapping allow.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub model_visibility_denylist: Vec<String>,
+}
+
+impl ModelVisibility {
+    /// Whether `(provider, model)` may be advertised, ignoring the free-tier
+    /// filter.
+    ///
+    /// Port of OmniRoute's `isModelExposureAllowed`
+    /// (`modelExposureList.ts:60-73`), including its two defaults: both lists
+    /// empty always exposes, and the denylist is consulted first so a deny beats
+    /// an overlapping allow. An entry matches either `[model]` or
+    /// `provider/model`, exactly upstream — so `gpt-4o` and `openai/*` both work.
+    #[must_use]
+    pub fn exposes(&self, provider: &str, model: &str) -> bool {
+        let deny = normalized(&self.model_visibility_denylist);
+        let allow = normalized(&self.model_visibility_allowlist);
+        if deny.is_empty() && allow.is_empty() {
+            return true;
+        }
+        let candidates = [model, &*format!("{provider}/{model}")];
+        if list_matches_any(&deny, &candidates) {
+            return false;
+        }
+        allow.is_empty() || list_matches_any(&allow, &candidates)
+    }
+
+    /// Whether this block is the no-op default, so `Config` can omit it.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Drops blank entries, mirroring upstream's `normalizeList`.
+///
+/// Upstream filters `v.trim() !== ""` but matches the *untrimmed* string, which
+/// means a whitespace-padded entry is kept and then matches nothing. Trimming
+/// here instead is the same emptiness rule with the useless padding gone: an
+/// entry that survived upstream's filter by carrying only spaces matches no
+/// candidate there and matches none here either.
+fn normalized(list: &[String]) -> Vec<&str> {
+    list.iter()
+        .map(String::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .collect()
+}
+
+/// Whether any entry in `list` matches one of `candidates`.
+///
+/// Exact compare first, glob only when the entry carries a wildcard — the same
+/// short-circuit `listMatchesAny` takes (`modelExposureList.ts:38-50`), so the
+/// common exact entry costs two string compares and no matcher run.
+fn list_matches_any(list: &[&str], candidates: &[&str]) -> bool {
+    list.iter().any(|entry| {
+        candidates.contains(entry)
+            || (glob::has_wildcard(entry) && candidates.iter().any(|c| glob::glob_match(entry, c)))
+    })
+}
+
+/// Catalog rules for one provider.
+///
+/// OmniRoute stores these per *connection* (`provider_connections`, `core.ts:220-265`)
+/// because one provider can hold several credentials with different allowances.
+/// artificial-route has one credential per provider id in this build, so the
+/// rules attach to the provider. The field names are upstream's.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct ProviderSettings {
+    /// Model ids this provider must not advertise — OmniRoute's
+    /// `provider_specific_data.excludedModels` (`connectionModelRules.ts:53-82`).
+    ///
+    /// Globs, matched against both `model` and `provider/model` with the same
+    /// [`glob`] matcher the allow/deny lists use.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub excluded_models: Vec<String>,
+}
+
+impl ProviderSettings {
+    /// Whether `(provider, model)` is excluded by this provider's denylist.
+    #[must_use]
+    pub fn excludes(&self, provider: &str, model: &str) -> bool {
+        let list = normalized(&self.excluded_models);
+        if list.is_empty() {
+            return false;
+        }
+        let candidates = [model, &*format!("{provider}/{model}")];
+        list_matches_any(&list, &candidates)
+    }
+}
+
 /// The whole P0 configuration document.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
@@ -829,6 +983,24 @@ pub struct Config {
     /// [`OAuthSession`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub oauth: Vec<OAuthSession>,
+    /// Operator's catalog-visibility choices.
+    ///
+    /// Every field defaults to the *unfiltered* catalog, which is the same
+    /// default OmniRoute's `settings.ts` uses and the reason none of these
+    /// settings can change what a client sees until an operator writes one. A
+    /// setting that mutated the catalog by default would be a proxy silently
+    /// reinterpreting its operator's config.
+    #[serde(default, skip_serializing_if = "ModelVisibility::is_default")]
+    pub visibility: ModelVisibility,
+    /// Per-provider catalog rules, keyed by provider id.
+    ///
+    /// The home for the one setting that is about a single provider rather than
+    /// the whole catalog — OmniRoute's `provider_specific_data.excludedModels`,
+    /// which it stores per *connection* and this stores per provider, since a
+    /// provider here resolves its credential the same way OmniRoute resolves an
+    /// active connection row.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub provider_settings: BTreeMap<String, ProviderSettings>,
 }
 
 impl Config {
@@ -1002,6 +1174,26 @@ impl Config {
     pub fn declares(&self, id: &str) -> bool {
         self.providers.iter().any(|p| p.id == id)
             || self.custom_providers.iter().any(|c| c.id == id)
+    }
+
+    /// Whether `(provider, model)` may appear in `/v1/models`.
+    ///
+    /// Every per-model rule that lives in this crate, in the order
+    /// `ar_server::config::ServerConfig` applies them: the provider's own
+    /// exclusion list, then the operator's deny/allow lists. Deliberately *not*
+    /// the free-tier rule — that one needs the generated budget table, which
+    /// lives in `ar-registry`, and a method on `Config` cannot reach it without
+    /// making this crate own a second copy of the same table.
+    #[must_use]
+    pub fn exposes_model(&self, provider: &str, model: &str) -> bool {
+        if self
+            .provider_settings
+            .get(provider)
+            .is_some_and(|s| s.excludes(provider, model))
+        {
+            return false;
+        }
+        self.visibility.exposes(provider, model)
     }
 }
 

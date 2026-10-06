@@ -301,6 +301,15 @@ pub struct ImportArgs {
     #[arg(long, value_name = "PATH")]
     pub path: Option<PathBuf>,
 
+    /// Read real combos from this OmniRoute `storage.sqlite` instead of
+    /// synthesising one combo per `provider/model`.
+    ///
+    /// `--from omniroute` only. Without it the import reproduces the catalog and
+    /// none of the operator's failover chains, weights or per-combo windows —
+    /// the file parses and routes, just not the way their dashboard does.
+    #[arg(long, value_name = "STORAGE_SQLITE")]
+    pub combos: Option<PathBuf>,
+
     /// Directory the two files are written into. Created if absent.
     #[arg(long, value_name = "DIR", default_value = ".")]
     pub out_dir: PathBuf,

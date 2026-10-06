@@ -141,6 +141,46 @@ fn is_zero(v: &u32) -> bool {
     *v == 0
 }
 
+/// Whether `id` is dropped from the catalog by an operator's blocked-provider set.
+///
+/// Port of OmniRoute's `isProviderBlockedByIdOrAlias`
+/// (`src/shared/utils/noAuthProviders.ts:19-31`), which matches on three keys:
+///
+/// 1. the provider id as written — `claude-web`;
+/// 2. the id with a `-search` suffix stripped — `claude-web-search` is blocked by
+///    naming `claude-web`, because the two are one provider and an operator who
+///    blocks one means the other;
+/// 3. the provider's alias — blocking `cc` drops `claude`.
+///
+/// The alias lookup goes through [`MetaCatalog::global`] because that is where
+/// the short ids live (`ProviderMeta::alias`); a matcher that only knew the
+/// canonical id would make the third case unimplementable at every call site
+/// that has only an id in hand.
+///
+/// An empty or blank `blocked` list blocks nothing, matching upstream's
+/// `normalizeBlockedProviderSet` (`noAuthProviders.ts:8-17`) which drops every
+/// non-string and every zero-length entry before matching.
+///
+/// ```
+/// use ar_registry::meta::is_provider_blocked;
+///
+/// assert!(is_provider_blocked("claude-web-search", &["claude-web".into()]));
+/// assert!(!is_provider_blocked("openai", &["claude-web".into()]));
+/// ```
+#[must_use]
+pub fn is_provider_blocked(id: &str, blocked: &[String]) -> bool {
+    if blocked.iter().all(|b| b.trim().is_empty()) {
+        return false;
+    }
+    let base = id.strip_suffix("-search").unwrap_or(id);
+    if blocked.iter().any(|b| b == id || b == base) {
+        return true;
+    }
+    global()
+        .get(id)
+        .is_some_and(|m| blocked.iter().any(|b| b == m.alias.as_ref()))
+}
+
 /// The whole generated table, keyed by provider id.
 #[derive(Debug, Clone, Default)]
 pub struct MetaCatalog {

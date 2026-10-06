@@ -34,10 +34,12 @@ use ar_config::{Combo, Strategy};
 use ar_core::Strng;
 use ar_registry::discovery::{self, DiscoveryError, LiveCatalog};
 use ar_registry::free::FreeBudgets;
+use ar_registry::lifecycle::ModelLifecycle;
 use ar_registry::meta::ProviderMeta;
 use ar_registry::{AuthClass, ProviderDef, WireFormat, global};
 use serde::Deserialize;
 
+mod combos;
 pub mod omniroute;
 
 use crate::commands::{block_on_value, fail};
@@ -84,6 +86,13 @@ pub struct Imported {
     /// field-by-field in four places outside this crate's write scope. Keyed by
     /// provider id like the registry, so both documents keep a single shape.
     pub provider_meta: BTreeMap<Strng, ProviderMeta>,
+    /// The vendor lifecycle snapshot, empty for a source that carries none.
+    ///
+    /// The fourth generated file, for the same reason `free_budgets` is the
+    /// third: the table is keyed by model id alone, so folding it into
+    /// `registry.json` would make that document a two-shape file no
+    /// `BTreeMap<Strng, ProviderDef>` loader can parse.
+    pub lifecycle: ModelLifecycle,
 }
 
 /// One `provider/model` pair, plus the alias a client would ask for.
@@ -287,6 +296,7 @@ fn assemble(rows: Vec<Row>) -> anyhow::Result<Imported> {
         config_yaml,
         free_budgets: FreeBudgets::default(),
         provider_meta: BTreeMap::new(),
+        lifecycle: ModelLifecycle::default(),
     })
 }
 
@@ -350,7 +360,21 @@ pub(crate) fn render_yaml(registry: &BTreeMap<Strng, ProviderDef>, combos: &[Com
             c.id,
             c.strategy.as_str()
         ));
-        out.extend(c.targets.iter().map(|t| format!("      - {t}")));
+        // A weighted target is written in the map form, which is the only
+        // `targets:` entry shape that carries a share (`ar-config`'s
+        // `TargetEntry`). Emitting a plain list and dropping the weights would
+        // turn an operator's weighted combo into a first-wins chain.
+        for t in &c.targets {
+            match c.weights.get(t) {
+                Some(w) => out.push(format!("      - target: {t}\n        weight: {w}")),
+                None => out.push(format!("      - {t}")),
+            }
+        }
+        // Carried only when the source declared one: an invented window would be
+        // a claim about the operator's chain that nothing measured.
+        if let Some(ctx) = c.context_length {
+            out.push(format!("    context_length: {ctx}"));
+        }
     }
     let mut yaml = out.join("\n");
     yaml.push('\n');
@@ -419,6 +443,19 @@ pub fn to_free_budgets_json(free: &FreeBudgets) -> anyhow::Result<String> {
 pub fn to_provider_meta_json(meta: &BTreeMap<Strng, ProviderMeta>) -> anyhow::Result<String> {
     serde_json::to_string(meta)
         .map_err(|e| fail(e, "the provider metadata could not be serialised"))
+}
+
+/// Serialises the vendor lifecycle snapshot: flat, one document shape, one parse
+/// path, exactly like [`to_catalog_json`].
+///
+/// # Errors
+///
+/// [`serde_json::Error`] when the snapshot cannot be serialised — unreachable for
+/// a struct of owned strings and a set, and kept so a future field names itself
+/// rather than panicking.
+pub fn to_lifecycle_json(lifecycle: &ModelLifecycle) -> anyhow::Result<String> {
+    serde_json::to_string(lifecycle)
+        .map_err(|e| fail(e, "the lifecycle snapshot could not be serialised"))
 }
 
 /// The upstream document: `path` if given, else the live catalog.

@@ -68,7 +68,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use ar_compress::Step;
-use ar_config::Config;
+use ar_config::{Config, ModelVisibility, ProviderSettings};
 use ar_exec::oauth::{OAuthKind, Session};
 use ar_keys::{CredentialStore, Secret};
 use ar_registry::WireFormat;
@@ -463,6 +463,22 @@ pub struct ServerConfig {
     ///
     /// Read from [`DISCOVERY_VAR`] by both constructors.
     pub model_discovery: bool,
+
+    /// The operator's catalog-visibility choices.
+    ///
+    /// Held here rather than re-read from `config.yaml` at request time because
+    /// [`Self::model_cards_with`] is what applies it, and it is called from the
+    /// models cache with no config file in scope.
+    ///
+    /// The default is the whole catalog. Every field is opt-in, matching
+    /// OmniRoute's `settings.ts` defaults (docs/12 §1.2).
+    pub visibility: ModelVisibility,
+
+    /// Per-provider catalog rules, keyed by provider id.
+    ///
+    /// The home for a provider's own `excluded_models` globs — upstream's
+    /// `provider_specific_data.excludedModels`.
+    pub provider_settings: BTreeMap<String, ProviderSettings>,
 }
 
 impl ServerConfig {
@@ -485,6 +501,8 @@ impl ServerConfig {
             http_master_key: None,
             timeouts: BTreeMap::new(),
             model_discovery: false,
+            visibility: ModelVisibility::default(),
+            provider_settings: BTreeMap::new(),
         }
     }
 
@@ -748,6 +766,8 @@ impl ServerConfig {
             http_master_key: None,
             timeouts: BTreeMap::new(),
             model_discovery: false,
+            visibility: cfg.visibility.clone(),
+            provider_settings: cfg.provider_settings.clone(),
         }
         .with_http_master_key_from_env()
         .with_auth_mode_from_env()
@@ -879,6 +899,23 @@ impl ServerConfig {
     /// is the operator-curated table and leads, while discovery fills the gaps —
     /// which is how a combo targeting `nvidia` (absent from `providerMeta.json`)
     /// resolves at all.
+    ///
+    /// # The visibility filters
+    ///
+    /// Every operator-curation rule lands here, and nowhere else, because this is
+    /// the one function that decides what `/v1/models` advertises. The order is
+    /// upstream's own (`catalog.ts:1093-1100`): lifecycle first, then the
+    /// per-connection exclusion list, then the paid filter, then the allow/deny
+    /// lists. Each drops the card alone and never rewrites a surviving one, so a
+    /// card that survives is exactly the card the provider declares.
+    ///
+    /// **Provider cards** carry the full set. **Combo cards** are exempt from the
+    /// paid filter and from the per-model lists, and are dropped only when every
+    /// target they route through is gone — upstream's own scope caveat
+    /// (`catalog.ts:345-350`) is that a combo's price and per-model exposure are
+    /// properties of its targets and there is no per-entry lookup for either.
+    /// Filtering a combo by its own id would hide every stack the moment one
+    /// target went.
     #[must_use]
     pub fn model_cards_with(&self, discovered: Option<&ModelWindow>) -> Vec<ModelCard> {
         if self.combos.is_empty() {
@@ -886,7 +923,9 @@ impl ServerConfig {
                 .providers
                 .iter()
                 .filter(|p| p.is_dispatchable() && !p.upstream_model.is_empty())
-                .map(|p| {
+                .filter(|p| !self.provider_blocked(p.id.as_ref()))
+                .filter(|p| self.model_visible(p.id.as_ref(), &p.upstream_model))
+                .flat_map(|p| {
                     // The published per-model window leads here too, for the same
                     // reason it leads in `ModelCard`: a provider-wide ceiling is
                     // the largest figure any of its models offers, and reporting
@@ -898,12 +937,13 @@ impl ServerConfig {
                             context_length: w,
                             ..ar_registry::discovery::DiscoveredModel::default()
                         });
-                    ModelCard::with_discovered(p.id.as_str(), &p.upstream_model, known)
+                    self.dual_ids(p.id.as_str(), &p.upstream_model, known)
                 })
                 .collect();
         }
         self.combos
             .iter()
+            .filter(|c| self.combo_survives(c))
             .map(|c| {
                 let mut card = ModelCard::new(&c.id, &c.id);
                 card.context_length = c
@@ -913,6 +953,93 @@ impl ServerConfig {
                 card
             })
             .collect()
+    }
+
+    /// Whether the operator's `blocked_providers` list drops this provider.
+    ///
+    /// Port of OmniRoute's `isProviderBlockedByIdOrAlias`: id, `-search`-stripped
+    /// id, or alias (`noAuthProviders.ts:19-31`). The matcher lives in
+    /// `ar_registry::meta` because that is where the aliases are.
+    fn provider_blocked(&self, id: &str) -> bool {
+        ar_registry::meta::is_provider_blocked(id, &self.visibility.blocked_providers)
+    }
+
+    /// Whether `(provider, model)` survives every per-model rule that applies to
+    /// a provider card.
+    ///
+    /// Order is upstream's (`catalog.ts:1093-1100`) and matters only for which
+    /// rule reports the drop — every one of them removes the card.
+    fn model_visible(&self, provider: &str, model: &str) -> bool {
+        // Vendor lifecycle: an id a vendor has retired is not offered, whatever
+        // the operator's lists say (`modelLifecycle.ts:287-304`).
+        if !ar_registry::lifecycle::global().is_selectable(provider, model) {
+            return false;
+        }
+        // The provider's own denylist — `provider_specific_data.excludedModels`.
+        if self
+            .provider_settings
+            .get(provider)
+            .is_some_and(|s| s.excludes(provider, model))
+        {
+            return false;
+        }
+        // `hidePaidModels`: a model with no documented free tier is hidden.
+        if self.visibility.hide_paid_models && !ar_registry::free::global().usable(provider, model)
+        {
+            return false;
+        }
+        self.visibility.exposes(provider, model)
+    }
+
+    /// Whether a combo still routes through at least one visible target.
+    ///
+    /// Upstream drops a combo with every target hidden (`catalog.ts:963-967`);
+    /// a combo card for a chain nothing can serve is an offer the server cannot
+    /// keep.
+    fn combo_survives(&self, combo: &RouteCombo) -> bool {
+        combo.targets.iter().chain(combo.pool.iter()).any(|t| {
+            !self.provider_blocked(t.provider.as_ref())
+                && self.model_visible(t.provider.as_ref(), &t.model)
+        })
+    }
+
+    /// The cards one provider/model produces: the canonical id, plus the alias id
+    /// when the provider declares a different one.
+    ///
+    /// OmniRoute's default `prefixMode` is `dual` (`.env.example:2137`,
+    /// `catalog.ts:336-339`), so a client that hardcoded `cc/claude-sonnet-4-6`
+    /// and one that hardcoded `claude/claude-sonnet-4-6` both resolve. Emitting
+    /// only the canonical id is what makes an alias a name this server has never
+    /// heard of.
+    ///
+    /// A self-aliased provider — one whose alias equals its own id, which is most
+    /// of the catalog — produces one card, not two, exactly as upstream avoids a
+    /// double row for `#12058`. The alias card keeps the *canonical* `provider`,
+    /// because `owned_by` is the owner and not the spelling the client used.
+    fn dual_ids(
+        &self,
+        provider: &str,
+        model: &str,
+        discovered: Option<ar_registry::discovery::DiscoveredModel>,
+    ) -> Vec<ModelCard> {
+        let canonical = ModelCard::with_discovered(provider, model, discovered);
+        let Some(alias) = ar_registry::meta::global()
+            .get(provider)
+            .map(|m| m.alias.as_ref())
+            .filter(|a| !a.is_empty() && **a != *provider)
+        else {
+            return vec![canonical];
+        };
+        if !self.visibility.exposes(alias, model) {
+            return vec![canonical];
+        }
+        // A copy of the canonical card with a different id, rather than a second
+        // construction: the alias row must carry the same window, the same output
+        // ceiling and the same `owned_by`, and resolving it separately would
+        // report a different figure for one model under two spellings.
+        let mut alias_card = canonical.clone();
+        alias_card.id = format!("{alias}/{model}");
+        vec![canonical, alias_card]
     }
 
     /// The window that bounds every request this combo can serve.
@@ -1303,7 +1430,29 @@ fn resolve_target(
     store: Option<&CredentialStore>,
     providers: &mut Vec<ProviderConfig>,
 ) -> Result<ComboTarget, ComboError> {
-    let (provider, model) = split_target_known(target, |id| catalog.get(id).is_some());
+    // A bare `provider` with no `/model` means "whatever model that provider is
+    // configured to serve". `split_target_known` would send that to
+    // `DEFAULT_COMBO_ID` — the flat-provider fallback for a hand-written target
+    // that names no provider at all — which is wrong here, because a *known*
+    // provider was named and the caller meant it. Resolving the model from the
+    // registry's own list is the only reading that cannot dispatch something the
+    // operator did not write down: the provider's declared models are already in
+    // `ProviderDef::models`, and anything else would be a guess.
+    let (provider, model) = match split_target_known(target, |id| catalog.get(id).is_some()) {
+        (p, m) if p == DEFAULT_COMBO_ID && m == target => match catalog.get(target) {
+            Some(def) => match def.models.first() {
+                Some(first) => (target, first.as_ref()),
+                None => {
+                    return Err(ComboError::UnknownProvider {
+                        target: target.to_owned(),
+                        provider: target.to_owned(),
+                    });
+                }
+            },
+            None => (p, m),
+        },
+        pair => pair,
+    };
     let def = catalog
         .get(provider)
         .ok_or_else(|| ComboError::UnknownProvider {
@@ -1663,7 +1812,7 @@ combos:
                     .with_model("gpt-4o-mini")
                     .with_price(0.15),
                 ProviderConfig::new(ar_route::ProviderId::new("groq"), "https://y/v1", "k")
-                    .with_model("llama-3.3-70b")
+                    .with_model("openai/gpt-oss-120b")
                     .with_price(0.59),
             ],
         )
@@ -1694,6 +1843,259 @@ combos:
     fn derives_model_cards() {
         let cards = flat().model_cards();
         assert_eq!(cards[0].id, "openai/gpt-4o-mini");
+    }
+
+    /// The two-provider, no-combo-table server the visibility tests filter.
+    ///
+    /// `openai/gpt-4o-mini` is chosen because the free-budget table has no row
+    /// for it — so it is a paid model under G3 — and `groq/openai/gpt-oss-120b`
+    /// because the table does, which is what separates the two halves of that
+    /// test.
+    fn visible() -> ServerConfig {
+        let mut cfg = flat();
+        cfg.visibility = ar_config::ModelVisibility::default();
+        cfg.provider_settings.clear();
+        cfg
+    }
+
+    fn card_ids(cfg: &ServerConfig) -> Vec<String> {
+        cfg.model_cards().into_iter().map(|c| c.id).collect()
+    }
+
+    // ---- G1: provider-level blocking ----
+
+    #[test]
+    fn should_drop_every_card_of_a_provider_when_the_blocked_list_names_it() {
+        let mut cfg = visible();
+        cfg.visibility.blocked_providers = vec!["groq".to_owned()];
+        assert_eq!(card_ids(&cfg), vec!["openai/gpt-4o-mini"]);
+    }
+
+    #[test]
+    fn should_drop_a_provider_card_when_the_blocked_list_names_its_alias() {
+        // `claude` is aliased `cc` in the generated metadata table; blocking the
+        // short id must drop the canonical card, or an operator who blocked the
+        // name they see in the dashboard blocks nothing.
+        let mut cfg = ServerConfig::single(
+            20128,
+            Strategy::Priority,
+            vec![
+                ProviderConfig::new(ar_route::ProviderId::new("claude"), "https://x/v1", "k")
+                    .with_model("sonnet-4-6"),
+            ],
+        );
+        cfg.visibility.blocked_providers = vec!["cc".to_owned()];
+        assert!(card_ids(&cfg).is_empty());
+    }
+
+    #[test]
+    fn should_drop_a_provider_card_when_the_blocked_list_names_its_search_variant() {
+        let mut cfg = ServerConfig::single(
+            20128,
+            Strategy::Priority,
+            vec![
+                ProviderConfig::new(
+                    ar_route::ProviderId::new("tavily-search"),
+                    "https://x/v1",
+                    "k",
+                )
+                .with_model("find"),
+            ],
+        );
+        cfg.visibility.blocked_providers = vec!["tavily".to_owned()];
+        assert!(card_ids(&cfg).is_empty());
+    }
+
+    #[test]
+    fn should_keep_a_combo_card_when_only_one_of_its_targets_is_blocked() {
+        let cfg = parse(
+            "keys:\n  openai: k\n  groq: k\nproviders:\n  - id: openai\n    key: openai\n  - id: groq\n    key: groq\nvisibility:\n  blocked_providers:\n    - groq\ncombos:\n  - id: stack\n    strategy: priority\n    targets: [openai/gpt-5.4, groq/llama-3.3-70b]\n",
+        )
+        .expect("config parses");
+        let cards = ServerConfig::from_ar_config(&cfg, None, None, false, None)
+            .expect("combos build")
+            .model_cards();
+        assert_eq!(cards.len(), 1, "the combo still routes through openai");
+        assert_eq!(cards[0].id, "stack");
+    }
+
+    #[test]
+    fn should_drop_a_combo_card_when_every_target_is_blocked() {
+        let cfg = parse(
+            "keys:\n  openai: k\nproviders:\n  - id: openai\n    key: openai\nvisibility:\n  blocked_providers:\n    - openai\ncombos:\n  - id: stack\n    strategy: priority\n    targets: [openai/gpt-5.4]\n",
+        )
+        .expect("config parses");
+        let cards = ServerConfig::from_ar_config(&cfg, None, None, false, None)
+            .expect("combos build")
+            .model_cards();
+        assert!(
+            cards.is_empty(),
+            "a chain with nothing behind it is not an offer"
+        );
+    }
+
+    // ---- G2: per-model allow/deny ----
+
+    #[test]
+    fn should_drop_a_model_card_when_a_denylist_glob_matches_it() {
+        let mut cfg = visible();
+        cfg.visibility.model_visibility_denylist = vec!["groq/openai/*".to_owned()];
+        assert_eq!(card_ids(&cfg), vec!["openai/gpt-4o-mini"]);
+    }
+
+    #[test]
+    fn should_keep_only_the_allowed_models_when_an_allowlist_is_non_empty() {
+        let mut cfg = visible();
+        cfg.visibility.model_visibility_allowlist = vec!["gpt-4o-*".to_owned()];
+        assert_eq!(card_ids(&cfg), vec!["openai/gpt-4o-mini"]);
+    }
+
+    #[test]
+    fn should_drop_a_model_card_when_a_denylist_entry_overlaps_the_allowlist() {
+        // Upstream checks the denylist first (`modelExposureList.ts:70-72`), so a
+        // deny beats an overlapping allow. Testing only one list would pass under
+        // either order.
+        let mut cfg = visible();
+        cfg.visibility.model_visibility_allowlist = vec!["*".to_owned()];
+        cfg.visibility.model_visibility_denylist = vec!["*gpt-oss*".to_owned()];
+        assert_eq!(card_ids(&cfg), vec!["openai/gpt-4o-mini"]);
+    }
+
+    // ---- G3: the free-tier filter ----
+
+    #[test]
+    fn should_drop_a_paid_model_card_when_hide_paid_is_on_and_the_model_has_no_free_tier() {
+        let mut cfg = visible();
+        cfg.visibility.hide_paid_models = true;
+        let ids = card_ids(&cfg);
+        assert!(
+            !ids.contains(&"openai/gpt-4o-mini".to_owned()),
+            "gpt-4o-mini has no documented free tier: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn should_keep_a_free_model_card_when_hide_paid_is_on_and_the_table_documents_a_tier() {
+        let mut cfg = visible();
+        cfg.visibility.hide_paid_models = true;
+        let ids = card_ids(&cfg);
+        assert!(
+            ids.iter().any(|i| i.starts_with("groq/")),
+            "groq/openai/gpt-oss-120b has a documented free tier: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn should_keep_every_card_when_hide_paid_is_off() {
+        assert_eq!(card_ids(&visible()).len(), 2);
+    }
+
+    // ---- G4: vendor lifecycle ----
+
+    #[test]
+    fn should_drop_a_model_card_when_the_vendor_retired_the_id() {
+        // `claude-opus-4-1-20250805` is one of the 68 ids the imported snapshot
+        // marks `retired`, and it is matched id-scoped: the `anthropic` prefix on
+        // the card is not consulted (`modelLifecycle.ts:177-184`).
+        let cfg = ServerConfig::single(
+            20128,
+            Strategy::Priority,
+            vec![
+                ProviderConfig::new(ar_route::ProviderId::new("anthropic"), "https://x/v1", "k")
+                    .with_model("claude-opus-4-1-20250805"),
+            ],
+        );
+        assert!(card_ids(&cfg).is_empty());
+    }
+
+    // ---- G7: dual ids ----
+
+    #[test]
+    fn should_advertise_the_alias_id_alongside_the_canonical_one_when_the_provider_has_an_alias() {
+        // `claude` declares alias `cc`, and OmniRoute's default prefix mode is
+        // `dual` (`catalog.ts:336-339`), so both spellings are catalog ids.
+        let cfg = ServerConfig::single(
+            20128,
+            Strategy::Priority,
+            vec![
+                ProviderConfig::new(ar_route::ProviderId::new("claude"), "https://x/v1", "k")
+                    .with_model("sonnet-4-6"),
+            ],
+        );
+        let cards = cfg.model_cards();
+        let ids: Vec<&str> = cards.iter().map(|c| c.id.as_str()).collect();
+        assert!(ids.contains(&"claude/sonnet-4-6"), "{ids:?}");
+        assert!(ids.contains(&"cc/sonnet-4-6"), "{ids:?}");
+        // `owned_by` is the owner, not the spelling the client used — upstream
+        // keeps it canonical on both rows (`catalog.ts:1120-1123`).
+        assert!(
+            cards.iter().all(|c| c.provider == "claude"),
+            "the alias row is owned_by the canonical provider"
+        );
+        assert_eq!(
+            cards[0].context_length, cards[1].context_length,
+            "one model under two spellings reports one window"
+        );
+    }
+
+    #[test]
+    fn should_advertise_one_card_when_the_alias_equals_the_provider_id() {
+        // Most of the catalog self-aliases; emitting both would double every row
+        // for no id a client could use.
+        let cfg = ServerConfig::single(
+            20128,
+            Strategy::Priority,
+            vec![
+                ProviderConfig::new(ar_route::ProviderId::new("openai"), "https://x/v1", "k")
+                    .with_model("gpt-4o-mini"),
+            ],
+        );
+        assert_eq!(card_ids(&cfg), vec!["openai/gpt-4o-mini"]);
+    }
+
+    // ---- G8: per-provider excluded models ----
+
+    #[test]
+    fn should_drop_a_model_card_when_the_provider_excludes_the_id() {
+        let mut cfg = visible();
+        cfg.provider_settings.insert(
+            "groq".to_owned(),
+            ar_config::ProviderSettings {
+                excluded_models: vec!["openai/*".to_owned()],
+            },
+        );
+        assert_eq!(card_ids(&cfg), vec!["openai/gpt-4o-mini"]);
+    }
+
+    #[test]
+    fn should_keep_a_model_card_when_the_exclusion_names_a_different_provider() {
+        // The denylist is per provider, not global: `openai`'s rules must not
+        // reach a model on `groq`.
+        let mut cfg = visible();
+        cfg.provider_settings.insert(
+            "openai".to_owned(),
+            ar_config::ProviderSettings {
+                excluded_models: vec!["*".to_owned()],
+            },
+        );
+        assert_eq!(card_ids(&cfg), vec!["groq/openai/gpt-oss-120b"]);
+    }
+
+    #[test]
+    fn should_drop_the_alias_card_when_the_denylist_names_the_alias_spelling() {
+        let mut cfg = ServerConfig::single(
+            20128,
+            Strategy::Priority,
+            vec![
+                ProviderConfig::new(ar_route::ProviderId::new("claude"), "https://x/v1", "k")
+                    .with_model("sonnet-4-6"),
+            ],
+        );
+        cfg.visibility.model_visibility_denylist = vec!["cc/*".to_owned()];
+        // The deny list matches against `[model, provider/model]` for whichever
+        // prefix the card was built under, so the alias row goes and the
+        // canonical row stays.
+        assert_eq!(card_ids(&cfg), vec!["claude/sonnet-4-6"]);
     }
 
     #[test]
@@ -2696,6 +3098,12 @@ combos:
     fn leaves_model_discovery_off_when_the_env_names_nothing() {
         // The default configuration must make no network call it did not
         // previously make, so an unset variable is the whole test.
+        //
+        // The lock is what makes "unset" true: this test *reads* the environment
+        // without going through `with_env`, so it can observe a variable a
+        // concurrent test has set and not yet cleared. It takes the same
+        // `ENV_LOCK` every writer takes for exactly that reason.
+        let _held = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let cfg = ServerConfig::from_env();
         assert!(!cfg.model_discovery, "an unset variable arms nothing");
     }

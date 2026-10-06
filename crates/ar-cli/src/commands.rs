@@ -1320,9 +1320,10 @@ fn setting_rows(cfg: &Config, path: &str) -> Vec<Row> {
 /// never leaves a table claiming a conversion that did not land.
 fn import_config(args: &ImportArgs) -> anyhow::Result<()> {
     let result = match args.from {
-        ImportFrom::Omniroute => {
-            import::omniroute::scan(import::upstream_tree(args.path.as_deref())?)?
-        }
+        ImportFrom::Omniroute => import::omniroute::scan(
+            import::upstream_tree(args.path.as_deref())?,
+            args.combos.as_deref(),
+        )?,
         ImportFrom::Litellm => {
             import::convert(args.from, &import::upstream(args.path.as_deref())?)?
         }
@@ -1359,6 +1360,14 @@ fn import_config(args: &ImportArgs) -> anyhow::Result<()> {
     write_file(
         &out.join("providerMeta.json"),
         &import::to_provider_meta_json(&result.provider_meta)?,
+    )?;
+    // A fifth file, keyed by model id alone. Same reason as the third: folding it
+    // into `registry.json` would make that document two-shaped. Written
+    // unconditionally, and empty for a source with no such table, so the output
+    // set is `--from`-independent.
+    write_file(
+        &out.join("modelLifecycle.json"),
+        &import::to_lifecycle_json(&result.lifecycle)?,
     )?;
 
     print!(

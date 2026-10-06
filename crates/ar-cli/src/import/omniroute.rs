@@ -40,6 +40,7 @@ use std::path::{Path, PathBuf};
 use ar_config::{Combo, Strategy};
 use ar_core::Strng;
 use ar_registry::free::{FreeBudgetRow, FreeBudgets, FreeRegime};
+use ar_registry::lifecycle::ModelLifecycle;
 use ar_registry::meta::ProviderMeta;
 use ar_registry::{AuthClass, Price, ProviderDef, wire_format};
 
@@ -52,11 +53,17 @@ use crate::import::{Imported, render_yaml};
 /// outside it (`OmniRoute/src/shared/constants/pricing`), so it is looked up as a
 /// sibling of the two parents that reach it; a missing price tree is not an
 /// error, because a registry with no prices is still a registry.
-pub fn scan(providers_dir: &Path) -> anyhow::Result<Imported> {
+///
+/// `storage` is the OmniRoute `storage.sqlite` holding its `combos` table, and
+/// is optional: without it the importer falls back to one one-target combo per
+/// `provider/model`, which reproduces the catalog and none of the operator's
+/// routing. See [`crate::import::combos`].
+pub fn scan(providers_dir: &Path, storage: Option<&Path>) -> anyhow::Result<Imported> {
     let root = read_tree(providers_dir)?;
     let prices = pricing(providers_dir);
     let flat_rate = flat_rate_ids(providers_dir);
     let free = free_budgets(providers_dir);
+    let lifecycle = model_lifecycle(providers_dir);
 
     let mut defs: BTreeMap<Strng, ProviderDef> = BTreeMap::new();
     let mut metas: BTreeMap<Strng, ProviderMeta> = BTreeMap::new();
@@ -113,7 +120,29 @@ pub fn scan(providers_dir: &Path) -> anyhow::Result<Imported> {
         eprintln!("note: {note}");
     }
 
-    let combos = combos(&defs);
+    let combos = match storage {
+        Some(db) => {
+            let read = crate::import::combos::read(db, &defs);
+            if read.is_empty() {
+                // A store with no combos is a real state — a fresh OmniRoute
+                // install — and falling back silently would make an operator
+                // think their chains were imported when they were not.
+                eprintln!(
+                    "note: {} holds no readable combos; the catalog falls back to one combo per provider/model",
+                    db.display()
+                );
+                combos(&defs)
+            } else {
+                read
+            }
+        }
+        None => {
+            eprintln!(
+                "note: no --combos given; the catalog falls back to one combo per provider/model"
+            );
+            combos(&defs)
+        }
+    };
     let config_yaml = render_yaml(&defs, &combos);
     Ok(Imported {
         registry: defs,
@@ -121,7 +150,87 @@ pub fn scan(providers_dir: &Path) -> anyhow::Result<Imported> {
         config_yaml,
         free_budgets: free,
         provider_meta: metas,
+        lifecycle,
     })
+}
+
+/// Reads `config/quality/model-lifecycle.json`, the vendor retirement snapshot.
+///
+/// A sibling of the `config` directory the provider tree lives under, reached by
+/// name from the tree's parent for the same reason
+/// [`free_budgets`] reaches its file: a missing file must read as an empty
+/// table, not as a different checkout's.
+fn model_lifecycle(providers_dir: &Path) -> ModelLifecycle {
+    let empty = ModelLifecycle::default();
+    // `providers/` -> `open-sse/config/` -> `open-sse/` -> the checkout root,
+    // which is where `config/quality/` lives. Three levels up, not two: the tree
+    // passed in is `OmniRoute/open-sse/config/providers`, so the root is the
+    // parent of the parent of its parent.
+    let Some(root) = providers_dir
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+    else {
+        return empty;
+    };
+    let path = root.join("config/quality/model-lifecycle.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        eprintln!(
+            "note: no model-lifecycle.json under {}; no vendor retirement will be applied",
+            path.display()
+        );
+        return empty;
+    };
+    match serde_json::from_str::<LifecycleFile>(&raw) {
+        Ok(f) => ModelLifecycle {
+            generated_at: Strng::from(f.generated_at.as_str()),
+            retired: f
+                .retired
+                .into_iter()
+                .filter(|(_, r)| r.is_retired())
+                .map(|(id, _)| Strng::from(id.to_lowercase()))
+                .collect(),
+        },
+        Err(e) => {
+            eprintln!(
+                "note: {} is unreadable ({e}); no retirement will be applied",
+                path.display()
+            );
+            empty
+        }
+    }
+}
+
+/// The upstream snapshot's two fields this reader takes.
+///
+/// `retired` is a map rather than a list, keyed by model id. Every value is read
+/// because only some statuses veto — see `ar_registry::lifecycle`.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LifecycleFile {
+    #[serde(default)]
+    generated_at: String,
+    #[serde(default)]
+    retired: BTreeMap<String, LifecycleRecord>,
+}
+
+/// One upstream retirement record.
+#[derive(serde::Deserialize)]
+struct LifecycleRecord {
+    #[serde(default)]
+    status: String,
+}
+
+impl LifecycleRecord {
+    /// Whether this status hides the model from the catalog.
+    ///
+    /// Only `retired`. Upstream's other two statuses (`retiring`, `deprecated`)
+    /// produce a warning, not a rejection (`modelLifecycle.ts:238-245`), and the
+    /// catalog passes neither `includeDeprecated` nor `includeShutdown`, so both
+    /// stay advertised.
+    fn is_retired(&self) -> bool {
+        self.status == "retired"
+    }
 }
 
 /// The parsed provider tree: every `.ts` file under `providers_dir`, plus a flat
@@ -1941,7 +2050,7 @@ mod tests {
                 "export const claudeProvider: RegistryEntry = { id: \"claude\", alias: \"cc\", baseUrl: \"https://api.anthropic.com\" };",
             ),
         ]);
-        let out = scan(&t.providers_dir()).expect("the tree holds one entry");
+        let out = scan(&t.providers_dir(), None).expect("the tree holds one entry");
         // The alias is metadata, read from the metadata table; the flat-rate flag
         // it resolved is on the definition. Neither half is the answer alone,
         // which is the point of keeping them in two files.
@@ -2134,7 +2243,7 @@ mod tests {
     fn carries_the_free_table_alongside_a_scanned_registry() {
         // The end-to-end shape: one `scan` produces both generated files, so a
         // caller never has to know which upstream file fed which.
-        let out = scan(&free_tree().providers_dir()).expect("the fixture tree has one entry");
+        let out = scan(&free_tree().providers_dir(), None).expect("the fixture tree has one entry");
         assert!(out.registry.contains_key("openai"));
         assert_eq!(out.free_budgets.rows.len(), 8);
         assert!(!out.config_yaml.is_empty());

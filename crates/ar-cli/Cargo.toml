@@ -60,6 +60,11 @@ jemallocator = { workspace = true }
 # workspace and in `Cargo.lock` via `ar-exec` / `ar-server`, so naming it here
 # adds no new dependency, only a new consumer of one that is already vetted.
 reqwest = { workspace = true }
+# `ar import --from omniroute --combos <storage.sqlite>` reads OmniRoute's
+# `combos` table. Already in the workspace and in `Cargo.lock` via `ar-keys` /
+# `ar-tokens`, so this names a consumer rather than a new dependency: the build
+# graph and the lockfile are unchanged.
+rusqlite = { workspace = true }
 # The `LiteLlm` shapes in `import.rs` are Deserialize; `serde_yaml` only
 # deserializes into them, it does not bring the derive.
 serde = { workspace = true }

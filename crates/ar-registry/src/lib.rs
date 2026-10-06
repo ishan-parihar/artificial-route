@@ -34,7 +34,9 @@
 
 pub mod discovery;
 pub mod free;
+pub mod lifecycle;
 pub mod meta;
+pub mod order;
 pub mod vector;
 
 use ar_core::Strng;
