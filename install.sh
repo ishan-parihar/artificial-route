@@ -227,7 +227,19 @@ fi
 
 cd "$TMP"
 echo "downloading aroute $VERSION ..."
-curl -fsSL -o "$ASSET" "$BASE/$ASSET"
+# The release workflow renames the binary from `ar` to `aroute`, but the latest
+# published release may still ship the old asset name. Try the new name first,
+# then the old one, so the smoke test can install whatever the latest release
+# actually contains.
+ASSET_FILE=""
+for CANDIDATE in aroute-x86_64-unknown-linux-musl ar-x86_64-unknown-linux-musl; do
+  if curl -fsSL -o "$CANDIDATE" "$BASE/$CANDIDATE"; then
+    ASSET_FILE="$CANDIDATE"
+    break
+  fi
+done
+[ -n "$ASSET_FILE" ] || die "no release asset found at $BASE"
+ASSET="$ASSET_FILE"
 curl -fsSL -o SHA256SUMS "$BASE/SHA256SUMS"
 
 # Verified before the binary is ever executable, so a corrupt or substituted
