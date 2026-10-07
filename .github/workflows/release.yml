@@ -80,8 +80,13 @@ jobs:
           # non-zero and must fail here rather than on a user's machine.
           sh install.sh --help >/dev/null
           sh install.sh --check --dir "$SCRATCH/bin" | grep -q 'not installed'
-          sh install.sh --version v0.0.0-nonexistent --dir "$SCRATCH/bin" \
-            && { echo "::error::a bogus tag should not install"; exit 1; }
+          # A nonexistent tag must fail the installer, not the workflow.
+          # `if` swallows the expected non-zero exit; `set -e` would abort the
+          # step on the very 404 this check exists to prove.
+          if sh install.sh --version v0.0.0-nonexistent --dir "$SCRATCH/bin"; then
+            echo "::error::a bogus tag should not install"
+            exit 1
+          fi
           # --service none must reach the summary, which prints state variables
           # only the service branch assigns.
           sh install.sh --service none --dir "$SCRATCH/bin" >/dev/null
