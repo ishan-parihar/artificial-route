@@ -48,6 +48,16 @@ pub fn run(args: &DashboardArgs) -> anyhow::Result<()> {
         );
     }
 
+    // The peer-stamp launcher must wrap server.js: the compiled UI's authz
+    // layer only trusts requests stamped with the real TCP peer, which the
+    // bare standalone server never sets — without it every request fails
+    // closed to "remote" and onboarding demands the log bootstrap token.
+    let entry = if dist.join("peer-stamp-launcher.cjs").is_file() {
+        "peer-stamp-launcher.cjs"
+    } else {
+        "server.js"
+    };
+
     // stderr, not stdout: the data channel (docs/06) stays clean, matching
     // `serve`'s banner.
     eprintln!(
@@ -57,7 +67,7 @@ pub fn run(args: &DashboardArgs) -> anyhow::Result<()> {
     );
 
     let mut child = Command::new("node")
-        .arg("server.js")
+        .arg(entry)
         .current_dir(&dist)
         // Loopback only: the dashboard manages credentials, and the child
         // would otherwise bind every interface like its parent project does.

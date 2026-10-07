@@ -181,6 +181,8 @@ broken unit.
 
 ## Running it
 
+The dashboard is a vendored, rebranded build of the OmniRoute front end: `aroute dashboard` starts the compiled UI as a supervised Node child, and `dashboard/update-dist.sh` is the one-step refresh path (pull upstream → `npm ci` → build → rebrand). Detail lives in [docs/14-web-ui-port-plan.md](docs/14-web-ui-port-plan.md).
+
 The install already puts `aroute` on a systemd unit, so on a box with systemd the
 proxy is already running — `curl -s localhost:20128/healthz` answers before you
 type anything. The commands above are for the no-systemd case, or for running a

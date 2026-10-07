@@ -44,6 +44,7 @@ log "copying standalone essentials → $DST"
 rm -rf "$DST"
 mkdir -p "$DST"
 cp "$SRC/server.js" "$SRC/package.json" "$DST/"
+cp "$AR_ROOT/dashboard/peer-stamp-launcher.cjs" "$DST/"
 cp -r "$SRC/public" "$DST/public"
 cp -r "$SRC/node_modules" "$DST/node_modules"
 cp -r "$SRC/.build" "$DST/.build"
@@ -78,6 +79,18 @@ ANCHORED='s/(["\x27\x60])OmniRoute(["\x27\x60])/${1}Artificial Route${2}/g;
 
 # openapi.yaml gets the hyphen-safe variant so X-OmniRoute-* header names survive.
 perl -pi -e 's/(?<![A-Za-z0-9_\/@-])OmniRoute(?![A-Za-z0-9_\/])/Artificial Route/g' "$DST/public/openapi.yaml"
+
+# ── 3.5 Sponsor/partner branding scrub ──────────────────────────────────────
+# The upstream bundle ships sponsor surfaces (Kimi/Cheaper Inference banners,
+# supporter badges/tooltips, supporter-offers copy). Scrubbed by
+# dashboard/scrub-sponsors.cjs, which decodes each embedded `JSON.parse`
+# payload with a real parser instead of a `[^}]*` regex (the regex stops at
+# the first `}` — inside ICU plurals / nested objects — and corrupted all 134
+# locale chunks). It also forces the banner render gates and the
+# ProviderCard/ProviderPageHeader partner flags off, because the message
+# fallbacks are hardcoded English sponsor copy.
+log "scrubbing sponsor branding"
+node "$AR_ROOT/dashboard/scrub-sponsors.cjs" "$DST"
 
 # ── 4. Parse gate: baseline pass-set, patch, re-check ───────────────────────
 log "baseline node --check over compiled JS"
@@ -141,7 +154,7 @@ systemd-run --user --collect --unit="$SMOKE_UNIT" \
   --property=WorkingDirectory="$DST" \
   --setenv=PORT="$PORT" --setenv=HOSTNAME=127.0.0.1 \
   --setenv=DATA_DIR="$DATA_DIR" \
-  node "$DST/server.js" >/dev/null 2>&1 || die "systemd-run failed"
+  node "$DST/peer-stamp-launcher.cjs" >/dev/null 2>&1 || die "systemd-run failed"
 trap "systemctl --user stop '$SMOKE_UNIT' >/dev/null 2>&1 || true; rm -f '$PASS' '$FAIL' '$NOCHECK'" EXIT
 ok=0
 for _ in $(seq 1 30); do

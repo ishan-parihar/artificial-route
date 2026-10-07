@@ -25,8 +25,10 @@ compiled output, aroute supervises it.** OmniRoute's repo is never edited.
 
 ## The pipeline: `dashboard/rebrand-dist.sh`
 
-Run once first: `(cd ../OmniRoute && npm install && npm run build)` — emits
-`.build/next/standalone`. Then `dashboard/rebrand-dist.sh`, which:
+Run `dashboard/update-dist.sh` to do the whole upstream refresh in one step —
+pull `../OmniRoute` (`--ff-only --autostash`), `npm ci`, `npm run build`, then
+`dashboard/rebrand-dist.sh`. The last step alone is enough when only the
+rebrand rules changed. `dashboard/rebrand-dist.sh`:
 
 1. Copies standalone essentials (`server.js`, `package.json`, `public/`,
    `node_modules/`, `.build/`, `migrations/`) into `dashboard/dist/`.
@@ -36,12 +38,19 @@ Run once first: `(cd ../OmniRoute && npm install && npm run build)` — emits
 3. Applies the general display-text rebrand — capital `OmniRoute` →
    `Artificial Route` in compiled JS/JSON/HTML/CSS, guarded so identifiers,
    URLs, package names, and header names are untouched (see below).
-4. **Parse gate**: `node --check` over all ~18,400 compiled JS files before and
+4. **Sponsor scrub**: `dashboard/scrub-sponsors.cjs` deletes the Kimi and
+   Cheaper Inference sponsor objects from every locale payload with a real
+   JSON parser, blanks the supporter badge/tooltip strings, and forces the
+   two banner components + the provider partner flags to render nothing.
+   A previous regex version stopped at the first `}` inside nested ICU
+   plurals and corrupted all 134 locale chunks; the parser version is what
+   keeps `dist/` bootable.
+5. **Parse gate**: `node --check` over all ~18,400 compiled JS files before and
    after the patch. Any file the patch breaks is restored and re-patched with
    quote-anchored-only (string-safe) substitutions. This gate is what makes a
    regex rebrand of minified code trustworthy: last run, 18,415 files parsed
    before, **zero failed after**.
-5. Boot smoke on an OS-picked free port: healthz 200, manifest name
+6. Boot smoke on an OS-picked free port: healthz 200, manifest name
    `"Artificial Route"`, login page renders the brand.
 
 The dist is a release artifact (≈2.0 GB, dominated by the traced
@@ -73,12 +82,18 @@ with `node_modules` layout, assembled scripts, or wire formats):
 
 `crates/ar-cli/src/dashboard.rs` resolves the dist (`--path` →
 `$AR_DASHBOARD_DIR` → `dashboard/dist` beside the binary), then spawns
-`node server.js` with:
+`node peer-stamp-launcher.cjs` with:
 
 - `PORT` — the `--port` flag (default 20149; `aroute serve` keeps 20128)
 - `HOSTNAME=127.0.0.1` — loopback only; the dashboard manages credentials
 - `DATA_DIR` — `$DATA_DIR` if set, else `~/.config/ar/dashboard-data`, so the
   rebranded product never writes into OmniRoute's own `~/.omniroute`
+
+The launcher restores the compiled UI's own peer-stamp contract before handing
+control to `server.js` (without it, every request — including loopback — is
+classified as remote and the wizard demands the bootstrap token from the log)
+and warms the `/v1/models` catalog cache after boot so the first page load does
+not pay the ~3 s catalog build.
 
 It blocks until the child exits and propagates failure. Same process group, so
 an interactive Ctrl-C stops both; under systemd, `KillMode` handles it.

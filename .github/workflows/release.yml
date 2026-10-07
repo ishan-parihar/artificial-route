@@ -94,15 +94,15 @@ jobs:
             --release \
             --locked \
             --target x86_64-unknown-linux-musl \
-            --bin ar
-          strip target/x86_64-unknown-linux-musl/release/ar || true
+            --bin aroute
+          strip target/x86_64-unknown-linux-musl/release/aroute || true
 
       - name: Smoke the artifact
         # A release that cannot print its own version is not worth uploading.
         # `--version` is the one invocation with no config or network needs, so
         # it is the only honest gate available before publishing.
         run: |
-          BIN=target/x86_64-unknown-linux-musl/release/ar
+          BIN=target/x86_64-unknown-linux-musl/release/aroute
           chmod +x "$BIN"
           "$BIN" --version
           # Match `static` rather than `statically linked`: a PIE binary reports
@@ -118,7 +118,7 @@ jobs:
           # this, a release can ship a binary whose own `--version` reports a
           # different number than its download URL — the failure is invisible
           # until a user sees `ar 0.1.2` installed from a v0.1.3 release.
-          GOT="$("$BIN" --version | sed -n 's/^ar //p')"
+          GOT="$("$BIN" --version | sed -n 's/^aroute //p')"
           # `inputs.tag` wins over the ref for the same reason it does below:
           # a dispatch arrives with GITHUB_REF_NAME=main, so reading the ref
           # compares the binary against a branch name.
@@ -132,9 +132,9 @@ jobs:
         id: pkg
         run: |
           mkdir -p dist
-          cp target/x86_64-unknown-linux-musl/release/ar dist/ar-x86_64-unknown-linux-musl
+          cp target/x86_64-unknown-linux-musl/release/aroute dist/aroute-x86_64-unknown-linux-musl
           cd dist
-          sha256sum ar-x86_64-unknown-linux-musl > SHA256SUMS
+          sha256sum aroute-x86_64-unknown-linux-musl > SHA256SUMS
           cat SHA256SUMS
           # The dispatch path arrives with GITHUB_REF_NAME=main, so reading the
           # ref here published a release literally tagged "main" — which the
@@ -159,13 +159,13 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.pkg.outputs.tag }}
-          name: ar ${{ steps.pkg.outputs.tag }}
+          name: aroute ${{ steps.pkg.outputs.tag }}
           # Replace rather than fail when the tag is re-pushed: a re-run after a
           # transient build failure should repair the release, not require a
           # version bump.
           fail_on_unmatched_files: false
           files: |
-            dist/ar-x86_64-unknown-linux-musl
+            dist/aroute-x86_64-unknown-linux-musl
             dist/SHA256SUMS
           body: |
             Static musl binary, no runtime dependencies.
