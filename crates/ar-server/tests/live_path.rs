@@ -589,6 +589,11 @@ async fn bypasses_the_cache_for_a_stream_and_says_so() {
 
 #[tokio::test]
 async fn refuses_a_prompt_injection_before_dispatch() {
+    // The guard's default is upstream's `warn` (observe, forward); this is the
+    // one test that needs the refusal path. Edition 2024 makes env mutation
+    // `unsafe`; process-wide is fine here - no other test in this binary
+    // sends a needle that any mode treats differently.
+    unsafe { std::env::set_var("INPUT_SANITIZER_MODE", "block") };
     let (a, a_seen) = counting_upstream(StatusCode::OK).await;
     let router = boot(ServerConfig::single(
         20128,
@@ -612,6 +617,24 @@ async fn refuses_a_prompt_injection_before_dispatch() {
         !text.contains("previous instructions"),
         "the prompt leaked: {text}"
     );
+}
+
+#[tokio::test]
+async fn forwards_a_markdown_system_heading_under_the_default_guard_mode() {
+    // The incident this guard must never reproduce: a `### system` markdown
+    // heading hard-refused a coding-agent request before dispatch.
+    let (a, a_seen) = counting_upstream(StatusCode::OK).await;
+    let router = boot(ServerConfig::single(
+        20128,
+        Strategy::Priority,
+        vec![ProviderConfig::new(ProviderId::new("a"), &a, "sk-a").with_model("m-a")],
+    ));
+    let body = r#"{"model":"m","messages":[{"role":"user","content":"describe these startup flags: the ### system section."}]}"#;
+
+    let (status, _, text) = call(&router, post("/v1/chat/completions", body, &[])).await;
+
+    assert_eq!(status, StatusCode::OK, "a benign heading refused: {text}");
+    assert_eq!(calls(&a_seen), 1, "the heading never reached upstream");
 }
 
 #[tokio::test]
