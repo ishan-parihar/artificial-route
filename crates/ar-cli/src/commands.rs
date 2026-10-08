@@ -1588,6 +1588,7 @@ mod tests {
                 targets: vec![],
                 weights: std::collections::BTreeMap::new(),
                 pool: vec![],
+                steps: vec![],
                 compression: None,
                 judge_model: None,
                 context_length: None,

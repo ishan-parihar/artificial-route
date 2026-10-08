@@ -413,8 +413,36 @@ enum TargetEntry {
     },
 }
 
+/// One step inside a combo: the target plus the metadata OmniRoute carries with it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComboStep {
+    /// The `provider/model` target string.
+    pub target: String,
+    /// Optional share when this specific step declared one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<f64>,
+    /// Per-step system instruction, meaningful for ordered pipeline steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// Freeform tags upstream stored alongside the step.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Connection ids this step is restricted to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_connection_ids: Vec<String>,
+    /// Whether this step should only be used after the standard targets exhaust quota.
+    #[serde(default)]
+    pub fallback_only_on_quota_exhaustion: bool,
+    /// Label from the step, when upstream stored one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Step id from upstream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
 /// A named chain of `provider/model` targets plus the strategy that walks it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Combo {
     /// Combo id; the `model` a client asks for resolves to this.
     pub id: String,
@@ -455,6 +483,15 @@ pub struct Combo {
     /// field existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pool: Vec<String>,
+    /// Per-step metadata carried alongside the target list.
+    ///
+    /// Empty for legacy configs; importers populate it from OmniRoute so a step
+    /// can be more than a provider/model string. `steps` preserves prompts,
+    /// tags, allowed connection ids, and quota-exhaustion-only moves in the same
+    /// order as `targets`, including repeated targets whose step metadata
+    /// differs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<ComboStep>,
     /// The engine that compresses this combo's prompts.
     ///
     /// Absent means off, which is what omission means everywhere else in this
@@ -514,6 +551,8 @@ impl<'de> Deserialize<'de> for Combo {
             judge_model: Option<String>,
             #[serde(default)]
             context_length: Option<u32>,
+            #[serde(default)]
+            steps: Vec<ComboStep>,
         }
 
         let wire = Wire::deserialize(d)?;
@@ -535,6 +574,7 @@ impl<'de> Deserialize<'de> for Combo {
             targets,
             weights,
             pool: wire.pool,
+            steps: wire.steps,
             compression: wire.compression,
             judge_model: wire.judge_model,
             context_length: wire.context_length,
@@ -960,7 +1000,7 @@ impl ProviderSettings {
 }
 
 /// The whole P0 configuration document.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     /// Listen address.
     #[serde(default)]

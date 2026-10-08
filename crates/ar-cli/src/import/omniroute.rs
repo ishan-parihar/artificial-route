@@ -1031,35 +1031,64 @@ fn collect_model_fields(
                 array_elements(inner.trim_start_matches('[').trim_end_matches(']'))
             }
         }
+    } else if t.starts_with("Object.freeze(") {
+        collect_model_fields(&unwrap_array(t), consts, root, field, out, depth + 1);
+        return;
+    } else if t.starts_with("buildSurfaceCatalog(") {
+        for element in surface_catalog_elements(t, consts, root) {
+            collect_model_field_element(&element, consts, root, field, out, depth + 1);
+        }
+        return;
     } else if let Some(name) = t.strip_prefix("...") {
-        let name = name.trim();
-        if let Some(v) = consts.get(name).or_else(|| root.consts.get(name)) {
+        if let Some(v) = consts
+            .get(name.trim())
+            .or_else(|| root.consts.get(name.trim()))
+        {
             collect_model_fields(v, consts, root, field, out, depth + 1);
         }
         return;
-    } else if let Some(v) = consts.get(t).or_else(|| root.consts.get(t)) {
-        collect_model_fields(v, consts, root, field, out, depth + 1);
+    } else if let Some(raw) = element_expression(t, consts, root) {
+        collect_model_fields(&raw, consts, root, field, out, depth + 1);
         return;
     } else {
         return;
     };
     for value in body {
-        if value.starts_with("..") {
-            continue;
+        collect_model_field_element(&value, consts, root, field, out, depth + 1);
+    }
+}
+
+/// Reads one model element's numeric field, expanding an inline spread first.
+fn collect_model_field_element(
+    value: &str,
+    consts: &Consts,
+    root: &Tree,
+    field: &str,
+    out: &mut Vec<(Option<String>, f64)>,
+    depth: usize,
+) {
+    if depth > 4 {
+        return;
+    }
+    let value = value.trim();
+    if let Some(name) = value.strip_prefix("...") {
+        if let Some(raw) = element_expression(name, consts, root) {
+            collect_model_fields(&raw, consts, root, field, out, depth + 1);
         }
-        if value.trim_start().starts_with('{') {
-            let f = fields(&value);
-            let id = f
-                .iter()
-                .find(|(k, _)| k == "id")
-                .and_then(|(_, v)| resolve_str(v, consts));
-            let n = f
-                .iter()
-                .find(|(k, _)| k == field)
-                .and_then(|(_, v)| number_value(v, consts));
-            if let Some(n) = n {
-                out.push((id, n));
-            }
+        return;
+    }
+    if value.starts_with('{') {
+        let f = fields(value);
+        let id = f
+            .iter()
+            .find(|(k, _)| k == "id")
+            .and_then(|(_, v)| resolve_str(v, consts));
+        let n = f
+            .iter()
+            .find(|(k, _)| k == field)
+            .and_then(|(_, v)| number_value(v, consts));
+        if let Some(n) = n {
+            out.push((id, n));
         }
     }
 }
@@ -1199,11 +1228,13 @@ fn first_of_array(raw: &str, consts: &Consts) -> Option<String> {
     // An element may itself resolve to an array (`[...NAME]`), in which case the
     // first element is inside that.
     array_elements(&body).into_iter().find_map(|e| {
-        let named = consts.get(e.trim()).map(str::to_owned);
-        let resolved = resolve_str(&e, consts)
-            .or_else(|| resolve_name(&e, consts))
+        let e = e.trim();
+        let e = e.strip_prefix("...").unwrap_or(e).trim();
+        let named = consts.get(e).map(str::to_owned);
+        let resolved = resolve_str(e, consts)
+            .or_else(|| resolve_name(e, consts))
             .or(named)
-            .unwrap_or(e);
+            .unwrap_or_else(|| e.to_owned());
         if resolved.trim_start().starts_with('[') || resolved.contains("Object.freeze") {
             first_of_array(&unwrap_array(&resolved), consts)
         } else {
@@ -1240,10 +1271,6 @@ fn array_elements(body: &str) -> Vec<String> {
             i = skip_ws(&b, i);
             continue;
         }
-        if b[i] == '.' {
-            // A spread element: `[...NAME]`.
-            i = skip_ws(&b, i + 3);
-        }
         let Some(end) = balanced_end(&b, i) else {
             break;
         };
@@ -1254,6 +1281,95 @@ fn array_elements(body: &str) -> Vec<String> {
         i = skip_ws(&b, end);
     }
     out
+}
+
+/// The top-level arguments of a call expression, split on commas that are not
+/// inside a bracket, brace, or quote.
+fn call_args(call: &str) -> Vec<String> {
+    let t = call.trim();
+    let Some(open) = t.find('(') else {
+        return Vec::new();
+    };
+    let chars: Vec<char> = t.chars().collect();
+    let Some(end) = balanced_end(&chars, open) else {
+        return Vec::new();
+    };
+    let inner: String = chars[open + 1..end.saturating_sub(1)].iter().collect();
+    let mut args = Vec::new();
+    let mut depth = 0_usize;
+    let mut quote = None;
+    let mut start = 0_usize;
+    for (i, c) in inner.char_indices() {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' => quote = Some(c),
+            '[' | '{' | '(' => depth += 1,
+            ']' | '}' | ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                args.push(inner[start..i].trim().to_owned());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    args.push(inner[start..].trim().to_owned());
+    args
+}
+
+/// The raw elements of an array expression, resolving `Object.freeze([...])`
+/// and a const that names one.
+fn expression_elements(raw: &str, consts: &Consts, root: &Tree, depth: usize) -> Vec<String> {
+    if depth > 4 {
+        return Vec::new();
+    }
+    let t = raw.trim();
+    if t.starts_with("Object.freeze(") {
+        return expression_elements(&unwrap_array(t), consts, root, depth + 1);
+    }
+    if let Some(inner) = t.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        return array_elements(inner);
+    }
+    if let Some(v) = consts.get(t).or_else(|| root.consts.get(t)) {
+        return expression_elements(v, consts, root, depth + 1);
+    }
+    Vec::new()
+}
+
+/// Evaluates `buildSurfaceCatalog(base, { add, remove })` into the raw model
+/// elements it produces, preserving the base order and applying the delta.
+fn surface_catalog_elements(call: &str, consts: &Consts, root: &Tree) -> Vec<String> {
+    let args = call_args(call);
+    let base = args.first().map(String::as_str).unwrap_or("");
+    let delta = args.get(1).map(String::as_str).unwrap_or("");
+    let mut elements = expression_elements(base, consts, root, 0);
+    let mut removed = BTreeSet::new();
+    for (key, raw) in fields(delta) {
+        match key.as_str() {
+            "add" => elements.extend(expression_elements(&raw, consts, root, 0)),
+            "remove" => {
+                for element in expression_elements(&raw, consts, root, 0) {
+                    if let Some(id) = resolve_str(&element, consts) {
+                        removed.insert(id);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    elements.retain(|element| {
+        let id = if element.trim_start().starts_with('{') {
+            string_field(element, "id")
+        } else {
+            resolve_str(element, consts)
+        };
+        id.is_none_or(|id| !removed.contains(&id))
+    });
+    elements
 }
 
 /// The model ids in a `models` expression.
@@ -1292,41 +1408,100 @@ fn collect_models(
                 array_elements(inner.trim_start_matches('[').trim_end_matches(']'))
             }
         }
+    } else if t.starts_with("Object.freeze(") {
+        collect_models(&unwrap_array(t), consts, root, out, seen, depth + 1);
+        return;
+    } else if t.starts_with("buildSurfaceCatalog(") {
+        for element in surface_catalog_elements(t, consts, root) {
+            collect_model_element(&element, consts, root, out, seen, depth + 1);
+        }
+        return;
     } else if let Some(name) = t.strip_prefix("...") {
-        let name = name.trim();
-        if let Some(v) = consts.get(name).or_else(|| root.consts.get(name)) {
+        if let Some(v) = consts
+            .get(name.trim())
+            .or_else(|| root.consts.get(name.trim()))
+        {
             collect_models(v, consts, root, out, seen, depth + 1);
         }
         return;
-    } else if let Some(v) = consts.get(t).or_else(|| root.consts.get(t)) {
-        collect_models(v, consts, root, out, seen, depth + 1);
+    } else if let Some(raw) = element_expression(t, consts, root) {
+        collect_models(&raw, consts, root, out, seen, depth + 1);
         return;
     } else {
         return;
     };
 
     for value in body {
-        if value.starts_with("..") {
-            continue;
-        }
-        if value.trim_start().starts_with('{') {
-            for (key, raw) in fields(&value) {
-                if key == "id"
-                    && let Some(id) = resolve_str(&raw, consts)
-                    && seen.insert(id.clone())
-                {
-                    out.push(Strng::from(id.as_str()));
-                }
-            }
-            continue;
-        }
-        // A bare string element: `buildModels(["a", "b"])`.
-        if let Some(id) = resolve_str(&value, consts)
-            && seen.insert(id.clone())
-        {
-            out.push(Strng::from(id.as_str()));
-        }
+        collect_model_element(&value, consts, root, out, seen, depth + 1);
     }
+}
+
+/// Collects the model ids from one array element, expanding an inline spread
+/// or reading the `id` out of an object literal.
+fn collect_model_element(
+    value: &str,
+    consts: &Consts,
+    root: &Tree,
+    out: &mut Vec<Strng>,
+    seen: &mut BTreeSet<String>,
+    depth: usize,
+) {
+    if depth > 4 {
+        return;
+    }
+    let value = value.trim();
+    if let Some(name) = value.strip_prefix("...") {
+        if let Some(raw) = element_expression(name, consts, root) {
+            collect_models(&raw, consts, root, out, seen, depth + 1);
+        }
+        return;
+    }
+    if value.starts_with('{') {
+        for (key, raw) in fields(value) {
+            if key == "id"
+                && let Some(id) = resolve_str(&raw, consts)
+                && seen.insert(id.clone())
+            {
+                out.push(Strng::from(id.as_str()));
+            }
+        }
+        return;
+    }
+    // A bare string element: `buildModels(["a", "b"])`.
+    if let Some(id) = resolve_str(value, consts)
+        && seen.insert(id.clone())
+    {
+        out.push(Strng::from(id.as_str()));
+    }
+}
+
+/// Resolves one spread element to the expression it names: either a const
+/// array, a provider object's `models` field, or a property path through one.
+fn element_expression(name: &str, consts: &Consts, root: &Tree) -> Option<String> {
+    let name = name.trim();
+    if let Some((base, prop)) = name.split_once('.') {
+        return consts
+            .get(base)
+            .or_else(|| root.consts.get(base))
+            .and_then(|v| {
+                if v.trim_start().starts_with('{') {
+                    fields(v)
+                        .into_iter()
+                        .find(|(k, _)| k == prop)
+                        .map(|(_, raw)| raw)
+                } else {
+                    None
+                }
+            });
+    }
+    let v = consts.get(name).or_else(|| root.consts.get(name))?;
+    if v.trim_start().starts_with('{') {
+        return fields(v)
+            .into_iter()
+            .find(|(k, _)| k == "models")
+            .map(|(_, raw)| raw);
+    }
+    Some(v.to_owned())
 }
 
 /// The conventional env var for a provider id.
@@ -1774,6 +1949,7 @@ fn combos(defs: &BTreeMap<Strng, ProviderDef>) -> Vec<Combo> {
                 // provider catalog, not OmniRoute's combo files, so it has no
                 // candidate pool to read and must not fabricate one.
                 pool: Vec::new(),
+                steps: Vec::new(),
                 compression: None,
                 judge_model: None,
                 // This importer folds a provider catalog rather than reading a
@@ -1926,6 +2102,121 @@ mod tests {
         let clean = strip_comments(src);
         let def = to_def(&entries(&clean)[0], &Consts::of(&clean), &Tree::empty()).unwrap();
         assert_eq!(def.models, vec![Strng::from("a"), Strng::from("b")]);
+    }
+
+    #[test]
+    fn reads_models_from_an_inline_spread_of_another_const() {
+        let src = r#"
+            const SHARED_MODELS = [{ id: "m1" }, { id: "m2" }];
+            export const pProvider: RegistryEntry = {
+              id: "p",
+              baseUrl: "https://x",
+              models: [...SHARED_MODELS],
+            };
+        "#;
+        let clean = strip_comments(src);
+        let def = to_def(&entries(&clean)[0], &Consts::of(&clean), &Tree::empty()).unwrap();
+        assert_eq!(def.models, vec![Strng::from("m1"), Strng::from("m2")]);
+    }
+
+    #[test]
+    fn reads_models_from_a_nested_provider_field_spread() {
+        let src = r#"
+            export const codexProvider: RegistryEntry = {
+              id: "codex",
+              baseUrl: "https://codex",
+              models: [{ id: "gpt-6-astra" }],
+            };
+            export const appProvider: RegistryEntry = {
+              id: "app",
+              baseUrl: "https://app",
+              models: [...codexProvider.models],
+            };
+        "#;
+        let clean = strip_comments(src);
+        let entries = entries(&clean);
+        let app = entries.iter().find(|e| e.id == "app").expect("app entry");
+        let def = to_def(app, &Consts::of(&clean), &Tree::empty()).unwrap();
+        assert_eq!(def.models, vec![Strng::from("gpt-6-astra")]);
+    }
+
+    #[test]
+    fn reads_models_from_build_models_with_an_inline_spread() {
+        let src = r#"
+            const NAMED_MODELS = ["a", "b"];
+            export const pProvider: RegistryEntry = {
+              id: "p",
+              baseUrl: "https://x",
+              models: buildModels([...NAMED_MODELS]),
+            };
+        "#;
+        let clean = strip_comments(src);
+        let def = to_def(&entries(&clean)[0], &Consts::of(&clean), &Tree::empty()).unwrap();
+        assert_eq!(def.models, vec![Strng::from("a"), Strng::from("b")]);
+    }
+
+    #[test]
+    fn reads_models_from_an_object_freeze_array_const() {
+        let src = r#"
+            const SHARED_MODELS = Object.freeze([
+              { id: "m1" },
+              { id: "m2" },
+            ]);
+            export const pProvider: RegistryEntry = {
+              id: "p",
+              baseUrl: "https://x",
+              models: [...SHARED_MODELS],
+            };
+        "#;
+        let clean = strip_comments(src);
+        let def = to_def(&entries(&clean)[0], &Consts::of(&clean), &Tree::empty()).unwrap();
+        assert_eq!(def.models, vec![Strng::from("m1"), Strng::from("m2")]);
+    }
+
+    #[test]
+    fn reads_models_from_build_surface_catalog() {
+        let src = r#"
+            const SHARED_MODELS = Object.freeze([
+              { id: "m1" },
+              { id: "m2" },
+              { id: "m3" },
+            ]);
+            export const PUBLIC_MODELS = buildSurfaceCatalog(SHARED_MODELS, {
+              add: [{ id: "m4" }],
+              remove: ["m2"],
+            });
+            export const pProvider: RegistryEntry = {
+              id: "p",
+              baseUrl: "https://x",
+              models: [...PUBLIC_MODELS],
+            };
+        "#;
+        let clean = strip_comments(src);
+        let def = to_def(&entries(&clean)[0], &Consts::of(&clean), &Tree::empty()).unwrap();
+        assert_eq!(
+            def.models,
+            vec![Strng::from("m1"), Strng::from("m3"), Strng::from("m4")]
+        );
+    }
+
+    #[test]
+    fn reads_models_from_a_property_path_on_a_const_object() {
+        let src = r#"
+            const CHAT_OPENAI_COMPAT_MODELS = {
+              ai21: [{ id: "jamba-large-1.7" }, { id: "jamba-mini-2" }],
+            };
+            export const pProvider: RegistryEntry = {
+              id: "p",
+              baseUrl: "https://x",
+              models: CHAT_OPENAI_COMPAT_MODELS.ai21,
+            };
+        "#;
+        let clean = strip_comments(src);
+        let def = to_def(&entries(&clean)[0], &Consts::of(&clean), &Tree::empty()).unwrap();
+        assert_eq!(
+            def.models,
+            vec![Strng::from("jamba-large-1.7"), Strng::from("jamba-mini-2")]
+        );
     }
 
     #[test]

@@ -64,6 +64,11 @@ same moment, rather than numbers from two different benches. Traffic figures
 cover the dispatch path against a localhost upstream (no SSE frames relayed);
 the SSE relay itself is proven by `tests/e2e.rs` against a mock upstream.
 
+Re-measured 2026-10-08 against the current development tree: `aroute serve`
+alone is ~33.8 MiB RSS; spawning `aroute dashboard` adds ~4.4 MiB of
+supervision plus the Next.js child at ~513 MiB RSS, ~548 MiB together under
+both. The local omniroute backend is ~1.26 GiB RSS in the same session.
+
 ## Parity
 
 | Surface | Artificial Route | OmniRoute | agentgateway |
@@ -141,7 +146,7 @@ is a different OmniRoute process state than the ~994 MiB above.
 
 Full depth, OAuth mechanics, refresh triggers, quota tables, engine-catalog divergences and every gap with its fix: [AUDIT-REPORT.md](AUDIT-REPORT.md).
 
-Known gaps, stated plainly: OAuth login works via `aroute auth login` — a PKCE browser redirect (loopback catch locally, or carry the URL to any device and paste the redirect back) or, for a session that declares `device_initiate_url`/`device_poll_url`, an RFC 8628 device code you approve on another device — plus four MCP tools, and no refresh/authorize/device endpoint is hardcoded, because an auth endpoint guessed from a provider id would be an invented wire format; `grok-cli` has an executor but only for authentication, its Responses body and `x-grok-*` headers are not transcribed, so it builds a session and still does not dispatch; `kilocode` is an RFC 8628 device-flow provider that also serves a free tier, and both mechanisms are ported — a device code, and `anonymous: true` dispatch that needs no credential row at all — but neither is an OAuth *executor*, because its dispatch wire is not transcribed, so with neither mechanism declared its `oauth/` row is still a `fail` whose fix names the YAML for either one; the full explanation is [AUDIT-REPORT.md](AUDIT-REPORT.md) R1; the local credential store holds API keys plus a non-secret `oauth_sessions` table (which credential name a provider's session lives behind, and whether a refresh retired it — never a token), so the generated terminal-status CHECK has a home, but a `config.yaml` must still *declare* each OAuth key name (a `$VAR` there has to be exported, empty is fine); custom providers are file-declared (`custom_providers:`), so a new endpoint needs no rebuild — but only the OpenAI wire dispatches, and an `id` that collides with a compiled-in one is refused; multi-provider `auto` pools fall back to config order (single-provider pools score identically); the MCP control plane is stdio-only (StreamableHTTP deferred) and ships behind `--features mcp`; the registry snapshot lags OmniRoute's model rotation — `aroute doctor` reports the snapshot's age, warns past 7 days, names each stale model and the `aroute import` fix; an unknown path returns a bare 404 with no body, where OmniRoute returns a JSON envelope carrying the path, so a client that parses every error as JSON gets nothing to parse on a typo'd route; `aroute serve` listens unauthenticated, because the `ar-server` bearer gate is driven by a `Components.master_key` that no shipped command sets (`AR_MASTER_KEY` arms the credential store, not HTTP auth), so loopback or a reverse proxy is the only thing between a caller and the provider keys; and the non-routing surface is deliberately narrow, with no dashboard, embeddings, media, audio, rerank, search, OCR, files, batches, WebSocket or A2A, which is where OmniRoute's other ~723 routes and 110 MCP tools live; and only `x-ar-compression` is read, so a client sending OmniRoute's `x-omniroute-compression` header, or its standard/aggressive/ultra plan modes, is silently ignored.
+Known gaps, stated plainly: OAuth login works via `aroute auth login` — a PKCE browser redirect (loopback catch locally, or carry the URL to any device and paste the redirect back) or, for a session that declares `device_initiate_url`/`device_poll_url`, an RFC 8628 device code you approve on another device — plus four MCP tools, and no refresh/authorize/device endpoint is hardcoded, because an auth endpoint guessed from a provider id would be an invented wire format; `grok-cli` has an executor but only for authentication, its Responses body and `x-grok-*` headers are not transcribed, so it builds a session and still does not dispatch; `kilocode` is an RFC 8628 device-flow provider that also serves a free tier, and both mechanisms are ported — a device code, and `anonymous: true` dispatch that needs no credential row at all — but neither is an OAuth *executor*, because its dispatch wire is not transcribed, so with neither mechanism declared its `oauth/` row is still a `fail` whose fix names the YAML for either one; the full explanation is [AUDIT-REPORT.md](AUDIT-REPORT.md) R1; the local credential store holds API keys plus a non-secret `oauth_sessions` table (which credential name a provider's session lives behind, and whether a refresh retired it — never a token), so the generated terminal-status CHECK has a home, but a `config.yaml` must still *declare* each OAuth key name (a `$VAR` there has to be exported, empty is fine); custom providers are file-declared (`custom_providers:`), so a new endpoint needs no rebuild — but only the OpenAI wire dispatches, and an `id` that collides with a compiled-in one is refused; multi-provider `auto` pools fall back to config order (single-provider pools score identically); the MCP control plane is stdio-only (StreamableHTTP deferred) and ships behind `--features mcp`; the registry snapshot lags OmniRoute's model rotation — `aroute doctor` reports the snapshot's age, warns past 7 days, names each stale model and the `aroute import` fix; an unknown path returns a bare 404 with no body, where OmniRoute returns a JSON envelope carrying the path, so a client that parses every error as JSON gets nothing to parse on a typo'd route; `aroute serve` listens unauthenticated, because the `ar-server` bearer gate is driven by a `Components.master_key` that no shipped command sets (`AR_MASTER_KEY` arms the credential store, not HTTP auth), so loopback or a reverse proxy is the only thing between a caller and the provider keys; and the non-routing surface is deliberately narrow, with no service count beyond the vendored dashboard plus `/v1` proxy — no embeddings, media, audio, rerank, search, OCR, files, batches, WebSocket or A2A, which is where OmniRoute's other ~723 routes and 110 MCP tools live; and only `x-ar-compression` is read, so a client sending OmniRoute's `x-omniroute-compression` header, or its standard/aggressive/ultra plan modes, is silently ignored.
 
 ## Installation
 
@@ -188,6 +193,10 @@ proxy is already running — `curl -s localhost:20128/healthz` answers before yo
 type anything. The commands above are for the no-systemd case, or for running a
 second instance in the foreground. One-shot without a server at all:
 `aroute run -m cheap -p 'hello'`.
+
+Smoke-tested locally on 2026-10-08: `aroute serve` + `aroute dashboard` serve
+`GET /healthz`, `GET /v1/models`, `GET /api/health`, `GET /` and `GET /login` and
+return valid OpenAI JSON for `free-stack` and `small-stack` chat completions.
 
 Keys can also live encrypted at rest in a gitignored `credentials.db` beside the config (`$AR_CRED_STORE` moves it; `$AR_MASTER_KEY` holds the 32-byte master). Resolution order is store → `$VAR`, so an install with no store behaves as before, and `aroute doctor` reports the `store` row and which source each key resolved from.
 
@@ -239,6 +248,10 @@ custom_providers:
 > [!WARNING]
 > `aroute doctor` and `aroute serve` share one target grammar: a config one accepts, the other accepts. If `serve` refuses a file, `doctor` says why.
 
+### Guardrails
+
+Every request passes the same two stages as OmniRoute's sanitizer: credentials and PII are redacted before the body is logged, cached or forwarded, and prompt-injection families (`override`, `system_leak`, `delimiter_injection`, plus role/jailbreak redactions) match upstream's exact needle sets — probes carry the `(system|initial|hidden|original)` qualifier upstream's #4041 requires, and bare template tokens that occur in ordinary code are never refusal triggers. Enforcement follows upstream's `INPUT_SANITIZER_MODE`: `warn` by default — rule names are logged and the request forwards — and `block` refuses with `400` before dispatch.
+
 ## Documentation
 
 `docs/00-overview.md` → `01..06` are the sources of truth (budgets, subsystems, roadmap, AXI/MCP). `AGENTS.md` holds the enforced Rust disciplines. Detail lives there; this file stays a funnel.
@@ -257,3 +270,20 @@ Both green, minimal diffs, no `unwrap` outside tests. See [CONTRIBUTING.md](CONT
 ## License
 
 [Apache-2.0](LICENSE) — © 2026 Ishan Parihar.
+
+## Current combo/fallback note
+
+`aroute import --from omniroute --combos <storage.sqlite>` reads real OmniRoute
+combos when the store has them: nested `combo-ref` steps are expanded into the
+parent chain, per-step prompts, tags, connection allow-lists, weights, and
+quota-exhaustion-only markers are preserved, and `fallbackOnlyOnQuotaExhaustion`
+steps are copied into the combo's `pool:`. On this machine the current storage
+still holds no readable `combos` rows, so the importer falls back to one combo
+per `provider/model`; the installed `~/.config/ar/config.yaml` therefore carries
+the `free-stack`/`small-stack` combos by hand.
+
+The installed live combos use `least-used`/`priority`; `round-robin` exists in
+the strategy grammar but is not what either stack runs. A smoke
+`GET /v1/chat/completions` on `free-stack` streams successfully; `small-stack`
+can answer `ok` on success paths and returns `chain_throttled` when every
+provider in the chain is rate-limited.

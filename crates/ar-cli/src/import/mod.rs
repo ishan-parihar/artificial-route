@@ -290,6 +290,7 @@ fn assemble(rows: Vec<Row>) -> anyhow::Result<Imported> {
                 // invents one: a bench that is not in the source is not in the file,
                 // and an operator adds `pool:` by hand.
                 pool: Vec::new(),
+                steps: Vec::new(),
                 compression: None,
                 judge_model: None,
                 // A LiteLLM export declares no per-combo window, so none is
@@ -414,6 +415,17 @@ pub(crate) fn render_yaml(
             match c.weights.get(t) {
                 Some(w) => out.push(format!("      - target: {t}\n        weight: {w}")),
                 None => out.push(format!("      - {t}")),
+            }
+        }
+        // A step record is emitted only when the importer actually saw one, so a
+        // hand-written config that never names prompts, tags, connection ids, or
+        // quota-exhaustion fallbacks stays byte-for-byte what it was.
+        if !c.steps.is_empty() {
+            out.push("    steps:".to_owned());
+            let rendered = serde_yaml::to_string(&c.steps)
+                .expect("a struct of strings, floats, and bools always serialises");
+            for line in rendered.trim_end().lines() {
+                out.push(format!("      {line}"));
             }
         }
         // Carried only when the source declared one: an invented window would be
@@ -664,6 +676,34 @@ model_list:
         .unwrap();
         assert_eq!(out.combos[0].id, "anthropic/claude-sonnet-4");
         assert_eq!(out.registry["anthropic"].wire_format, WireFormat::Anthropic);
+    }
+
+    #[test]
+    fn renders_step_metadata_that_round_trips_through_the_config_loader() {
+        let combo = Combo {
+            id: "rich".to_owned(),
+            strategy: Strategy::Priority,
+            targets: vec!["groq/llama-3.3-70b".to_owned()],
+            weights: BTreeMap::new(),
+            pool: Vec::new(),
+            steps: vec![ar_config::ComboStep {
+                target: "groq/llama-3.3-70b".to_owned(),
+                weight: Some(70.0),
+                prompt: Some("Keep the answer short".to_owned()),
+                tags: vec!["fast".to_owned()],
+                allowed_connection_ids: vec!["conn-a".to_owned()],
+                fallback_only_on_quota_exhaustion: true,
+                label: Some("primary".to_owned()),
+                id: Some("step-1".to_owned()),
+            }],
+            compression: None,
+            judge_model: None,
+            context_length: Some(200_000),
+        };
+        let yaml = render_yaml(&BTreeMap::new(), std::slice::from_ref(&combo), &[]);
+        let parsed = ar_config::Config::parse(&yaml, |n| Ok(Some(format!("<{n}>"))))
+            .expect("steps serialize to loadable YAML");
+        assert_eq!(parsed.combos, vec![combo]);
     }
 
     #[test]
