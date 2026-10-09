@@ -118,7 +118,7 @@ fi
 if [ "$DASHBOARD" -eq 1 ] && [ -n "$DASH_SRC" ]; then
   case "$DASH_SRC" in
     *.tar.gz|*.tgz) [ -f "$DASH_SRC" ] || { echo "error: no tarball at $DASH_SRC" >&2; exit 2; } ;;
-    *) [ -x "$DASH_SRC/server.js" ] || { echo "error: $DASH_SRC is not a dashboard dist (want server.js inside)" >&2; exit 2; } ;;
+    *) [ -f "$DASH_SRC/server.js" ] || { echo "error: $DASH_SRC is not a dashboard dist (want server.js inside)" >&2; exit 2; } ;;
   esac
 fi
 
@@ -229,7 +229,7 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
     echo "status:    update available (run this script again)"
   fi
   printf 'config:    %s%s\n' "$CONFIG" "$([ -f "$CONFIG" ] && echo '' || echo '  (missing)')"
-  if [ -d "$DASH_DEST" ] && [ -x "$DASH_DEST/server.js" ]; then
+  if [ -d "$DASH_DEST" ] && [ -f "$DASH_DEST/server.js" ]; then
     echo "dashboard: installed ($(du -sh "$DASH_DEST" 2>/dev/null | cut -f1)) — launch: aroute dashboard"
   else
     echo "dashboard: not installed (--with-dashboard installs it from a local build)"
@@ -265,14 +265,14 @@ install_dashboard() {
     # The common case: this script run from a checkout of the repo, where
     # <repo>/dashboard/dist is the freshly built tree.
     guess="$(dirname "$SCRIPT_SRC")/dashboard/dist"
-    if [ -z "$SCRIPT_SRC" ] || [ ! -x "$guess/server.js" ]; then
+    if [ -z "$SCRIPT_SRC" ] || [ ! -f "$guess/server.js" ]; then
       die "pass --dashboard-src <dist-dir-or-tarball> — build it with dashboard/rebrand-dist.sh"
     fi
     DASH_SRC="$guess"
   fi
   case "$DASH_SRC" in
     *.tar.gz|*.tgz) [ -f "$DASH_SRC" ] || die "no tarball at $DASH_SRC" ;;
-    *) [ -x "$DASH_SRC/server.js" ] || die "$DASH_SRC is not a dashboard dist (want server.js inside)" ;;
+    *) [ -f "$DASH_SRC/server.js" ] || die "$DASH_SRC is not a dashboard dist (want server.js inside)" ;;
   esac
 
   mkdir -p "$(dirname "$DASH_DEST")"
@@ -283,7 +283,7 @@ install_dashboard() {
     *.tar.gz|*.tgz) tar -xzf "$DASH_SRC" -C "${DASH_DEST}.new" ;;
     *) cp -a "$DASH_SRC/." "${DASH_DEST}.new/" ;;
   esac
-  [ -x "${DASH_DEST}.new/server.js" ] || die "the unpacked dist has no server.js — bad source?"
+  [ -f "${DASH_DEST}.new/server.js" ] || die "the unpacked dist has no server.js — bad source?"
   rm -rf "${DASH_DEST}.old"
   [ -d "$DASH_DEST" ] && mv "$DASH_DEST" "${DASH_DEST}.old"
   mv "${DASH_DEST}.new" "$DASH_DEST"
@@ -554,7 +554,7 @@ fi
 if [ "$DASHBOARD" -eq 1 ]; then
   install_dashboard
 else
-  if [ -d "$DASH_DEST" ] && [ -x "$DASH_DEST/server.js" ]; then
+  if [ -d "$DASH_DEST" ] && [ -f "$DASH_DEST/server.js" ]; then
     DASH_STATE="kept — $DASH_DEST (upgrades: --with-dashboard --dashboard-src <dist>)"
   else
     DASH_STATE="not installed (add it: --with-dashboard --dashboard-src <dist>)"

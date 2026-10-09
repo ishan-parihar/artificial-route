@@ -35,23 +35,39 @@ fn resolve_dist(flag: Option<PathBuf>, env: Option<PathBuf>, exe_dir: Option<Pat
 
 /// [`resolve_dist`] with HOME as a parameter, so the whole chain is testable
 /// without mutating process env.
+///
+/// `--path` and `$AR_DASHBOARD_DIR` are authoritative: a caller who names a
+/// dist gets exactly that, right or wrong. The two location *guesses* — beside
+/// the binary, and the `--with-dashboard` install location — are validated: a
+/// guess only wins when it actually contains a `server.js`, so an installed
+/// binary finds the installed dist instead of stopping at an empty guess.
 fn resolve_dist_with(
     flag: Option<PathBuf>,
     env: Option<PathBuf>,
     exe_dir: Option<PathBuf>,
     home: Option<std::ffi::OsString>,
 ) -> PathBuf {
-    flag.or(env)
-        .or_else(|| exe_dir.map(|d| d.join("dashboard").join("dist")))
-        .or_else(|| {
-            home.map(|h| {
-                PathBuf::from(h)
-                    .join(".config")
-                    .join("ar")
-                    .join("dashboard")
-            })
-        })
-        .unwrap_or_else(|| PathBuf::from("dashboard/dist"))
+    if let Some(explicit) = flag.or(env) {
+        return explicit;
+    }
+    let mut guesses: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = exe_dir {
+        guesses.push(dir.join("dashboard").join("dist"));
+    }
+    if let Some(h) = home {
+        guesses.push(
+            PathBuf::from(h)
+                .join(".config")
+                .join("ar")
+                .join("dashboard"),
+        );
+    }
+    guesses.push(PathBuf::from("dashboard/dist"));
+    guesses
+        .iter()
+        .find(|g| g.join("server.js").is_file())
+        .cloned()
+        .unwrap_or_else(|| guesses[0].clone())
 }
 
 /// Spawns the dashboard server and blocks until it exits.
@@ -152,10 +168,29 @@ mod tests {
         assert_eq!(got, p("/env"));
     }
 
+    /// A temp dir with `server.js` inside, so an existence-validated guess has
+    /// something to find. The caller removes the dir.
+    fn dist_dir(tag: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("ar-dash-guess-{tag}-{}", std::process::id()));
+        let dist = root.join("dashboard").join("dist");
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(dist.join("server.js"), b"// next standalone").unwrap();
+        (root, dist)
+    }
+
     #[test]
     fn resolve_dist_looks_beside_the_binary_when_only_exe_dir_known() {
-        let got = resolve_dist(None, None, Some(p("/usr/local/bin")));
-        assert_eq!(got, p("/usr/local/bin/dashboard/dist"));
+        let (root, dist) = dist_dir("beside");
+        // exe_dir IS the dir the binary sits in, so its guess is
+        // <exe_dir>/dashboard/dist — exactly what dist_dir created under root.
+        let got = resolve_dist_with(
+            None,
+            None,
+            Some(root.clone()),
+            Some(std::ffi::OsString::from("/nonexistent-home")),
+        );
+        assert_eq!(got, dist);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -168,15 +203,48 @@ mod tests {
     fn resolve_dist_finds_the_installer_location_when_home_is_known() {
         // No flag, no env, no dist beside the binary: the --with-dashboard
         // install location is what `aroute dashboard` serves.
-        let got = resolve_dist_with(None, None, None, Some(std::ffi::OsString::from("/home/op")));
-        assert_eq!(got, p("/home/op/.config/ar/dashboard"));
+        let (root, _unused) = dist_dir("installed");
+        let home = root.join("home");
+        let installed = home.join(".config").join("ar").join("dashboard");
+        std::fs::create_dir_all(&installed).unwrap();
+        std::fs::write(installed.join("server.js"), b"// next standalone").unwrap();
+        let got = resolve_dist_with(
+            None,
+            None,
+            Some(root.join("bin")),
+            Some(home.into_os_string()),
+        );
+        assert_eq!(
+            got, installed,
+            "an installed binary must find the installed dist"
+        );
         // A dist beside the binary still outranks the install location.
+        let (beside_root, beside_dist) = dist_dir("beside-wins");
+        let beside_home = beside_root.join("home");
+        let beside_installed = beside_home.join(".config").join("ar").join("dashboard");
+        std::fs::create_dir_all(&beside_installed).unwrap();
+        std::fs::write(beside_installed.join("server.js"), b"// next standalone").unwrap();
         let beside = resolve_dist_with(
             None,
             None,
-            Some(p("/opt/bin")),
-            Some(std::ffi::OsString::from("/home/op")),
+            Some(beside_root.clone()),
+            Some(beside_home.into_os_string()),
         );
-        assert_eq!(beside, p("/opt/bin/dashboard/dist"));
+        assert_eq!(beside, beside_dist);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&beside_root);
+    }
+
+    #[test]
+    fn resolve_dist_names_the_first_guess_when_none_exist() {
+        // All guesses missing: the error message still names the most likely
+        // intended location rather than a bare relative path.
+        let got = resolve_dist_with(
+            None,
+            None,
+            Some(p("/opt/bin")),
+            Some(std::ffi::OsString::from("/nonexistent-home")),
+        );
+        assert_eq!(got, p("/opt/bin/dashboard/dist"));
     }
 }
