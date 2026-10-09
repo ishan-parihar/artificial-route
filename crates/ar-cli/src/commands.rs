@@ -1586,6 +1586,18 @@ fn sync_env_file(env_path: &Path, db: &Path, doc: &str) -> anyhow::Result<(usize
     let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
     for row in rows {
         let (provider, api_key) = row?;
+        // OmniRoute encrypts provider keys at rest (`enc:v1:...`) and only the
+        // instance holding STORAGE_ENCRYPTION_KEY can open them. A sync must
+        // never materialise ciphertext as a credential: leave the env value
+        // alone and say which provider was skipped, so a working hand-set key
+        // survives and a missing one surfaces as the empty-var case below.
+        if api_key.starts_with("enc:v1:") {
+            eprintln!(
+                "note: AR_KEY_{} is encrypted at rest and was left untouched — decrypt the connection in the dashboard first",
+                import::env_name(&provider)
+            );
+            continue;
+        }
         values
             .entry(format!("AR_KEY_{}", import::env_name(&provider)))
             .or_insert(api_key);
@@ -1868,6 +1880,12 @@ mod tests {
             [],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO provider_connections (id, provider, api_key, is_active, priority, created_at) \
+             VALUES ('k2', 'groq', 'enc:v1:deadbeef', 1, 9, '2024-01-01')",
+            [],
+        )
+        .unwrap();
         drop(conn);
 
         let config = dir.join("config.yaml");
@@ -1904,6 +1922,10 @@ mod tests {
         assert!(
             envdoc.contains("AR_KEY_NVIDIA=nvapi-secret"),
             "key not materialised:\n{envdoc}"
+        );
+        assert!(
+            !envdoc.contains("enc:v1:"),
+            "encrypted-at-rest ciphertext leaked into the env file:\n{envdoc}"
         );
         assert!(
             envdoc.contains("AR_KEY_GHOST="),
