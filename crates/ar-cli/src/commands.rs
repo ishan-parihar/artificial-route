@@ -18,7 +18,9 @@ use ar_server::config::split_target_known;
 use clap::CommandFactory;
 use clap::error::ErrorKind;
 
-use crate::cli::{Cli, Command, ConfigureArgs, ImportArgs, ListArgs, SyncArgs};
+use crate::cli::{
+    ClearLimitsArgs, Cli, Command, ConfigureArgs, ImportArgs, ListArgs, SetLimitsArgs, SyncArgs,
+};
 use crate::import;
 use crate::import::ImportFrom;
 use crate::serve;
@@ -41,6 +43,9 @@ const COMBO_COLUMNS: [&str; 5] = ["id", "provider", "status", "strategy", "targe
 /// Columns available from `aroute sync`: one row per combo the dashboard
 /// handed over.
 const SYNC_COLUMNS: [&str; 5] = ["id", "provider", "status", "strategy", "targets"];
+/// Columns of an `aroute limits` row. `key` leads but is not `id`: the
+/// `default` row is a row like any other here, and the column names it.
+const LIMIT_COLUMNS: [&str; 5] = ["key", "rpm", "usd_micros", "tokens", "refuse_unpriced"];
 /// Columns of a `doctor` finding.
 const CHECK_COLUMNS: [&str; 3] = ["check", "status", "detail"];
 /// Columns of the `configure` dump.
@@ -482,6 +487,166 @@ pub fn gate_master(store: &CredentialStore) -> Result<Option<ar_keys::Secret>, K
     store.get(GATE_ROW)
 }
 
+/// The config file's text, for the verbs that splice a section of it.
+fn read_config_text(cli: &Cli) -> anyhow::Result<String> {
+    std::fs::read_to_string(&cli.config).map_err(|e| {
+        fail(
+            format!("cannot read {}: {e}", cli.config.display()),
+            "the limits verbs edit the config in place; pass --config <PATH>",
+        )
+    })
+}
+
+/// `aroute limits` — the block as one TOON row per key.
+///
+/// The `default` row is always first, because it is the row anonymous traffic
+/// and any key without its own get; printing it only when it limits something
+/// would hide the row that governs the rest.
+pub fn limits_view(cli: &Cli) -> anyhow::Result<()> {
+    let cfg = load(cli)?;
+    let rows: Vec<Row> = std::iter::once(("default".to_owned(), cfg.limits.default.clone()))
+        .chain(
+            cfg.limits
+                .keys
+                .iter()
+                .map(|(name, row)| (name.clone(), row.clone())),
+        )
+        .map(|(name, row)| {
+            vec![
+                name,
+                opt_cell(row.rpm),
+                opt_cell(row.usd_micros),
+                opt_cell(row.tokens),
+                row.refuse_unpriced.to_string(),
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        toon::list(
+            "limits",
+            "limits",
+            &LIMIT_COLUMNS,
+            &toon::every_field(&LIMIT_COLUMNS),
+            &rows,
+            false,
+        )
+    );
+    Ok(())
+}
+
+/// The cell for an unset arm: `-`, because an empty cell reads as a broken row.
+fn opt_cell(value: Option<impl std::fmt::Display>) -> String {
+    value.map_or_else(|| "-".to_owned(), |v| v.to_string())
+}
+
+/// `aroute limits set` — merge the named arms into one row, rewrite the section.
+///
+/// The rewrite goes through [`import::limits::render`], the one renderer for
+/// the section, so a row this command writes and a row sync carries cannot
+/// drift on spelling.
+pub fn limits_set(cli: &Cli, args: &SetLimitsArgs) -> anyhow::Result<()> {
+    // A zero arm is the one value the parser refuses, and the one a writer
+    // must refuse too: `0` reads as "never" to an operator and "refill from
+    // empty forever" to a bucket, and this command cannot write what `ar
+    // serve` would then refuse to load.
+    for (field, zero) in [
+        ("rpm", args.rpm.is_some_and(|v| v == 0)),
+        ("usd_micros", args.usd_micros.is_some_and(|v| v == 0)),
+        ("tokens", args.tokens.is_some_and(|v| v == 0)),
+    ] {
+        if zero {
+            return Err(fail(
+                format!("--{field} 0 is refused"),
+                "0 means \"never\" to an operator and \"refill from empty forever\" to a bucket; omit the arm to leave it unlimited",
+            ));
+        }
+    }
+    if args.rpm.is_none()
+        && args.usd_micros.is_none()
+        && args.tokens.is_none()
+        && args.refuse_unpriced.is_none()
+    {
+        return Err(fail(
+            "no arm given",
+            "pass at least one of --rpm, --usd-micros, --tokens, --refuse-unpriced",
+        ));
+    }
+    let doc = read_config_text(cli)?;
+    let mut cfg = load(cli)?;
+    let label = args.key.clone().unwrap_or_else(|| "default".to_owned());
+    // The merge is per arm: a named arm is set, an arm not passed stays as it
+    // was — `set --rpm` must not quietly drop a ceiling the row already
+    // carried. Removing an arm is `clear`'s job, or the dashboard's.
+    let row = match &args.key {
+        Some(name) => cfg.limits.keys.entry(name.clone()).or_default(),
+        None => &mut cfg.limits.default,
+    };
+    row.rpm = args.rpm.or(row.rpm);
+    row.usd_micros = args.usd_micros.or(row.usd_micros);
+    row.tokens = args.tokens.or(row.tokens);
+    if let Some(refuse) = args.refuse_unpriced {
+        row.refuse_unpriced = refuse;
+    }
+    if row.is_empty() {
+        return Err(fail(
+            format!("the {label} row would be empty"),
+            "nothing to set — pass at least one arm, or `aroute limits clear` removes the row",
+        ));
+    }
+    let summary = (
+        opt_cell(row.rpm),
+        opt_cell(row.usd_micros),
+        opt_cell(row.tokens),
+        row.refuse_unpriced,
+    );
+    let next = splice_section(&doc, "limits", &import::limits::render(&cfg.limits));
+    write_file(&cli.config, &next)?;
+    println!(
+        "limits: {label} — rpm={} usd_micros={} tokens={} refuse_unpriced={}",
+        summary.0, summary.1, summary.2, summary.3
+    );
+    Ok(())
+}
+
+/// `aroute limits clear` — remove one key's row (`--key`), or the whole block.
+pub fn limits_clear(cli: &Cli, args: &ClearLimitsArgs) -> anyhow::Result<()> {
+    let doc = read_config_text(cli)?;
+    match &args.key {
+        Some(name) => {
+            let mut cfg = load(cli)?;
+            if cfg.limits.keys.remove(name).is_none() {
+                return Err(fail(
+                    format!("no limits row for key {name:?}"),
+                    "`aroute limits` prints the rows that exist",
+                ));
+            }
+            // Removing the last row can empty the block, and an empty
+            // `limits:` is not a block at all — the section goes rather than
+            // leaving a null body behind.
+            let next = if cfg.limits.is_empty() {
+                remove_section(&doc, "limits")
+            } else {
+                splice_section(&doc, "limits", &import::limits::render(&cfg.limits))
+            };
+            write_file(&cli.config, &next)?;
+            println!("limits: key {name:?} removed");
+        }
+        None => {
+            let next = remove_section(&doc, "limits");
+            if next == doc {
+                return Err(fail(
+                    "no limits block in the config",
+                    "nothing to remove; `aroute limits` prints what is there",
+                ));
+            }
+            write_file(&cli.config, &next)?;
+            println!("limits: block removed");
+        }
+    }
+    Ok(())
+}
+
 /// Dispatches a parsed command.
 pub fn dispatch(cli: &Cli) -> anyhow::Result<()> {
     match &cli.command {
@@ -504,6 +669,11 @@ pub fn dispatch(cli: &Cli) -> anyhow::Result<()> {
                 arm_gate(cli, &args.key_id, args.key.as_deref())
             }
             crate::cli::KeysCommand::Mint(args) => keys_mint(cli, &args.key_id),
+        },
+        Some(Command::Limits(a)) => match &a.command {
+            None => limits_view(cli),
+            Some(crate::cli::LimitsCommand::Set(args)) => limits_set(cli, args),
+            Some(crate::cli::LimitsCommand::Clear(args)) => limits_clear(cli, args),
         },
     }
 }
@@ -1617,6 +1787,46 @@ fn sync_config(cli: &Cli, args: &SyncArgs) -> anyhow::Result<()> {
         );
         next = add_missing_custom_key_refs(&next, &custom);
     }
+
+    // The dashboard's per-key request-rate ceiling, carried arm by arm. The
+    // dashboard audit (docs/15) found `max_requests_per_minute` is the one
+    // column that maps 1:1 — its dollar and token ceilings are *windows*
+    // (daily, weekly, monthly) where this engine's arms are cumulative, and
+    // carrying them would change what the operator asked for rather than move
+    // it. A key the dashboard names gets its `rpm` updated; every other arm,
+    // row, and the default row stay exactly as written, because a partial
+    // source must not own the whole block. A dashboard with nothing to say
+    // leaves the section untouched.
+    //
+    // Parsed as a bare value rather than through `Config::parse` because the
+    // limits block holds no `$VAR`s, and a full parse would demand every
+    // other section's variables resolve first — a demand sync never makes.
+    let rpm = import::limits::read_rpm(&db);
+    let carried = rpm.len();
+    if !rpm.is_empty() {
+        let mut limits = match serde_yaml::from_str::<serde_yaml::Value>(&next) {
+            Err(e) => {
+                return Err(fail(
+                    e,
+                    "the config did not parse as yaml; fix it by hand and re-run sync",
+                ))
+            }
+            Ok(root) => match root.get("limits") {
+                None => ar_config::Limits::default(),
+                Some(block) => serde_yaml::from_value::<ar_config::Limits>(block.clone())
+                    .map_err(|e| {
+                        fail(
+                            e,
+                            "the config's `limits:` block did not parse; fix it by hand and re-run sync",
+                        )
+                    })?,
+            },
+        };
+        for (name, value) in rpm {
+            limits.keys.entry(name).or_default().rpm = Some(value);
+        }
+        next = splice_section(&next, "limits", &import::limits::render(&limits));
+    }
     let config_changed = next != doc;
     if config_changed {
         write_file(&cli.config, &next)?;
@@ -1652,6 +1862,9 @@ fn sync_config(cli: &Cli, args: &SyncArgs) -> anyhow::Result<()> {
         "env: {materialised} key(s) materialised, {ensured} referenced var(s) ensured — {}",
         env_path.display()
     );
+    if carried > 0 {
+        println!("limits: {carried} key(s) rpm carried from the dashboard");
+    }
     // The proxy's routing tables are built at boot, so the synced edits only
     // land after a restart. Doing it here keeps `aroute sync` one command
     // rather than a command plus a reminder the operator has to remember.
@@ -1677,6 +1890,29 @@ fn sync_config(cli: &Cli, args: &SyncArgs) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Removes one top-level `name:` section, leaving every other line
+/// line-for-line. A section that is not present returns the input unchanged,
+/// which is how callers detect "nothing to remove" — the same changed
+/// comparison the splice path relies on.
+fn remove_section(content: &str, name: &str) -> String {
+    let header = format!("{name}:");
+    let mut out: Vec<String> = Vec::new();
+    let mut skipping = false;
+    for line in content.lines() {
+        if line == header {
+            skipping = true;
+            continue;
+        }
+        if skipping && is_section_header(line) {
+            skipping = false;
+        }
+        if !skipping {
+            out.push(line.to_owned());
+        }
+    }
+    out.join("\n") + "\n"
 }
 
 /// Replaces one top-level `name:` section with `rendered`, which carries its
@@ -2879,5 +3115,273 @@ mod tests {
         assert_eq!(decode_hex("00FF10"), Some(vec![0x00, 0xff, 0x10]));
         assert_eq!(decode_hex("0"), None, "odd length");
         assert_eq!(decode_hex("zz"), None, "not hex");
+    }
+
+    /// The config the limits verbs edit: minimal, valid, and free of `$VAR`s
+    /// so `load` resolves everything from the file alone.
+    fn limits_cli(dir: &std::path::Path) -> Cli {
+        let config = dir.join("config.yaml");
+        std::fs::write(
+            &config,
+            "keys:\n  local: dummy\ncombos:\n  - id: c\n    strategy: priority\n    targets:\n      - openai/gpt-5.4\n",
+        )
+        .unwrap();
+        Cli {
+            config,
+            command: None,
+        }
+    }
+
+    #[test]
+    fn limits_set_merges_arms_and_splices_the_section() {
+        let dir = tmpdir("limits-set");
+        let cli = limits_cli(&dir);
+        limits_set(
+            &cli,
+            &SetLimitsArgs {
+                key: Some("prod".to_owned()),
+                rpm: Some(600),
+                usd_micros: None,
+                tokens: Some(1000),
+                refuse_unpriced: None,
+            },
+        )
+        .unwrap();
+        let cfg = load(&cli).unwrap();
+        let row = cfg.limits.for_key("prod");
+        assert_eq!(row.rpm, Some(600));
+        assert_eq!(row.tokens, Some(1000));
+        assert!(!row.refuse_unpriced);
+
+        // The merge is per arm: the second set names a different arm and the
+        // first must survive it — `set --rpm` cannot quietly drop a ceiling
+        // the row already carried.
+        limits_set(
+            &cli,
+            &SetLimitsArgs {
+                key: Some("prod".to_owned()),
+                rpm: None,
+                usd_micros: Some(5_000_000),
+                tokens: None,
+                refuse_unpriced: Some(true),
+            },
+        )
+        .unwrap();
+        let cfg = load(&cli).unwrap();
+        let row = cfg.limits.for_key("prod");
+        assert_eq!(row.rpm, Some(600), "an arm not passed stays as it was");
+        assert_eq!(row.tokens, Some(1000));
+        assert_eq!(row.usd_micros, Some(5_000_000));
+        assert!(row.refuse_unpriced);
+
+        // The default row, without --key.
+        limits_set(
+            &cli,
+            &SetLimitsArgs {
+                key: None,
+                rpm: Some(60),
+                usd_micros: None,
+                tokens: None,
+                refuse_unpriced: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(load(&cli).unwrap().limits.default.rpm, Some(60));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn limits_set_refuses_a_zero_arm_and_an_armless_call() {
+        let dir = tmpdir("limits-zero");
+        let cli = limits_cli(&dir);
+        let zero = limits_set(
+            &cli,
+            &SetLimitsArgs {
+                key: None,
+                rpm: Some(0),
+                usd_micros: None,
+                tokens: None,
+                refuse_unpriced: None,
+            },
+        );
+        assert!(
+            zero.is_err(),
+            "a writer must not write what the parser refuses"
+        );
+        let empty = limits_set(
+            &cli,
+            &SetLimitsArgs {
+                key: Some("k".to_owned()),
+                rpm: None,
+                usd_micros: None,
+                tokens: None,
+                refuse_unpriced: None,
+            },
+        );
+        assert!(empty.is_err(), "nothing to set");
+        // Neither refusal wrote anything.
+        assert!(load(&cli).unwrap().limits.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn limits_clear_removes_a_row_and_the_block_when_it_empties() {
+        let dir = tmpdir("limits-clear");
+        let cli = limits_cli(&dir);
+        limits_set(
+            &cli,
+            &SetLimitsArgs {
+                key: Some("k".to_owned()),
+                rpm: Some(10),
+                usd_micros: None,
+                tokens: None,
+                refuse_unpriced: None,
+            },
+        )
+        .unwrap();
+        limits_set(
+            &cli,
+            &SetLimitsArgs {
+                key: None,
+                rpm: Some(5),
+                usd_micros: None,
+                tokens: None,
+                refuse_unpriced: None,
+            },
+        )
+        .unwrap();
+        limits_clear(
+            &cli,
+            &ClearLimitsArgs {
+                key: Some("k".to_owned()),
+            },
+        )
+        .unwrap();
+        let cfg = load(&cli).unwrap();
+        assert!(cfg.limits.keys.is_empty());
+        assert_eq!(
+            cfg.limits.default.rpm,
+            Some(5),
+            "the default row is its own row"
+        );
+
+        // The whole block goes, and the rest of the config is line-for-line.
+        limits_clear(&cli, &ClearLimitsArgs { key: None }).unwrap();
+        let text = std::fs::read_to_string(&cli.config).unwrap();
+        assert!(!text.contains("limits:"), "the block was removed:\n{text}");
+        assert!(text.contains("combos:"), "the rest of the config survives");
+
+        // Clearing what is not there is an error, not a silent no-op.
+        assert!(limits_clear(&cli, &ClearLimitsArgs { key: None }).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sync_carries_dashboard_rpm_per_arm_and_leaves_the_rest() {
+        let dir = tmpdir("limits-sync");
+        let db = dir.join("storage.sqlite");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE combos (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, \
+             data TEXT NOT NULL, sort_order INTEGER NOT NULL DEFAULT 0, \
+             created_at TEXT NOT NULL, updated_at TEXT NOT NULL); \
+             CREATE TABLE provider_connections (id TEXT PRIMARY KEY, \
+             provider TEXT NOT NULL, api_key TEXT, is_active INTEGER DEFAULT 1, \
+             priority INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL); \
+             CREATE TABLE api_keys (id TEXT PRIMARY KEY, name TEXT NOT NULL, \
+             key TEXT NOT NULL UNIQUE, is_active INTEGER NOT NULL DEFAULT 1, \
+             revoked_at TEXT, max_requests_per_minute INTEGER, \
+             created_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO combos (id, name, data, sort_order, created_at, updated_at) \
+             VALUES ('c1', 'stack', ?1, 0, '', '')",
+            rusqlite::params![
+                r#"{\"name\":\"stack\",\"strategy\":\"priority\",\"\
+models\":[{\"kind\":\"model\",\"model\":\"nvidia/z-ai/glm-5.3\",\"providerId\":\"nvidia\",\"weight\":0}]}\"#
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO provider_connections (id, provider, api_key, is_active, priority, created_at) \
+             VALUES ('k1', 'nvidia', 'nv', 1, 5, '2024-01-01')",
+            [],
+        )
+        .unwrap();
+        for (id, name, key, active, revoked, rpm) in [
+            ("a1", "prod-deploy", "x1", 1, "NULL", Some(600)),
+            ("a2", "quiet", "x2", 1, "NULL", None),
+            ("a3", "retired", "x3", 0, "NULL", Some(999)),
+            ("a4", "gone", "x4", 1, "'2024-01-01'", Some(777)),
+            ("a5", "zeroed", "x5", 1, "NULL", Some(0)),
+        ] {
+            let rpm = rpm.map_or("NULL".to_owned(), |v| v.to_string());
+            conn.execute(
+                &format!(
+                    "INSERT INTO api_keys (id, name, key, is_active, revoked_at, max_requests_per_minute, created_at) \
+                     VALUES ('{id}', '{name}', '{key}', {active}, {revoked}, {rpm}, '')"
+                ),
+                [],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let config = dir.join("config.yaml");
+        std::fs::write(
+            &config,
+            "keys:\n  nvidia: $AR_KEY_NVIDIA\nproviders:\n  - id: nvidia\n    key: nvidia\nlimits:\n  default:\n    rpm: 30\n  keys:\n    hand-written:\n      usd_micros: 500\ncombos:\n  - id: old\n    strategy: priority\n    targets:\n      - nvidia/z-ai/glm-5.3\n",
+        )
+        .unwrap();
+        let env = dir.join("ar.env");
+        std::fs::write(&env, "AR_KEY_NVIDIA=x\n").unwrap();
+        let cli = Cli {
+            config: config.clone(),
+            command: None,
+        };
+        sync_config(
+            &cli,
+            &SyncArgs {
+                db: Some(db),
+                env: Some(env),
+                no_restart: true,
+            },
+        )
+        .unwrap();
+
+        let cfg = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            cfg.contains("rpm: 30"),
+            "the hand-written default row survives:\n{cfg}"
+        );
+        assert!(
+            cfg.contains("usd_micros: 500"),
+            "a hand-written arm survives:\n{cfg}"
+        );
+        assert!(
+            cfg.contains("prod-deploy:\n      rpm: 600"),
+            "the dashboard key's ceiling is carried:\n{cfg}"
+        );
+        assert!(!cfg.contains("retired"), "an inactive key is not carried");
+        assert!(!cfg.contains("gone:\n"), "a revoked key is not carried");
+        assert!(
+            !cfg.contains("quiet"),
+            "a key with no ceiling is not invented"
+        );
+        assert!(!cfg.contains("zeroed"), "a zero ceiling is not carried");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_rpm_treats_a_missing_table_as_nothing_to_say() {
+        let dir = tmpdir("limits-nodb");
+        let db = dir.join("storage.sqlite");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE combos (id TEXT);")
+            .unwrap();
+        drop(conn);
+        assert!(import::limits::read_rpm(&db).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

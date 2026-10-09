@@ -41,6 +41,7 @@ use serde::Deserialize;
 
 pub(crate) mod combos;
 pub(crate) mod custom;
+pub(crate) mod limits;
 pub mod omniroute;
 
 use crate::commands::{block_on_value, fail};

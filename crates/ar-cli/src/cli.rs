@@ -124,6 +124,21 @@ pub enum Command {
     #[command(verbatim_doc_comment)]
     Keys(KeysArgs),
 
+    /// View and edit the `limits:` policy block: per-key rpm and spend ceilings.
+    ///
+    /// With no subcommand, prints the block as one row per key — the `default`
+    /// row governs anonymous traffic and any key without one of its own.
+    /// `set` merges the arms it is given into one row (`--key` names a client
+    /// key; omit it for the default row) and rewrites the section; `clear`
+    /// removes one key's row, or the whole block.
+    ///
+    /// Examples:
+    ///   aroute limits
+    ///   aroute limits set --key prod-deploy --rpm 600 --usd-micros 5000000
+    ///   aroute limits clear --key prod-deploy
+    #[command(verbatim_doc_comment)]
+    Limits(LimitsCliArgs),
+
     /// Convert another tool's provider/model list into config.yaml + registry.json.
     ///
     /// Writes no credential: keys stay `$VAR` references. `omniroute` reads a
@@ -314,6 +329,75 @@ pub struct MintArgs {
     /// `limits.keys:` block key this credential by.
     #[arg(long, default_value = "default")]
     pub key_id: String,
+}
+
+/// Options for `aroute limits`. No subcommand is the view.
+#[derive(Debug, Args)]
+pub struct LimitsCliArgs {
+    #[command(subcommand)]
+    pub command: Option<LimitsCommand>,
+}
+
+/// Subcommands of `aroute limits`. `None` prints the block.
+#[derive(Debug, Subcommand)]
+pub enum LimitsCommand {
+    /// Merge arms into one `limits:` row and rewrite the section.
+    ///
+    /// Named arms are set on the row; arms not passed stay as they were — the
+    /// merge is per arm, so `set --rpm` cannot quietly drop a ceiling the row
+    /// already carried. A zero arm is refused: `0` reads as "never" to an
+    /// operator and "refill from empty forever" to the bucket, the one
+    /// ambiguity the parser refuses too. To remove a row, `clear`.
+    ///
+    /// Examples:
+    ///   aroute limits set --rpm 60
+    ///   aroute limits set --key ci --rpm 120 --tokens 100000
+    ///   aroute limits set --key ci --refuse-unpriced
+    ///   aroute limits set --key ci --refuse-unpriced false
+    #[command(verbatim_doc_comment)]
+    Set(SetLimitsArgs),
+
+    /// Remove one key's row (`--key`), or the whole `limits:` block.
+    ///
+    /// Examples:
+    ///   aroute limits clear --key ci
+    ///   aroute limits clear
+    #[command(verbatim_doc_comment)]
+    Clear(ClearLimitsArgs),
+}
+
+/// Options for `aroute limits set`.
+#[derive(Debug, Args)]
+pub struct SetLimitsArgs {
+    /// The client key whose row this sets. Omit for the `default` row.
+    #[arg(long)]
+    pub key: Option<String>,
+    /// Requests per minute, as a token bucket keyed by the credential.
+    #[arg(long)]
+    pub rpm: Option<u32>,
+    /// Cumulative micro-dollar ceiling, against the usage ledger's spend.
+    #[arg(long)]
+    pub usd_micros: Option<u64>,
+    /// Cumulative token ceiling, against the usage ledger's spend.
+    #[arg(long)]
+    pub tokens: Option<u64>,
+    /// Refuse models with no pricing row. `--refuse-unpriced` alone is true;
+    /// `--refuse-unpriced false` unsets it.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::value_parser!(bool)
+    )]
+    pub refuse_unpriced: Option<bool>,
+}
+
+/// Options for `aroute limits clear`.
+#[derive(Debug, Args)]
+pub struct ClearLimitsArgs {
+    /// The client key whose row is removed. Omit for the whole block.
+    #[arg(long)]
+    pub key: Option<String>,
 }
 
 /// Subcommands of `aroute auth`.
