@@ -69,7 +69,12 @@ pub struct Prices {
     pub output_micros_per_mtok: u64,
 }
 
-const fn cost_micros(tokens: u32, micros_per_mtok: u64) -> u64 {
+/// Micro-dollars a token count costs at a per-MTok micro-dollar rate.
+///
+/// Public because a pre-flight projection and the response path's bill must
+/// agree to the arithmetic, not merely to the input: two copies of this one
+/// multiplication is how they drift.
+pub const fn cost_micros(tokens: u32, micros_per_mtok: u64) -> u64 {
     (tokens as u64 * micros_per_mtok) / 1_000_000
 }
 
@@ -120,6 +125,16 @@ impl PricingTable {
     /// Registers (or replaces) the price row for one provider/model pair.
     pub fn set(&mut self, provider: &str, model: &str, prices: Prices) {
         self.rows.insert(row_key(provider, model), prices);
+    }
+
+    /// The price row for one provider/model pair, if the table has one.
+    ///
+    /// A pre-flight cost projection needs this: a spend ceiling is checked
+    /// before dispatch, so the caller estimates from the same rows the
+    /// response path prices against.
+    #[must_use]
+    pub fn get(&self, provider: &str, model: &str) -> Option<Prices> {
+        self.rows.get(&row_key(provider, model)).copied()
     }
 
     /// Loads every priced row and every flat-rate provider from the registry.

@@ -12,6 +12,7 @@
 //!   The token arm is what stops a flat-rate key from running unbounded, and it
 //!   is also the only arm that can deny a model with no pricing row at all.
 
+use std::fmt;
 use std::path::Path;
 
 use rusqlite::{Connection, params};
@@ -152,6 +153,11 @@ pub enum DenyReason {
     /// The model has no pricing row and the key's cap asked to fail closed on
     /// that. Not a budget problem: a budget cannot be evaluated.
     Unpriced,
+    /// The spend table could not be read at all, so whether the key is within
+    /// its ceiling is unknowable. Carried so a policy layer can fail closed on
+    /// a ledger that errors under the request rather than serving at an
+    /// unevaluated cost.
+    Unauditable,
 }
 
 impl DenyReason {
@@ -162,6 +168,49 @@ impl DenyReason {
     #[must_use]
     pub fn status(&self) -> http::StatusCode {
         http::StatusCode::PAYMENT_REQUIRED
+    }
+
+    /// The machine-readable code for the error envelope, one per variant.
+    ///
+    /// A client branching on this can tell "my budget is spent" from "the
+    /// model is unpriced" without matching a sentence, which is the same
+    /// contract the router's `code`/`reason` pair makes elsewhere.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::UsdCap { .. } => "usd_cap",
+            Self::TokenCap { .. } => "token_cap",
+            Self::Unpriced => "unpriced",
+            Self::Unauditable => "unauditable",
+        }
+    }
+}
+
+/// The refusal a client can read. The ledger's own words, so every surface
+/// that carries a verdict — the router's 402 body, a future CLI report —
+/// renders the same denial identically.
+impl fmt::Display for DenyReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UsdCap { spent, cap } => write!(
+                f,
+                "this key has spent ${}, which reaches its ${} ceiling",
+                spent.as_decimal_string(),
+                cap.as_decimal_string()
+            ),
+            Self::TokenCap { spent, cap } => write!(
+                f,
+                "this key has spent {spent} tokens, which reaches its {cap}-token ceiling"
+            ),
+            Self::Unpriced => write!(
+                f,
+                "the model has no pricing row, and this key refuses unpriced requests"
+            ),
+            Self::Unauditable => write!(
+                f,
+                "the spend ledger could not be read, so this key's ceilings cannot be checked"
+            ),
+        }
     }
 }
 
@@ -463,8 +512,27 @@ impl Ledger {
         let Some(cap) = self.cap(key_id)? else {
             return Ok(Verdict::Allow);
         };
+        self.admit_with(key_id, &cap, projected, projected_tokens)
+    }
+
+    /// The cap check for a caller that holds its cap from somewhere other than
+    /// the store — a policy layer enforcing a `limits:` row from config.
+    ///
+    /// The check still consults the ledger's spend totals, because that is
+    /// where they live; the *source* of the cap is what differs. A cap with
+    /// neither arm set is `Allow`, since it constrains nothing.
+    pub fn admit_with(
+        &self,
+        key_id: &str,
+        cap: &Cap,
+        projected: Cost,
+        projected_tokens: u32,
+    ) -> Result<Verdict, TokenError> {
         if cap.refuse_unpriced && !projected.priced {
             return Ok(Verdict::Deny(DenyReason::Unpriced));
+        }
+        if cap.usd_micros.is_none() && cap.tokens.is_none() {
+            return Ok(Verdict::Allow);
         }
         let spend = self.spend(key_id)?;
         let pending_usd = to_u64(i64::try_from(projected.usd.micros).unwrap_or(i64::MAX));

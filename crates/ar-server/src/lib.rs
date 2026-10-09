@@ -67,6 +67,7 @@ pub mod keys;
 pub mod media;
 pub mod metrics;
 pub mod models;
+pub mod policy;
 pub mod routes;
 pub mod text;
 pub mod toon;

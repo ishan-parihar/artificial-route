@@ -48,5 +48,5 @@ pub use count::{
 pub use error::TokenError;
 pub use ledger::{Cap, CostReport, DenyReason, Entry, Ledger, LedgerRow, Spend, Verdict};
 pub use meta::{ResponseMeta, usage_from_body};
-pub use pricing::{Cost, Prices, PricingTable, Usd};
+pub use pricing::{Cost, Prices, PricingTable, Usd, cost_micros};
 pub use usage::NormalizedUsage;

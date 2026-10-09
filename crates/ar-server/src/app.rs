@@ -201,6 +201,13 @@ pub struct AppState {
     /// configured: a gate whose mode lives somewhere else is a mode that can
     /// disagree with it.
     pub auth_mode: crate::config::AuthMode,
+    /// The `limits:` block enforced: rate buckets keyed by credential, spend
+    /// caps against the ledger.
+    ///
+    /// Built from [`ServerConfig::limits`] regardless of whether the block
+    /// exists — a default block disables every arm — and shared by every
+    /// request, so the buckets are the only mutable state in it.
+    pub policy: Arc<crate::policy::Policy>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -341,6 +348,14 @@ impl Components {
                     .map(ar_keys::Secret::to_owned_secret)
             });
         let auth_mode = self.config.auth_mode;
+        // The spend arms read the ledger's totals, so they are armed only when
+        // one is configured. Read here, once, rather than per request: the
+        // ledger is built at boot and is not going to appear mid-flight.
+        let armed = self.ledger.is_some();
+        let policy = Arc::new(crate::policy::Policy::from_limits(
+            &self.config.limits,
+            armed,
+        ));
         let config = Arc::new(self.config);
         // A combo's window is reduced over its targets, which means it can only
         // reduce what a lookup can resolve — and `providerMeta.json` has no
@@ -415,6 +430,7 @@ impl Components {
                     }
                 }),
             auth_mode,
+            policy,
             // `Secret` has no `Deref`, so the gate takes the bytes rather than the
             // wrapper; the wrapper stays in `master` so it is zeroized on drop.
             auth: master.as_ref().map(|m| m.as_bytes()).and_then(build_gate),

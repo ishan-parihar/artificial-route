@@ -265,6 +265,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ar-limit"
+version = "0.1.8"
+
+[[package]]
 name = "ar-mcp"
 version = "0.1.8"
 dependencies = [
@@ -329,6 +333,7 @@ dependencies = [
  "ar-exec",
  "ar-guard",
  "ar-keys",
+ "ar-limit",
  "ar-obs",
  "ar-registry",
  "ar-route",

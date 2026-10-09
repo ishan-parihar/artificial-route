@@ -68,7 +68,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use ar_compress::Step;
-use ar_config::{Config, ModelVisibility, ProviderSettings};
+use ar_config::{Config, Limits, ModelVisibility, ProviderSettings};
 use ar_exec::oauth::{OAuthKind, Session};
 use ar_keys::{CredentialStore, Secret};
 use ar_registry::WireFormat;
@@ -431,6 +431,13 @@ pub struct ServerConfig {
     /// Defaults to [`AuthMode::Required`], which is inert until
     /// [`Self::http_master_key`] is `Some`. See [`AuthMode`].
     pub auth_mode: AuthMode,
+    /// Request-rate and spend ceilings, enforced by [`crate::policy`] before a
+    /// request reaches a provider.
+    ///
+    /// `Limits::default()` — the state every config that predates the block
+    /// parses to — limits nothing, so the field is inert until the config says
+    /// otherwise.
+    pub limits: Limits,
     /// The HTTP gate's master key, when one is configured.
     ///
     /// `None` — the default, and what every in-repo test uses — means no gate
@@ -498,6 +505,7 @@ impl ServerConfig {
             prices: PricingTable::global(),
             public: false,
             auth_mode: AuthMode::default(),
+            limits: Limits::default(),
             http_master_key: None,
             timeouts: BTreeMap::new(),
             model_discovery: false,
@@ -763,6 +771,7 @@ impl ServerConfig {
             prices: table,
             public,
             auth_mode: AuthMode::default(),
+            limits: cfg.limits.clone(),
             http_master_key: None,
             timeouts: BTreeMap::new(),
             model_discovery: false,

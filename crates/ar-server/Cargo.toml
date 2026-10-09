@@ -29,6 +29,9 @@ ar-cache = { path = "../ar-cache" }
 ar-guard = { path = "../ar-guard" }
 ar-keys = { path = "../ar-keys" }
 ar-tokens = { path = "../ar-tokens" }
+# The request-rate half of the `limits:` policy block. A token bucket per
+# rpm value, enforced in `policy.rs` before a request reaches a provider.
+ar-limit = { path = "../ar-limit" }
 # The observability owner `docs/04` names. `/metrics` renders its work half:
 # tokens, cost, cache disposition, queue lane, duration histograms.
 ar-obs = { path = "../ar-obs" }

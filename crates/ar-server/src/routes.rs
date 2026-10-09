@@ -419,6 +419,25 @@ async fn handle_chat(
         Ok(key_id) => key_id,
         Err(reason) => return *reason,
     };
+    // The policy layer's 429 arm, before any body work: a key past its
+    // requests-per-minute bucket is told when its next token lands and
+    // nothing else happens. Checked before the parse because a rate-limited
+    // client should not cost the router a translation, and keyed by the
+    // credential the gate authenticated — anonymous traffic shares the
+    // `default` row, which is what that row is for.
+    let policy_key = key_id.as_deref().unwrap_or("anonymous");
+    if let Some(wait) = state.policy.rate_wait(policy_key) {
+        let mut resp = error_because(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "rate_limited",
+            &format!(
+                "this key is past its requests-per-minute ceiling; its next token lands in {wait}s"
+            ),
+        );
+        stamp(&mut resp, "retry-after", &wait.to_string());
+        return resp;
+    }
     if !state.config.has_provider() {
         return error_because(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -545,6 +564,39 @@ async fn handle_chat(
         && let Some(hit) = cache_hit(cache, key, plan.chain.first(), plan.strategy)
     {
         return hit.with_guard(guard_verdict);
+    }
+
+    // The policy layer's 402 arm: the projected cost of what is about to be
+    // dispatched, checked against the spend this key already holds in the
+    // ledger. After the cache because a hit serves from memory and is never
+    // recorded as spend — what the ledger does not bill, the cap does not
+    // deny — and before the dispatch, the only point at which refusing the
+    // request costs the client nothing. Priced from the chain's first target
+    // against the same rows the response path bills from, so the estimate and
+    // the eventual bill agree to the row.
+    if let (Some(ledger), Some(target)) = (state.ledger.as_ref(), plan.chain.first()) {
+        let projection = crate::policy::Projection {
+            provider: target.provider.as_str(),
+            model: &target.model,
+            tokens_in: ar_tokens::count_text(&String::from_utf8_lossy(&canonical.body)),
+            tokens_out: declared_output_ceiling(&canonical.body),
+            prices: &state.config.prices,
+        };
+        let verdict = {
+            // Poisoned is the record path's convention too: a ledger that
+            // panicked mid-write is a bug to surface, not a ceiling to guess.
+            let guard = ledger.lock().expect("ledger lock");
+            state.policy.spend_verdict(policy_key, &guard, &projection)
+        };
+        if let ar_tokens::Verdict::Deny(reason) = verdict {
+            return error_because(
+                reason.status(),
+                "payment_required",
+                reason.code(),
+                &reason.to_string(),
+            )
+            .with_guard(guard_verdict);
+        }
     }
 
     // Started here so the latency the response reports is the provider's time and
@@ -2319,6 +2371,7 @@ const fn kind_for(status: StatusCode) -> &'static str {
     match status.as_u16() {
         400 | 415 => "invalid_request_error",
         401 => "authentication_error",
+        402 => "billing_error",
         403 => "permission_error",
         404 => "not_found",
         409 => "conflict_error",
@@ -2498,6 +2551,23 @@ impl WithGuard for Response {
 /// is a programming error rather than a runtime one — and the alternative
 /// (propagating it) would make each of the four call sites carry a `Result` for
 /// a value that cannot be wrong.
+/// The output-token ceiling a request declares for itself, `0` when it names
+/// none.
+///
+/// A projection needs an upper bound on the response, and the only bound a
+/// request carries is the one it chose: `max_tokens`, read straight from the
+/// canonical body. A request that names no ceiling projects a `0`-token
+/// response, which under-counts — and is the honest projection, because a
+/// request that declared no ceiling has told the server nothing to project
+/// from.
+fn declared_output_ceiling(body: &[u8]) -> u32 {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("max_tokens").and_then(serde_json::Value::as_u64))
+        .and_then(|t| u32::try_from(t).ok())
+        .unwrap_or(0)
+}
+
 fn stamp(resp: &mut Response, name: &str, value: &str) {
     if let (Ok(n), Ok(v)) = (HeaderName::try_from(name), HeaderValue::from_str(value)) {
         resp.headers_mut().insert(n, v);
@@ -4786,6 +4856,135 @@ mod tests {
         let body = body_of(resp).await;
         assert_eq!(body["error"]["code"], "unsupported_media_type");
         assert_eq!(body["error"]["type"], "invalid_request_error");
+    }
+
+    /// A one-provider server whose `limits:` block is `limits`, with the
+    /// in-memory ledger the spend arms read.
+    fn limited(limits: &str) -> AppState {
+        let mut config = one_provider_config();
+        config.limits = ar_config::Config::parse(limits, |_| Ok(None))
+            .expect("test limits parse")
+            .limits;
+        let ledger = Arc::new(Mutex::new(
+            ar_tokens::Ledger::open_in_memory().expect("in-memory ledger"),
+        ));
+        Components {
+            ledger: Some(ledger),
+            ..Components::unconfigured(config)
+        }
+        .into_state()
+    }
+
+    #[tokio::test]
+    async fn a_key_past_its_requests_per_minute_is_told_when_to_retry() {
+        let mut config = one_provider_config();
+        config.limits = ar_config::Config::parse("limits:\n  default:\n    rpm: 1\n", |_| Ok(None))
+            .expect("test limits parse")
+            .limits;
+        let router = crate::app::app(Components::unconfigured(config).into_state());
+        let body = "{\"model\":\"m\",\"messages\":[]}";
+        let first = drive(&router, chat(body, &[])).await;
+        assert_ne!(
+            first.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the first request is within the bucket"
+        );
+        let second = drive(&router, chat(body, &[])).await;
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry = second
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        assert_eq!(
+            retry,
+            Some(61),
+            "a full minute plus the rounding-up second, so a client that waits exactly it is admitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_past_its_token_ceiling_is_refused_before_dispatch() {
+        let router = crate::app::app(limited("limits:\n  default:\n    tokens: 1\n"));
+        let resp = drive(
+            &router,
+            chat("{\"model\":\"m\",\"messages\":[],\"max_tokens\":50}", &[]),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        let body = body_of(resp).await;
+        assert_eq!(body["error"]["type"], "billing_error");
+        assert_eq!(body["error"]["code"], "payment_required");
+        assert_eq!(body["error"]["reason"], "token_cap");
+    }
+
+    #[tokio::test]
+    async fn a_key_past_its_dollar_ceiling_is_refused_before_dispatch() {
+        let mut config = one_provider_config();
+        // $1 per MTok both ways, so a request declaring fifty output tokens
+        // projects past a one-micro-dollar ceiling whatever the input counts.
+        config.prices.set(
+            "p",
+            "m",
+            ar_tokens::Prices {
+                input_micros_per_mtok: 1_000_000,
+                output_micros_per_mtok: 1_000_000,
+            },
+        );
+        config.limits =
+            ar_config::Config::parse("limits:\n  default:\n    usd_micros: 1\n", |_| Ok(None))
+                .expect("test limits parse")
+                .limits;
+        let ledger = Arc::new(Mutex::new(
+            ar_tokens::Ledger::open_in_memory().expect("in-memory ledger"),
+        ));
+        let router = crate::app::app(
+            Components {
+                ledger: Some(ledger),
+                ..Components::unconfigured(config)
+            }
+            .into_state(),
+        );
+        let resp = drive(
+            &router,
+            chat("{\"model\":\"m\",\"messages\":[],\"max_tokens\":50}", &[]),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(body_of(resp).await["error"]["reason"], "usd_cap");
+    }
+
+    #[tokio::test]
+    async fn a_key_refusing_unpriced_models_gets_a_402_for_a_model_with_no_row() {
+        // The one-provider catalog is a provider no registry row covers, so the
+        // projection is unpriced and `refuse_unpriced` is the arm that bites.
+        let router = crate::app::app(limited("limits:\n  default:\n    refuse_unpriced: true\n"));
+        let resp = drive(&router, chat("{\"model\":\"m\",\"messages\":[]}", &[])).await;
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(body_of(resp).await["error"]["reason"], "unpriced");
+    }
+
+    #[tokio::test]
+    async fn spend_arms_stay_inert_without_a_ledger() {
+        // A cap that cannot read its spend is not a cap: the request passes to
+        // the pipeline (and fails there, at the null executor, for unrelated
+        // reasons) rather than at the policy layer.
+        let mut config = one_provider_config();
+        config.limits =
+            ar_config::Config::parse("limits:\n  default:\n    tokens: 1\n", |_| Ok(None))
+                .expect("test limits parse")
+                .limits;
+        let router = crate::app::app(Components::unconfigured(config).into_state());
+        let resp = drive(
+            &router,
+            chat("{\"model\":\"m\",\"messages\":[],\"max_tokens\":50}", &[]),
+        )
+        .await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::PAYMENT_REQUIRED,
+            "no ledger means the spend arms read nothing and deny nothing"
+        );
     }
 
     #[test]
