@@ -256,6 +256,8 @@ Every request passes the same two stages as OmniRoute's sanitizer: credentials a
 
 `aroute dashboard` serves the rebranded web UI on loopback with its data at `~/.config/ar/dashboard-data` — the one integrated config DB. Providers, API keys, combos and models are configured there, in the browser. `aroute sync` is the bridge onto the routing engine: it rewrites the `combos:` and `custom_providers:` sections of `config.yaml` from that DB, materialises every provider connection's API key into the env file (highest-priority active connection per provider), guarantees every `$AR_KEY_*` reference exists so a sync can never hand `serve` a config it cannot load, and restarts `aroute.service` so the boot-built routing tables pick the changes up — `--no-restart` prints the command instead. What the dashboard saves is what the proxy routes.
 
+The dist is ~2 GiB of compiled Next.js with its traced `node_modules` — too large for a release asset — so it is built locally (`dashboard/rebrand-dist.sh`) and installed from that tree: `install.sh --with-dashboard --dashboard-src <dashboard/dist>` lays it down at `~/.config/ar/dashboard`, which `aroute dashboard` resolves with no flags and nothing fetched from npm. The default install is `--lite`: the Rust binary only, and the weekly update timer never touches an installed dashboard.
+
 ## Documentation
 
 `docs/00-overview.md` → `01..06` are the sources of truth (budgets, subsystems, roadmap, AXI/MCP). `AGENTS.md` holds the enforced Rust disciplines. Detail lives there; this file stays a funnel.

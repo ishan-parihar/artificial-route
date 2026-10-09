@@ -11,18 +11,30 @@
 # to drift out of sync with this one.
 #
 # Flags:
-#   --version <tag>    pin an exact tag instead of the newest release
-#   --dir <path>       install somewhere else (default $HOME/.local/bin)
-#   --service <scope>  systemd unit scope: system | user | none
-#                      (default: system when run as root, else user)
-#   --no-service       same as --service none
-#   --check            report installed vs newest and service state; change nothing
-#   --uninstall        remove the binary, unit, and autostart; keep the config
+#   --version <tag>        pin an exact tag instead of the newest release
+#   --dir <path>           install somewhere else (default $HOME/.local/bin)
+#   --service <scope>      systemd unit scope: system | user | none
+#                          (default: system when run as root, else user)
+#   --no-service           same as --service none
+#   --lite                 rust binary only — no web dashboard (the default)
+#   --with-dashboard       also install the web dashboard from a local build.
+#                          The dist (~2 GiB of compiled Next.js plus its traced
+#                          node_modules) is too large for a release asset, so it
+#                          is built on this machine (`dashboard/rebrand-dist.sh`)
+#                          and laid down from that tree — nothing is downloaded
+#                          from npm at install time.
+#   --dashboard-src <path>  the dist to install: the `dashboard/dist` directory
+#                          or a tarball of it. Default: `dashboard/dist` in the
+#                          checkout this script lives in.
+#   --check                report installed vs newest and service state; change nothing
+#   --uninstall            remove the binary, unit, autostart, and dashboard dist;
+#                          keep the config, credentials, and dashboard data
 #   --help
 # Unknown flags fail loudly (exit 2).
 #
 # Env knobs: AR_VERSION (pin a tag), AR_INSTALL_DIR (install dir),
-#            AR_SERVICE (unit scope), AR_CONFIG (config path for the unit).
+#            AR_SERVICE (unit scope), AR_CONFIG (config path for the unit),
+#            AR_DASHBOARD (1 = --with-dashboard), AR_DASHBOARD_SRC (dist source).
 set -eu
 
 REPO="ishan-parihar/artificial-route"
@@ -51,6 +63,8 @@ DIR="${AR_INSTALL_DIR:-$HOME/.local/bin}"
 CONFIG="${AR_CONFIG:-$HOME/.config/ar/config.yaml}"
 VERSION="${AR_VERSION:-}"
 SERVICE="${AR_SERVICE:-auto}"
+DASHBOARD="${AR_DASHBOARD:-0}"
+DASH_SRC="${AR_DASHBOARD_SRC:-}"
 CHECK_ONLY=0
 UNINSTALL=0
 
@@ -84,6 +98,9 @@ while [ $# -gt 0 ]; do
     --dir) DIR="$2"; shift 2 ;;
     --service) SERVICE="$2"; shift 2 ;;
     --no-service) SERVICE=none; shift ;;
+    --lite) DASHBOARD=0; shift ;;
+    --with-dashboard) DASHBOARD=1; shift ;;
+    --dashboard-src) DASH_SRC="$2"; shift 2 ;;
     --check) CHECK_ONLY=1; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -91,6 +108,19 @@ while [ $# -gt 0 ]; do
   esac
 done
 TARGET="$DIR/aroute"
+DASH_DEST="$HOME/.config/ar/dashboard"
+
+if [ -n "$DASH_SRC" ] && [ "$DASHBOARD" -ne 1 ]; then
+  echo "error: --dashboard-src needs --with-dashboard (see --help)" >&2; exit 2
+fi
+# Fail fast: a bad source is better raised before the 15 MB binary download,
+# because the dashboard was the point of the invocation.
+if [ "$DASHBOARD" -eq 1 ] && [ -n "$DASH_SRC" ]; then
+  case "$DASH_SRC" in
+    *.tar.gz|*.tgz) [ -f "$DASH_SRC" ] || { echo "error: no tarball at $DASH_SRC" >&2; exit 2; } ;;
+    *) [ -x "$DASH_SRC/server.js" ] || { echo "error: $DASH_SRC is not a dashboard dist (want server.js inside)" >&2; exit 2; } ;;
+  esac
+fi
 
 case "$SERVICE" in
   auto) if [ "$(id -u)" -eq 0 ]; then SERVICE=system; else SERVICE=user; fi ;;
@@ -166,6 +196,11 @@ if [ "$UNINSTALL" -eq 1 ]; then
     systemctl_cmd daemon-reload >/dev/null 2>&1 || true
   fi
   rm -f "$TARGET" "$DIR/.aroute.new"
+  if [ -d "$DASH_DEST" ]; then
+    rm -rf "$DASH_DEST" "$DASH_DEST.old"
+    echo "removed dashboard dist."
+    echo "kept:   $HOME/.config/ar/dashboard-data   (the dashboard's DB; delete by hand if unwanted)"
+  fi
   # The config and the credentials stay: uninstalling a binary should not
   # destroy the operator's routing setup, which is the expensive part to
   # rebuild. Named explicitly, because an env file full of real keys outliving
@@ -194,6 +229,11 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
     echo "status:    update available (run this script again)"
   fi
   printf 'config:    %s%s\n' "$CONFIG" "$([ -f "$CONFIG" ] && echo '' || echo '  (missing)')"
+  if [ -d "$DASH_DEST" ] && [ -x "$DASH_DEST/server.js" ]; then
+    echo "dashboard: installed ($(du -sh "$DASH_DEST" 2>/dev/null | cut -f1)) — launch: aroute dashboard"
+  else
+    echo "dashboard: not installed (--with-dashboard installs it from a local build)"
+  fi
   if [ "$SERVICE" = none ]; then
     echo "service:   not managed"
   elif have_systemd; then
@@ -205,6 +245,57 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
   fi
   exit 0
 fi
+
+# ------------------------------------------------------------- dashboard --
+# The web dashboard is a compiled Next.js standalone — ~2 GiB with its traced
+# node_modules — far too large to ship as a release asset, so it is built on
+# this machine (dashboard/rebrand-dist.sh) and installed from that local tree.
+# Nothing is fetched from npm: the dist carries every dependency it needs.
+install_dashboard() {
+  if ! command -v node >/dev/null 2>&1; then
+    die "--with-dashboard needs Node.js >= 18 on PATH (the compiled server runs on node)"
+  fi
+  NODE_MAJOR="$(node --version 2>/dev/null | sed 's/^v\([0-9][0-9]*\).*/\1/')"
+  case "$NODE_MAJOR" in
+    ''|*[!0-9]*) die "cannot read the node version" ;;
+  esac
+  [ "$NODE_MAJOR" -ge 18 ] || die "--with-dashboard needs Node.js >= 18 (found $(node --version))"
+
+  if [ -z "$DASH_SRC" ]; then
+    # The common case: this script run from a checkout of the repo, where
+    # <repo>/dashboard/dist is the freshly built tree.
+    guess="$(dirname "$SCRIPT_SRC")/dashboard/dist"
+    if [ -z "$SCRIPT_SRC" ] || [ ! -x "$guess/server.js" ]; then
+      die "pass --dashboard-src <dist-dir-or-tarball> — build it with dashboard/rebrand-dist.sh"
+    fi
+    DASH_SRC="$guess"
+  fi
+  case "$DASH_SRC" in
+    *.tar.gz|*.tgz) [ -f "$DASH_SRC" ] || die "no tarball at $DASH_SRC" ;;
+    *) [ -x "$DASH_SRC/server.js" ] || die "$DASH_SRC is not a dashboard dist (want server.js inside)" ;;
+  esac
+
+  mkdir -p "$(dirname "$DASH_DEST")"
+  rm -rf "${DASH_DEST}.new"
+  mkdir "${DASH_DEST}.new"
+  echo "installing dashboard from $DASH_SRC ..."
+  case "$DASH_SRC" in
+    *.tar.gz|*.tgz) tar -xzf "$DASH_SRC" -C "${DASH_DEST}.new" ;;
+    *) cp -a "$DASH_SRC/." "${DASH_DEST}.new/" ;;
+  esac
+  [ -x "${DASH_DEST}.new/server.js" ] || die "the unpacked dist has no server.js — bad source?"
+  rm -rf "${DASH_DEST}.old"
+  [ -d "$DASH_DEST" ] && mv "$DASH_DEST" "${DASH_DEST}.old"
+  mv "${DASH_DEST}.new" "$DASH_DEST"
+  rm -rf "${DASH_DEST}.old"
+  if command -v pgrep >/dev/null 2>&1 \
+     && pgrep -f "aroute dashboard" >/dev/null 2>&1; then
+    echo "note: a dashboard is still running from the old tree — restart it:"
+    echo "      pkill -f 'aroute dashboard'; aroute dashboard"
+  fi
+  DASH_STATE="installed -> $DASH_DEST (launch: aroute dashboard)"
+  echo "dashboard: installed $(du -sh "$DASH_DEST" 2>/dev/null | cut -f1) -> $DASH_DEST"
+}
 
 # ------------------------------------------------------------------ install --
 # A system-wide --dir needs root, and saying so plainly beats a permission
@@ -457,6 +548,19 @@ TIMEREOF
   fi
 fi
 
+# The dashboard installs independently of the service scope, so --service none
+# still gets it, and the weekly update timer (which never passes a dashboard
+# flag) leaves an installed dist alone rather than deleting it.
+if [ "$DASHBOARD" -eq 1 ]; then
+  install_dashboard
+else
+  if [ -d "$DASH_DEST" ] && [ -x "$DASH_DEST/server.js" ]; then
+    DASH_STATE="kept — $DASH_DEST (upgrades: --with-dashboard --dashboard-src <dist>)"
+  else
+    DASH_STATE="not installed (add it: --with-dashboard --dashboard-src <dist>)"
+  fi
+fi
+
 # ---------------------------------------------------------------- verify -----
 # Prove the install rather than asserting it. `doctor` exits non-zero when the
 # credentials are absent, which is expected on a first run, so this reports and
@@ -484,6 +588,7 @@ installed to $TARGET
   env file:  $ENV_FILE   (chmod 600; put keys here)
   service:   $SERVICE_STATE
   updater:   $UPDATE_STATE
+  dashboard: $DASH_STATE
 
   $TARGET doctor      # re-check at any time
   $TARGET serve       # foreground; the unit already runs it as a service
@@ -491,6 +596,7 @@ installed to $TARGET
 Upgrade:  curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | sh
 Check:    curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | sh -s -- --check
 Remove:   curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | sh -s -- --uninstall
+Dashboard: sh install.sh --with-dashboard --dashboard-src <dashboard/dist-or-tarball>
 EOF
 
 case ":$PATH:" in

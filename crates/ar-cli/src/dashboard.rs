@@ -25,11 +25,32 @@ pub const DASHBOARD_DIR_VAR: &str = "AR_DASHBOARD_DIR";
 const DEFAULT_DATA_SUBDIR: &str = ".config/ar/dashboard-data";
 
 /// Dist resolution: `--path`, then `$AR_DASHBOARD_DIR`, then a
-/// `dashboard/dist` beside the binary. Falls back to a CWD-relative path so
-/// the error message still names something actionable.
+/// `dashboard/dist` beside the binary, then the `--with-dashboard`
+/// install location (`~/.config/ar/dashboard`, where `install.sh` lays the
+/// locally built dist down). Falls back to a CWD-relative path so the
+/// error message still names something actionable.
 fn resolve_dist(flag: Option<PathBuf>, env: Option<PathBuf>, exe_dir: Option<PathBuf>) -> PathBuf {
+    resolve_dist_with(flag, env, exe_dir, std::env::var_os("HOME"))
+}
+
+/// [`resolve_dist`] with HOME as a parameter, so the whole chain is testable
+/// without mutating process env.
+fn resolve_dist_with(
+    flag: Option<PathBuf>,
+    env: Option<PathBuf>,
+    exe_dir: Option<PathBuf>,
+    home: Option<std::ffi::OsString>,
+) -> PathBuf {
     flag.or(env)
         .or_else(|| exe_dir.map(|d| d.join("dashboard").join("dist")))
+        .or_else(|| {
+            home.map(|h| {
+                PathBuf::from(h)
+                    .join(".config")
+                    .join("ar")
+                    .join("dashboard")
+            })
+        })
         .unwrap_or_else(|| PathBuf::from("dashboard/dist"))
 }
 
@@ -139,7 +160,23 @@ mod tests {
 
     #[test]
     fn resolve_dist_names_a_cwd_relative_path_when_nothing_is_known() {
-        let got = resolve_dist(None, None, None);
+        let got = resolve_dist_with(None, None, None, None);
         assert_eq!(got, p("dashboard/dist"));
+    }
+
+    #[test]
+    fn resolve_dist_finds_the_installer_location_when_home_is_known() {
+        // No flag, no env, no dist beside the binary: the --with-dashboard
+        // install location is what `aroute dashboard` serves.
+        let got = resolve_dist_with(None, None, None, Some(std::ffi::OsString::from("/home/op")));
+        assert_eq!(got, p("/home/op/.config/ar/dashboard"));
+        // A dist beside the binary still outranks the install location.
+        let beside = resolve_dist_with(
+            None,
+            None,
+            Some(p("/opt/bin")),
+            Some(std::ffi::OsString::from("/home/op")),
+        );
+        assert_eq!(beside, p("/opt/bin/dashboard/dist"));
     }
 }
