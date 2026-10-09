@@ -10,6 +10,14 @@
 > `resolve()`, but a projection can only price against a resolved row, so the
 > 402 runs after resolve — and after the cache lookup, which a hit skips
 > because the ledger never records a hit as spend.
+>
+> **Phase 3 landed the same day:** `aroute keys arm-gate` generates the 32-byte
+> master into the credential store's `http-gate` row and prints the first
+> client token (30-day TTL — the library's 15-minute default is an
+> interactive-login figure); `aroute keys mint` issues more; `aroute serve`
+> reads the row at boot and arms the gate; `aroute doctor` carries the armed /
+> not-armed / unreadable row. The README's standing unauthenticated-listener
+> warning now names the arming command instead of the absence of one.
 
 Import the *worthy* agentgateway mechanisms into aroute, and nothing else. Every
 row below was verified against both source trees on 2026-10-09.

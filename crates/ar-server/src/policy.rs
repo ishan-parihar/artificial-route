@@ -129,7 +129,7 @@ impl Policy {
         let projected_tokens = projection.tokens_in.saturating_add(projection.tokens_out);
         ledger
             .admit_with(key_id, &cap, projected, projected_tokens)
-            .unwrap_or_else(|_| Verdict::Deny(ar_tokens::DenyReason::Unauditable))
+            .unwrap_or(Verdict::Deny(ar_tokens::DenyReason::Unauditable))
     }
 }
 

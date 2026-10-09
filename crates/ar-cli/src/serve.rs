@@ -52,6 +52,11 @@ fn components(
         ));
     }
 
+    // Held rather than opened inline: `from_ar_config` resolves provider
+    // credentials through it, and the gate master is the same store's
+    // `http-gate` row — one connection, one source of truth.
+    let store = commands::credential_store(cli);
+
     // Loopback only: P0 has no credential gate, so a routable bind would publish
     // an unauthenticated LLM proxy. `ar-server::bind_addr` enforces the same
     // rule for the socket this hands to.
@@ -60,7 +65,7 @@ fn components(
         port,
         Some(PricingTable::global()),
         false,
-        commands::credential_store(cli).as_ref(),
+        store.as_ref(),
     )
     .map_err(|e| {
         commands::fail(
@@ -108,7 +113,26 @@ fn components(
     // rendering either way.
     let obs_dir = std::env::var_os(OBS_DIR_VAR).map(std::path::PathBuf::from);
 
+    // docs/15 phase 3: the master key `aroute keys arm-gate` stored, read at
+    // boot so the shipped serve path arms the gate the library always had.
+    // `Components.master_key` wins over `server.http_master_key` in
+    // `into_state`, so an armed store row beats any stray env-derived key.
+    // A row that exists but will not decrypt is a warning and an unarmed
+    // gate: a proxy that refuses to boot because one credential is stale
+    // would strand every credential that is fine (the same demotion
+    // `credential_store` itself makes).
+    let master_key = store.as_ref().and_then(|s| {
+        commands::gate_master(s)
+            .map_err(|e| {
+                eprintln!("ar: gate row present but unreadable — serving ungated: {e}");
+            })
+            .ok()
+            .flatten()
+            .map(|secret| secret.as_bytes().to_vec())
+    });
+
     Ok(Components {
+        master_key,
         ledger,
         obs_dir,
         ..Components::with_exec(config, exec)

@@ -110,6 +110,20 @@ pub enum Command {
     #[command(verbatim_doc_comment)]
     Auth(AuthArgs),
 
+    /// Manage the HTTP gate's credentials: arm it, mint client tokens.
+    ///
+    /// The gate verifies signed tokens minted from a 32-byte master key.
+    /// `arm-gate` generates that master into the credential store and prints
+    /// the first client token; `mint` issues another from the stored master.
+    /// `aroute serve` reads the master from the store at boot, and `aroute
+    /// doctor` reports the gate armed once the row exists.
+    ///
+    /// Examples:
+    ///   aroute keys arm-gate --key-id prod-deploy
+    ///   aroute keys mint --key-id ci-runner
+    #[command(verbatim_doc_comment)]
+    Keys(KeysArgs),
+
     /// Convert another tool's provider/model list into config.yaml + registry.json.
     ///
     /// Writes no credential: keys stay `$VAR` references. `omniroute` reads a
@@ -242,6 +256,64 @@ pub struct McpArgs {
     /// Print the tool catalog and exit, without serving or reading the config.
     #[arg(long)]
     pub list: bool,
+}
+
+/// Options for `aroute keys`.
+#[derive(Debug, Args)]
+pub struct KeysArgs {
+    #[command(subcommand)]
+    pub command: KeysCommand,
+}
+
+/// Subcommands of `aroute keys`.
+#[derive(Debug, Subcommand)]
+pub enum KeysCommand {
+    /// Arm the bearer gate: generate a 32-byte master key into the credential
+    /// store, then mint and print the first client token.
+    ///
+    /// The master key itself is never printed — it lives encrypted in the
+    /// store and `aroute serve` reads it from there at boot. The client token
+    /// is printed once, with its expiry, because a token that is never shown
+    /// cannot authorize anyone. `--key <hex>` stores an explicit 32-byte
+    /// master instead of generating one.
+    ///
+    /// Examples:
+    ///   aroute keys arm-gate
+    ///   aroute keys arm-gate --key-id prod-deploy
+    ///   aroute keys arm-gate --key $(openssl rand -hex 32)
+    #[command(verbatim_doc_comment)]
+    ArmGate(ArmGateArgs),
+
+    /// Mint another client token from the already-stored gate master.
+    ///
+    /// The first token comes from `arm-gate`; this is for the second client
+    /// onward. The token is printed once, with its expiry.
+    ///
+    /// Examples:
+    ///   aroute keys mint --key-id ci-runner
+    #[command(verbatim_doc_comment)]
+    Mint(MintArgs),
+}
+
+/// Options for `aroute keys arm-gate`.
+#[derive(Debug, Args)]
+pub struct ArmGateArgs {
+    /// Key id the minted token belongs to: what the usage ledger and the
+    /// `limits.keys:` block key this credential by.
+    #[arg(long, default_value = "default")]
+    pub key_id: String,
+    /// An explicit 32-byte master key, hex-encoded, instead of a generated one.
+    #[arg(long, value_name = "HEX_32")]
+    pub key: Option<String>,
+}
+
+/// Options for `aroute keys mint`.
+#[derive(Debug, Args)]
+pub struct MintArgs {
+    /// Key id the minted token belongs to: what the usage ledger and the
+    /// `limits.keys:` block key this credential by.
+    #[arg(long, default_value = "default")]
+    pub key_id: String,
 }
 
 /// Subcommands of `aroute auth`.

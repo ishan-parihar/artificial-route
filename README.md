@@ -172,10 +172,11 @@ cost ~823MB, while `aroute` covers the routing core in ~14.6MB. The ~823MB figur
 is a different OmniRoute process state than the ~994 MiB above.
 
 > [!WARNING]
-> `aroute serve` listens unauthenticated. `ar-server` has a bearer gate, but it reads
-> `Components.master_key` and no shipped command sets that field, so the
-> listener is open whatever `AR_MASTER_KEY` holds (that arms the credential
-> store, not HTTP auth). Keep it on loopback or front it with an authenticating proxy.
+> `aroute serve` arms its bearer gate only when `aroute keys arm-gate` has stored a
+> master key — `aroute doctor` reports the gate's state, and `aroute keys mint`
+> issues further client tokens. Until it is armed the listener is open: keep it on
+> loopback or front it with an authenticating proxy. `$AR_MASTER_KEY` arms the
+> credential store, not HTTP auth.
 
 Full depth, OAuth mechanics, refresh triggers, quota tables, engine-catalog divergences and every gap with its fix: [AUDIT-REPORT.md](AUDIT-REPORT.md).
 

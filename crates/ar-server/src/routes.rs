@@ -84,6 +84,10 @@ use crate::translate::to_canonical_for_route;
 pub const SESSION_HEADER: &str = "x-ar-session";
 /// Routing verdict, for the client and for support.
 pub const DECISION_HEADER: &str = "x-ar-decision";
+/// The cap arm that denied a request: `usd_cap`, `token_cap`, `unpriced`,
+/// `unauditable`. The arm, never the amounts — the operator knows their own
+/// numbers, and a header log does not need them.
+pub const DENY_HEADER: &str = "x-ar-deny-reason";
 /// Attempt accounting. P0 counts attempts; token accounting is `ar-tokens` (P1).
 pub const USAGE_HEADER: &str = "x-ar-usage";
 /// Cache verdict: `hit`, `miss` or `bypass`.
@@ -589,13 +593,16 @@ async fn handle_chat(
             state.policy.spend_verdict(policy_key, &guard, &projection)
         };
         if let ar_tokens::Verdict::Deny(reason) = verdict {
-            return error_because(
+            let mut resp = error_because(
                 reason.status(),
                 "payment_required",
                 reason.code(),
                 &reason.to_string(),
-            )
-            .with_guard(guard_verdict);
+            );
+            // The arm that denied, never the amounts: the operator knows
+            // their own numbers, and a header log does not need them.
+            stamp(&mut resp, DENY_HEADER, reason.code());
+            return resp.with_guard(guard_verdict);
         }
     }
 
@@ -2849,9 +2856,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        CACHE_HEADER, COMPRESSION_ECHO, CacheControl, Dialect, FALLBACK_ATTEMPTS_HEADER, Keepalive,
-        LATENCY_MS_HEADER, MODEL_HEADER, PROVIDER_HEADER, RESPONSE_COST_HEADER,
-        SAVINGS_TOKENS_HEADER, Stages, TOKENS_IN_HEADER, TOKENS_OUT_HEADER,
+        CACHE_HEADER, COMPRESSION_ECHO, CacheControl, DENY_HEADER, Dialect,
+        FALLBACK_ATTEMPTS_HEADER, Keepalive, LATENCY_MS_HEADER, MODEL_HEADER, PROVIDER_HEADER,
+        RESPONSE_COST_HEADER, SAVINGS_TOKENS_HEADER, Stages, TOKENS_IN_HEADER, TOKENS_OUT_HEADER,
         TOKENS_PER_SECOND_HEADER, USAGE_FRAME_CAP, UsageTee, VERSION_HEADER, accept_forces_stream,
         build_chain, card_json, declares_stream, decorate, error, error_because, kind_for, model,
         models_head, not_found, outcome_label, require_json, terminator_seen, unknown_model,
@@ -4985,6 +4992,48 @@ mod tests {
             StatusCode::PAYMENT_REQUIRED,
             "no ledger means the spend arms read nothing and deny nothing"
         );
+    }
+
+    #[tokio::test]
+    async fn a_key_under_its_token_ceiling_reaches_the_pipeline() {
+        // The mirror of the over-cap test: a ceiling the request stays well
+        // under must not cost it anything at the policy layer, so the request
+        // proceeds to dispatch and fails there, at the null executor, for
+        // unrelated reasons.
+        let router = crate::app::app(limited("limits:\n  default:\n    tokens: 100000\n"));
+        let resp = drive(
+            &router,
+            chat("{\"model\":\"m\",\"messages\":[],\"max_tokens\":50}", &[]),
+        )
+        .await;
+        assert_ne!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn an_unpriced_model_serves_when_the_key_does_not_refuse_unpriced() {
+        // The same provider with no pricing row, but the default posture: the
+        // request prices at zero and serves rather than being denied —
+        // refuse_unpriced is opt-in, and without it an unknown row is a cost
+        // of zero, not a refusal.
+        let router = crate::app::app(limited("limits:\n  default:\n    usd_micros: 1000\n"));
+        let resp = drive(&router, chat("{\"model\":\"m\",\"messages\":[]}", &[])).await;
+        assert_ne!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn the_402_names_its_arm_in_a_header_and_never_its_amounts() {
+        let router = crate::app::app(limited("limits:\n  default:\n    tokens: 1\n"));
+        let resp = drive(
+            &router,
+            chat("{\"model\":\"m\",\"messages\":[],\"max_tokens\":50}", &[]),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        let deny = resp
+            .headers()
+            .get(DENY_HEADER)
+            .and_then(|v| v.to_str().ok());
+        assert_eq!(deny, Some("token_cap"), "the arm, not the amounts");
     }
 
     #[test]

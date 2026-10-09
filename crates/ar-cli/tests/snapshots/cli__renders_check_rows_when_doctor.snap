@@ -1,13 +1,14 @@
 ---
 source: crates/ar-cli/tests/cli.rs
-assertion_line: 191
+assertion_line: 194
 expression: frozen_age(stdout(&out))
 ---
-count: 11 of 11 total
-checks[11]{check,status,detail}:
+count: 12 of 12 total
+checks[12]{check,status,detail}:
   config,ok,config.yaml (2 providers + 0 custom + 2 combos)
   registry,ok,276 providers compiled in + snapshot <N>d old
   store,skip,no store at credentials.db; $VAR only
+  gate,skip,no store so no gate — loopback only
   terminal-status,ok,6 terminal row(s); store CHECK from ar_exec::oauth::terminal_check_constraint(); executors: codex+cline+claude+gemini-cli+cursor+grok-cli+kilocode
   provider/openai,ok,in registry
   provider/anthropic,ok,in registry

@@ -331,6 +331,157 @@ pub fn armed_spelling(status: &str) -> &'static str {
     if status == "ok" { "armed" } else { "unarmed" }
 }
 
+/// The credential-store row the HTTP gate's master key lives in.
+///
+/// Written by `aroute keys arm-gate`, read by `aroute serve` at boot and by
+/// `aroute doctor`'s gate row. One constant rather than a config field: the row
+/// name is a contract between three commands, and a typo in one of three
+/// string literals is a gate that stores a master key nothing reads.
+pub const GATE_ROW: &str = "http-gate";
+
+/// The provider column the gate row is stored under. Part of the row's AAD,
+/// so changing it makes every stored gate master unreadable — which is the
+/// point: the row says which command wrote it.
+const GATE_PROVIDER: &str = "aroute";
+
+/// How long a client token `aroute keys` mints lives: thirty days.
+///
+/// The library default is fifteen minutes, which is right for an interactive
+/// login and wrong for a single-operator gateway's only credential — the
+/// renew story here is "mint again", and a 15-minute rotation on that story is
+/// 96 tokens a day for nothing. `Issue::ttl` is the knob; no CLI flag exposes
+/// it because the one caller who wants a different number is rotating on a
+/// schedule `mint` already serves.
+const GATE_TOKEN_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600);
+
+/// `aroute keys arm-gate` — docs/15 phase 3: close the last shipped gap between
+/// "a gate exists" and "a command arms it".
+///
+/// Generates (or accepts) the 32-byte master, stores it as [`GATE_ROW`], mints
+/// the first client token, and prints it once with its expiry. The master is
+/// never printed: it lives encrypted in the store, and the token is the thing
+/// a client actually presents.
+pub fn arm_gate(cli: &Cli, key_id: &str, explicit: Option<&str>) -> anyhow::Result<()> {
+    let Some(store) = credential_store(cli) else {
+        return Err(fail(
+            "no credential store to hold the gate master",
+            "export $AR_MASTER_KEY (from `openssl rand -hex 32`) so a store can be opened, then retry",
+        ));
+    };
+    let master = match explicit {
+        None => ar_keys::Secret::generate(),
+        Some(hex) => decode_hex(hex)
+            .ok_or_else(|| {
+                fail(
+                    "--key is not 32 bytes of hex",
+                    "pass 64 hex characters, e.g. $(openssl rand -hex 32)",
+                )
+            })
+            .and_then(|bytes| {
+                ar_keys::Secret::from_slice(&bytes)
+                    .map_err(|e| fail(e, "the gate master must be exactly 32 bytes"))
+            })?,
+    };
+    store
+        .insert(GATE_PROVIDER, GATE_ROW, &master)
+        .map_err(|e| {
+            fail(
+                e,
+                "the store refused the gate row; is the store on a read-only disk?",
+            )
+        })?;
+    let issued = mint_from(&master, key_id)?;
+    println!("gate: armed — master stored as credential {GATE_ROW} (never printed)");
+    println!("key id: {key_id}");
+    println!("token: {}", issued.access);
+    println!(
+        "expires: {} (unix) — `aroute keys mint` issues the next one",
+        issued.expires_at
+    );
+    println!("use: Authorization: Bearer <token>");
+    Ok(())
+}
+
+/// `aroute keys mint` — another client token from the stored gate master.
+pub fn keys_mint(cli: &Cli, key_id: &str) -> anyhow::Result<()> {
+    let Some(store) = credential_store(cli) else {
+        return Err(fail(
+            "no credential store to read the gate master from",
+            "run `aroute keys arm-gate` first; it stores the master the gate verifies against",
+        ));
+    };
+    let Some(master) = store.get(GATE_ROW).map_err(|e| {
+        fail(
+            e,
+            "the gate row could not be decrypted; was $AR_MASTER_KEY rotated?",
+        )
+    })?
+    else {
+        return Err(fail(
+            "the gate is not armed — no master key row in the store",
+            "run `aroute keys arm-gate` first; it generates and stores the master",
+        ));
+    };
+    let issued = mint_from(&master, key_id)?;
+    println!("key id: {key_id}");
+    println!("token: {}", issued.access);
+    println!("expires: {} (unix)", issued.expires_at);
+    Ok(())
+}
+
+/// The one minting path both verbs share, so a token printed by either is
+/// verifiable by the gate `aroute serve` builds from the same master.
+///
+/// `Tokens::new` (no audience) is the same engine `AuthGate::new` builds — the
+/// pairing that makes a CLI-minted token pass the server's gate is structural,
+/// not tested-in.
+fn mint_from(master: &ar_keys::Secret, key_id: &str) -> anyhow::Result<ar_keys::Issued> {
+    let tokens = ar_keys::Tokens::new(&ar_keys::MasterKey::new(
+        master.to_owned_secret(),
+        ar_keys::KeyMeta::generate(),
+    )?);
+    tokens
+        .issue(ar_keys::Issue {
+            key_id,
+            scopes: ar_keys::ScopeSet::of([ar_keys::Scope::ExecuteCompletions]),
+            device_id: None,
+            ttl: Some(GATE_TOKEN_TTL),
+        })
+        .map_err(|e| {
+            fail(
+                e,
+                "the token could not be minted; is the clock before the Unix epoch?",
+            )
+        })
+}
+
+/// Lowercase-or-uppercase hex, `None` on any non-hex character or odd length —
+/// the same contract `ar-keys`' own codec keeps, written here because that
+/// module is deliberately `pub(crate)` there.
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    s.as_bytes()
+        .chunks(2)
+        .map(|pair| {
+            let hi = (pair[0] as char).to_digit(16)?;
+            let lo = (pair[1] as char).to_digit(16)?;
+            Some((hi << 4 | lo) as u8)
+        })
+        .collect()
+}
+
+/// The gate's master bytes from a store, for `aroute serve`'s boot read and the
+/// doctor row. `Ok(None)` when the gate was never armed.
+///
+/// A row that exists but will not decrypt is an error rather than `None`:
+/// silently treating a broken gate row as "not armed" would arm nothing and
+/// report `skip`, which is exactly the confusion the row exists to prevent.
+pub fn gate_master(store: &CredentialStore) -> Result<Option<ar_keys::Secret>, KeyError> {
+    store.get(GATE_ROW)
+}
+
 /// Dispatches a parsed command.
 pub fn dispatch(cli: &Cli) -> anyhow::Result<()> {
     match &cli.command {
@@ -348,6 +499,12 @@ pub fn dispatch(cli: &Cli) -> anyhow::Result<()> {
         #[cfg(feature = "mcp")]
         Some(Command::Mcp(a)) => block_on(crate::mcp::run(cli, a)),
         Some(Command::Dashboard(a)) => crate::dashboard::run(a),
+        Some(Command::Keys(a)) => match &a.command {
+            crate::cli::KeysCommand::ArmGate(args) => {
+                arm_gate(cli, &args.key_id, args.key.as_deref())
+            }
+            crate::cli::KeysCommand::Mint(args) => keys_mint(cli, &args.key_id),
+        },
     }
 }
 
@@ -677,6 +834,35 @@ fn findings(cfg: &Config, path: &str, store: &StoreProbe<'_>) -> Vec<Row> {
     ];
     let (status, detail) = store.row();
     rows.push(vec!["store".to_owned(), status, detail]);
+
+    // The HTTP gate: armed when `aroute keys arm-gate` stored a master row.
+    // `skip` rather than `fail` when it is not — loopback-ungated is the default
+    // supported install, and doctor exits 1 on `fail` — but the detail says how
+    // to close it, because the row's job is to make the state visible. Names
+    // only, like every other doctor row: this listing never decrypts, so the
+    // row NAME is the armed state, and a row that will not decrypt under the
+    // current $AR_MASTER_KEY still lists as armed — `aroute serve`'s boot read
+    // is the surface that opens the row, and it is the one that reports that.
+    let gate = match store {
+        StoreProbe::Open { names, .. } => {
+            if names.iter().any(|n| n == GATE_ROW) {
+                (
+                    "ok".to_owned(),
+                    "armed — bearer tokens required (`keys mint` issues more)".to_owned(),
+                )
+            } else {
+                (
+                    "skip".to_owned(),
+                    "not armed — loopback only; `aroute keys arm-gate` arms it".to_owned(),
+                )
+            }
+        }
+        _ => (
+            "skip".to_owned(),
+            "no store so no gate — loopback only".to_owned(),
+        ),
+    };
+    rows.push(vec!["gate".to_owned(), gate.0, gate.1]);
 
     // F-MED-2: the terminal-status list, reported from the executor's own copy
     // so an operator sees the same rows the classifier uses and the store's
@@ -2640,5 +2826,58 @@ mod tests {
         assert!(!dir.join("registry.json.1").exists());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The seam the whole phase rests on: a token minted by `aroute keys`
+    /// must pass the gate `aroute serve` builds from the same stored master.
+    /// Structural — `mint_from` and `AuthGate::new` both build `Tokens::new`
+    /// from the master — but stated as a test so the pairing survives a
+    /// refactor of either side.
+    #[test]
+    fn a_minted_token_passes_the_gate_serve_builds() {
+        let master = ar_keys::Secret::generate();
+        let issued = mint_from(&master, "prod-deploy").expect("token mints");
+        let gate = ar_server::keys::AuthGate::new(master.as_bytes()).expect("gate builds");
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Bearer {}", issued.access)
+                .parse()
+                .expect("header value"),
+        );
+        let key_id = gate
+            .authorize(
+                (&headers, "/v1/chat/completions"),
+                ar_server::config::AuthMode::Required,
+            )
+            .expect("token verifies");
+        assert_eq!(
+            key_id.as_deref(),
+            Some("prod-deploy"),
+            "the key id `mint_from` stamped is the one the ledger and limits key by"
+        );
+    }
+
+    /// `aroute serve`'s boot read: the row `arm-gate` writes is the master the
+    /// gate verifies against, via the same `gate_master` helper.
+    #[test]
+    fn the_gate_master_round_trips_through_the_store() {
+        let store = ar_keys::CredentialStore::open_in_memory(&ar_keys::Secret::generate())
+            .expect("in-memory store");
+        assert!(gate_master(&store).unwrap().is_none(), "never armed");
+        let master = ar_keys::Secret::generate();
+        store
+            .insert(GATE_PROVIDER, GATE_ROW, &master)
+            .expect("row stores");
+        let read = gate_master(&store).unwrap().expect("row reads back");
+        assert_eq!(read.as_bytes(), master.as_bytes());
+    }
+
+    #[test]
+    fn hex_decodes_round_trip_and_refuses_garbage() {
+        assert_eq!(decode_hex("00ff10"), Some(vec![0x00, 0xff, 0x10]));
+        assert_eq!(decode_hex("00FF10"), Some(vec![0x00, 0xff, 0x10]));
+        assert_eq!(decode_hex("0"), None, "odd length");
+        assert_eq!(decode_hex("zz"), None, "not hex");
     }
 }
