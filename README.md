@@ -203,9 +203,9 @@ Static musl binary, checksum-verified, no runtime deps. Lands in `~/.local/bin/a
 | `--service <scope>` | `system` \| `user` \| `none`; defaults to `system` under root, else `user` |
 | `--no-service` | same as `--service none` |
 | `--lite` | rust binary only — **the default**; the weekly update timer always runs this mode |
-| `--with-dashboard` | also install the web dashboard (see [Dashboard](#dashboard)): ~2 GiB of compiled Next.js with its traced `node_modules`, built locally by `dashboard/rebrand-dist.sh` and installed from that tree — nothing is fetched from npm |
+| `--with-dashboard` | also install the web dashboard (see [Dashboard](#dashboard)): ~2 GiB of compiled Next.js with its traced `node_modules`, built locally by `dashboard/rebrand-dist.sh` and installed from that tree — nothing is fetched from npm. Writes an `aroute-dashboard.service` unit, **not started** |
 | `--dashboard-src <path>` | the dist to install: the `dashboard/dist` directory or a tarball of it; defaults to `dashboard/dist` beside the script |
-| `--check` | installed vs newest, config and dashboard presence, service state — changes nothing |
+| `--check` | installed vs newest, config and dashboard presence, service and dashsvc state — changes nothing |
 | `--uninstall` | remove binary, unit, timer and dashboard dist; **keeps** config, credentials and the dashboard's data DB |
 
 Re-running it *is* the update path: it replaces the binary, leaves your config
@@ -302,6 +302,17 @@ Every request passes the same two stages as OmniRoute's sanitizer: credentials a
 `aroute dashboard` serves the rebranded web UI on loopback with its data at `~/.config/ar/dashboard-data` — the one integrated config DB. Providers, API keys, combos and models are configured there, in the browser. `aroute sync` is the bridge onto the routing engine: it rewrites the `combos:` and `custom_providers:` sections of `config.yaml` from that DB, materialises every provider connection's API key into the env file (highest-priority active connection per provider), guarantees every `$AR_KEY_*` reference exists so a sync can never hand `serve` a config it cannot load, and restarts `aroute.service` so the boot-built routing tables pick the changes up — `--no-restart` prints the command instead. What the dashboard saves is what the proxy routes.
 
 The dist is ~2 GiB of compiled Next.js with its traced `node_modules` — too large for a release asset — so it is built locally (`dashboard/rebrand-dist.sh`) and installed from that tree: `install.sh --with-dashboard --dashboard-src <dashboard/dist>` lays it down at `~/.config/ar/dashboard`, which `aroute dashboard` resolves with no flags and nothing fetched from npm. The default install is `--lite`: the Rust binary only, and the weekly update timer never touches an installed dashboard.
+
+When the dashboard *is* installed it comes up as its own unit, **stopped by default** — `--with-dashboard` writes the unit, starts nothing:
+
+```sh
+systemctl --user start aroute-dashboard   # UI up; the Node child holds ~700 MB RSS
+systemctl --user stop  aroute-dashboard   # RSS reclaimed, port 20149 freed
+systemctl --user enable aroute-dashboard  # optional: bring it up at boot instead
+sh install.sh --check                    # reports dashboard + dashsvc state
+```
+
+The proxy has never needed the dashboard: `serve` reads config and env only, so on a memory-tight box the UI is a deliberate, reversible choice. An update while the unit is running stops it for the binary swap and restarts it on the new build (`dashsvc: restarted on aroute <version>`), so unattended updates never leave a stale dashboard or a half-swapped binary.
 
 For the initial one-time import, `aroute import --from omniroute --combos <storage.sqlite>` reads real OmniRoute combos: nested `combo-ref` steps expand into the parent chain, per-step prompts, tags, connection allow-lists, weights and quota-exhaustion-only markers are preserved, and `fallbackOnlyOnQuotaExhaustion` steps are copied into the combo's `pool:` — without `--combos` the importer falls back to one combo per `provider/model`. One operational note: OmniRoute encrypts provider keys at rest (`enc:v1:` AES-256-GCM); a dashboard instance without `STORAGE_ENCRYPTION_KEY` cannot open them, and `aroute sync` deliberately skips such rows with a note rather than materialise ciphertext as a credential — decrypt the connections in the dashboard first, then re-sync. Every verified dispatch claim in this file comes from the [streaming battery](#streaming-under-load).
 

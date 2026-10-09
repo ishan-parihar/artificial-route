@@ -34,7 +34,14 @@
 #
 # Env knobs: AR_VERSION (pin a tag), AR_INSTALL_DIR (install dir),
 #            AR_SERVICE (unit scope), AR_CONFIG (config path for the unit),
-#            AR_DASHBOARD (1 = --with-dashboard), AR_DASHBOARD_SRC (dist source).
+#            AR_DASHBOARD (1 = --with-dashboard), AR_DASHBOARD_SRC (dist source),
+#            AR_DASHBOARD_PORT (the dashboard unit's port, default 20149).
+#
+# Runtime on/off, once installed: the dashboard is its own systemd unit so the
+# ~700 MB Node child is started only on demand —
+#   systemctl --user start aroute-dashboard   # bring the UI up
+#   systemctl --user stop  aroute-dashboard   # reclaim the RSS
+# and it is deliberately NOT started at install time; the proxy never needs it.
 set -eu
 
 REPO="ishan-parihar/artificial-route"
@@ -65,6 +72,7 @@ VERSION="${AR_VERSION:-}"
 SERVICE="${AR_SERVICE:-auto}"
 DASHBOARD="${AR_DASHBOARD:-0}"
 DASH_SRC="${AR_DASHBOARD_SRC:-}"
+DASH_PORT="${AR_DASHBOARD_PORT:-20149}"
 CHECK_ONLY=0
 UNINSTALL=0
 
@@ -82,6 +90,7 @@ fi
 # `--service none` aborted on an unbound variable without one.
 SERVICE_STATE="not requested"
 UPDATE_STATE="not requested"
+DASH_UNIT_STATE="not installed"
 UNIT=""
 WANTED_BY=""
 TIMER=""
@@ -196,6 +205,16 @@ if [ "$UNINSTALL" -eq 1 ]; then
     systemctl_cmd daemon-reload >/dev/null 2>&1 || true
   fi
   rm -f "$TARGET" "$DIR/.aroute.new"
+  for unit in "$HOME/.config/systemd/user/${SERVICE_NAME}-dashboard.service" \
+              "/etc/systemd/user/${SERVICE_NAME}-dashboard.service"; do
+    [ -f "$unit" ] || continue
+    if [ "$unit" = "$HOME/.config/systemd/user/${SERVICE_NAME}-dashboard.service" ]; then
+      systemctl --user disable --now "$SERVICE_NAME-dashboard.service" >/dev/null 2>&1 || true
+    else
+      systemctl disable --now "$SERVICE_NAME-dashboard.service" >/dev/null 2>&1 || true
+    fi
+    rm -f "$unit"
+  done
   if [ -d "$DASH_DEST" ]; then
     rm -rf "$DASH_DEST" "$DASH_DEST.old"
     echo "removed dashboard dist."
@@ -230,9 +249,23 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
   fi
   printf 'config:    %s%s\n' "$CONFIG" "$([ -f "$CONFIG" ] && echo '' || echo '  (missing)')"
   if [ -d "$DASH_DEST" ] && [ -f "$DASH_DEST/server.js" ]; then
-    echo "dashboard: installed ($(du -sh "$DASH_DEST" 2>/dev/null | cut -f1)) — launch: aroute dashboard"
+    echo "dashboard: installed ($(du -sh "$DASH_DEST" 2>/dev/null | cut -f1)) — run: aroute dashboard"
   else
     echo "dashboard: not installed (--with-dashboard installs it from a local build)"
+  fi
+  # The dashboard's own unit is the on/off switch for its ~700 MB Node child;
+  # report it by whichever scope exists.
+  DASH_UNIT_CHECK=""
+  for unit in "$HOME/.config/systemd/user/${SERVICE_NAME}-dashboard.service" \
+              "/etc/systemd/user/${SERVICE_NAME}-dashboard.service"; do
+    [ -f "$unit" ] && DASH_UNIT_CHECK="$unit" && break
+  done
+  if [ -n "$DASH_UNIT_CHECK" ]; then
+    case "$DASH_UNIT_CHECK" in
+      "$HOME"/*) dctl="systemctl --user" ;;
+      *) dctl="systemctl" ;;
+    esac
+    echo "dashsvc:   $($dctl is-active "$SERVICE_NAME-dashboard.service" 2>/dev/null || echo inactive) — $dctl start|stop $SERVICE_NAME-dashboard"
   fi
   if [ "$SERVICE" = none ]; then
     echo "service:   not managed"
@@ -288,13 +321,66 @@ install_dashboard() {
   [ -d "$DASH_DEST" ] && mv "$DASH_DEST" "${DASH_DEST}.old"
   mv "${DASH_DEST}.new" "$DASH_DEST"
   rm -rf "${DASH_DEST}.old"
-  if command -v pgrep >/dev/null 2>&1 \
-     && pgrep -f "aroute dashboard" >/dev/null 2>&1; then
-    echo "note: a dashboard is still running from the old tree — restart it:"
-    echo "      pkill -f 'aroute dashboard'; aroute dashboard"
-  fi
-  DASH_STATE="installed -> $DASH_DEST (launch: aroute dashboard)"
+  DASH_STATE="installed -> $DASH_DEST"
   echo "dashboard: installed $(du -sh "$DASH_DEST" 2>/dev/null | cut -f1) -> $DASH_DEST"
+}
+
+# ----------------------------------------------------- dashboard unit ----
+# On/off for the dashboard, as a service rather than a nohup: `systemctl
+# --user start aroute-dashboard` brings the ~700 MB Next.js child up, `stop`
+# reclaims it, and the default after install is *stopped* — the proxy has
+# never needed it, and the operator's box (OOM history) wants the choice.
+# Same discipline as the proxy unit: env file outside the unit, secrets never
+# in the process table.
+install_dashboard_unit() {
+  DASH_UNIT=""
+  DASH_UNIT_STATE="not managed"
+  DASH_CTL="systemctl --user"
+  [ -f "$DASH_DEST/server.js" ] || return 0
+  have_systemd || return 0
+  if [ "$SERVICE" = system ]; then
+    DASH_UNIT="/etc/systemd/user/${SERVICE_NAME}-dashboard.service"
+    DASH_CTL="systemctl"
+  else
+    DASH_UNIT="$HOME/.config/systemd/user/${SERVICE_NAME}-dashboard.service"
+  fi
+  DASH_UNIT_DIR="${DASH_UNIT%/*}"
+  [ "$DASH_UNIT_DIR" = "$DASH_UNIT" ] && DASH_UNIT_DIR="."
+  mkdir -p "$DASH_UNIT_DIR"
+  cat > "$DASH_UNIT" <<DASHEOF
+[Unit]
+Description=artificial-route (ar) — web dashboard
+Documentation=https://github.com/$REPO
+
+[Service]
+Type=simple
+# Same dist-resolution chain as any other aroute dashboard run: \$AR_DASHBOARD_DIR,
+# a dist beside the binary, then the install location. No --path needed.
+ExecStart=$TARGET dashboard --port $DASH_PORT
+EnvironmentFile=$ENV_FILE
+# Same as the proxy unit: HOME decides where \$HOME/.config/ar/dashboard-data
+# lives, and it stays out of the process table.
+Environment=HOME=$HOME
+Restart=on-failure
+RestartSec=5s
+# The Node child holds roughly 700 MB RSS while the UI is served; stopping
+# this unit is how that is given back.
+KillSignal=SIGTERM
+TimeoutStopSec=20s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+# Not enabled at install time — the default is "off" so the ~700 MB Node
+# child costs nothing until asked for. `systemctl --user enable` flips that
+# per-machine; stop/start reclaims it on demand either way.
+WantedBy=default.target
+DASHEOF
+  systemctl_cmd daemon-reload
+  DASH_UNIT_STATE="installed, not started"
+  echo "dashsvc:   wrote $DASH_UNIT (not started)"
+  echo "          start:  $DASH_CTL start $SERVICE_NAME-dashboard"
+  echo "          stop:   $DASH_CTL stop $SERVICE_NAME-dashboard   (reclaims ~700 MB RSS)"
 }
 
 # ------------------------------------------------------------------ install --
@@ -350,12 +436,27 @@ echo "checksum verified"
 
 chmod +x "$ASSET"
 mkdir -p "$DIR"
+# A unit running the old binary keeps it busy: stop it for the swap, and bring
+# it back on the new one if it was running. The proxy unit is restarted by its
+# own branch below.
+DASH_WAS_ACTIVE=0
+if command -v systemctl >/dev/null 2>&1; then
+  if systemctl --user is-active --quiet "$SERVICE_NAME-dashboard.service" 2>/dev/null; then
+    DASH_WAS_ACTIVE=1
+    systemctl --user stop "$SERVICE_NAME-dashboard.service" >/dev/null 2>&1 || DASH_WAS_ACTIVE=0
+  fi
+fi
 # Written beside the target and renamed in: an `ar` starting during the swap sees
 # the old binary or the new one, never a truncated file that cannot exec.
 cp "$ASSET" "$DIR/.aroute.new"
 chmod +x "$DIR/.aroute.new"
 mv "$DIR/.aroute.new" "$TARGET"
 INSTALLED="$("$TARGET" --version)"
+if [ "$DASH_WAS_ACTIVE" -eq 1 ]; then
+  systemctl --user start "$SERVICE_NAME-dashboard.service" >/dev/null 2>&1 \
+    || echo "warning: dashboard unit did not restart (start it by hand)" >&2
+  echo "dashsvc:   restarted on $INSTALLED"
+fi
 
 if [ -n "$CURRENT" ] && [ "$CURRENT_NUM" != "${VERSION#v}" ]; then
   echo "updated $CURRENT -> $INSTALLED"
@@ -553,6 +654,7 @@ fi
 # flag) leaves an installed dist alone rather than deleting it.
 if [ "$DASHBOARD" -eq 1 ]; then
   install_dashboard
+  install_dashboard_unit
 else
   if [ -d "$DASH_DEST" ] && [ -f "$DASH_DEST/server.js" ]; then
     DASH_STATE="kept — $DASH_DEST (upgrades: --with-dashboard --dashboard-src <dist>)"
@@ -589,6 +691,7 @@ installed to $TARGET
   service:   $SERVICE_STATE
   updater:   $UPDATE_STATE
   dashboard: $DASH_STATE
+  dashsvc:   $DASH_UNIT_STATE
 
   $TARGET doctor      # re-check at any time
   $TARGET serve       # foreground; the unit already runs it as a service
