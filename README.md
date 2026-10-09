@@ -2,7 +2,7 @@
 
 **One OpenAI-compatible endpoint over 276 providers — a static binary that idles at ~28 MiB serving the full catalog.**
 
-[![release](https://img.shields.io/github/v/release/ishan-parihar/artificial-route)](https://github.com/ishan-parihar/artificial-route/releases) [![license](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE) [![musl](https://img.shields.io/badge/binary-static--musl-lightgrey)](https://github.com/ishan-parihar/artificial-route/releases) ![tests](https://img.shields.io/badge/tests-1760_passing-brightgreen)
+[![release](https://img.shields.io/github/v/release/ishan-parihar/artificial-route)](https://github.com/ishan-parihar/artificial-route/releases) [![license](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE) [![musl](https://img.shields.io/badge/binary-static--musl-lightgrey)](https://github.com/ishan-parihar/artificial-route/releases) ![tests](https://img.shields.io/badge/tests-1874_passing-brightgreen)
 
 A minimal-RAM Rust port of the [OmniRoute](https://github.com/ishan-parihar/OmniRoute) gateway core: same combos, strategies and dialects, none of the desktop. File YAML in, SSE out — no control plane, no UI, no runtime dependencies.
 
@@ -20,6 +20,8 @@ It does **not** add the weekly update timer when piped. The timer runs a saved c
 curl -fsSL -o install.sh https://raw.githubusercontent.com/ishan-parihar/artificial-route/main/install.sh
 sh install.sh
 ```
+
+The default install is **lite**: the rust binary only. The web dashboard — ~2 GiB of compiled Next.js built locally by `dashboard/rebrand-dist.sh`, too large to ship as a release asset — installs from that local tree with `--with-dashboard`; every flag is in the table under [Installation](#installation).
 
 Then:
 
@@ -69,6 +71,32 @@ alone is ~33.8 MiB RSS; spawning `aroute dashboard` adds ~4.4 MiB of
 supervision plus the Next.js child at ~513 MiB RSS, ~548 MiB together under
 both. The local omniroute backend is ~1.26 GiB RSS in the same session.
 
+### Streaming under load
+
+Measured 2026-10-09 against the released v0.1.8 musl binary on loopback,
+driving free-tier upstreams through the live combos (an `omp` headless agent
+for the end-to-end runs, raw SSE probes for the numbers). Every stream below
+relayed through `aroute serve` as pure SSE — no batching, no buffering:
+
+| probe | combo | input | first byte | stream length | SSE frames | outcome |
+|---|---|---|---|---|---|---|
+| short ask | free-stack | 80 B | **1.2 s** | 128 s | 1,211 | budget cut — the model spent its 4k budget on reasoning |
+| long generation | browser-stack-2 | 200 B | **1.8 s** | 265 s | 2,307 | clean `stop`; 14k content + 16k reasoning chars |
+| 234 KB codebase in | free-stack | 234 KB | **3.0 s** | 8 s | 90 | 234 KB body forwarded intact, upstream prefill fast |
+| 234 KB in + long out | browser-stack-2 | 234 KB | **5.3 s** | 341 s | 2,478 | 5.7-minute stream held, budget cut at 8k |
+| 3 concurrent streams | free-stack ×3 | 200 B | **0.67–1.9 s** | 167–233 s | ~4,000 | all three completed; zero 429s, zero failovers |
+
+Across the whole battery: zero dropped or corrupt frames, zero guard
+refusals or false alarms (234 KB of raw Rust source — file paths, URLs,
+secret-shaped test fixtures — forwarded untouched), and `aroute` RSS moved
+**28.9 → 33.7 MiB** over 35 minutes of continuous multi-stream load — inside
+the idle budget. TTFB is upstream generation start, not proxy work: the relay
+adds no measurable first-byte latency. Two honest caveats from the same
+session: `glm-5.3` is a heavy reasoning model whose thinking tokens consume
+the `max_tokens` budget before visible content, so size the budget
+accordingly; and `paper-stack` cannot dispatch at all — see the zenmux bullet
+under [Known gaps](#known-gaps).
+
 ## Parity
 
 | Surface | Artificial Route | OmniRoute | agentgateway |
@@ -105,6 +133,11 @@ explanation is [AUDIT-REPORT.md](AUDIT-REPORT.md).
   pools score identically; the auto scoring engages for literal `auto/*` names.
 - **Custom providers dispatch the OpenAI wire only.** An `anthropic-compatible`
   node is accepted and named by `aroute doctor`, then refused at dispatch.
+  The same limit reaches registry providers whose OmniRoute entry points at an
+  Anthropic endpoint — `zenmux-free` (base URL `…/api/anthropic/v1/messages`)
+  serves the catalog but returns `upstream_unavailable` at dispatch, so any
+  combo whose targets are all Anthropic-wire cannot route until the
+  anthropic-messages executor lands.
 - **The MCP control plane is stdio-only** and ships behind `--features mcp`.
 - **The registry snapshot lags OmniRoute's model rotation.** `aroute doctor` reports
   its age and warns past 7 days; `aroute import --from omniroute` regenerates it.
@@ -146,7 +179,14 @@ is a different OmniRoute process state than the ~994 MiB above.
 
 Full depth, OAuth mechanics, refresh triggers, quota tables, engine-catalog divergences and every gap with its fix: [AUDIT-REPORT.md](AUDIT-REPORT.md).
 
-Known gaps, stated plainly: OAuth login works via `aroute auth login` — a PKCE browser redirect (loopback catch locally, or carry the URL to any device and paste the redirect back) or, for a session that declares `device_initiate_url`/`device_poll_url`, an RFC 8628 device code you approve on another device — plus four MCP tools, and no refresh/authorize/device endpoint is hardcoded, because an auth endpoint guessed from a provider id would be an invented wire format; `grok-cli` has an executor but only for authentication, its Responses body and `x-grok-*` headers are not transcribed, so it builds a session and still does not dispatch; `kilocode` is an RFC 8628 device-flow provider that also serves a free tier, and both mechanisms are ported — a device code, and `anonymous: true` dispatch that needs no credential row at all — but neither is an OAuth *executor*, because its dispatch wire is not transcribed, so with neither mechanism declared its `oauth/` row is still a `fail` whose fix names the YAML for either one; the full explanation is [AUDIT-REPORT.md](AUDIT-REPORT.md) R1; the local credential store holds API keys plus a non-secret `oauth_sessions` table (which credential name a provider's session lives behind, and whether a refresh retired it — never a token), so the generated terminal-status CHECK has a home, but a `config.yaml` must still *declare* each OAuth key name (a `$VAR` there has to be exported, empty is fine); custom providers are file-declared (`custom_providers:`), so a new endpoint needs no rebuild — but only the OpenAI wire dispatches, and an `id` that collides with a compiled-in one is refused; multi-provider `auto` pools fall back to config order (single-provider pools score identically); the MCP control plane is stdio-only (StreamableHTTP deferred) and ships behind `--features mcp`; the registry snapshot lags OmniRoute's model rotation — `aroute doctor` reports the snapshot's age, warns past 7 days, names each stale model and the `aroute import` fix; an unknown path returns a bare 404 with no body, where OmniRoute returns a JSON envelope carrying the path, so a client that parses every error as JSON gets nothing to parse on a typo'd route; `aroute serve` listens unauthenticated, because the `ar-server` bearer gate is driven by a `Components.master_key` that no shipped command sets (`AR_MASTER_KEY` arms the credential store, not HTTP auth), so loopback or a reverse proxy is the only thing between a caller and the provider keys; and the non-routing surface is deliberately narrow, with no service count beyond the vendored dashboard plus `/v1` proxy — no embeddings, media, audio, rerank, search, OCR, files, batches, WebSocket or A2A, which is where OmniRoute's other ~723 routes and 110 MCP tools live; and only `x-ar-compression` is read, so a client sending OmniRoute's `x-omniroute-compression` header, or its standard/aggressive/ultra plan modes, is silently ignored.
+Known gaps, stated once: every one of them — the OAuth executor inventory,
+`grok-cli` and `kilocode` dispatch wires, the `auto` pool fallback, the
+OpenAI-wire-only dispatch surface (including Anthropic-wire registry
+providers like `zenmux-free`), the stdio-only MCP plane, and the registry
+snapshot's lag — is listed as a bullet under [Known gaps](#known-gaps),
+with the full explanations in [AUDIT-REPORT.md](AUDIT-REPORT.md) and the
+OAuth login flow and its `$VAR`-must-be-exported rule under
+[Configuration](#configuration).
 
 ## Installation
 
@@ -161,19 +201,24 @@ Static musl binary, checksum-verified, no runtime deps. Lands in `~/.local/bin/a
 | `--version <tag>` | pin an exact tag instead of the newest release |
 | `--dir <path>` | install somewhere else (default `~/.local/bin`) |
 | `--service <scope>` | `system` \| `user` \| `none`; defaults to `system` under root, else `user` |
-| `--check` | installed vs newest, config presence, service state — changes nothing |
-| `--uninstall` | remove binary, unit and timer; **keeps** config and credentials |
+| `--no-service` | same as `--service none` |
+| `--lite` | rust binary only — **the default**; the weekly update timer always runs this mode |
+| `--with-dashboard` | also install the web dashboard (see [Dashboard](#dashboard)): ~2 GiB of compiled Next.js with its traced `node_modules`, built locally by `dashboard/rebrand-dist.sh` and installed from that tree — nothing is fetched from npm |
+| `--dashboard-src <path>` | the dist to install: the `dashboard/dist` directory or a tarball of it; defaults to `dashboard/dist` beside the script |
+| `--check` | installed vs newest, config and dashboard presence, service state — changes nothing |
+| `--uninstall` | remove binary, unit, timer and dashboard dist; **keeps** config, credentials and the dashboard's data DB |
 
 Re-running it *is* the update path: it replaces the binary, leaves your config
 and credentials untouched, and refreshes the unit. `--check` tells you honestly
 whether an update exists.
 
-Unattended updates are a systemd timer (`ar.update.timer`, weekly, with a first
+Unattended updates are a systemd timer (`aroute.update.timer`, weekly, with a first
 re-check 15 minutes after boot). It runs a **saved copy of the installer**
 rather than a URL, so the audited script is what runs, and an updated binary
-restarts the service so the live proxy changes too.
+restarts the service so the live proxy changes too. The timer never passes a
+dashboard flag, so an installed dist is left alone by weekly updates.
 
-The unit is `ar.service`, `Restart=on-failure`, reading credentials from an
+The unit is `aroute.service`, `Restart=on-failure`, reading credentials from an
 `EnvironmentFile` so secrets stay out of the process table. It does **not**
 override the bind address: loopback comes from `server.host` in the config, so
 the sample config binds `127.0.0.1` and an operator who edits that line changes
@@ -186,7 +231,7 @@ broken unit.
 
 ## Running it
 
-The dashboard is a vendored, rebranded build of the OmniRoute front end: `aroute dashboard` starts the compiled UI as a supervised Node child, and `dashboard/update-dist.sh` is the one-step refresh path (pull upstream → `npm ci` → build → rebrand). Detail lives in [docs/14-web-ui-port-plan.md](docs/14-web-ui-port-plan.md).
+The dashboard is a vendored, rebranded build of the OmniRoute front end: `aroute dashboard` starts the compiled UI as a supervised Node child, resolving the dist from `--path`, `$AR_DASHBOARD_DIR`, beside the binary, or the `--with-dashboard` install location (`~/.config/ar/dashboard`) — no flags needed after an install. `dashboard/rebrand-dist.sh` is the one-step rebuild path (pull upstream → `npm ci` → build → rebrand); refresh an installed dist by re-running the installer with `--with-dashboard`. Detail lives in [docs/14-web-ui-port-plan.md](docs/14-web-ui-port-plan.md).
 
 The install already puts `aroute` on a systemd unit, so on a box with systemd the
 proxy is already running — `curl -s localhost:20128/healthz` answers before you
@@ -258,6 +303,8 @@ Every request passes the same two stages as OmniRoute's sanitizer: credentials a
 
 The dist is ~2 GiB of compiled Next.js with its traced `node_modules` — too large for a release asset — so it is built locally (`dashboard/rebrand-dist.sh`) and installed from that tree: `install.sh --with-dashboard --dashboard-src <dashboard/dist>` lays it down at `~/.config/ar/dashboard`, which `aroute dashboard` resolves with no flags and nothing fetched from npm. The default install is `--lite`: the Rust binary only, and the weekly update timer never touches an installed dashboard.
 
+For the initial one-time import, `aroute import --from omniroute --combos <storage.sqlite>` reads real OmniRoute combos: nested `combo-ref` steps expand into the parent chain, per-step prompts, tags, connection allow-lists, weights and quota-exhaustion-only markers are preserved, and `fallbackOnlyOnQuotaExhaustion` steps are copied into the combo's `pool:` — without `--combos` the importer falls back to one combo per `provider/model`. One operational note: OmniRoute encrypts provider keys at rest (`enc:v1:` AES-256-GCM); a dashboard instance without `STORAGE_ENCRYPTION_KEY` cannot open them, and `aroute sync` deliberately skips such rows with a note rather than materialise ciphertext as a credential — decrypt the connections in the dashboard first, then re-sync. Every verified dispatch claim in this file comes from the [streaming battery](#streaming-under-load).
+
 ## Documentation
 
 `docs/00-overview.md` → `01..06` are the sources of truth (budgets, subsystems, roadmap, AXI/MCP). `AGENTS.md` holds the enforced Rust disciplines. Detail lives there; this file stays a funnel.
@@ -276,20 +323,3 @@ Both green, minimal diffs, no `unwrap` outside tests. See [CONTRIBUTING.md](CONT
 ## License
 
 [Apache-2.0](LICENSE) — © 2026 Ishan Parihar.
-
-## Current combo/fallback note
-
-`aroute import --from omniroute --combos <storage.sqlite>` reads real OmniRoute
-combos when the store has them: nested `combo-ref` steps are expanded into the
-parent chain, per-step prompts, tags, connection allow-lists, weights, and
-quota-exhaustion-only markers are preserved, and `fallbackOnlyOnQuotaExhaustion`
-steps are copied into the combo's `pool:`. Without `--combos` the importer falls
-back to one combo per `provider/model`. Ongoing configuration is the dashboard's
-job: what it saves in `dashboard-data/storage.sqlite`, `aroute sync` carries into
-`config.yaml` (see Dashboard).
-
-The installed live combos use `least-used`/`priority`; `round-robin` exists in
-the strategy grammar but is not what either stack runs. A smoke
-`GET /v1/chat/completions` on `free-stack` streams successfully; `small-stack`
-can answer `ok` on success paths and returns `chain_throttled` when every
-provider in the chain is rate-limited.
