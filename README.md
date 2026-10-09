@@ -252,6 +252,10 @@ custom_providers:
 
 Every request passes the same two stages as OmniRoute's sanitizer: credentials and PII are redacted before the body is logged, cached or forwarded, and prompt-injection families (`override`, `system_leak`, `delimiter_injection`, plus role/jailbreak redactions) match upstream's exact needle sets — probes carry the `(system|initial|hidden|original)` qualifier upstream's #4041 requires, and bare template tokens that occur in ordinary code are never refusal triggers. Enforcement follows upstream's `INPUT_SANITIZER_MODE`: `warn` by default — rule names are logged and the request forwards — and `block` refuses with `400` before dispatch.
 
+### Dashboard
+
+`aroute dashboard` serves the rebranded web UI on loopback with its data at `~/.config/ar/dashboard-data` — the one integrated config DB. Providers, API keys, combos and models are configured there, in the browser. `aroute sync` is the bridge onto the routing engine: it rewrites the `combos:` and `custom_providers:` sections of `config.yaml` from that DB, materialises every provider connection's API key into the env file (highest-priority active connection per provider), guarantees every `$AR_KEY_*` reference exists so a sync can never hand `serve` a config it cannot load, and restarts `aroute.service` so the boot-built routing tables pick the changes up — `--no-restart` prints the command instead. What the dashboard saves is what the proxy routes.
+
 ## Documentation
 
 `docs/00-overview.md` → `01..06` are the sources of truth (budgets, subsystems, roadmap, AXI/MCP). `AGENTS.md` holds the enforced Rust disciplines. Detail lives there; this file stays a funnel.
@@ -277,10 +281,10 @@ Both green, minimal diffs, no `unwrap` outside tests. See [CONTRIBUTING.md](CONT
 combos when the store has them: nested `combo-ref` steps are expanded into the
 parent chain, per-step prompts, tags, connection allow-lists, weights, and
 quota-exhaustion-only markers are preserved, and `fallbackOnlyOnQuotaExhaustion`
-steps are copied into the combo's `pool:`. On this machine the current storage
-still holds no readable `combos` rows, so the importer falls back to one combo
-per `provider/model`; the installed `~/.config/ar/config.yaml` therefore carries
-the `free-stack`/`small-stack` combos by hand.
+steps are copied into the combo's `pool:`. Without `--combos` the importer falls
+back to one combo per `provider/model`. Ongoing configuration is the dashboard's
+job: what it saves in `dashboard-data/storage.sqlite`, `aroute sync` carries into
+`config.yaml` (see Dashboard).
 
 The installed live combos use `least-used`/`priority`; `round-robin` exists in
 the strategy grammar but is not what either stack runs. A smoke

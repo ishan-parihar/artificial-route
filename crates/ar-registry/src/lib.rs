@@ -523,6 +523,12 @@ impl Registry {
         self.defs.iter()
     }
 
+    /// The whole catalog map, for a caller that expands a provider wildcard
+    /// against every provider the way `aroute import` and `aroute sync` do.
+    pub fn defs(&self) -> &BTreeMap<Strng, ProviderDef> {
+        &self.defs
+    }
+
     /// The price of one provider/model pair, if the catalog has a row for it.
     ///
     /// Both halves are matched exactly, as the catalog stores them: the ids come

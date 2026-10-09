@@ -162,7 +162,7 @@ struct DetailedStep {
 /// table, missing file or an unparseable row is reported and skipped rather than
 /// failing the import: the catalog is the primary output, and a database this
 /// build cannot read must not make the provider tree unimportable.
-pub(super) fn read(
+pub(crate) fn read(
     path: &Path,
     defs: &BTreeMap<ar_core::Strng, ar_registry::ProviderDef>,
 ) -> Vec<Combo> {

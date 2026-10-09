@@ -46,7 +46,7 @@ struct ConnectionData {
 /// Absent table, absent file, or an unreadable row is a note, never a failure:
 /// the provider tree is the primary output and a store this build cannot read
 /// must not make it unimportable. Same contract as `combos::read`.
-pub(super) fn read(path: &Path) -> Vec<CustomProvider> {
+pub(crate) fn read(path: &Path) -> Vec<CustomProvider> {
     let Ok(conn) = rusqlite::Connection::open_with_flags(
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,

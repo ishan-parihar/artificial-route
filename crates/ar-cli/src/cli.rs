@@ -125,6 +125,23 @@ pub enum Command {
     #[command(verbatim_doc_comment)]
     Import(ImportArgs),
 
+    /// Pull the dashboard's combos, providers and API keys into the routing config.
+    ///
+    /// The web dashboard is the configuration surface: everything it saves lands
+    /// in its integrated sqlite (`dashboard-data/storage.sqlite` beside the
+    /// config). This verb is the bridge onto the routing engine — it rewrites
+    /// the `combos:` and `custom_providers:` sections of config.yaml from that
+    /// DB, and materialises every provider connection's API key into the env
+    /// file the service loads. The proxy builds its routing tables at boot,
+    /// so when anything changed sync restarts `aroute.service` through systemd
+    /// (pass --no-restart to get the command printed instead).
+    ///
+    /// Examples:
+    ///   aroute --config ~/.config/ar/config.yaml sync
+    ///   aroute sync --db ~/.config/ar/dashboard-data/storage.sqlite --no-restart
+    #[command(verbatim_doc_comment)]
+    Sync(SyncArgs),
+
     /// Serve the MCP control plane over stdio (12 tools + tool_search).
     ///
     /// Needs `--features mcp`; without it this verb does not exist, so a host
@@ -345,4 +362,24 @@ pub struct ImportArgs {
     /// Directory the two files are written into. Created if absent.
     #[arg(long, value_name = "DIR", default_value = ".")]
     pub out_dir: PathBuf,
+}
+
+/// Options for `aroute sync`.
+#[derive(Debug, Args)]
+pub struct SyncArgs {
+    /// The dashboard's integrated sqlite to read. Defaults to
+    /// `dashboard-data/storage.sqlite` beside the config.
+    #[arg(long, value_name = "STORAGE_SQLITE")]
+    pub db: Option<PathBuf>,
+
+    /// The env file the service loads (systemd `EnvironmentFile`), where
+    /// provider keys are materialised. Defaults to `ar.env` beside the
+    /// config. Values are written there, never to config.yaml.
+    #[arg(long, value_name = "FILE")]
+    pub env: Option<PathBuf>,
+
+    /// Print the restart command instead of running it, for a sync that must
+    /// not disturb in-flight traffic.
+    #[arg(long)]
+    pub no_restart: bool,
 }

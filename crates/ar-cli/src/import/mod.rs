@@ -39,8 +39,8 @@ use ar_registry::meta::ProviderMeta;
 use ar_registry::{AuthClass, ProviderDef, WireFormat, global};
 use serde::Deserialize;
 
-mod combos;
-mod custom;
+pub(crate) mod combos;
+pub(crate) mod custom;
 pub mod omniroute;
 
 use crate::commands::{block_on_value, fail};
@@ -101,7 +101,7 @@ pub struct Imported {
 /// Upper-cased with `-` and `.` folded to `_`, which is what every generated
 /// `keys:` entry already spells. Idempotent and total: a uuid-shaped provider id
 /// is a legal variable name once folded.
-fn env_name(id: &str) -> String {
+pub(crate) fn env_name(id: &str) -> String {
     id.to_uppercase().replace(['-', '.'], "_")
 }
 
@@ -387,20 +387,21 @@ pub(crate) fn render_yaml(
     // before `combos:` so a reader meets the definition first, and omitted
     // entirely when empty so a source with no connections gains no dead block.
     if !custom.is_empty() {
-        out.push("custom_providers:".to_owned());
-        for c in custom {
-            out.push(format!(
-                "  - id: {}\n    protocol: {}\n    base_url: {}\n    key_ref: {}",
-                c.id,
-                serde_yaml::to_string(&c.protocol)
-                    .expect("a two-variant enum always serializes")
-                    .trim_end(),
-                c.base_url,
-                c.key_ref
-            ));
-        }
+        out.push(render_custom_section(custom));
     }
-    out.push("combos:".to_owned());
+    out.push(render_combos_section(combos));
+    let mut yaml = out.join("\n");
+    yaml.push('\n');
+    yaml
+}
+
+/// The `combos:` section alone, exactly as [`render_yaml`] writes it.
+///
+/// `aroute sync` splices this into a live `config.yaml` without touching any
+/// other section; one renderer in one place is what stops the import and the
+/// sync from disagreeing about what a combo entry looks like.
+pub(crate) fn render_combos_section(combos: &[Combo]) -> String {
+    let mut out: Vec<String> = vec!["combos:".to_owned()];
     for c in combos {
         out.push(format!(
             "  - id: {}\n    strategy: {}\n    targets:",
@@ -434,9 +435,26 @@ pub(crate) fn render_yaml(
             out.push(format!("    context_length: {ctx}"));
         }
     }
-    let mut yaml = out.join("\n");
-    yaml.push('\n');
-    yaml
+    out.join("\n")
+}
+
+/// The `custom_providers:` section alone, exactly as [`render_yaml`] writes
+/// it. Same splicing contract as [`render_combos_section`]; the caller owns
+/// whether the section appears at all.
+pub(crate) fn render_custom_section(custom: &[ar_registry::CustomProvider]) -> String {
+    let mut out: Vec<String> = vec!["custom_providers:".to_owned()];
+    for c in custom {
+        out.push(format!(
+            "  - id: {}\n    protocol: {}\n    base_url: {}\n    key_ref: {}",
+            c.id,
+            serde_yaml::to_string(&c.protocol)
+                .expect("a two-variant enum always serializes")
+                .trim_end(),
+            c.base_url,
+            c.key_ref
+        ));
+    }
+    out.join("\n")
 }
 
 /// The `aroute import` TOON rows: one per imported combo, and where it landed.

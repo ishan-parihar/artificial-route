@@ -7,7 +7,7 @@
 //! The two async verbs live in [`crate::serve`]; everything here is synchronous
 //! so the whole surface stays testable in-process without a runtime.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -18,7 +18,7 @@ use ar_server::config::split_target_known;
 use clap::CommandFactory;
 use clap::error::ErrorKind;
 
-use crate::cli::{Cli, Command, ConfigureArgs, ImportArgs, ListArgs};
+use crate::cli::{Cli, Command, ConfigureArgs, ImportArgs, ListArgs, SyncArgs};
 use crate::import;
 use crate::import::ImportFrom;
 use crate::serve;
@@ -38,6 +38,9 @@ const MODEL_COLUMNS: [&str; 4] = ["id", "provider", "status", "combo"];
 /// provider set: a combo is not owned by one provider, but that set is the fact
 /// an agent asks for next.
 const COMBO_COLUMNS: [&str; 5] = ["id", "provider", "status", "strategy", "targets"];
+/// Columns available from `aroute sync`: one row per combo the dashboard
+/// handed over.
+const SYNC_COLUMNS: [&str; 5] = ["id", "provider", "status", "strategy", "targets"];
 /// Columns of a `doctor` finding.
 const CHECK_COLUMNS: [&str; 3] = ["check", "status", "detail"];
 /// Columns of the `configure` dump.
@@ -341,6 +344,7 @@ pub fn dispatch(cli: &Cli) -> anyhow::Result<()> {
         Some(Command::Run(a)) => block_on(serve::run(cli, a)),
         Some(Command::Configure(a)) => configure(cli, a),
         Some(Command::Import(a)) => import_config(a),
+        Some(Command::Sync(a)) => sync_config(cli, a),
         #[cfg(feature = "mcp")]
         Some(Command::Mcp(a)) => block_on(crate::mcp::run(cli, a)),
         Some(Command::Dashboard(a)) => crate::dashboard::run(a),
@@ -1385,6 +1389,292 @@ fn import_config(args: &ImportArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `aroute sync` — the dashboard's integrated DB is the config surface; this
+/// verb is the bridge onto the routing engine.
+///
+/// Rewrites exactly what the dashboard owns — the `combos:` section, the
+/// `custom_providers:` section for ad-hoc chat nodes, and the `AR_KEY_*`
+/// values in the env file the service loads — and leaves every other section
+/// byte-for-byte. The proxy builds its routing tables at boot, so a sync that
+/// changed anything restarts `aroute.service` (unless `--no-restart`).
+fn sync_config(cli: &Cli, args: &SyncArgs) -> anyhow::Result<()> {
+    let dir = cli.config.parent().unwrap_or_else(|| Path::new("."));
+    let db = args
+        .db
+        .clone()
+        .unwrap_or_else(|| dir.join("dashboard-data").join("storage.sqlite"));
+    if !db.is_file() {
+        return Err(fail(
+            format!("no integrated dashboard db at {}", db.display()),
+            "start `aroute dashboard` once, or pass --db <STORAGE_SQLITE>",
+        ));
+    }
+    let env_path = args.env.clone().unwrap_or_else(|| dir.join("ar.env"));
+    let defs = registry().defs();
+
+    // Read-only against the DB: the dashboard may be running while sync runs.
+    let combos = import::combos::read(&db, defs);
+    let custom = import::custom::read(&db);
+
+    let doc = std::fs::read_to_string(&cli.config).map_err(|e| {
+        fail(
+            format!("cannot read {}: {e}", cli.config.display()),
+            "sync splices into an existing config; run `aroute import` first",
+        )
+    })?;
+    let mut next = splice_section(&doc, "combos", &import::render_combos_section(&combos));
+    if !custom.is_empty() {
+        next = splice_section(
+            &next,
+            "custom_providers",
+            &import::render_custom_section(&custom),
+        );
+        next = add_missing_custom_key_refs(&next, &custom);
+    }
+    let config_changed = next != doc;
+    if config_changed {
+        write_file(&cli.config, &next)?;
+    }
+
+    let (materialised, ensured, env_changed) = sync_env_file(&env_path, &db, &next)?;
+
+    let rows: Vec<Row> = combos
+        .iter()
+        .map(|c| {
+            let providers: BTreeSet<&str> = c.targets.iter().map(|t| target_provider(t)).collect();
+            vec![
+                c.id.clone(),
+                providers.into_iter().collect::<Vec<_>>().join("+"),
+                "active".to_owned(),
+                c.strategy.as_str().to_owned(),
+                c.targets.len().to_string(),
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        toon::list(
+            "synced",
+            "synced",
+            &SYNC_COLUMNS,
+            &toon::every_field(&SYNC_COLUMNS),
+            &rows,
+            false,
+        )
+    );
+    println!(
+        "env: {materialised} key(s) materialised, {ensured} referenced var(s) ensured — {}",
+        env_path.display()
+    );
+    // The proxy's routing tables are built at boot, so the synced edits only
+    // land after a restart. Doing it here keeps `aroute sync` one command
+    // rather than a command plus a reminder the operator has to remember.
+    if !config_changed && !env_changed {
+        println!("service: nothing changed — aroute.service left untouched");
+    } else if args.no_restart {
+        println!(
+            "note: apply with `systemctl --user restart aroute.service` (or your deployment's restart)"
+        );
+    } else {
+        let restarted = std::process::Command::new("systemctl")
+            .args(["--user", "restart", "aroute.service"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if restarted {
+            println!("service: aroute.service restarted — the synced config is live");
+        } else {
+            println!(
+                "note: apply with `systemctl --user restart aroute.service` (or your deployment's restart)"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Replaces one top-level `name:` section with `rendered`, which carries its
+/// own header line. A section that is not present is inserted before
+/// `combos:` — definition before use — or appended when there is none.
+fn splice_section(content: &str, name: &str, rendered: &str) -> String {
+    let header = format!("{name}:");
+    let mut out: Vec<String> = Vec::new();
+    let mut skipping = false;
+    let mut replaced = false;
+    for line in content.lines() {
+        if line == header {
+            out.push(rendered.to_owned());
+            replaced = true;
+            skipping = true;
+            continue;
+        }
+        if skipping && is_section_header(line) {
+            skipping = false;
+        }
+        if !skipping {
+            out.push(line.to_owned());
+        }
+    }
+    if replaced {
+        out.join("\n") + "\n"
+    } else {
+        let anchor = out.iter().position(|l| l == "combos:");
+        match anchor {
+            Some(i) => {
+                out.insert(i, rendered.to_owned());
+                out.join("\n") + "\n"
+            }
+            None => format!("{}\n{}\n", content.trim_end(), rendered),
+        }
+    }
+}
+
+/// A top-level YAML section header: unindented, one word, a colon, nothing
+/// else. Entry lines never match: they are indented, and a top-level scalar
+/// carries a value after the colon.
+fn is_section_header(line: &str) -> bool {
+    !line.starts_with([' ', '#'])
+        && line.ends_with(':')
+        && line[..line.len() - 1]
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Adds `keys:` entries for ad-hoc custom nodes the config does not reference
+/// yet. The loader refuses to start on a `key_ref` with no `keys:` row, so a
+/// sync that writes a new node must also name its variable — without touching
+/// the operator's existing key rows.
+fn add_missing_custom_key_refs(doc: &str, custom: &[ar_registry::CustomProvider]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut inserted = false;
+    for line in doc.lines() {
+        if !inserted && line == "providers:" {
+            for c in custom {
+                if !doc.contains(&format!("  {}: ", c.id)) {
+                    out.push(format!("  {}: $AR_KEY_{}", c.id, import::env_name(&c.id)));
+                }
+            }
+            inserted = true;
+        }
+        out.push(line.to_owned());
+    }
+    out.join("\n") + "\n"
+}
+
+/// Materialises provider keys into the env file, then guarantees every
+/// `$AR_KEY_*` the config references exists there — an unset variable aborts
+/// a serve at `$VAR` expansion, so a sync must never hand the proxy a config
+/// it cannot load.
+///
+/// One credential per provider: the highest-priority active connection wins,
+/// because the config carries one key binding per provider id; rotation
+/// across a provider's pool of keys stays an engine feature. Values are
+/// written to the env file and never returned or printed.
+fn sync_env_file(env_path: &Path, db: &Path, doc: &str) -> anyhow::Result<(usize, usize, bool)> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    // First row wins: `priority DESC, created_at ASC` puts the operator's
+    // preferred connection first.
+    let mut values: BTreeMap<String, String> = BTreeMap::new();
+    let mut stmt = conn.prepare(concat!(
+        "SELECT provider, api_key FROM provider_connections ",
+        "WHERE is_active = 1 AND coalesce(api_key, '') != '' ",
+        "ORDER BY priority DESC, created_at ASC"
+    ))?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    for row in rows {
+        let (provider, api_key) = row?;
+        values
+            .entry(format!("AR_KEY_{}", import::env_name(&provider)))
+            .or_insert(api_key);
+    }
+
+    // Every `$AR_KEY_*` the config names must exist in the env file afterwards.
+    let mut targets: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for (var, key) in &values {
+        targets.insert(var.clone(), Some(key.clone()));
+    }
+    for var in ar_key_refs(doc) {
+        targets.entry(var).or_insert(None);
+    }
+
+    let mut lines: Vec<String> = if env_path.is_file() {
+        std::fs::read_to_string(env_path)
+            .map_err(|e| {
+                fail(
+                    format!("cannot read {}: {e}", env_path.display()),
+                    "fix the file, or pass --env <FILE> at a path you can write",
+                )
+            })?
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut materialised = 0;
+    let mut ensured = 0;
+    for (var, value) in &targets {
+        let entry = match value {
+            Some(v) => format!("{var}={v}"),
+            None => format!("{var}="),
+        };
+        if let Some(existing) = lines.iter_mut().find(|l| l.starts_with(&format!("{var}="))) {
+            if value.is_some() && *existing != entry {
+                *existing = entry;
+                materialised += 1;
+            }
+        } else {
+            lines.push(entry);
+            if value.is_some() {
+                materialised += 1;
+            } else {
+                ensured += 1;
+            }
+        }
+    }
+    let changed = materialised + ensured > 0;
+    if changed {
+        std::fs::write(env_path, lines.join("\n") + "\n").map_err(|e| {
+            fail(
+                format!("cannot write {}: {e}", env_path.display()),
+                "fix the file, or pass --env <FILE> at a path you can write",
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(env_path, std::fs::Permissions::from_mode(0o600)).map_err(
+                |e| {
+                    fail(
+                        format!("cannot chmod {}: {e}", env_path.display()),
+                        "fix the file, or pass --env <FILE> at a path you can write",
+                    )
+                },
+            )?;
+        }
+    }
+    Ok((materialised, ensured, changed))
+}
+
+/// Every `AR_KEY_*` variable name the document references after a `$`.
+fn ar_key_refs(doc: &str) -> BTreeSet<String> {
+    let mut refs = BTreeSet::new();
+    let mut rest = doc;
+    while let Some(i) = rest.find("$AR_KEY_") {
+        let start = i + "$AR_KEY_".len();
+        let end = rest[start..]
+            .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+            .map_or(rest.len(), |k| start + k);
+        refs.insert(format!("AR_KEY_{}", &rest[start..end]));
+        rest = &rest[end..];
+    }
+    refs
+}
+
 /// How many previous versions of a generated file are kept.
 ///
 /// Three rather than one: a bad import is usually only noticed on the *second*
@@ -1543,9 +1833,115 @@ mod tests {
             PROVIDER_COLUMNS.as_slice(),
             MODEL_COLUMNS.as_slice(),
             COMBO_COLUMNS.as_slice(),
+            SYNC_COLUMNS.as_slice(),
         ] {
             assert_eq!(&cols[..3], &toon::DEFAULT_FIELDS[..], "{cols:?}");
         }
+    }
+
+    #[test]
+    fn sync_splices_the_combos_section_and_materialises_keys() {
+        let dir = std::env::temp_dir().join(format!("ar-sync-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("storage.sqlite");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE combos (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, \
+             data TEXT NOT NULL, sort_order INTEGER NOT NULL DEFAULT 0, \
+             created_at TEXT NOT NULL, updated_at TEXT NOT NULL); \
+             CREATE TABLE provider_connections (id TEXT PRIMARY KEY, \
+             provider TEXT NOT NULL, api_key TEXT, is_active INTEGER DEFAULT 1, \
+             priority INTEGER DEFAULT 0, created_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO combos (id, name, data, sort_order, created_at, updated_at) \
+             VALUES ('c1', 'stack', ?1, 0, '', '')",
+            rusqlite::params![
+                r#"{"name":"stack","strategy":"priority","models":[{"kind":"model","model":"nvidia/z-ai/glm-5.3","providerId":"nvidia","weight":0}]}"#
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO provider_connections (id, provider, api_key, is_active, priority, created_at) \
+             VALUES ('k1', 'nvidia', 'nvapi-secret', 1, 5, '2024-01-01')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let config = dir.join("config.yaml");
+        std::fs::write(
+            &config,
+            "keys:\n  nvidia: $AR_KEY_NVIDIA\n  ghost: $AR_KEY_GHOST\nproviders:\n  - id: nvidia\n    key: nvidia\ncombos:\n  - id: old\n    strategy: priority\n    targets:\n      - nvidia/z-ai/glm-5.3\n",
+        )
+        .unwrap();
+        let env = dir.join("ar.env");
+        std::fs::write(&env, "AR_KEY_NVIDIA=stale\n").unwrap();
+
+        let cli = Cli {
+            config: config.clone(),
+            command: None,
+        };
+        sync_config(
+            &cli,
+            &SyncArgs {
+                db: Some(db),
+                env: Some(env.clone()),
+                no_restart: true,
+            },
+        )
+        .unwrap();
+
+        let cfg = std::fs::read_to_string(&config).unwrap();
+        assert!(cfg.contains("  - id: stack"), "combo not spliced:\n{cfg}");
+        assert!(!cfg.contains("- id: old"), "stale combo survived:\n{cfg}");
+        assert!(
+            cfg.contains("keys:\n  nvidia: $AR_KEY_NVIDIA\n  ghost: $AR_KEY_GHOST\nproviders:"),
+            "keys section disturbed:\n{cfg}"
+        );
+        let envdoc = std::fs::read_to_string(&env).unwrap();
+        assert!(
+            envdoc.contains("AR_KEY_NVIDIA=nvapi-secret"),
+            "key not materialised:\n{envdoc}"
+        );
+        assert!(
+            envdoc.contains("AR_KEY_GHOST="),
+            "a referenced var with no connection was not ensured empty:\n{envdoc}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn splice_replaces_only_the_named_section() {
+        let doc = "keys:\n  a: $AR_KEY_A\nproviders:\n  - id: p\ncustom_providers:\n  - id: old\ncombos:\n  - id: c\n";
+        let out = splice_section(doc, "custom_providers", "custom_providers:\n  - id: new");
+        assert!(out.contains("  - id: new"), "not spliced:\n{out}");
+        assert!(!out.contains("  - id: old"), "stale entry survived:\n{out}");
+        assert!(
+            out.contains("combos:\n  - id: c"),
+            "later section eaten:\n{out}"
+        );
+    }
+
+    #[test]
+    fn splice_inserts_a_missing_section_before_combos() {
+        let doc = "keys:\n  a: $AR_KEY_A\ncombos:\n  - id: c\n";
+        let out = splice_section(doc, "custom_providers", "custom_providers:\n  - id: adhoc");
+        assert!(
+            out.contains("custom_providers:\n  - id: adhoc\ncombos:"),
+            "definition must precede use:\n{out}"
+        );
+    }
+
+    #[test]
+    fn finds_every_ar_key_reference() {
+        let refs = ar_key_refs("  a: $AR_KEY_NVIDIA\n  b: $AR_KEY_OPENAI_CHAT_ABC\nplain\n");
+        let want: BTreeSet<String> = ["AR_KEY_NVIDIA", "AR_KEY_OPENAI_CHAT_ABC"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(refs, want);
     }
 
     #[test]
