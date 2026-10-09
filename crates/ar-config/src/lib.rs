@@ -1603,6 +1603,46 @@ combos:
     }
 
     #[test]
+    fn parses_limits_and_resolves_per_key() {
+        let yaml = "limits:\n  default:\n    rpm: 60\n  keys:\n    prod:\n      rpm: 600\n      usd_micros: 5000000\n      refuse_unpriced: true\n";
+        let cfg = Config::parse(yaml, stub_lookup).unwrap();
+        assert_eq!(cfg.limits.default.rpm, Some(60));
+        let prod = cfg.limits.for_key("prod");
+        assert_eq!(prod.rpm, Some(600));
+        assert_eq!(prod.usd_micros, Some(5_000_000));
+        assert!(prod.refuse_unpriced);
+        // A key without its own row gets the default's ceiling, which is
+        // what that row is for.
+        assert_eq!(cfg.limits.for_key("other").rpm, Some(60));
+    }
+
+    #[test]
+    fn a_zero_ceiling_is_refused_at_parse() {
+        // `rpm: 0` means "no requests ever" to an operator and "refill from
+        // empty forever" to a token bucket — the one value where the two
+        // readings cannot be told apart, so parse refuses it.
+        let yaml = "limits:\n  default:\n    rpm: 0\n";
+        let err = Config::parse(yaml, stub_lookup).unwrap_err();
+        assert!(matches!(err, ConfigError::ZeroLimit { .. }), "got: {err:?}");
+    }
+
+    #[test]
+    fn an_absent_limits_block_limits_nothing() {
+        let cfg = Config::parse("keys:\n  k: v\n", stub_lookup).unwrap();
+        assert!(cfg.limits.is_empty());
+        assert!(cfg.limits.for_key("anyone").is_empty());
+    }
+
+    #[test]
+    fn limits_round_trip_through_serialization() {
+        let yaml = "limits:\n  default:\n    rpm: 5\n    refuse_unpriced: true\n  keys:\n    k:\n      tokens: 100\n";
+        let cfg = Config::parse(yaml, stub_lookup).unwrap();
+        let again = serde_yaml::to_string(&cfg.limits).unwrap();
+        let re: Limits = serde_yaml::from_str(&again).unwrap();
+        assert_eq!(re, cfg.limits);
+    }
+
+    #[test]
     fn expands_dollar_var_before_parsing() {
         let cfg = Config::parse(SAMPLE, stub_lookup).unwrap();
         assert_eq!(
