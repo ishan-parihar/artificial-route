@@ -297,6 +297,19 @@ custom_providers:
 
 Every request passes the same two stages as OmniRoute's sanitizer: credentials and PII are redacted before the body is logged, cached or forwarded, and prompt-injection families (`override`, `system_leak`, `delimiter_injection`, plus role/jailbreak redactions) match upstream's exact needle sets — probes carry the `(system|initial|hidden|original)` qualifier upstream's #4041 requires, and bare template tokens that occur in ordinary code are never refusal triggers. Enforcement follows upstream's `INPUT_SANITIZER_MODE`: `warn` by default — rule names are logged and the request forwards — and `block` refuses with `400` before dispatch.
 
+### Limits
+
+The `limits:` block is the policy layer, and it is opt-in: a config that never mentions it serves exactly as before. `limits.default` governs the anonymous bucket and every key without a row; `limits.keys.<client-key>` overrides per credential. Each row arms any subset of four ceilings — `rpm` (requests per minute: a token bucket keyed by the authenticated client key, bursting to `rpm` and refilling continuously), `usd_micros` and `tokens` (cumulative spend ceilings, checked against the usage ledger before dispatch), and `refuse_unpriced` (fail closed on a model with no pricing row, so an unpriced model cannot slip through a dollar cap as "free"):
+
+```yaml
+limits:
+  default: { rpm: 60 }
+  keys:
+    prod-deploy: { rpm: 600, usd_micros: 5_000_000, tokens: 20_000_000 }
+```
+
+Enforcement sits at the two points where refusing costs nothing. Past `rpm` the request is refused `429` with `Retry-After` before any body work — the wait is the bucket's own answer, rounded up one second so a client that waits exactly it is admitted. A projected spend at or past a ceiling is refused `402 Payment Required` with the arm named in `x-ar-deny-reason` (`usd_cap`, `token_cap`, `unpriced`, `unauditable`) and in the error envelope's `reason` — never the amounts, which the operator already knows. The projection prices the resolved model from the same pricing rows the response path bills against: input tokens are counted, output tokens are the request's own `max_tokens`, and the token ceiling counts both because the ledger records both. Cache hits skip the spend arm — a hit serves from memory and is never recorded as spend, so the cap does not deny it either. The spend arms read the usage ledger (`ar serve` opens one by default); without one they stay inert rather than pretending a ceiling they cannot evaluate, and a ledger that errors under the request fails closed. The mechanism is ported from agentgateway's local rate limiter minus its CEL bucket-keying and cache dependency; `crates/ar-limit`'s and `crates/ar-server/src/policy.rs`'s module docs name their source.
+
 ### Dashboard
 
 `aroute dashboard` serves the rebranded web UI on loopback with its data at `~/.config/ar/dashboard-data` — the one integrated config DB. Providers, API keys, combos and models are configured there, in the browser. `aroute sync` is the bridge onto the routing engine: it rewrites the `combos:` and `custom_providers:` sections of `config.yaml` from that DB, materialises every provider connection's API key into the env file (highest-priority active connection per provider), guarantees every `$AR_KEY_*` reference exists so a sync can never hand `serve` a config it cannot load, and restarts `aroute.service` so the boot-built routing tables pick the changes up — `--no-restart` prints the command instead. What the dashboard saves is what the proxy routes.

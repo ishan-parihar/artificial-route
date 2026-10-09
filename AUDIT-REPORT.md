@@ -14,6 +14,16 @@ F-MED-2 and the circuit half of F-HIGH-4 have landed; each entry below says what
 is done and what is not. The strategy count in the summary below was 19 and is
 now 21 — `expiry-first` and the fusion judge's own dispatch landed after that
 line was written; `Strategy::all()` (strategy.rs:424) is the arbiter.
+**Policy layer (2026-10-10):** the enforcement half of the ledger landed — the
+`limits:` config block (`rpm`, `usd_micros`, `tokens`, `refuse_unpriced`, per
+key), a ported token-bucket rate limiter (`ar-limit`, from agentgateway's
+`localratelimit.rs`, stdlib only), and `handle_chat` enforcement: 429 +
+`Retry-After` at the edge, 402 with the arm named in `x-ar-deny-reason` before
+dispatch, checked through the ledger's own `admit_with` so the cap and the bill
+cannot drift. Caps without a ledger stay inert by design (a cap that cannot
+read its spend is not a cap); a ledger error under a request fails closed
+(`unauditable`). See [docs/15-policy-security-layer.md](docs/15-policy-security-layer.md)
+for the decision record and the deliberate divergences.
 
 ## Live inventory (OmniRoute, this machine — counts only)
 

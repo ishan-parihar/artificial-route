@@ -1,5 +1,16 @@
 # 15 — Policy & security layer upgrade plan
 
+> **Status (2026-10-10):** Phases 1 and 2 have landed — `limits:` parses in
+> `ar-config`, `ar-limit` buckets the requests, and `handle_chat` enforces both
+> arms (429 with `Retry-After` after the gate, 402 after the cache, spend via
+> the ledger's own `Ledger::admit_with`). The plan text below is kept as the
+> decision record; where the landed shape diverges, the module docs in
+> `crates/ar-limit` and `crates/ar-server/src/policy.rs` are the truth. The
+> one deliberate divergence: Phase 1 as written projected cost before
+> `resolve()`, but a projection can only price against a resolved row, so the
+> 402 runs after resolve — and after the cache lookup, which a hit skips
+> because the ledger never records a hit as spend.
+
 Import the *worthy* agentgateway mechanisms into aroute, and nothing else. Every
 row below was verified against both source trees on 2026-10-09.
 
