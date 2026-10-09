@@ -149,6 +149,24 @@ mkdir -p "$DATA_DIR"
 if [ -z "${AR_DASH_PORT:-}" ]; then
   PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
 fi
+# ---------------------------------------------------------------------------
+# ONNX runtime is opt-in, never shipped.
+#
+# The model-inference stack (onnxruntime-node/-web/-common, @huggingface,
+# @atjsh/llmlingua-2, js-tiktoken) is ~450 MB of the ~2 GB dist and nothing on
+# the boot path touches it: OmniRoute's vector memory is `enabled: false` by
+# default (src/lib/memory/settings.ts) and the LLMLingua worker imports these
+# dynamically under a fail-open contract, so an absent module degrades one
+# opt-in feature instead of breaking the server. Verified by booting the pruned
+# tree: /api/health, /api/combos, and completions all serve.
+# `dashboard/enable-onnx.sh` fetches the stack into an installed dist when an
+# operator actually turns those features on.
+BEFORE_KB=$(du -sk "$DST" | cut -f1)
+for pkg in onnxruntime-node onnxruntime-web onnxruntime-common @huggingface @atjsh js-tiktoken; do
+  rm -rf "${DST:?}/node_modules/$pkg"
+done
+log "ONNX prune: $((BEFORE_KB - $(du -sk "$DST" | cut -f1))) KB lighter — dist is $(du -sh "$DST" | cut -f1)"
+
 log "boot smoke on :$PORT"
 systemd-run --user --collect --unit="$SMOKE_UNIT" \
   --property=WorkingDirectory="$DST" \
