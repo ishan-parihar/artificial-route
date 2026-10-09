@@ -81,6 +81,15 @@ pub enum ConfigError {
         /// The value as written, verbatim.
         url: String,
     },
+    /// A `limits:` row carries a zero ceiling, which reads as "unlimited" to
+    /// the engine and as "stop everything" to the operator who typed it.
+    #[error("limits {key:?} {field} must be > 0, got 0")]
+    ZeroLimit {
+        /// The key the row governs, or "default".
+        key: String,
+        /// Which arm carried the zero.
+        field: &'static str,
+    },
     /// The filesystem watcher could not be installed.
     #[error("cannot watch {path}: {cause}")]
     Watch {
@@ -1044,6 +1053,81 @@ pub struct Config {
     /// active connection row.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub provider_settings: BTreeMap<String, ProviderSettings>,
+    /// Request-rate and spend ceilings, per client key.
+    ///
+    /// The enforcement half of the policy layer: a key over its ceiling is
+    /// refused before a byte reaches a provider (429 for the request-rate
+    /// arm, 402 for the spend arms). The row is keyed by the client key the
+    /// gate authenticates; `default` governs the anonymous bucket and any key
+    /// without a row. The spend arms are *cumulative* against the usage
+    /// ledger, matching `ar_tokens::Cap`'s own semantics — a rolling daily
+    /// window is a different shape and is not claimed here.
+    #[serde(default, skip_serializing_if = "Limits::is_empty")]
+    pub limits: Limits,
+}
+
+/// Request-rate and spend ceilings.
+///
+/// An absent block is no limits, which is every config written before the
+/// block existed: the proxy serves exactly as it did, and the policy layer is
+/// opt-in rather than opt-out.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Limits {
+    /// The ceiling for the anonymous bucket and for any key without a row.
+    /// A `default` that limits nothing (every field `None`) is the same as no
+    /// row at all.
+    #[serde(default, skip_serializing_if = "Limit::is_empty")]
+    pub default: Limit,
+    /// Per-key ceilings, keyed by the client key name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub keys: BTreeMap<String, Limit>,
+}
+
+impl Limits {
+    /// Whether this block limits anything at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.default.is_empty() && self.keys.is_empty()
+    }
+
+    /// The ceiling in force for one client key: its own row if present, then
+    /// `default`, then the empty limit.
+    #[must_use]
+    pub fn for_key(&self, key_id: &str) -> &Limit {
+        self.keys.get(key_id).unwrap_or(&self.default)
+    }
+}
+
+/// One ceiling: any subset of the three arms. `None` means that arm is
+/// unlimited — the same convention `ar_tokens::Cap` uses, so a config row and
+/// a store row read identically.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Limit {
+    /// Requests per minute, as a token bucket (burst up to `rpm`, refilling
+    /// at `rpm` per 60s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpm: Option<u32>,
+    /// Cumulative spend ceiling in micro-dollars (1_000_000 = $1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usd_micros: Option<u64>,
+    /// Cumulative token ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<u64>,
+    /// Fail closed on a model with no pricing row, the same opt-in
+    /// `ar_tokens::Cap` carries: a budget cannot police an unknown cost.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub refuse_unpriced: bool,
+}
+
+impl Limit {
+    /// Whether this row limits anything.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rpm.is_none()
+            && self.usd_micros.is_none()
+            && self.tokens.is_none()
+            && !self.refuse_unpriced
+    }
 }
 
 impl Config {
@@ -1098,6 +1182,29 @@ impl Config {
                     provider: c.id.clone(),
                     key: c.key_ref.clone(),
                 });
+            }
+        }
+        // A zero ceiling is the one value both the operator and the engine
+        // cannot agree on, so it is refused at parse time rather than
+        // enforced one way or the other.
+        for (name, limit) in
+            self.limits
+                .keys
+                .iter()
+                .map(|(k, l)| (k.clone(), l))
+                .chain(std::iter::once((
+                    "default".to_owned(),
+                    &self.limits.default,
+                )))
+        {
+            for (field, zero) in [
+                ("rpm", limit.rpm == Some(0)),
+                ("usd_micros", limit.usd_micros == Some(0)),
+                ("tokens", limit.tokens == Some(0)),
+            ] {
+                if zero {
+                    return Err(ConfigError::ZeroLimit { key: name, field });
+                }
             }
         }
         for s in &self.oauth {
