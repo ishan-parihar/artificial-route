@@ -408,10 +408,16 @@ pub(crate) fn render_keys_section(entries: &BTreeMap<String, String>) -> String 
     if entries.is_empty() {
         return "keys:\n".to_owned();
     }
-    format!(
-        "keys:\n{}",
-        serde_yaml::to_string(entries).expect("a string map serializes")
-    )
+    // serde_yaml emits a mapping at column 0, so every line is re-indented
+    // under the header: `keys:` followed by column-0 entries is a null key
+    // plus root-level scalars, and every provider's ref goes undeclared.
+    let body = serde_yaml::to_string(entries).expect("a string map serializes");
+    let indented = body
+        .lines()
+        .map(|line| format!("  {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("keys:\n{indented}\n")
 }
 
 /// Renders the `providers:` section: each row's `id`, `key`, and the optional
@@ -420,10 +426,23 @@ pub(crate) fn render_providers_section(rows: &[ar_config::ProviderCfg]) -> Strin
     if rows.is_empty() {
         return "providers:\n".to_owned();
     }
-    format!(
-        "providers:\n{}",
-        serde_yaml::to_string(rows).expect("a provider list serializes")
-    )
+    // Same re-indent as the keys renderer: a block sequence at column 0 still
+    // parses under its header, but the section's house style is indented, and
+    // the splicer's `is_section_header` scan should never see a row as a
+    // header.
+    let body = serde_yaml::to_string(rows).expect("a provider list serializes");
+    let indented = body
+        .lines()
+        .map(|line| {
+            if line.is_empty() {
+                line.to_owned()
+            } else {
+                format!("  {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("providers:\n{indented}\n")
 }
 
 pub(crate) fn render_combos_section(combos: &[Combo]) -> String {

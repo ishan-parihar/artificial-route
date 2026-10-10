@@ -2483,10 +2483,46 @@ mod tests {
             cfg.contains("nvidia-2: $AR_KEY_NVIDIA_2"),
             "the second connection is not bound as a numbered credential:\n{cfg}"
         );
-        assert!(
-            cfg.contains("keys:\n  - nvidia-2"),
-            "the provider row does not name its cycling extras:\n{cfg}"
+        // Parse-back, not string-match: the re-rendered sections must still
+        // BE the sections. A `contains` assertion passed while serde_yaml's
+        // column-0 mapping made every keys entry a root-level scalar and the
+        // server refused the config — the exact regression this catches.
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&cfg).expect("the synced config must parse");
+        let keys = parsed
+            .get("keys")
+            .and_then(serde_yaml::Value::as_mapping)
+            .expect("keys: must be a mapping, not a null key");
+        assert_eq!(
+            keys.get("nvidia-2").and_then(|v| v.as_str()),
+            Some("$AR_KEY_NVIDIA_2"),
+            "the second connection is not in the keys map:\n{cfg}"
         );
+        assert_eq!(
+            keys.get("ghost").and_then(|v| v.as_str()),
+            Some("$AR_KEY_GHOST"),
+            "a hand-set entry must survive:\n{cfg}"
+        );
+        let providers = parsed
+            .get("providers")
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("providers: must be a sequence");
+        let nvidia = providers
+            .iter()
+            .find(|r| r.get("id").and_then(|v| v.as_str()) == Some("nvidia"))
+            .expect("the nvidia provider row");
+        assert_eq!(
+            nvidia.get("key").and_then(|v| v.as_str()),
+            Some("nvidia"),
+            "the row keeps its first credential"
+        );
+        let extras = nvidia
+            .get("keys")
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("the row carries its cycling extras");
+        assert_eq!(extras.len(), 1);
+        assert_eq!(extras[0].as_str(), Some("nvidia-2"));
+
         let envdoc = std::fs::read_to_string(&env).unwrap();
         assert!(
             envdoc.contains("AR_KEY_NVIDIA=nvapi-secret"),
