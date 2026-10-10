@@ -1852,7 +1852,12 @@ fn build_chain(picked: &ProviderId, candidates: &[Candidate]) -> Vec<ChainTarget
                 target_of,
             ),
     );
-    chain.dedup_by(|a, b| a.provider == b.provider);
+    // The failure domain is the credential, not the provider: a combo pairing
+    // two models on one multi-key provider must keep both targets, or its
+    // "fallback chain" is the winner alone and a single 429 ends the request
+    // with nothing left to fail over to. Only a duplicated (provider, model)
+    // row — the same pair listed twice — collapses.
+    chain.dedup_by(|a, b| a.provider == b.provider && a.model == b.model);
     chain
 }
 
@@ -3137,6 +3142,24 @@ mod tests {
             chain.len(),
             2,
             "a repeated provider must not be attempted twice: {chain:?}"
+        );
+    }
+
+    #[test]
+    fn keeps_both_models_of_one_multi_credential_provider() {
+        // The failure domain is the credential, not the provider: a combo
+        // pairing two models on one multi-key provider must keep both
+        // targets, or its fallback chain is the winner alone and a single
+        // 429 ends the request with nothing left to fail over to.
+        let cands = [
+            ar_route::Candidate::new(ProviderId::new("nvidia"), "glm-5.3"),
+            ar_route::Candidate::new(ProviderId::new("nvidia"), "kimi-k3"),
+        ];
+        let chain = build_chain(&ProviderId::new("nvidia"), &cands);
+        assert_eq!(
+            chain.len(),
+            2,
+            "a same-provider fallback that dedupes away is no fallback: {chain:?}"
         );
     }
 

@@ -23,7 +23,8 @@ use http::StatusCode;
 use crate::contract::{CanonicalRequest, ExecError, Executor, ProviderId, Upstream};
 use crate::error::RouteError;
 use crate::resilience::{
-    BreakerClass, LOCKOUT_BASE_COOLDOWN, LockReason, Resilience, quota_cooldown,
+    BreakerClass, DEFAULT_BASE_BACKOFF, LOCKOUT_BASE_COOLDOWN, LockReason, Resilience,
+    quota_cooldown,
 };
 use crate::simulate::ChainTarget;
 
@@ -189,6 +190,9 @@ const ADVANCE_400_ROWS: &[&str] = &[
 /// backoff is a hot loop against a provider that cannot serve anyone until
 /// someone is paid.
 const PAYMENT_REQUIRED: u16 = 402;
+/// A refused credential: one key's token is bad, not the endpoint's health.
+const UNAUTHORIZED: u16 = 401;
+const FORBIDDEN: u16 = 403;
 
 /// Rate limit. Also the status that *carries* the quota-vs-throttle split, so
 /// it gets a dedicated constant rather than a bare literal at four sites.
@@ -348,31 +352,55 @@ fn charge_failure(
     retry_after: Option<Duration>,
 ) -> (Duration, bool) {
     let provider = provider.as_str();
+    // A provider holding more than one credential fails one credential at a
+    // time: the executor's per-key cycling state owns that scope, and a
+    // provider-scope charge here would cool every healthy sibling for one
+    // sibling's refusal. Single-credential providers keep the P0 semantics
+    // unchanged — for them the layering collapses on purpose, because there
+    // is nothing for a dead credential to fall back to.
+    let multi = resilience.is_multi(provider);
     match classify_fault(status, body) {
         // Retirement is the whole answer here. A cooldown would just buy one
-        // wasted upstream call per window, forever.
+        // wasted upstream call per window, forever. A *provider*-wide
+        // retirement, though, is only ever one credential's account being
+        // banned when the provider is multi-credential — the executor's
+        // doubling lockout holds that key out while the rest still answer.
         Fault::Terminal(scope) => {
             match scope {
+                Terminal::Provider if multi => {}
                 Terminal::Provider => resilience.retire_provider(provider),
                 Terminal::Model => resilience.retire_model(provider, model),
             }
             (Duration::ZERO, false)
         }
-        // The allowance is spent: a day-boundary lockout on the model, and the
-        // client told to come back then. Note the provider breaker is *not*
-        // charged — an empty account says nothing about the endpoint's health.
-        Fault::QuotaExhausted => (
-            resilience.lock_model(
-                provider,
-                model,
-                LockReason::QuotaExhausted,
-                quota_cooldown(),
-            ),
-            true,
-        ),
+        // The allowance is spent — on one credential. A multi-credential
+        // provider still has allowance on its other keys, so the model stays
+        // routable and the capped key re-probes once per its own cooldown
+        // rather than holding the model to the day boundary.
+        Fault::QuotaExhausted => {
+            if multi {
+                (quota_cooldown(), true)
+            } else {
+                (
+                    resilience.lock_model(
+                        provider,
+                        model,
+                        LockReason::QuotaExhausted,
+                        quota_cooldown(),
+                    ),
+                    true,
+                )
+            }
+        }
         // A throttle answers to both scopes at their own widths: the key takes
         // the backoff and honours `Retry-After`, the model takes a long lockout
-        // so one model riding a shared limit stops being re-selected.
+        // so one model riding a shared limit stops being re-selected. Both
+        // charges assume the key *is* the provider — with more credentials the
+        // executor cools the refused key and rotates, so the router cools
+        // nothing and a fresh key's very next request still routes. The retry
+        // hint stays honest: the window upstream asked for is what a same-key
+        // retry must wait out.
+        Fault::Throttled if multi => (retry_after.unwrap_or(DEFAULT_BASE_BACKOFF), true),
         Fault::Throttled => {
             let cooldown = resilience.record_failure(provider, retry_after);
             resilience.lock_model(
@@ -385,10 +413,16 @@ fn charge_failure(
         }
         // Everything else — 5xx, transport, an auth refusal — is the key's
         // problem and the provider breaker's to count. Here the layering
-        // collapses on purpose: with one key per provider there is nothing for
-        // a dead credential to fall back to, so an auth refusal *is* the
-        // provider's failure.
+        // collapses on purpose for a single-credential provider: with one key
+        // there is nothing for a dead credential to fall back to, so an auth
+        // refusal *is* the provider's failure. A multi-credential provider
+        // splits the cases: an auth refusal is one credential's (the
+        // executor's doubling lockout already isolates it) and cools nothing,
+        // while 5xx and transport remain the endpoint's and keep every charge.
         Fault::Transient => {
+            if multi && (status == UNAUTHORIZED || status == FORBIDDEN) {
+                return (Duration::ZERO, false);
+            }
             let cooldown = resilience.record_failure(provider, retry_after);
             // A 400 the request itself provoked is the key's cooldown and
             // nothing more: after a dozen oversized prompts, a breaker that
@@ -1294,5 +1328,168 @@ mod tests {
             ["p2"],
             "only the dead model is skipped on retry"
         );
+    }
+
+    // ── Multi-credential scoping: the boot mark flips the failure scope ─────
+
+    #[test]
+    fn multi_credential_keys_isolate_a_throttle_end_to_end() {
+        // The free-stack shape: one provider, two models, many keys. Marked
+        // multi, a 429 on the first model is the refused *key's* cooldown —
+        // the sibling model dispatches, in the same request.
+        let r = Resilience::new();
+        r.mark_multi("nvidia");
+        let exec = Scripted::new(vec![PLAIN_429, Verdict::Ok]);
+        let Ok(AttemptOutcome::Succeeded { attempts, .. }) = block(attempt_loop(
+            &req(),
+            &targets(&[("nvidia", "glm-5.3"), ("nvidia", "kimi-k3")]),
+            &exec,
+            &r,
+        )) else {
+            panic!("expected the sibling model to serve");
+        };
+        assert_eq!(attempts, 2, "seen: {:?}", exec.seen());
+        assert!(
+            !r.is_cooling_for("nvidia", "glm-5.3"),
+            "a key-scoped 429 must not lock the model"
+        );
+        assert!(r.is_usable("nvidia"));
+    }
+
+    #[test]
+    fn single_credential_throttle_stops_at_the_provider() {
+        // Without the mark, one key *is* the provider (the P0 semantics): its
+        // 429 cools the provider string and the sibling model is a
+        // known-dead target the loop must skip rather than spend on.
+        let r = Resilience::new();
+        let exec = Scripted::new(vec![PLAIN_429, Verdict::Ok]);
+        let Ok(AttemptOutcome::Retry { .. }) = block(attempt_loop(
+            &req(),
+            &targets(&[("nvidia", "glm-5.3"), ("nvidia", "kimi-k3")]),
+            &exec,
+            &r,
+        )) else {
+            panic!("expected retry");
+        };
+        assert_eq!(exec.seen().len(), 1, "the sibling must be skipped");
+    }
+
+    #[test]
+    fn multi_credential_keys_isolate_an_auth_refusal() {
+        let r = Resilience::new();
+        r.mark_multi("nvidia");
+        let exec = Scripted::new(vec![Verdict::Status(401, "bad token"), Verdict::Ok]);
+        let Ok(AttemptOutcome::Succeeded { attempts, .. }) = block(attempt_loop(
+            &req(),
+            &targets(&[("nvidia", "glm-5.3"), ("nvidia", "kimi-k3")]),
+            &exec,
+            &r,
+        )) else {
+            panic!("expected the sibling model to serve");
+        };
+        assert_eq!(attempts, 2, "seen: {:?}", exec.seen());
+        assert!(
+            !r.is_cooling("nvidia"),
+            "one dead token must not cool the endpoint"
+        );
+        assert!(
+            r.is_usable("nvidia"),
+            "the breaker must not count a key's 401"
+        );
+    }
+
+    #[test]
+    fn multi_credential_endpoint_faults_still_stop_the_provider() {
+        // A 5xx is the endpoint's, not one credential's: every charge stays,
+        // and the sibling model is skipped for the cooldown's width.
+        let r = Resilience::new();
+        r.mark_multi("nvidia");
+        let exec = Scripted::new(vec![Verdict::Status(500, "boom"), Verdict::Ok]);
+        // A transient fault with no throttle anywhere reports Failover — a
+        // retry would just hit the same cooling endpoint — and the loop's own
+        // attempt count is the witness that the sibling was skipped.
+        let Ok(AttemptOutcome::Failover { status, tried, .. }) = block(attempt_loop(
+            &req(),
+            &targets(&[("nvidia", "glm-5.3"), ("nvidia", "kimi-k3")]),
+            &exec,
+            &r,
+        )) else {
+            panic!("expected failover");
+        };
+        assert_eq!(status, 500);
+        assert_eq!(tried, 1, "the endpoint is cooling — sibling skipped");
+        assert_eq!(exec.seen().len(), 1);
+    }
+
+    #[test]
+    fn multi_credential_quota_spares_the_model() {
+        let _clock = QuotaClockGuard::fixed(NOON);
+        let r = Resilience::new();
+        r.mark_multi("p");
+        let (hint, retry) = super::charge_failure(
+            &r,
+            &ProviderId::new("p"),
+            "m",
+            402,
+            "payment required",
+            None,
+        );
+        assert!(retry);
+        assert!(
+            hint > Duration::from_secs(3600),
+            "the retry hint still says day boundary: {hint:?}"
+        );
+        assert!(
+            !r.is_cooling_for("p", "m"),
+            "one spent key must not lock the model for its siblings"
+        );
+    }
+
+    #[test]
+    fn multi_credential_account_ban_retires_the_key_not_the_provider() {
+        let r = Resilience::new();
+        r.mark_multi("p");
+        super::charge_failure(
+            &r,
+            &ProviderId::new("p"),
+            "m",
+            401,
+            "your account has been deactivated",
+            None,
+        );
+        assert!(!r.is_retired_provider("p"), "sibling keys still answer");
+
+        // The single-credential case still retires the provider wholesale.
+        let solo = Resilience::new();
+        super::charge_failure(
+            &solo,
+            &ProviderId::new("q"),
+            "m",
+            401,
+            "your account has been deactivated",
+            None,
+        );
+        assert!(solo.is_retired_provider("q"));
+    }
+
+    #[test]
+    fn multi_credential_throttle_reports_the_window_without_charging() {
+        let r = Resilience::new();
+        r.mark_multi("p");
+        let (hint, retry) = super::charge_failure(
+            &r,
+            &ProviderId::new("p"),
+            "m",
+            429,
+            "slow down",
+            Some(Duration::from_secs(30)),
+        );
+        assert!(retry);
+        assert_eq!(
+            hint,
+            Duration::from_secs(30),
+            "upstream's window is the hint"
+        );
+        assert!(!r.is_cooling("p"), "the router charged nothing");
     }
 }

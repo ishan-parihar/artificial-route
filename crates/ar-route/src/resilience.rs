@@ -201,6 +201,12 @@ pub struct Resilience {
     /// Test-only override of [`LOCKOUT_ESCALATION_WINDOW`], same reason. The
     /// lockout *base* needs no knob: it arrives per call.
     lock_window: Duration,
+    /// Providers holding more than one credential, marked once at boot. The
+    /// cooldowns this table charges are endpoint- and model-scoped; a
+    /// one-credential fault on a marked provider belongs to the executor's
+    /// per-key state instead, so the failure-scope charges consult this set
+    /// before cooling a provider every healthy sibling shares.
+    multi: Mutex<HashSet<Strng>>,
 }
 
 impl Resilience {
@@ -225,7 +231,27 @@ impl Resilience {
             breakers: Mutex::new(HashMap::new()),
             reset_override: None,
             lock_window: LOCKOUT_ESCALATION_WINDOW,
+            multi: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Marks `provider` as holding more than one credential.
+    ///
+    /// Called once at boot from the executor registry: a provider row with a
+    /// keyless or single-key `api_keys` stays unmarked and keeps the P0
+    /// semantics untouched.
+    pub fn mark_multi(&self, provider: &str) {
+        let id = Strng::from(provider);
+        self.multi.lock().expect("multi set").insert(id);
+    }
+
+    /// Whether `provider` dispatches under more than one credential.
+    #[must_use]
+    pub fn is_multi(&self, provider: &str) -> bool {
+        self.multi
+            .lock()
+            .expect("multi set")
+            .contains(&Strng::from(provider))
     }
 
     /// Records a failure for `key` and returns the cooldown now in effect.
@@ -990,5 +1016,14 @@ mod tests {
             last = r.lock_model("p", "m", LockReason::Throttled, Duration::from_secs(120));
         }
         assert_eq!(last, super::LOCKOUT_MAX_COOLDOWN);
+    }
+
+    #[test]
+    fn marks_multi_credential_providers() {
+        let r = Resilience::new();
+        assert!(!r.is_multi("nvidia"));
+        r.mark_multi("nvidia");
+        assert!(r.is_multi("nvidia"));
+        assert!(!r.is_multi("kimi"), "unmarked providers stay P0-scoped");
     }
 }

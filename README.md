@@ -279,6 +279,18 @@ provider's first become numbered credentials (`nvidia-2` holding
 `$AR_KEY_NVIDIA_2`), in the dashboard's own priority order — a provider with
 seven keys there is never stuck on the first one here.
 
+The router's cooldowns follow the same scope. A provider with more than one
+key is marked multi-credential at boot, and its credential-scoped faults — a
+throttle, an auth refusal, quota spent on one key, one banned account — charge
+the executor's per-key state and nothing at the provider scope, so a fresh
+key's very next request routes as if nothing happened. Endpoint-scoped faults
+(5xx, transport) keep every charge: a dead socket is not one credential's
+opinion. A single-credential provider keeps the strict P0 semantics unchanged
+— with one key there is nothing to fall to, so its 429 *is* the provider's —
+and the fallback chain no longer collapses same-provider targets: a combo
+pairing two models on one multi-key provider keeps both, so a 429 on the first
+fails over to the second inside the same request.
+
 To adopt an OmniRoute provider tree wholesale, `aroute import --from omniroute
 --path <OmniRoute/open-sse/config/providers> --out-dir <dir>` regenerates the
 config and the registry from OmniRoute's own source. It reports every provider

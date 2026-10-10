@@ -400,10 +400,22 @@ impl Components {
             Arc::new(StaticCatalog::new(cards))
         };
 
+        let resilience = Arc::new(Resilience::new());
+        // Multi-credential providers fail one key at a time; marking them here
+        // routes those failures to the executor's per-key cooldowns instead of
+        // this table's provider-scope charges (`attempt::charge_failure`). An
+        // OAuth row rotates sessions inside ar-exec and stays
+        // single-credential at this table's scope.
+        for provider in &config.providers {
+            if provider.api_keys.len() > 1 {
+                resilience.mark_multi(provider.id.as_str());
+            }
+        }
+
         AppState {
             config,
             exec: self.exec,
-            resilience: Arc::new(Resilience::new()),
+            resilience,
             lkgp: Arc::new(LkgpPins::new()),
             rr: Arc::new(AtomicU64::new(0)),
             metrics: Arc::new(Metrics::new()),
