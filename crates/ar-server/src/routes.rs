@@ -1835,22 +1835,24 @@ fn order(state: &AppState, candidates: Vec<Candidate>) -> Vec<ChainTarget> {
 /// Winner-first fallback chain.
 /// Winner-first fallback chain.
 fn build_chain(picked: &ProviderId, candidates: &[Candidate]) -> Vec<ChainTarget> {
+    // The winner's own (provider, model) pair is what this chain leads with;
+    // every other candidate stays a fallback. A provider excluded wholesale
+    // would strand a combo pairing two models on one multi-key provider —
+    // a sibling model is a different failure domain under key cycling.
+    let winner = candidates.iter().find(|c| c.provider == *picked);
     let mut chain = candidates
         .iter()
-        .filter(|c| c.provider != *picked)
+        .filter(|c| !matches!(winner, Some(w) if c.provider == w.provider && c.model == w.model))
         .map(target_of)
         .collect::<Vec<_>>();
     // The winner leads even when no candidate matches it (`pick` only ever
     // returns one of them, so this is the empty-list guard rather than a branch).
     chain.insert(
         0,
-        candidates
-            .iter()
-            .find(|c| c.provider == *picked)
-            .map_or_else(
-                || ChainTarget::new(picked.clone(), Strng::from(picked.as_str())),
-                target_of,
-            ),
+        winner.map_or_else(
+            || ChainTarget::new(picked.clone(), Strng::from(picked.as_str())),
+            target_of,
+        ),
     );
     // The failure domain is the credential, not the provider: a combo pairing
     // two models on one multi-key provider must keep both targets, or its
