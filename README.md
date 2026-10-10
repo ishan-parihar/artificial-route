@@ -2,7 +2,7 @@
 
 **One OpenAI-compatible endpoint over 276 providers — a static binary that idles at ~28 MiB serving the full catalog.**
 
-[![release](https://img.shields.io/github/v/release/ishan-parihar/artificial-route)](https://github.com/ishan-parihar/artificial-route/releases) [![license](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE) [![musl](https://img.shields.io/badge/binary-static--musl-lightgrey)](https://github.com/ishan-parihar/artificial-route/releases) ![tests](https://img.shields.io/badge/tests-1874_passing-brightgreen)
+[![release](https://img.shields.io/github/v/release/ishan-parihar/artificial-route)](https://github.com/ishan-parihar/artificial-route/releases) [![license](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE) [![musl](https://img.shields.io/badge/binary-static--musl-lightgrey)](https://github.com/ishan-parihar/artificial-route/releases) ![tests](https://img.shields.io/badge/tests-1910_passing-brightgreen)
 
 A minimal-RAM Rust port of the [OmniRoute](https://github.com/ishan-parihar/OmniRoute) gateway core: same combos, strategies and dialects, none of the desktop. File YAML in, SSE out — no control plane, no UI, no runtime dependencies.
 
@@ -44,6 +44,7 @@ Full flag table, service details and `--uninstall` are further down under
 - **OAuth dispatch** — codex, cline, claude, gemini-cli, cursor and grok-cli: token injection, refresh on expiry, one rotation retry on 401, per-connection single-flight so a concurrent burst cannot trip `refresh_token_reused`. Two login mechanisms, both with every endpoint operator-supplied: PKCE browser redirect, and RFC 8628 **device flow** for providers that publish no redirect endpoint
 - **One terminal-status list** — 6 `(status, reason)` rows plus 1 carve-out-only row, generated into the store's CHECK clause; Cursor's `expired` and Claude's transient `invalid_grant` are carve-outs toward retry, grok-cli's `invalid_client` is a carve-out toward terminal, and a transient can never retire an account — the one remaining intentional divergence from OmniRoute's taxonomy is first-sighting timing on `(401, token_revoked)`: we retire it on the first sighting, OmniRoute on the third attempt
 - **Quota-aware failover** — per-key backoff, `Retry-After` wins, throttle anywhere outranks later transport failure
+- **Policy & gate** — a `limits:` block (per-key rpm + cumulative dollar/token ceilings + `refuse_unpriced`) enforced at the edge: `429` with `Retry-After` before any body work, `402` with the denying arm in `x-ar-deny-reason` before dispatch, spend checked against the same usage ledger the response path records into; a bearer gate armed by `aroute keys arm-gate` (master in the encrypted store, 30-day signed client tokens, `keys mint` for more, `aroute doctor` reports armed/unarmed); `aroute limits` views and edits the block, and `aroute sync` carries the dashboard's per-key rpm into it
 - **Agent-native CLI** — TOON output, `--fields` narrowing, stdout data / stderr diagnostics, exit 0/1/2, fail-loud flags
 - **Hot-reload config** — `config.yaml` watched live; secrets stay in `$VAR`, never in the file
 
@@ -107,6 +108,7 @@ under [Known gaps](#known-gaps).
 | compression | 3 engines + intensity dial, per-combo **and** per-request | 12 (+stubs), per-combo | 4, reactive, no knob |
 | upstream auth | apikey + OAuth dispatch (codex, cline, claude, gemini-cli, cursor) | apikey + 24-entry OAuth | 9 strategies, exchange-only |
 | key storage | encrypted local sqlite + `$VAR` fallback | encrypted DB | env/file/`ate-secret://` |
+| policy | `limits:` block — rpm bucket (`429`) + cumulative spend caps (`402`) per key, `refuse_unpriced`; bearer gate opt-in | per-connection quota, daily/weekly windows | local rate limit, CEL conditions |
 | model refresh | snapshot + import | sync + overlays | catalog + refresh API |
 | routes | 14 (`chat`, `messages`, `responses`, `api/chat`, `/v1/completions` legacy alias, `embeddings`, `audio/transcriptions`, `audio/translations`, `images/generations`, `ocr`, `models`, `healthz`, `metrics`) | full gateway + UI | 22 data-plane |
 
@@ -154,13 +156,13 @@ Measured 2026-10-01, `aroute` 0.1.1 against a live OmniRoute v16.3.1, both on lo
 | unknown model | 400, names the routable combos | 400, suggests a `provider/` prefix |
 | malformed JSON | 400 | 400 |
 | unknown path | 404, JSON envelope carrying the path and the routable list | 404, JSON envelope carrying the path |
-| `/v1/*` auth | none, see below | API key required, 401 JSON envelope without one |
+| `/v1/*` auth | opt-in bearer gate — armed by `aroute keys arm-gate`, 30-day signed tokens; open until armed, see the warning below | API key required, 401 JSON envelope without one |
 | RSS | **~21.7MB** (2026-10-03 re-measure, `/proc/PID/status` VmRSS, with `narenas:2,dirty_decay_ms:1000,muzzy_decay_ms:1000` compiled in after the closeout traced the ~120MB untuned figure to jemalloc's 4-arenas-per-CPU default) | **~823MB** (**~38x**) |
 | cold boot | ~1s | not measured |
-| CLI verbs | 10: `serve`, `models`, `providers`, `combo`, `doctor`, `run`, `configure`, `auth`, `import`, plus `mcp` behind `--features mcp` | ~78 |
+| CLI verbs | 13: `serve`, `models`, `providers`, `combo`, `doctor`, `run`, `configure`, `auth`, `keys`, `limits`, `import`, `sync`, `dashboard`, plus `mcp` behind `--features mcp` | ~78 |
 | MCP tools | 12-tool catalog + `tool_search`, behind the default-off `mcp` feature | 110 tools + A2A |
 | terminal-status list | 6 rows + 1 carve-out-only, generated into the store's CHECK | taxonomy it was reconciled against |
-| test gate | 42 suites, 1741 passed, 0 failed; clippy `-D warnings` clean | not measured |
+| test gate | 44 suites, 1910 passed, 0 failed; clippy `-D warnings` clean | not measured |
 
 No upstream chat call was made in either column, so the shared-route row is a
 surface match, not verified call parity. The classifiers agree except for one
@@ -336,7 +338,7 @@ For the initial one-time import, `aroute import --from omniroute --combos <stora
 
 ## Documentation
 
-`docs/00-overview.md` → `01..06` are the sources of truth (budgets, subsystems, roadmap, AXI/MCP). `AGENTS.md` holds the enforced Rust disciplines. Detail lives there; this file stays a funnel.
+`docs/` 00–07 are the standing sources of truth (budgets, subsystems, roadmap, AXI/MCP); 11–15 are the port plans with their closeouts — 15 is the policy/security layer. `AGENTS.md` holds the enforced Rust disciplines. Detail lives there; this file stays a funnel.
 
 ## Contributing
 
