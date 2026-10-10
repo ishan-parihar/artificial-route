@@ -372,7 +372,7 @@ StandardError=journal
 
 [Install]
 # Not enabled at install time — the default is "off" so the ~700 MB Node
-# child costs nothing until asked for. `systemctl --user enable` flips that
+# child costs nothing until asked for. "systemctl --user enable" flips that
 # per-machine; stop/start reclaims it on demand either way.
 WantedBy=default.target
 DASHEOF

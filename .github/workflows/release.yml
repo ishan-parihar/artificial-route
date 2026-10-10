@@ -66,10 +66,15 @@ jobs:
           sh -n install.sh
           # shellcheck's own binary, not a package manager: the runner is
           # ephemeral and this is the only step that needs it.
+          # Pinned, not `stable`: `stable` moved from 0.10.x to 0.11.0 between
+          # the v0.1.8 and v0.1.9 runs and the new version flagged backticks in
+          # a unit-file heredoc the old one never saw - a moving dependency
+          # must not gate a release. Bump the pin deliberately, with the
+          # installer re-linted locally first.
           curl -fsSL -o /tmp/sc.tar.xz \
-            https://github.com/koalaman/shellcheck/releases/download/stable/shellcheck-stable.linux.x86_64.tar.xz
+            https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz
           tar -xJf /tmp/sc.tar.xz -C /tmp
-          /tmp/shellcheck-stable/shellcheck -s sh install.sh
+          /tmp/shellcheck-v0.11.0/shellcheck -s sh install.sh
 
       - name: Smoke the installer
         run: |
