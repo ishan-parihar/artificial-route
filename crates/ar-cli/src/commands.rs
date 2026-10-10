@@ -1788,6 +1788,11 @@ fn sync_config(cli: &Cli, args: &SyncArgs) -> anyhow::Result<()> {
         next = add_missing_custom_key_refs(&next, &custom);
     }
 
+    // The credential bridge: the dashboard's connections beyond each
+    // provider's first become numbered credentials the executor cycles
+    // through when an earlier one throttles or is refused.
+    next = sync_credentials(&next, &db)?;
+
     // The dashboard's per-key request-rate ceiling, carried arm by arm. The
     // dashboard audit (docs/15) found `max_requests_per_minute` is the one
     // column that maps 1:1 — its dollar and token ceilings are *windows*
@@ -1992,6 +1997,116 @@ fn add_missing_custom_key_refs(doc: &str, custom: &[ar_registry::CustomProvider]
 /// because the config carries one key binding per provider id; rotation
 /// across a provider's pool of keys stays an engine feature. Values are
 /// written to the env file and never returned or printed.
+/// The dashboard's connections beyond each provider's first, bound as
+/// numbered credentials the provider cycles through when an earlier one
+/// throttles or is refused: `nvidia-2` in `keys:` holding `$AR_KEY_NVIDIA_2`,
+/// and the provider row's `keys:` naming them in order. Both this walk and
+/// [`sync_env_file`]'s numbering read the dashboard's own priority order, so
+/// the i-th connection here is the i-th var there.
+///
+/// A provider with one usable connection is untouched — the numbered bridge
+/// exists only where there is something to cycle — and a dashboard that
+/// cannot be read changes nothing, the same graceful-absence posture as the
+/// other importers.
+// ponytail: custom providers cycle too once CustomProvider grows a keys
+// list; the numbered bridge already covers every registry provider.
+fn sync_credentials(doc: &str, db: &Path) -> anyhow::Result<String> {
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    ) else {
+        return Ok(doc.to_owned());
+    };
+    let Ok(mut rows) = conn.prepare(concat!(
+        "SELECT provider FROM provider_connections ",
+        "WHERE is_active = 1 AND coalesce(api_key, '') != '' ",
+        "AND api_key NOT LIKE 'enc:v1:%' ",
+        "ORDER BY priority DESC, created_at ASC"
+    )) else {
+        return Ok(doc.to_owned());
+    };
+    let Ok(mapped) = rows.query_map([], |r| r.get::<_, String>(0)) else {
+        return Ok(doc.to_owned());
+    };
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for provider in mapped.flatten() {
+        *counts.entry(provider).or_insert(0) += 1;
+    }
+    let extras: BTreeMap<String, Vec<String>> = counts
+        .iter()
+        .filter(|(_, n)| **n > 1)
+        .map(|(provider, n)| {
+            (
+                provider.clone(),
+                (2..=*n).map(|i| format!("{provider}-{i}")).collect(),
+            )
+        })
+        .collect();
+    if extras.is_empty() {
+        return Ok(doc.to_owned());
+    }
+
+    let root: serde_yaml::Value = serde_yaml::from_str(doc).map_err(|e| {
+        fail(
+            e,
+            "the config did not parse as yaml; fix it by hand and re-run sync",
+        )
+    })?;
+    let Some(map) = root.as_mapping().cloned() else {
+        return Err(fail(
+            "the config is not a yaml mapping",
+            "fix it by hand and re-run sync",
+        ));
+    };
+    // `keys:` — one ref per numbered credential, merged over the existing
+    // names so a hand-set entry survives and a numbered one is overwritten
+    // by the connection it names.
+    let mut key_rows: BTreeMap<String, String> = match map.get("keys") {
+        Some(v) => serde_yaml::from_value(v.clone()).map_err(|e| {
+            fail(
+                e,
+                "the config's `keys:` block did not parse; fix it by hand and re-run sync",
+            )
+        })?,
+        None => BTreeMap::new(),
+    };
+    for (provider, names) in &extras {
+        for (i, name) in names.iter().enumerate() {
+            key_rows.insert(
+                name.clone(),
+                format!("$AR_KEY_{}_{}", import::env_name(provider), i + 2),
+            );
+        }
+    }
+    // `providers:` — the row's `keys:` list, upserted on rows with extras.
+    // An absent section binds nothing, so the numbered refs would be dead
+    // weight: the doc goes back unchanged rather than half-bridged.
+    let mut providers: Vec<ar_config::ProviderCfg> = match map.get("providers") {
+        Some(v) => serde_yaml::from_value(v.clone()).map_err(|e| {
+            fail(
+                e,
+                "the config's `providers:` block did not parse; fix it by hand and re-run sync",
+            )
+        })?,
+        None => return Ok(doc.to_owned()),
+    };
+    if providers.is_empty() {
+        return Ok(doc.to_owned());
+    }
+    for row in &mut providers {
+        if let Some(names) = extras.get(&row.id) {
+            row.keys = Some(names.clone());
+        }
+    }
+    let mut out = splice_section(doc, "keys", &import::render_keys_section(&key_rows));
+    out = splice_section(
+        &out,
+        "providers",
+        &import::render_providers_section(&providers),
+    );
+    Ok(out)
+}
+
 fn sync_env_file(env_path: &Path, db: &Path, doc: &str) -> anyhow::Result<(usize, usize, bool)> {
     let conn = rusqlite::Connection::open_with_flags(
         db,
@@ -2000,6 +2115,9 @@ fn sync_env_file(env_path: &Path, db: &Path, doc: &str) -> anyhow::Result<(usize
     // First row wins: `priority DESC, created_at ASC` puts the operator's
     // preferred connection first.
     let mut values: BTreeMap<String, String> = BTreeMap::new();
+    // How many usable connections each provider has produced so far, so the
+    // numbering below agrees with `sync_credentials`'s on the same walk.
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
     let mut stmt = conn.prepare(concat!(
         "SELECT provider, api_key FROM provider_connections ",
         "WHERE is_active = 1 AND coalesce(api_key, '') != '' ",
@@ -2020,9 +2138,18 @@ fn sync_env_file(env_path: &Path, db: &Path, doc: &str) -> anyhow::Result<(usize
             );
             continue;
         }
-        values
-            .entry(format!("AR_KEY_{}", import::env_name(&provider)))
-            .or_insert(api_key);
+        // One numbered var per usable connection, in the dashboard's own
+        // priority order: the first keeps the provider's plain name, the
+        // rest gain `_2`, `_3`... — the same numbering `sync_credentials`
+        // binds them under, so the i-th connection here is the i-th there.
+        let n = seen.entry(provider.clone()).or_insert(0);
+        *n += 1;
+        let var = if *n == 1 {
+            format!("AR_KEY_{}", import::env_name(&provider))
+        } else {
+            format!("AR_KEY_{}_{}", import::env_name(&provider), n)
+        };
+        values.insert(var, api_key);
     }
 
     // Every `$AR_KEY_*` the config names must exist in the env file afterwards.
@@ -2308,6 +2435,14 @@ mod tests {
             [],
         )
         .unwrap();
+        // A second usable nvidia connection, lower priority than k1: the
+        // cycling bridge numbers it as the provider's second credential.
+        conn.execute(
+            "INSERT INTO provider_connections (id, provider, api_key, is_active, priority, created_at) \
+             VALUES ('k1b', 'nvidia', 'nvapi-second', 1, 3, '2024-01-02')",
+            [],
+        )
+        .unwrap();
         drop(conn);
 
         let config = dir.join("config.yaml");
@@ -2337,13 +2472,29 @@ mod tests {
         assert!(cfg.contains("  - id: stack"), "combo not spliced:\n{cfg}");
         assert!(!cfg.contains("- id: old"), "stale combo survived:\n{cfg}");
         assert!(
-            cfg.contains("keys:\n  nvidia: $AR_KEY_NVIDIA\n  ghost: $AR_KEY_GHOST\nproviders:"),
-            "keys section disturbed:\n{cfg}"
+            cfg.contains("nvidia: $AR_KEY_NVIDIA\n"),
+            "the first connection keeps its name:\n{cfg}"
+        );
+        assert!(
+            cfg.contains("ghost: $AR_KEY_GHOST"),
+            "a hand-set key entry must survive the re-render:\n{cfg}"
+        );
+        assert!(
+            cfg.contains("nvidia-2: $AR_KEY_NVIDIA_2"),
+            "the second connection is not bound as a numbered credential:\n{cfg}"
+        );
+        assert!(
+            cfg.contains("keys:\n  - nvidia-2"),
+            "the provider row does not name its cycling extras:\n{cfg}"
         );
         let envdoc = std::fs::read_to_string(&env).unwrap();
         assert!(
             envdoc.contains("AR_KEY_NVIDIA=nvapi-secret"),
             "key not materialised:\n{envdoc}"
+        );
+        assert!(
+            envdoc.contains("AR_KEY_NVIDIA_2=nvapi-second"),
+            "the second connection was not materialised:\n{envdoc}"
         );
         assert!(
             !envdoc.contains("enc:v1:"),

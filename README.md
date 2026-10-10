@@ -262,6 +262,23 @@ Three keys, and every one is load-bearing: without `combos` no model is
 routable and `aroute doctor` says so, because providers are addresses and only a
 combo is something a client can ask for.
 
+A provider may name more than one credential, and the extras cycle: `key` is
+the first, `keys:` lists the rest in try order, and a throttle (429) or an auth
+refusal (401/403) on one moves traffic to the next instead of cooling the
+whole provider — a 5xx is the endpoint's fault, not the credential's, and
+charges the key nothing. `Retry-After` on a throttle is honored per key, and an
+auth refusal doubles the lockout per strike, so a dead key is probed
+geometrically less often rather than forgotten.
+
+```yaml
+providers: [{ id: nvidia, key: nvidia, keys: [nvidia-2, nvidia-3] }]
+```
+
+`aroute sync` builds that list itself: the dashboard's connections beyond each
+provider's first become numbered credentials (`nvidia-2` holding
+`$AR_KEY_NVIDIA_2`), in the dashboard's own priority order — a provider with
+seven keys there is never stuck on the first one here.
+
 To adopt an OmniRoute provider tree wholesale, `aroute import --from omniroute
 --path <OmniRoute/open-sse/config/providers> --out-dir <dir>` regenerates the
 config and the registry from OmniRoute's own source. It reports every provider

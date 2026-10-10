@@ -393,6 +393,31 @@ pub struct ProviderCfg {
     pub id: String,
     /// Name of the entry in `keys:` holding this provider's credential.
     pub key: String,
+    /// Further `keys:` entries this provider may dispatch under, tried after
+    /// `key` in the order written. One throttled or refused credential moves
+    /// traffic to the next instead of cooling the whole provider — the
+    /// cycling is the default, not an option.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<Vec<String>>,
+}
+
+impl ProviderCfg {
+    /// Every `keys:` entry this provider dispatches under, in try order.
+    ///
+    /// `key` first, then the extras, duplicates removed: a name written
+    /// twice would cool twice under one credential and gain nothing.
+    #[must_use]
+    pub fn key_refs(&self) -> Vec<&str> {
+        let mut refs = vec![self.key.as_str()];
+        if let Some(extra) = &self.keys {
+            for name in extra {
+                if !refs.contains(&name.as_str()) {
+                    refs.push(name.as_str());
+                }
+            }
+        }
+        refs
+    }
 }
 
 /// One `targets:` entry as written: a bare `provider/model` string, or the
@@ -1319,6 +1344,23 @@ impl Config {
             })
     }
 
+    /// Every credential `id` dispatches under, in try order — the provider's
+    /// `key` plus its extras, or the custom provider's one ref. `None` when
+    /// the config declares no such provider, same as [`Self::key_name`].
+    #[must_use]
+    pub fn key_names(&self, id: &str) -> Option<Vec<String>> {
+        self.providers
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.key_refs().into_iter().map(String::from).collect())
+            .or_else(|| {
+                self.custom_providers
+                    .iter()
+                    .find(|c| c.id == id)
+                    .map(|c| vec![c.key_ref.clone()])
+            })
+    }
+
     /// Whether `id` names a provider this config declares, from either list.
     #[must_use]
     pub fn declares(&self, id: &str) -> bool {
@@ -2048,6 +2090,46 @@ combos:
     fn loads_a_custom_provider_when_declared() {
         let cfg = Config::parse(CUSTOM, stub_lookup).unwrap();
         assert_eq!(cfg.custom_providers[0].id, "local-gateway");
+    }
+
+    #[test]
+    fn a_provider_may_name_extra_credentials_in_try_order() {
+        let yaml = "keys:\n  a: v\n  b: v\n  c: v\nproviders:\n  - id: openai\n    key: a\n    keys: [b, c]\n";
+        let cfg = Config::parse(yaml, stub_lookup).unwrap();
+        assert_eq!(cfg.providers[0].key_refs(), vec!["a", "b", "c"]);
+        assert_eq!(cfg.key_names("openai").unwrap(), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn a_provider_without_extras_is_its_single_key() {
+        let yaml = "keys:\n  a: v\nproviders:\n  - id: openai\n    key: a\n";
+        let cfg = Config::parse(yaml, stub_lookup).unwrap();
+        assert_eq!(cfg.providers[0].key_refs(), vec!["a"]);
+        assert!(
+            cfg.providers[0].keys.is_none(),
+            "the extras stay absent, not empty"
+        );
+    }
+
+    #[test]
+    fn duplicate_extra_credentials_collapse() {
+        let yaml =
+            "keys:\n  a: v\n  b: v\nproviders:\n  - id: openai\n    key: a\n    keys: [b, a]\n";
+        let cfg = Config::parse(yaml, stub_lookup).unwrap();
+        assert_eq!(
+            cfg.providers[0].key_refs(),
+            vec!["a", "b"],
+            "one name cools once"
+        );
+    }
+
+    #[test]
+    fn extra_credentials_round_trip_through_serialization() {
+        let yaml = "keys:\n  a: v\n  b: v\nproviders:\n  - id: openai\n    key: a\n    keys: [b]\n";
+        let cfg = Config::parse(yaml, stub_lookup).unwrap();
+        let rendered = serde_yaml::to_string(&cfg).unwrap();
+        let again = Config::parse(&rendered, stub_lookup).unwrap();
+        assert_eq!(again.providers[0].key_refs(), vec!["a", "b"]);
     }
 
     #[test]

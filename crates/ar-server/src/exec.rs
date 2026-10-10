@@ -134,6 +134,33 @@ impl std::fmt::Debug for OAuthAuth {
     }
 }
 
+/// One credential's cycling state.
+///
+/// Deliberately not the router's `Resilience` table: that one is keyed by
+/// target and answers "is this provider's model cooling"; this one is indexed
+/// beside the credential list and answers "which credential serves this
+/// provider right now". Two questions, two tables, one truth each.
+#[derive(Clone, Copy, Debug, Default)]
+struct KeySlot {
+    /// When this credential becomes usable again; `None` is usable now.
+    blocked_until: Option<std::time::Instant>,
+    /// Consecutive auth refusals (401/403). The lockout doubles per strike,
+    /// so a dead key is probed geometrically less often, not forgotten.
+    auth_strikes: u16,
+}
+
+/// A throttle with no `Retry-After` cools the credential the same three
+/// seconds the router cools the target it serves: the two tables agree on
+/// the default, or the credential comes back before the target it would
+/// dispatch for does.
+const KEY_THROTTLE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The base lockout for an auth refusal, doubling per strike and capped at
+/// thirty minutes — the same shape as `ar_route`'s lockout ladder, kept
+/// local so the credential layer owns its own ceiling in one place.
+const KEY_LOCKOUT_BASE: std::time::Duration = std::time::Duration::from_secs(30);
+const KEY_LOCKOUT_CAP: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
 /// One configured upstream provider.
 ///
 /// `Copy`-shaped metadata with a borrowed dispatch bundle at call time: the
@@ -145,8 +172,16 @@ pub struct ProviderConfig {
     pub id: ProviderId,
     /// Base URL without a trailing slash, e.g. `https://api.openai.com/v1`.
     pub base_url: String,
-    /// Bearer credential. Empty means no auth header (keyless providers).
-    pub api_key: String,
+    /// Bearer credentials this provider dispatches under, in try order. The
+    /// first is the `key:` the config names; the rest are its `keys:` extras.
+    /// An empty string means no auth header (a keyless provider), and each
+    /// entry cools on its own — a throttled or refused credential moves
+    /// traffic to the next rather than cooling the whole provider.
+    pub api_keys: Vec<String>,
+    /// One slot per [`Self::api_keys`] entry: the cycling state a dispatch
+    /// reads and the response charges. `Arc` because the row is cloned into
+    /// the by-id table and both copies must observe the same cooldowns.
+    key_state: std::sync::Arc<std::sync::Mutex<Vec<KeySlot>>>,
     /// Model id as this provider spells it. The client-facing id may differ.
     pub upstream_model: String,
     /// Dialect this provider speaks.
@@ -202,10 +237,20 @@ impl ProviderConfig {
     /// Builds a provider with no price, top rank and the OpenAI wire.
     #[must_use]
     pub fn new(id: ProviderId, base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
+        Self::with_keys(id, base_url, vec![api_key.into()])
+    }
+
+    /// The multi-credential constructor. The list carries every key in try
+    /// order and is never empty by construction — callers resolve at least
+    /// the `key:` name, and a keyless provider passes one empty string.
+    #[must_use]
+    pub fn with_keys(id: ProviderId, base_url: impl Into<String>, api_keys: Vec<String>) -> Self {
+        let state = vec![KeySlot::default(); api_keys.len()];
         Self {
             id,
             base_url: base_url.into().trim_end_matches('/').to_owned(),
-            api_key: api_key.into(),
+            api_keys,
+            key_state: std::sync::Arc::new(std::sync::Mutex::new(state)),
             upstream_model: String::new(),
             wire_format: WireFormat::Openai,
             input_usd_per_mtok: None,
@@ -373,13 +418,79 @@ impl ProviderConfig {
         stream: bool,
         upstream_model: &'a str,
     ) -> Dispatch<'a> {
+        self.dispatch_for_key(stream, upstream_model, self.pick_key())
+    }
+
+    /// [`Self::dispatch_for`] for a credential the caller has already chosen,
+    /// so the same index that served an attempt can be handed its verdict.
+    pub(crate) fn dispatch_for_key<'a>(
+        &'a self,
+        stream: bool,
+        upstream_model: &'a str,
+        key: usize,
+    ) -> Dispatch<'a> {
         Dispatch {
             base_url: &self.base_url,
             wire_format: self.wire_format,
-            api_key: &self.api_key,
+            api_key: self.api_keys.get(key).map_or("", String::as_str),
             upstream_model,
             stream,
             headers: &self.headers,
+        }
+    }
+
+    /// The credential index the next dispatch should use: the first that is
+    /// not cooling, or the soonest to recover when every one is — a dispatch
+    /// into a fully cooling set is one wasted upstream call, never a refused
+    /// one, because the router above this layer still owns the refusal.
+    #[must_use]
+    pub fn pick_key(&self) -> usize {
+        let state = self.key_state.lock().expect("key state lock");
+        let now = std::time::Instant::now();
+        if let Some(idx) = state
+            .iter()
+            .position(|slot| !slot.blocked_until.is_some_and(|t| t > now))
+        {
+            return idx;
+        }
+        state
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, slot)| slot.blocked_until.unwrap_or(now))
+            .map_or(0, |(idx, _)| idx)
+    }
+
+    /// Charges or clears the credential an attempt used, per its verdict.
+    ///
+    /// A throttle (429) and an auth refusal (401/403) are the only statuses a
+    /// *credential* earns: those move traffic to the next key. A 5xx is the
+    /// endpoint's fault — the router's own cooldown table handles it, and
+    /// charging a key for it would rotate away from a healthy credential.
+    fn note_key_result(
+        &self,
+        key: usize,
+        status: StatusCode,
+        retry_after: Option<std::time::Duration>,
+    ) {
+        let mut state = self.key_state.lock().expect("key state lock");
+        let Some(slot) = state.get_mut(key) else {
+            return;
+        };
+        if status.is_success() {
+            *slot = KeySlot::default();
+            return;
+        }
+        let now = std::time::Instant::now();
+        match status.as_u16() {
+            429 => {
+                slot.blocked_until = Some(now + retry_after.unwrap_or(KEY_THROTTLE));
+            }
+            401 | 403 => {
+                slot.auth_strikes = slot.auth_strikes.saturating_add(1).min(6);
+                let lockout = KEY_LOCKOUT_BASE * (1 << slot.auth_strikes);
+                slot.blocked_until = Some(now + lockout.min(KEY_LOCKOUT_CAP));
+            }
+            _ => {}
         }
     }
 }
@@ -528,8 +639,8 @@ impl HttpExec {
 
 impl std::fmt::Debug for HttpExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `ProviderConfig` carries `api_key`, and `Debug` on it would print the
-        // credential. Count the tables instead.
+        // `ProviderConfig` carries credentials, and `Debug` on them would print
+        // the secrets. Count the tables instead.
         f.debug_struct("HttpExec")
             .field("providers", &self.providers.len())
             .field("oauth", &self.oauth.len())
@@ -570,7 +681,11 @@ impl ArRouteExec for HttpExec {
             } else {
                 canonical.model.as_ref()
             };
-            let shape = cfg.dispatch_for(canonical.stream, requested);
+            // The credential this attempt carries, chosen here so the same
+            // index can be handed the verdict below: one key per attempt, the
+            // next usable one when an earlier key is still cooling.
+            let key = cfg.pick_key();
+            let shape = cfg.dispatch_for_key(canonical.stream, requested, key);
             // The provider's wire is rendered by `ar-exec`, not by the caller: the canonical
             // body is a provider-neutral shape, and translating it into the
             // registry's declared dialect is the executor's job. The OpenAI arm is
@@ -620,6 +735,12 @@ impl ArRouteExec for HttpExec {
 
             let status = stream.status();
             let retry_after = stream.retry_after();
+            // The credential layer's own verdict on the key that carried the
+            // attempt. OAuth sessions manage their own rotation and never
+            // read the `api_keys` list, so they are exempt.
+            if !self.oauth.contains_key(provider) {
+                cfg.note_key_result(key, status, retry_after);
+            }
             if !status.is_success() {
                 let (status, body, _) = stream.into_failure().await;
                 return Ok(Upstream::failure(status, body, retry_after));
@@ -1255,5 +1376,35 @@ mod tests {
             value.get("system").is_none(),
             "a claude body leaked onto the openai wire: {body}"
         );
+    }
+
+    #[test]
+    fn a_throttled_credential_moves_traffic_to_the_next() {
+        let p = ProviderConfig::with_keys(
+            ProviderId::new("two-keys"),
+            "https://x/v1",
+            vec!["first".to_owned(), "second".to_owned()],
+        );
+        assert_eq!(p.pick_key(), 0, "the first credential serves by default");
+
+        p.note_key_result(0, StatusCode::TOO_MANY_REQUESTS, None);
+        assert_eq!(p.pick_key(), 1, "a 429 cools the key, not the provider");
+
+        p.note_key_result(0, StatusCode::OK, None);
+        assert_eq!(
+            p.pick_key(),
+            0,
+            "a success clears the credential's throttle"
+        );
+
+        p.note_key_result(0, StatusCode::BAD_GATEWAY, None);
+        assert_eq!(
+            p.pick_key(),
+            0,
+            "a 5xx is the endpoint's fault, not the credential's"
+        );
+
+        p.note_key_result(0, StatusCode::FORBIDDEN, None);
+        assert_eq!(p.pick_key(), 1, "an auth refusal locks the credential out");
     }
 }

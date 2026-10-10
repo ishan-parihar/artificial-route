@@ -401,6 +401,31 @@ pub(crate) fn render_yaml(
 /// `aroute sync` splices this into a live `config.yaml` without touching any
 /// other section; one renderer in one place is what stops the import and the
 /// sync from disagreeing about what a combo entry looks like.
+/// Renders the `keys:` section from name -> `$VAR` refs: serde_yaml's own
+/// block style with the header prepended, so the section's spelling has the
+/// same single source as the other renderers here.
+pub(crate) fn render_keys_section(entries: &BTreeMap<String, String>) -> String {
+    if entries.is_empty() {
+        return "keys:\n".to_owned();
+    }
+    format!(
+        "keys:\n{}",
+        serde_yaml::to_string(entries).expect("a string map serializes")
+    )
+}
+
+/// Renders the `providers:` section: each row's `id`, `key`, and the optional
+/// ordered `keys:` extras in the struct's own field order.
+pub(crate) fn render_providers_section(rows: &[ar_config::ProviderCfg]) -> String {
+    if rows.is_empty() {
+        return "providers:\n".to_owned();
+    }
+    format!(
+        "providers:\n{}",
+        serde_yaml::to_string(rows).expect("a provider list serializes")
+    )
+}
+
 pub(crate) fn render_combos_section(combos: &[Combo]) -> String {
     let mut out: Vec<String> = vec!["combos:".to_owned()];
     for c in combos {

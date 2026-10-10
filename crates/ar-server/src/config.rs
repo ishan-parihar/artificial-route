@@ -1485,16 +1485,27 @@ fn resolve_target(
             // one with no account and therefore nothing to put in `keys:`.
             Some(entry) => entry,
             None => {
-                let key_name = cfg.key_name(provider).unwrap_or(provider);
-                let key = resolve_key(cfg, provider, key_name, store)?;
-                let mut entry = ProviderConfig::new(ProviderId::new(provider), &def.base_url, key)
-                    .with_wire_format(def.wire_format)
-                    .with_headers(def.headers.clone())
-                    // The catalog's `authType`, carried so `is_dispatchable` can tell a
-                    // provider that *needs* an OAuth executor from one that merely has a
-                    // session configured. Without it, `oauth: None` would mean both
-                    // "keyless" and "labelled oauth, and this build cannot do it".
-                    .with_needs_oauth_executor(def.auth_kind.as_ref() == "oauth");
+                // Every credential this provider names, resolved in try order: one that
+                // throttles or is refused moves traffic to the next inside the executor.
+                // An unresolved name fails the whole provider rather than leaving a hole
+                // the cycle would fall into mid-stream.
+                let names: Vec<String> = cfg
+                    .key_names(provider)
+                    .unwrap_or_else(|| vec![provider.to_owned()]);
+                let mut keys = Vec::with_capacity(names.len());
+                for name in &names {
+                    keys.push(resolve_key(cfg, provider, name, store)?);
+                }
+                let key_name = names.first().map_or(provider, String::as_str);
+                let mut entry =
+                    ProviderConfig::with_keys(ProviderId::new(provider), &def.base_url, keys)
+                        .with_wire_format(def.wire_format)
+                        .with_headers(def.headers.clone())
+                        // The catalog's `authType`, carried so `is_dispatchable` can tell a
+                        // provider that *needs* an OAuth executor from one that merely has a
+                        // session configured. Without it, `oauth: None` would mean both
+                        // "keyless" and "labelled oauth, and this build cannot do it".
+                        .with_needs_oauth_executor(def.auth_kind.as_ref() == "oauth");
                 if let Some(auth) = resolve_oauth(cfg, provider, key_name, store)? {
                     entry = entry.with_oauth(auth);
                 }
@@ -1753,7 +1764,7 @@ oauth:
         )
         .expect("the free tier builds");
         let row = cfg.providers.first().expect("one dispatch row");
-        assert_eq!(row.api_key, "anonymous");
+        assert_eq!(row.api_keys[0], "anonymous");
         assert_eq!(
             row.headers.get("X-KILOCODE-EDITORNAME").map(String::as_str),
             Some("artificial-route")
@@ -2702,8 +2713,9 @@ combos:
             .iter()
             .find(|p| p.id.as_str() == "openai")
             .expect("openai row")
-            .api_key
-            .as_str()
+            .api_keys
+            .first()
+            .map_or("", String::as_str)
     }
 
     #[test]
@@ -2842,7 +2854,7 @@ combos:
         let cfg = parse(CUSTOM_YAML).expect("config parses");
         let server =
             ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("the node merges");
-        assert_eq!(server.providers[0].api_key, "k-local");
+        assert_eq!(server.providers[0].api_keys[0], "k-local");
     }
 
     #[test]
