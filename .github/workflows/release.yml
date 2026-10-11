@@ -19,6 +19,15 @@ on:
 permissions:
   contents: write
 
+# One release pipeline per tag, ever: a re-pushed tag cancels the in-flight
+# run rather than building the same asset twice in parallel — double the
+# minutes and a race over the release's asset list. `cancel-in-progress` is
+# safe here because publishing is the last step and the action is
+# replace-mode; a cancelled run leaves nothing half-published.
+concurrency:
+  group: release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   release:
     runs-on: ubuntu-latest
