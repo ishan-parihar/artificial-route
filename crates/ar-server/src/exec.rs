@@ -149,6 +149,19 @@ struct KeySlot {
     auth_strikes: u16,
 }
 
+/// The rotating cursor over one provider's credential list.
+///
+/// Rounds-robin rather than "first non-cooling": a sticky `position()` hands
+/// every request to account #1 until it throttles, provoking the rate-limit
+/// storms the rotation is meant to prevent. "Dynamic round robin of the
+/// accounts within each provider" is the contract this cursor implements.
+#[derive(Clone, Copy, Debug, Default)]
+struct KeyCursor {
+    /// Index of the credential that served the last dispatch; `None` before
+    /// the first pick, so the rotation starts at the top of the list.
+    last: Option<usize>,
+}
+
 /// A throttle with no `Retry-After` cools the credential the same three
 /// seconds the router cools the target it serves: the two tables agree on
 /// the default, or the credential comes back before the target it would
@@ -182,6 +195,9 @@ pub struct ProviderConfig {
     /// reads and the response charges. `Arc` because the row is cloned into
     /// the by-id table and both copies must observe the same cooldowns.
     key_state: std::sync::Arc<std::sync::Mutex<Vec<KeySlot>>>,
+    /// The rotating credential cursor, shared with `key_state` for the same
+    /// reason: every clone of this row must advance one rotation, not its own.
+    key_cursor: std::sync::Arc<std::sync::Mutex<KeyCursor>>,
     /// Model id as this provider spells it. The client-facing id may differ.
     pub upstream_model: String,
     /// Dialect this provider speaks.
@@ -251,6 +267,7 @@ impl ProviderConfig {
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             api_keys,
             key_state: std::sync::Arc::new(std::sync::Mutex::new(state)),
+            key_cursor: std::sync::Arc::new(std::sync::Mutex::new(KeyCursor::default())),
             upstream_model: String::new(),
             wire_format: WireFormat::Openai,
             input_usd_per_mtok: None,
@@ -439,20 +456,33 @@ impl ProviderConfig {
         }
     }
 
-    /// The credential index the next dispatch should use: the first that is
-    /// not cooling, or the soonest to recover when every one is — a dispatch
-    /// into a fully cooling set is one wasted upstream call, never a refused
-    /// one, because the router above this layer still owns the refusal.
+    /// The credential index the next dispatch should use: the next non-cooling
+    /// slot *after the one that served last*, wrapping — the rotation that
+    /// spreads load across every account instead of burning the first one
+    /// until it throttles. When every slot is cooling, the soonest to recover
+    /// serves — a dispatch into a fully cooling set is one wasted upstream
+    /// call, never a refused one, because the router above this layer still
+    /// owns the refusal.
     #[must_use]
     pub fn pick_key(&self) -> usize {
         let state = self.key_state.lock().expect("key state lock");
+        let mut cursor = self.key_cursor.lock().expect("key cursor lock");
         let now = std::time::Instant::now();
-        if let Some(idx) = state
-            .iter()
-            .position(|slot| !slot.blocked_until.is_some_and(|t| t > now))
-        {
-            return idx;
+        let usable = |slot: &KeySlot| !slot.blocked_until.is_some_and(|t| t > now);
+        let n = state.len();
+        // The scan starts at `last + 1` so the same credential never serves
+        // twice in a row while a healthy sibling exists; before the first
+        // dispatch it starts at the top of the list.
+        let start = cursor.last.map_or(0, |l| (l + 1) % n.max(1));
+        for off in 0..n {
+            let idx = (start + off) % n;
+            if usable(&state[idx]) {
+                cursor.last = Some(idx);
+                return idx;
+            }
         }
+        // All cooling: soonest to recover, without advancing the cursor —
+        // the rotation resumes where it left off once windows expire.
         state
             .iter()
             .enumerate()
@@ -1385,7 +1415,7 @@ mod tests {
             "https://x/v1",
             vec!["first".to_owned(), "second".to_owned()],
         );
-        assert_eq!(p.pick_key(), 0, "the first credential serves by default");
+        assert_eq!(p.pick_key(), 0, "the first credential serves first");
 
         p.note_key_result(0, StatusCode::TOO_MANY_REQUESTS, None);
         assert_eq!(p.pick_key(), 1, "a 429 cools the key, not the provider");
@@ -1400,11 +1430,53 @@ mod tests {
         p.note_key_result(0, StatusCode::BAD_GATEWAY, None);
         assert_eq!(
             p.pick_key(),
-            0,
-            "a 5xx is the endpoint's fault, not the credential's"
+            1,
+            "a 5xx does not advance the rotation past a healthy sibling"
         );
 
-        p.note_key_result(0, StatusCode::FORBIDDEN, None);
-        assert_eq!(p.pick_key(), 1, "an auth refusal locks the credential out");
+        p.note_key_result(1, StatusCode::FORBIDDEN, None);
+        assert_eq!(p.pick_key(), 0, "an auth refusal locks the credential out");
+    }
+
+    #[test]
+    fn keys_round_robin_across_requests() {
+        // "Dynamic round robin of the accounts within each provider": three
+        // healthy credentials must serve three consecutive requests in
+        // rotation, not three dispatches onto account #1.
+        let p = ProviderConfig::with_keys(
+            ProviderId::new("three-keys"),
+            "https://x/v1",
+            vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
+        );
+        let first = p.pick_key();
+        let second = p.pick_key();
+        let third = p.pick_key();
+        assert_eq!(
+            (first, second, third),
+            (0, 1, 2),
+            "healthy credentials rotate: got {first},{second},{third}"
+        );
+        assert_eq!(p.pick_key(), 0, "the rotation wraps");
+    }
+
+    #[test]
+    fn rotation_skips_the_cooling_key_and_resumes_after_it() {
+        let p = ProviderConfig::with_keys(
+            ProviderId::new("three-keys"),
+            "https://x/v1",
+            vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
+        );
+        // Land the cursor on 1 so the next pick starts at 2.
+        assert_eq!(p.pick_key(), 0);
+        assert_eq!(p.pick_key(), 1);
+        p.note_key_result(2, StatusCode::TOO_MANY_REQUESTS, None);
+        assert_eq!(
+            p.pick_key(),
+            0,
+            "a cooling key is skipped without breaking the rotation"
+        );
+        // The wrapped rotation lands back on the cooled key only when it is
+        // usable again — but it must not be stuck: the pick after 0 is 1.
+        assert_eq!(p.pick_key(), 1);
     }
 }

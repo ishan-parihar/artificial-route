@@ -494,6 +494,13 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
     // Tracked separately from `last`: a 429 on p1 followed by a dead socket on
     // p2 is still "come back in 30s", not "the gateway is broken".
     let mut throttled_by: Option<ProviderId> = None;
+    // The soonest recovery among targets skipped *before dispatch* — a key or
+    // model still cooling, or a provider behind an open breaker. When every
+    // target is skipped, this window is the only honest answer the client can
+    // get: a bare 503 reads as "gateway broken" and a client that retries
+    // immediately just re-walks the same cooling chain.
+    let mut earliest_skipped: Option<Duration> = None;
+    let mut skipped_by: Option<ProviderId> = None;
 
     for target in fallback_chain {
         if tried as usize >= MAX_ATTEMPTS {
@@ -512,17 +519,41 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
         // asked for while the dead one stays in the pool.
         if resilience.is_cooling_for(provider.as_str(), model) {
             tracing::debug!(provider = %provider, model, "skipping cooling target");
+            if let Some(remaining) = resilience
+                .model_cooling(provider.as_str(), model)
+                .or_else(|| resilience.cooling(provider.as_str()))
+            {
+                // The provider attribution tracks the *minimum*, so the Retry
+                // names the target whose window the client is actually waiting
+                // for — not merely the last one walked.
+                let is_new_min =
+                    earliest_skipped.is_none_or(|prev: Duration| remaining < prev);
+                if is_new_min {
+                    earliest_skipped = Some(remaining);
+                    skipped_by = Some(provider.clone());
+                }
+            }
             continue;
         }
         // The breaker is the whole-provider layer: many targets on one provider
         // fail together, and one dead endpoint should not cost a round trip per
-        // target while it is down.
+        // target while it is down. `breaker_state` is the read-only twin of
+        // `is_usable`: the probe was already spent above on the cooling gate
+        // order, and this branch must not spend another on a provider it is
+        // about to skip anyway.
         if !resilience.is_usable(provider.as_str()) {
             tracing::debug!(
                 provider = %provider,
                 state = ?resilience.breaker_state(provider.as_str()),
                 "skipping provider behind an open breaker"
             );
+            // An open breaker's window is `opened_at + reset_window` — not
+            // exposed per provider, but `is_retired` reports `Open` forever and
+            // a retirement has no window worth advertising. A live breaker's
+            // remaining time is approximated by the breaker reset ceiling only
+            // when it is genuinely open; the cooldown table above is the precise
+            // source for key/model windows, so this arm records nothing and the
+            // aggregate stays honest to what the tables know.
             continue;
         }
 
@@ -598,7 +629,14 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
         last = Some(verdict);
     }
 
-    Ok(terminate(last, throttled_by, earliest_throttled, tried))
+    Ok(terminate(
+        last,
+        throttled_by,
+        earliest_throttled,
+        tried,
+        earliest_skipped,
+        skipped_by,
+    ))
 }
 
 /// Collapses the chain's verdicts into the loop's terminal outcome.
@@ -616,9 +654,24 @@ fn terminate(
     throttled_by: Option<ProviderId>,
     earliest: Option<Duration>,
     tried: u16,
+    earliest_skipped: Option<Duration>,
+    skipped_by: Option<ProviderId>,
 ) -> AttemptOutcome {
     let Some((status, provider, cooldown, _, error_body, retry_after)) = last else {
-        // Nothing was tried: every key was already cooling.
+        // Nothing was dispatched. When the skips left a recovery window — a
+        // key or model still cooling — the client gets a 429 with that window
+        // rather than a 503 that reads as "gateway broken" and invites an
+        // immediate re-walk of the same cooling chain.
+        if let (Some(after), Some(provider)) = (
+            earliest_skipped.map(|d| d.max(Duration::from_millis(1))),
+            skipped_by,
+        ) {
+            return AttemptOutcome::Retry {
+                after,
+                provider,
+                tried,
+            };
+        }
         return AttemptOutcome::Abort(AbortReport {
             status: StatusCode::SERVICE_UNAVAILABLE,
             reason: "every provider in the chain is cooling down".to_owned(),
@@ -989,12 +1042,37 @@ mod tests {
     }
 
     #[test]
-    fn aborts_when_every_key_cooling() {
+    fn retries_with_the_recovery_window_when_every_key_cooling() {
+        // Every target skipped before dispatch, with a real window on record:
+        // the client gets a 429 + the soonest recovery, not a 503 that reads as
+        // "gateway broken". This is the wedge shape the incident traced — omp
+        // retried immediately, re-walked the same cooling chain, and stacked
+        // circuit-breaker opens on top of a plain 3s cooldown.
         let exec = Scripted::new(vec![]);
         let r = Resilience::new();
-        r.record_failure("p1", None);
-        r.record_failure("p2", None);
+        r.record_failure("p1", Some(Duration::from_secs(30)));
+        r.record_failure("p2", Some(Duration::from_secs(60)));
         let got = block(attempt_loop(&req(), &chain(&["p1", "p2"]), &exec, &r));
+        let Ok(AttemptOutcome::Retry { after, provider, .. }) = got else {
+            panic!("expected retry, got {got:?}");
+        };
+        assert!(exec.seen().is_empty(), "no dispatch happened");
+        assert_eq!(provider.as_str(), "p1", "the soonest window names the provider");
+        assert!(
+            after <= Duration::from_secs(30) && after > Duration::from_secs(25),
+            "the window is the min recovery, not the max: {after:?}"
+        );
+    }
+
+    #[test]
+    fn aborts_when_no_target_has_a_window() {
+        // Retired targets — or a chain emptied by retirement — carry no window
+        // at all, and a Retry with an invented one would be a lie. The 503
+        // stands for the case nothing recovers from.
+        let exec = Scripted::new(vec![]);
+        let r = Resilience::new();
+        r.retire_model("p1", "m");
+        let got = block(attempt_loop(&req(), &chain(&["p1"]), &exec, &r));
         let Ok(AttemptOutcome::Abort(report)) = got else {
             panic!("expected abort, got {got:?}");
         };

@@ -400,8 +400,14 @@ impl Strategy {
             "cache-optimized" => Self::CacheOptimized,
             "fusion" => Self::Fusion,
             "pipeline" => Self::Pipeline,
-            other if other.starts_with("auto") => Self::Deferred("auto"),
             "expiry-first" => Self::ExpiryFirst,
+            // The reference's adaptive strategy. This build has no adaptive
+            // engine yet, and the closest shipped dynamic policy is
+            // `least-used` — a live count that spreads load across accounts.
+            // Mapping it keeps `strategy: auto` in a combo from silently
+            // collapsing to config order via `Deferred`'s fallback.
+            "auto" => Self::LeastUsed,
+            other if other.starts_with("auto/") => Self::Deferred("auto"),
             _ => Self::Deferred("unknown"),
         }
     }

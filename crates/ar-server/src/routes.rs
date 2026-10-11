@@ -1748,7 +1748,7 @@ pub(crate) fn resolve(
             ))),
         },
         DefaultChain::Flat => Ok(RoutePlan {
-            chain: order(state, state.config.candidates(None)),
+            chain: order(state, state.config.strategy, state.config.candidates(None)),
             strategy: state.config.strategy,
             compression: None,
             judge: None,
@@ -1792,7 +1792,11 @@ fn judge(state: &AppState, combo: &RouteCombo) -> Option<ProviderId> {
 /// A pool provider already in the chain is skipped: the loop must not spend two
 /// of its three attempt slots on one endpoint.
 fn chain(state: &AppState, combo: &RouteCombo) -> Vec<ChainTarget> {
-    let mut chain = order(state, state.config.candidates(Some(combo)));
+    let mut chain = order(
+        state,
+        combo.strategy,
+        state.config.candidates(Some(combo)),
+    );
     for target in state.config.pool(combo) {
         if !chain.iter().any(|t| t.provider == target.provider) {
             chain.push(ChainTarget::new(
@@ -1810,12 +1814,12 @@ fn chain(state: &AppState, combo: &RouteCombo) -> Vec<ChainTarget> {
 /// deduplicated: attempting the same provider twice with a different model
 /// spelling is a second round trip to an endpoint that already refused this
 /// request shape.
-fn order(state: &AppState, candidates: Vec<Candidate>) -> Vec<ChainTarget> {
+fn order(state: &AppState, strategy: Strategy, candidates: Vec<Candidate>) -> Vec<ChainTarget> {
     if candidates.is_empty() {
         return Vec::new();
     }
     match pick(
-        state.config.strategy,
+        strategy,
         None,
         &candidates,
         &state.rr,
@@ -1826,7 +1830,7 @@ fn order(state: &AppState, candidates: Vec<Candidate>) -> Vec<ChainTarget> {
             // `pick` refuses an empty list, which is checked above; anything else
             // is a strategy this build has not implemented yet. Config order is
             // the documented fallback rather than a 500.
-            tracing::warn!(error = %e, "no strategy winner; falling back to config order");
+            tracing::warn!(error = %e, strategy = %strategy, "no strategy winner; falling back to config order");
             candidates.iter().map(target_of).collect()
         }
     }
