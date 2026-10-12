@@ -2,7 +2,7 @@
 
 **One OpenAI-compatible endpoint over 276 providers — a static binary that idles at ~28 MiB serving the full catalog.**
 
-[![release](https://img.shields.io/github/v/release/ishan-parihar/artificial-route)](https://github.com/ishan-parihar/artificial-route/releases) [![license](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE) [![musl](https://img.shields.io/badge/binary-static--musl-lightgrey)](https://github.com/ishan-parihar/artificial-route/releases) ![tests](https://img.shields.io/badge/tests-1910_passing-brightgreen)
+[![release](https://img.shields.io/github/v/release/ishan-parihar/artificial-route)](https://github.com/ishan-parihar/artificial-route/releases) [![license](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE) [![musl](https://img.shields.io/badge/binary-static--musl-lightgrey)](https://github.com/ishan-parihar/artificial-route/releases) ![tests](https://img.shields.io/badge/tests-1927_passing-brightgreen)
 
 A minimal-RAM Rust port of the [OmniRoute](https://github.com/ishan-parihar/OmniRoute) gateway core: same combos, strategies and dialects, none of the desktop. File YAML in, SSE out — no control plane, no UI, no runtime dependencies.
 
@@ -37,13 +37,13 @@ Full flag table, service details and `--uninstall` are further down under
 
 ## Features
 
-- **21 routing strategies + `auto/*`** — priority, least-used, quota-weighted/fair, cost-optimized, expiry-first, reset-aware, fusion, pipeline… plus an 8-variant auto factory scored over 16 factors, with `simulate`/`explain` in the library
+- **21 routing strategies + `auto/*`** — priority, least-used, quota-weighted/fair, cost-optimized, expiry-first, reset-aware, fusion, pipeline… with `simulate`/`explain` in the library. A combo's `strategy:` reaches the pick since 0.1.12 — it was silently shadowed by the global default before. Bare `auto` maps to `least-used`; the 8-variant auto factory engages for literal `auto/*` names
 - **276 providers, 1559 models** compiled in — the same provider set as OmniRoute's registry, regenerated from it by `aroute import --from omniroute`
 - **6 wire dialects** — OpenAI, Anthropic, OpenAI-Responses, Gemini, Ollama inbound, OpenAI render; 18 further pairs named loudly instead of half-ported
 - **3 compression engines** (lite, rtk, caveman) with honor-and-echo semantics, per-combo in `config.yaml` and per-request via header, on an intensity dial (`rtk` minimal/standard/aggressive, `caveman` lite/full/ultra) rather than a dozen half-wired engine ids
 - **OAuth dispatch** — codex, cline, claude, gemini-cli, cursor and grok-cli: token injection, refresh on expiry, one rotation retry on 401, per-connection single-flight so a concurrent burst cannot trip `refresh_token_reused`. Two login mechanisms, both with every endpoint operator-supplied: PKCE browser redirect, and RFC 8628 **device flow** for providers that publish no redirect endpoint
 - **One terminal-status list** — 6 `(status, reason)` rows plus 1 carve-out-only row, generated into the store's CHECK clause; Cursor's `expired` and Claude's transient `invalid_grant` are carve-outs toward retry, grok-cli's `invalid_client` is a carve-out toward terminal, and a transient can never retire an account — the one remaining intentional divergence from OmniRoute's taxonomy is first-sighting timing on `(401, token_revoked)`: we retire it on the first sighting, OmniRoute on the third attempt
-- **Quota-aware failover** — per-key backoff, `Retry-After` wins, throttle anywhere outranks later transport failure
+- **Quota-aware failover** — per-key backoff, `Retry-After` wins, throttle anywhere outranks later transport failure. When every target in the chain is cooling before dispatch, the answer is a `429` with the soonest recovery window in `Retry-After` — never a bare 503 a client would read as "gateway broken" and retry into the same cooling chain
 - **Policy & gate** — a `limits:` block (per-key rpm + cumulative dollar/token ceilings + `refuse_unpriced`) enforced at the edge: `429` with `Retry-After` before any body work, `402` with the denying arm in `x-ar-deny-reason` before dispatch, spend checked against the same usage ledger the response path records into; a bearer gate armed by `aroute keys arm-gate` (master in the encrypted store, 30-day signed client tokens, `keys mint` for more, `aroute doctor` reports armed/unarmed); `aroute limits` views and edits the block, and `aroute sync` carries the dashboard's per-key rpm into it
 - **Agent-native CLI** — TOON output, `--fields` narrowing, stdout data / stderr diagnostics, exit 0/1/2, fail-loud flags
 - **Hot-reload config** — `config.yaml` watched live; secrets stay in `$VAR`, never in the file
@@ -131,8 +131,7 @@ explanation is [AUDIT-REPORT.md](AUDIT-REPORT.md).
 - **`kilocode` has neither mechanism declared**, so its `oauth/` row is a `fail`
   whose fix names the YAML for either one. Its device flow and anonymous dispatch
   are both ported; the dispatch wire is not.
-- **Multi-provider `auto` pools fall back to config order.** Single-provider
-  pools score identically; the auto scoring engages for literal `auto/*` names.
+- **Multi-provider `auto/*` pools fall back to config order.** Single-provider pools score identically; bare `auto` maps to `least-used` since 0.1.12, and the auto scoring engages for literal `auto/*` names.
 - **Custom providers dispatch the OpenAI wire only.** An `anthropic-compatible`
   node is accepted and named by `aroute doctor`, then refused at dispatch.
   The same limit reaches registry providers whose OmniRoute entry points at an
@@ -162,7 +161,7 @@ Measured 2026-10-01, `aroute` 0.1.1 against a live OmniRoute v16.3.1, both on lo
 | CLI verbs | 13: `serve`, `models`, `providers`, `combo`, `doctor`, `run`, `configure`, `auth`, `keys`, `limits`, `import`, `sync`, `dashboard`, plus `mcp` behind `--features mcp` | ~78 |
 | MCP tools | 12-tool catalog + `tool_search`, behind the default-off `mcp` feature | 110 tools + A2A |
 | terminal-status list | 6 rows + 1 carve-out-only, generated into the store's CHECK | taxonomy it was reconciled against |
-| test gate | 44 suites, 1910 passed, 0 failed; clippy `-D warnings` clean | not measured |
+| test gate | 44 suites, 1927 passed, 0 failed; clippy `-D warnings` clean | not measured |
 
 No upstream chat call was made in either column, so the shared-route row is a
 surface match, not verified call parity. The classifiers agree except for one
@@ -262,13 +261,7 @@ Three keys, and every one is load-bearing: without `combos` no model is
 routable and `aroute doctor` says so, because providers are addresses and only a
 combo is something a client can ask for.
 
-A provider may name more than one credential, and the extras cycle: `key` is
-the first, `keys:` lists the rest in try order, and a throttle (429) or an auth
-refusal (401/403) on one moves traffic to the next instead of cooling the
-whole provider — a 5xx is the endpoint's fault, not the credential's, and
-charges the key nothing. `Retry-After` on a throttle is honored per key, and an
-auth refusal doubles the lockout per strike, so a dead key is probed
-geometrically less often rather than forgotten.
+A provider may name more than one credential, and the extras **rotate**: `key` serves first, `keys:` lists the rest, and a rotating cursor walks them one per dispatch so load spreads across every account instead of burning the first until it throttles — the dynamic round robin OmniRoute promises. A throttle (429) or an auth refusal (401/403) on one skips it and the rotation continues with the next; when every credential is cooling, the soonest to recover serves without advancing the cursor. A 5xx is the endpoint's fault, not the credential's, and charges the key nothing. `Retry-After` on a throttle is honored per key, and an auth refusal doubles the lockout per strike, so a dead key is probed geometrically less often rather than forgotten.
 
 ```yaml
 providers: [{ id: nvidia, key: nvidia, keys: [nvidia-2, nvidia-3] }]
