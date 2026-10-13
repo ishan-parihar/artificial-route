@@ -156,3 +156,43 @@ layer, not routing, and it is the one defect I fixed only halfway.
   was never on $PATH and costs nothing to leave.
 - **Discovery's memory cost**: 34 MiB config-only → 120 MiB with 9,715
   discovered models. Documented in the unit, not a defect.
+
+## Memory-wire defect sweep (2026-10-13)
+
+Source: downstream memory-wire soak (`AROUTE_BUGS.md` in memory-wire docs),
+3,282 LLM calls through `small-stack` on 2026-10-12. Four defects, all in-repo,
+fixed here in MW1 → MW4 order. (MW labels, not B: B1–B4 above are this file's
+own blockers.)
+
+- **MW1 (their B1): 200-with-error bodies classify as success.** `classify_status`
+in `ar-route/src/attempt.rs` maps any 2xx to `Success` and only ever reads
+`error_body` (empty for 2xx); the success payload sits unread in
+`Upstream.stream` until `buffer_for_accounting` drains it for usage only.
+Fix: for non-streaming requests, the attempt loop drains the 2xx body, scans
+for a top-level `error` object (non-null; `"error":null` frames must not
+count) or an SSE `data:` error event with no content, and fails over with the
+mapped code (4xx/5xx/429, else 502) through the existing `charge_failure`
+path. Streamed client requests keep the raw relay (headers are already sent).
+- **MW2 (their B2): cline gateway envelope relayed verbatim.** The cline gateway wraps
+its OpenAI-shaped reply as `{"success":…,"data":{…}}`; `post_chat` relays
+raw bytes, so clients see an empty answer. Fix: `ar-server`'s `post_chat`
+non-stream success arm strips the envelope when the provider row's executor
+family is `OAuthKind::Cline` (keyed on `ProviderConfig::oauth_executor()`, not
+a live session — the live cline row is API-key, 6 keys). `success:false`
+becomes `Upstream::failure`; non-envelopes pass through. Stream unwrap is P2
+pending a gateway probe.
+- **MW3 (their B3): cline token/cost accounting reads 0.** Pure MW2 fallout:
+`read_and_record` reads top-level `usage`, hidden under `data`. No code fix;
+test pins non-zero `x-ar-tokens-in/out` and a matching ledger row once MW2
+lands.
+- **MW4 (their B4): multi-credential 401/403 cools nothing, one wasted round trip
+per request.** `charge_failure` returns `Duration::ZERO` for multi+401/403
+trusting the executor, but `pick_key`'s all-blocked arm still dispatches to
+the soonest-blocked key, deferring the refusal to a router that never refuses
+(live: 7-key opencode-zen, all 403 → 1,658 wasted trips). Kept semantics:
+rotation while any key is usable is untouched. Fix: executor refuses without a
+round trip only when every key is auth-blocked (`auth_strikes > 0`); the
+loop's existing transport-error arm then charges the provider cooldown and
+breaker ticks, so the dead provider leaves rotation and self-heals via
+half-open probes. One `warn!` at the transition (last live key blocks), not
+per request; `/healthz` stays liveness-only.

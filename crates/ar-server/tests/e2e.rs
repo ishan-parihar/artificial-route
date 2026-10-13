@@ -316,6 +316,125 @@ async fn e2e_returns_400_for_body_without_model() {
     assert!(text.contains("model"), "unhelpful error: {text}");
 }
 
+#[tokio::test]
+async fn e2e_fails_over_when_a_200_carries_an_error_body() {
+    // p1 answers 200 with a provider error object, p2 is healthy: the
+    // non-streaming request must fail over, not relay the error as a 200.
+    let broken = error_shaped_200().await;
+    let healthy = mock_upstream().await;
+    let config = error_shaped_config(&broken, &healthy);
+    let (router, _state) = boot_with(config, vec![]);
+    let (status, headers, text) = call(
+        &router,
+        post_chat(r#"{"model":"m1","stream":false}"#, &[]),
+    )
+    .await;
+
+    assert_eq!(status, 200, "the healthy member must serve: {text}");
+    assert!(
+        text.contains("\"content\":\"Hel\""),
+        "p2's answer did not arrive: {text}"
+    );
+    let decision = header_of(&headers, "x-ar-decision");
+    assert!(
+        decision.contains("outcome=ok") && decision.contains("provider=p2"),
+        "decision was: {decision}"
+    );
+    assert!(
+        header_of(&headers, "x-ar-usage").contains("attempts=2"),
+        "decision was: {decision}"
+    );
+}
+
+#[tokio::test]
+async fn e2e_fails_over_when_a_200_stream_carries_only_an_error() {
+    // p1 answers 200 with an error-only SSE body, p2 is healthy: the
+    // non-streaming request buffers p1's frames and must still fail over.
+    let broken = error_shaped_sse().await;
+    let healthy = mock_upstream().await;
+    let config = error_shaped_config(&broken, &healthy);
+    let (router, _state) = boot_with(config, vec![]);
+    let (status, headers, text) = call(
+        &router,
+        post_chat(r#"{"model":"m1","stream":false}"#, &[]),
+    )
+    .await;
+
+    assert_eq!(status, 200, "the healthy member must serve: {text}");
+    assert!(
+        text.contains("\"delta\":{\"content\":\"Hel\"}"),
+        "p2's answer did not arrive: {text}"
+    );
+    let decision = header_of(&headers, "x-ar-decision");
+    assert!(
+        decision.contains("outcome=ok") && decision.contains("provider=p2"),
+        "decision was: {decision}"
+    );
+}
+
+/// A 200 whose body the proxy inspected: the upstream answered 200 but its
+/// body is a provider error object, so the stub must fail over. Priority
+/// order: the error-shaped upstream first, the healthy one second.
+async fn error_shaped_200() -> String {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"id":"gen-1","error":{"code":502,"message":"Provider returned error"}}"#,
+                ))
+                .unwrap_or_else(|_| fallback(StatusCode::INTERNAL_SERVER_ERROR))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr: SocketAddr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}/v1")
+}
+
+/// A 200 whose stream carries only an error event: the non-streaming client's
+/// attempt sees the buffered frames and must fail over to the healthy member.
+async fn error_shaped_sse() -> String {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(futures::stream::iter([
+                    Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                        b"data: {\"error\":{\"code\":503,\"message\":\"busy\"}}\n\n",
+                    )),
+                    Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+                ])))
+                .unwrap_or_else(|_| fallback(StatusCode::INTERNAL_SERVER_ERROR))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr: SocketAddr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}/v1")
+}
+
+/// Two providers: the error-shaped first, the healthy mock second.
+fn error_shaped_config(broken: &str, healthy: &str) -> ServerConfig {
+    let providers = vec![
+        ProviderConfig::new(ProviderId::new("p1"), broken, "k").with_model("m1"),
+        ProviderConfig::new(ProviderId::new("p2"), healthy, "k").with_model("m2"),
+    ];
+    ServerConfig::single(20128, Strategy::Priority, providers)
+}
+
 /// An upstream that always 429s with `Retry-After: 30`.
 async fn always_429() -> String {
     let app = Router::new().route(
@@ -353,4 +472,139 @@ fn two_provider_config(throttled: &str) -> ServerConfig {
 /// Wraps padding into a valid chat body.
 fn big_body(pad: &str) -> String {
     format!(r#"{{"model":"m","pad":"{pad}"}}"#)
+}
+
+/// A gateway that answers in the Cline envelope: `{"success":true,
+/// "data":{<completion>}}`. Provider id `cline` is what keys the unwrap —
+/// `ProviderConfig::oauth_executor` parses the id — so the e2e exercises the
+/// exact production arm (an API-key cline row, no OAuth connection).
+async fn cline_gateway() -> String {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"success":true,"data":{"id":"c1","choices":[{"index":0,"message":{"role":"assistant","content":"Hel"},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":4}}}"#,
+                ))
+                .unwrap_or_else(|_| fallback(StatusCode::INTERNAL_SERVER_ERROR))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr: SocketAddr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}/v1")
+}
+
+#[tokio::test]
+async fn e2e_strips_the_cline_envelope_and_counts_its_usage() {
+    // MW2+MW3: the envelope must come off before the client sees the body
+    // (top-level `choices`), and the usage hidden under `data` must reach the
+    // token headers that read top-level `usage`. Before the unwrap both read
+    // empty: the client saw `success` and the ledger saw 0 tokens.
+    let upstream = cline_gateway().await;
+    let config = ServerConfig::single(
+        20128,
+        Strategy::Priority,
+        vec![ProviderConfig::new(ProviderId::new("cline"), &upstream, "k").with_model("m")],
+    );
+    let (router, _state) = boot_with(config, vec![]);
+    let (status, headers, text) = call(
+        &router,
+        post_chat(r#"{"model":"cline/m","stream":false}"#, &[]),
+    )
+    .await;
+
+    assert_eq!(status, 200, "body was: {text}");
+    let body: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("bare json: {text}"));
+    assert_eq!(
+        body["choices"][0]["message"]["content"], "Hel",
+        "the inner completion did not reach the client: {text}"
+    );
+    assert!(
+        body.get("success").is_none(),
+        "the envelope skin survived: {text}"
+    );
+    assert_eq!(
+        header_of(&headers, "x-ar-tokens-in"),
+        "9",
+        "headers: {headers:?}"
+    );
+    assert_eq!(header_of(&headers, "x-ar-tokens-out"), "4");
+}
+
+/// An upstream that always answers 403 and counts the dispatches it saw, so
+/// a test can prove the refusal gate stopped paying round trips (MW4).
+async fn forbidden_gateway(hits: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> String {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let hits = Arc::clone(&hits);
+            async move {
+                hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"error":{"message":"key rejected"}}"#))
+                    .unwrap_or_else(|_| fallback(StatusCode::INTERNAL_SERVER_ERROR))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr: SocketAddr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}/v1")
+}
+
+#[tokio::test]
+async fn e2e_stops_paying_round_trips_when_every_key_is_auth_locked() {
+    // MW4, the journal shape: opencode-zen, every key 403. The first two
+    // requests each strike one key; the third must be refused by the
+    // executor without the upstream ever seeing it — the hit count is the
+    // whole assertion.
+    use std::sync::atomic::Ordering;
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let upstream = forbidden_gateway(Arc::clone(&hits)).await;
+    let config = ServerConfig::single(
+        20128,
+        Strategy::Priority,
+        vec![ProviderConfig::with_keys(
+            ProviderId::new("deadkeys"),
+            &upstream,
+            vec!["k1".to_owned(), "k2".to_owned()],
+        )
+        .with_model("m")],
+    );
+    let (router, _state) = boot_with(config, vec![]);
+
+    // Two dispatches: one per credential, each earning its strike.
+    for _ in 0..2 {
+        let _ = call(&router, post_chat(r#"{"model":"deadkeys/m"}"#, &[])).await;
+    }
+    assert_eq!(
+        hits.load(Ordering::Relaxed),
+        2,
+        "each request should have spent exactly one dispatch"
+    );
+
+    // The third request: every key is auth-locked, so it must be refused
+    // without a round trip — the loop still reports a failure verdict the
+    // client can see.
+    let (status, _, _) = call(&router, post_chat(r#"{"model":"deadkeys/m"}"#, &[])).await;
+    assert_eq!(
+        hits.load(Ordering::Relaxed),
+        2,
+        "a fully auth-locked set must not pay another round trip"
+    );
+    assert_eq!(status, 502, "the refusal surfaces as a gateway failure");
 }

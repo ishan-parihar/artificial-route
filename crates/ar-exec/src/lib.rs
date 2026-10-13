@@ -23,7 +23,10 @@
 //! ([`ar_translate::to_anthropic_response`],
 //! [`ar_translate::to_responses_response`]), and
 //! `ar_translate::missing_pairs` naming every remaining re-framing cell with the
-//! reason it is still missing.
+//! reason it is still missing. The one upstream-specific response shape this
+//! crate owns is the Cline gateway's envelope ([`unwrap_cline`]): the gateway
+//! answers every provider behind it in its own skin, so the adapter lives
+//! beside the wire gate rather than in each caller that dials one.
 //!
 //! # Why `reqwest` and not `ar-pool`
 //!
@@ -463,6 +466,53 @@ impl ArExec {
         }
         Ok(Bytes::from(render_for_wire(&chat, wire)))
     }
+}
+
+/// Unwraps the Cline gateway's response envelope, if the body wears one.
+///
+/// The gateway answers OpenAI-shaped requests in its own skin:
+/// `{"success": true, "data": {<completion>}}`. A client reading that skin
+/// finds no `choices` and an accounting path reading it finds no `usage`, so
+/// the envelope has to come off before either sees the body.
+///
+/// Returns `None` when the body is not an envelope — anything but a JSON
+/// object with `success` and `data` passes through verbatim, so a gateway
+/// that stops wrapping degrades to a relay rather than a refusal.
+///
+/// `Some(Ok(inner))` is the completion bytes, re-serialised from the parsed
+/// value: whitespace-normalised, never re-framed, because the inner object is
+/// the provider's own answer and its field order is not ours to edit.
+/// `Some(Err(status))` is a `success: false` envelope: the gateway refused the
+/// request and the caller must treat it as the failure it is, with this
+/// status, rather than relaying a body shaped like an answer.
+///
+/// Non-streaming only. A stream's frames may each wear the skin — that path is
+/// open until a gateway probe pins its shape, and relaying it unchanged is the
+/// honest half of this function.
+#[must_use]
+pub fn unwrap_cline(body: &[u8]) -> Option<Result<Bytes, StatusCode>> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let envelope = value.as_object()?;
+    let success = envelope.get("success")?.as_bool()?;
+    let data = envelope.get("data")?;
+    if !success {
+        // The gateway's refusal: prefer the payload's own numeric code when
+        // it is one, else 502 — the same projection `ar-route` applies to a
+        // 2xx body carrying an error object.
+        let status = data
+            .get("error")
+            .and_then(|e| e.get("code"))
+            .and_then(serde_json::Value::as_u64)
+            .filter(|code| (100..600).contains(code))
+            .map_or(StatusCode::BAD_GATEWAY, |code| {
+                StatusCode::from_u16(code as u16).unwrap_or(StatusCode::BAD_GATEWAY)
+            });
+        return Some(Err(status));
+    }
+    if !data.is_object() {
+        return None;
+    }
+    serde_json::to_vec(data).ok().map(Bytes::from).map(Ok)
 }
 
 /// Maps a registry wire onto the renderer this build has for it.
@@ -1229,6 +1279,47 @@ mod tests {
     /// The default path must not move: same bytes, same model rewrite. Asserted
     /// against `rewrite_model` rather than against a golden string, so the
     /// delegation is what is under test.
+    #[test]
+    fn unwraps_a_cline_envelope_to_the_inner_completion() {
+        // The gateway skin: `{"success":true,"data":{<completion>}}`. The
+        // inner object is the answer the client and the usage reader need.
+        let inner = unwrap_cline(
+            br#"{"success":true,"data":{"id":"c1","choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":3}}}"#,
+        )
+        .expect("an envelope");
+        let inner = inner.expect("success");
+        let value: serde_json::Value = serde_json::from_slice(&inner).expect("inner is json");
+        assert_eq!(value["choices"][0]["message"]["content"], "hi");
+        assert_eq!(value["usage"]["prompt_tokens"], 3);
+        assert!(value.get("success").is_none(), "the skin stayed on");
+    }
+
+    #[test]
+    fn refuses_a_cline_envelope_that_reported_failure() {
+        let verdict = unwrap_cline(
+            br#"{"success":false,"data":{"error":{"code":503,"message":"busy"}}}"#,
+        )
+        .expect("an envelope");
+        assert_eq!(verdict.expect_err("a failure").as_u16(), 503);
+    }
+
+    #[test]
+    fn a_refused_envelope_with_no_usable_code_is_a_502() {
+        let verdict =
+            unwrap_cline(br#"{"success":false,"data":{"error":"nope"}}"#)
+                .expect("an envelope");
+        assert_eq!(verdict.expect_err("a failure").as_u16(), 502);
+    }
+
+    #[test]
+    fn a_bare_completion_is_not_an_envelope() {
+        // A gateway that stops wrapping degrades to a relay, not a refusal.
+        assert_eq!(
+            unwrap_cline(br#"{"choices":[{"message":{"content":"hi"}}]}"#),
+            None
+        );
+    }
+
     #[test]
     fn leaves_the_openai_wire_byte_identical() {
         let exec = ArExec::new().unwrap();

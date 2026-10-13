@@ -277,7 +277,9 @@ enum Terminal {
 /// [`Resilience::record_failure`], next to the backoff it has to beat — the
 /// same split as the upstream's `connectionCooldown.ts`.
 ///
-/// * **2xx** → `Success`.
+/// * **2xx** → `Success`, unless the attempt was non-streaming and the body
+///   itself carries an error object (see [`error_status_in_body`]) — a failed
+///   attempt wearing a 200, which fails over with the body's code.
 /// * **400 matching a stop row** → `Abort`. The body is wrong for every
 ///   provider, and replaying it is pure latency.
 /// * **everything else** → `Failover`. 429, 5xx, 401/403, 408/499 and other
@@ -285,7 +287,17 @@ enum Terminal {
 #[must_use]
 fn classify_status(status: u16, body: &str) -> Step {
     if (200..300).contains(&status) {
-        return Step::Success;
+        return match error_status_in_body(body) {
+            // A 2xx is only ever scanned when something drained its body. The
+            // streaming relay never does — its frames cross untouched — so a
+            // populated scan here always comes from a drained non-streaming
+            // attempt, and failing it over cannot split a stream the client
+            // is already reading.
+            Some(error_status) => Step::Failover {
+                status: error_status,
+            },
+            None => Step::Success,
+        };
     }
     if status == 400 && is_stop_400(body) {
         return Step::Abort {
@@ -293,6 +305,106 @@ fn classify_status(status: u16, body: &str) -> Step {
         };
     }
     Step::Failover { status }
+}
+
+/// Status a 2xx body carries when the body itself is the failure, if it is.
+///
+/// Some upstreams answer 200 with an error object — a full JSON body shaped
+/// `{"error": {...}}`, or an SSE stream whose `data:` events carry one —
+/// rather than with the error's own status. The attempt loop cannot reuse
+/// [`classify_status`]'s status-only table for those: without this scan an
+/// error-shaped 200 classifies as `Success`, is logged `outcome=ok`, and is
+/// relayed to a client that sees a 200 with no answer.
+///
+/// Pure: the same contract as `classify_status`, and unit-tested the same way.
+/// `None` means "no error found" — including `"error":null`, which the
+/// Anthropic and Responses dialects carry on healthy frames, and any body with
+/// content, where a partial answer still beats a failover that re-spends the
+/// prompt.
+///
+/// A body that fails to parse as JSON in either shape is not an error: an
+/// undecodable body is the relay's business, and inventing a failure here
+/// would cool a provider for our own parser's opinion.
+#[must_use]
+fn error_status_in_body(body: &str) -> Option<u16> {
+    const MAX_BODY_SCAN: usize = 2048;
+    let body = body.get(..body.len().min(MAX_BODY_SCAN)).unwrap_or(body);
+    error_status_in_json(body).or_else(|| error_status_in_sse(body))
+}
+
+/// `Some(status)` when the whole body is a JSON error object, else `None`.
+fn error_status_in_json(body: &str) -> Option<u16> {
+    let value: serde_json::Value = serde_json::from_str(body.trim_start()).ok()?;
+    if has_content(&value) {
+        return None;
+    }
+    error_code(value.get("error"))
+}
+
+/// `Some(status)` when an SSE body's `data:` events carry an error object and
+/// none of them carries content, else `None`.
+fn error_status_in_sse(body: &str) -> Option<u16> {
+    let mut saw_error = None;
+    let mut saw_content = false;
+    for line in body.lines() {
+        let Some(payload) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(payload.trim_start())
+        else {
+            continue;
+        };
+        if has_content(&value) {
+            saw_content = true;
+        }
+        if saw_error.is_none() {
+            saw_error = error_code(value.get("error"));
+        }
+    }
+    match (saw_error, saw_content) {
+        (Some(status), false) => Some(status),
+        _ => None,
+    }
+}
+
+/// Whether a decoded frame already delivered an answer: OpenAI `choices` with
+/// message or delta content, Anthropic `content` blocks, or Responses
+/// `output`. Presence means a failover would discard work the client could
+/// have used.
+fn has_content(value: &serde_json::Value) -> bool {
+    const NON_EMPTY_STR: fn(&serde_json::Value) -> bool =
+        |v| v.as_str().is_some_and(|s| !s.is_empty());
+    if value
+        .pointer("/choices/0/message/content")
+        .or_else(|| value.pointer("/choices/0/delta/content"))
+        .is_some_and(NON_EMPTY_STR)
+    {
+        return true;
+    }
+    value
+        .pointer("/content/0/text")
+        .or_else(|| value.pointer("/delta/text"))
+        .or_else(|| value.pointer("/output/0/content/0/text"))
+        .is_some_and(NON_EMPTY_STR)
+}
+
+/// Maps an `error` value to the status the attempt fails over with.
+///
+/// A numeric `code` that is itself an HTTP status is projected through, so a
+/// body's `429` rides the throttle path it would have ridden as a status and
+/// its windows land in the aggregate. Anything else — a string code, a missing
+/// one — is a gateway-shaped 502: the provider refused to answer a well-formed
+/// request and no chain member can do better with the same status.
+fn error_code(error: Option<&serde_json::Value>) -> Option<u16> {
+    let error = error.filter(|e| e.is_object())?;
+    match error.get("code") {
+        Some(serde_json::Value::Number(n)) => {
+            let code = n.as_u64().unwrap_or(502);
+            (100..600).contains(&code).then_some(code as u16)
+        }
+        // No usable code: the error's presence is the verdict, 502 is the shape.
+        _ => Some(502),
+    }
 }
 
 /// Splits a failover into the scope it has to be charged to, and says whether
@@ -563,8 +675,30 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
         // teaching the executor that a request can disagree with its own body.
         let attempt = canonical.clone().with_model(model);
         let verdict = match exec.call(provider, &attempt).await {
-            Ok(upstream) => {
-                match classify_status(upstream.status.as_u16(), &body_text(&upstream)) {
+            Ok(mut upstream) => {
+                // A non-streaming attempt's body is drainable here and nowhere
+                // earlier: the executor relays the success payload as a chunk
+                // stream, and `error_body` only ever holds non-2xx. Draining a
+                // streamed attempt would serialize the relay the client is
+                // already reading, so the scan below reaches streaming bodies
+                // as the empty string and can never fail them.
+                let drained = if canonical.stream {
+                    String::new()
+                } else {
+                    let body = drain_success_body(&mut upstream).await;
+                    // Re-wrap the exact bytes so the relay below is
+                    // byte-identical to what the upstream sent: the scan borrows,
+                    // the client keeps the original.
+                    let text = String::from_utf8_lossy(&body).into_owned();
+                    upstream.stream = Box::pin(futures::stream::once(async move { body }));
+                    text
+                };
+                let scan = if drained.is_empty() {
+                    body_text(&upstream)
+                } else {
+                    drained
+                };
+                match classify_status(upstream.status.as_u16(), &scan) {
                     Step::Success => {
                         // Success clears all error state for this key
                         // (`connectionCooldown.ts`), so the next failure of an
@@ -698,6 +832,24 @@ fn terminate(
     }
 }
 
+/// Drains a success payload the loop already owns, so a non-streaming 2xx
+/// can be scanned for an error-shaped body before it classifies.
+///
+/// The payload is a `Pin<Box<dyn Stream>>`: borrowing the `Pin<Box<..>>`
+/// gives a `Pin<&mut dyn Stream>`, which `StreamExt::next` polls in place.
+/// The caller re-wraps the returned bytes as the new stream — draining
+/// without re-wrapping would eat the relay the client is owed.
+async fn drain_success_body(upstream: &mut Upstream) -> Bytes {
+    use futures::StreamExt as _;
+    let mut buffered = Vec::new();
+    let stream: &mut crate::contract::ChunkStream = &mut upstream.stream;
+    let mut stream = stream.as_mut();
+    while let Some(chunk) = stream.next().await {
+        buffered.extend_from_slice(&chunk);
+    }
+    Bytes::from(buffered)
+}
+
 /// UTF-8 body of a failed upstream, lossily decoded and capped.
 ///
 /// The cap is not a size optimisation: a 400 body is scanned by
@@ -730,6 +882,7 @@ mod tests {
 
     use super::{
         Fault, MAX_ATTEMPTS, Step, Terminal, attempt_loop, classify_fault, classify_status,
+        error_status_in_body,
     };
     use crate::AttemptOutcome;
     use crate::contract::{CanonicalRequest, ExecError, Executor, ProviderId, Strng, Upstream};
@@ -750,6 +903,7 @@ mod tests {
     #[derive(Clone, Debug)]
     enum Verdict {
         Ok,
+        OkBody(&'static str),
         RateLimited(Option<Duration>),
         Status(u16, &'static str),
         Transport(&'static str),
@@ -759,6 +913,11 @@ mod tests {
         fn build(&self) -> Result<Upstream, ExecError> {
             match *self {
                 Self::Ok => Ok(Upstream::success(Box::pin(futures::stream::empty()))),
+                // A 200 whose body the loop drains: one chunk, exactly what an
+                // executor relays for a non-streaming reply.
+                Self::OkBody(body) => Ok(Upstream::success(Box::pin(
+                    futures::stream::once(async move { Bytes::from_static(body.as_bytes()) }),
+                ))),
                 Self::RateLimited(retry_after) => Ok(Upstream::failure(
                     StatusCode::TOO_MANY_REQUESTS,
                     Bytes::from_static(b"slow down"),
@@ -895,6 +1054,72 @@ mod tests {
     }
 
     #[test]
+    fn an_error_shaped_200_maps_the_bodys_code() {
+        // A 200 carrying a provider's error object: HTTP 200 with
+        // `{"id":…,"error":{"code":502,…}}` (the memory-wire soak shape).
+        assert_eq!(
+            error_status_in_body(
+                r#"{"id":"gen-1","error":{"code":502,"message":"Provider returned error"}}"#
+            ),
+            Some(502)
+        );
+    }
+
+    #[test]
+    fn an_error_with_no_numeric_code_is_a_gateway_failure() {
+        assert_eq!(
+            error_status_in_body(r#"{"error":{"code":"stream_error","message":"ended"}}"#),
+            Some(502)
+        );
+    }
+
+    #[test]
+    fn a_null_error_is_not_a_failure() {
+        // Anthropic and Responses frames carry `"error":null` on healthy
+        // bodies; the scan must not flip those into failovers.
+        assert_eq!(
+            error_status_in_body(r#"{"id":"r1","error":null,"choices":[]}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn content_beats_an_error_object() {
+        // A partial answer still beats a failover that re-spends the prompt.
+        assert_eq!(
+            error_status_in_body(
+                r#"{"choices":[{"message":{"content":"hi"}}],"error":{"code":502}}"#
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn an_sse_error_event_maps_its_code() {
+        assert_eq!(
+            error_status_in_body(
+                "data: {\"error\":{\"code\":503,\"message\":\"busy\"}}\n\ndata: [DONE]\n\n"
+            ),
+            Some(503)
+        );
+    }
+
+    #[test]
+    fn an_sse_stream_with_content_is_not_failed() {
+        assert_eq!(
+            error_status_in_body(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"error\":{\"code\":502}}\n\n"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn an_undecodable_body_is_not_a_failure() {
+        assert_eq!(error_status_in_body("not json at all"), None);
+    }
+
+    #[test]
     fn fails_over_when_provider_429() {
         // p1 is rate-limited, p2 answers 200: the loop must report p2 served it.
         let exec = Scripted::new(vec![
@@ -968,6 +1193,59 @@ mod tests {
             (after, provider.as_str(), tried),
             (Duration::from_secs(30), "p1", 2)
         );
+    }
+
+    #[test]
+    fn fails_over_when_a_200_carries_an_error_body() {
+        // p1 answers 200 with an error object (the kilocode/OpenRouter shape),
+        // p2 answers 200 clean: the loop must fail over, not serve the error.
+        let exec = Scripted::new(vec![
+            Verdict::OkBody(r#"{"id":"gen-1","error":{"code":502,"message":"nope"}}"#),
+            Verdict::OkBody(r#"{"id":"r2","choices":[{"message":{"content":"hi"}}]}"#),
+        ]);
+        let r = Resilience::new();
+        let got = block(attempt_loop(&req(), &chain(&["p1", "p2"]), &exec, &r));
+        let Ok(AttemptOutcome::Succeeded { provider, .. }) = got else {
+            panic!("expected success, got {got:?}");
+        };
+        assert_eq!(provider.as_str(), "p2");
+        assert!(r.is_cooling("p1"), "the error-shaped 200 must charge p1");
+    }
+
+    #[test]
+    fn a_clean_200_still_succeeds_after_the_drain() {
+        // The drain-and-rewrap must not corrupt a healthy body's relay.
+        let exec = Scripted::new(vec![Verdict::OkBody(
+            r#"{"id":"r1","choices":[{"message":{"content":"hi"}}]}"#,
+        )]);
+        let got = block(attempt_loop(
+            &req(),
+            &chain(&["p1"]),
+            &exec,
+            &Resilience::new(),
+        ));
+        assert!(matches!(got, Ok(AttemptOutcome::Succeeded { .. })));
+    }
+
+    #[test]
+    fn reports_the_body_code_when_every_member_errors_in_200() {
+        // All three members answer 200-with-error: the client gets the last
+        // member's projected code, not a 200.
+        let exec = Scripted::new(vec![
+            Verdict::OkBody(r#"{"error":{"code":503}}"#),
+            Verdict::OkBody(r#"{"error":{"message":"down"}}"#),
+            Verdict::OkBody(r#"{"error":{"code":502}}"#),
+        ]);
+        let got = block(attempt_loop(
+            &req(),
+            &chain(&["p1", "p2", "p3"]),
+            &exec,
+            &Resilience::new(),
+        ));
+        let Ok(AttemptOutcome::Failover { status, tried, .. }) = got else {
+            panic!("expected failover, got {got:?}");
+        };
+        assert_eq!((status, tried), (502, 3));
     }
 
     #[test]

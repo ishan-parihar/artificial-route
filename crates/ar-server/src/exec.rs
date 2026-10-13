@@ -34,7 +34,10 @@
 //! Gemini SSE when the router picked a Gemini provider. The two non-streaming
 //! envelopes built for that job are `ar_translate::to_anthropic_response` and
 //! `ar_translate::to_responses_response`, and `ar_translate::missing_pairs` names
-//! every remaining re-framing cell with its reason.
+//! every remaining re-framing cell with its reason. The one response shape this
+//! layer owns sits one level down: a gateway's private envelope
+//! ([`ar_exec::unwrap_cline`]), stripped per provider row before the router
+//! ever sees the body.
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -460,9 +463,10 @@ impl ProviderConfig {
     /// slot *after the one that served last*, wrapping — the rotation that
     /// spreads load across every account instead of burning the first one
     /// until it throttles. When every slot is cooling, the soonest to recover
-    /// serves — a dispatch into a fully cooling set is one wasted upstream
-    /// call, never a refused one, because the router above this layer still
-    /// owns the refusal.
+    /// serves — a throttle window is seconds and the lockout probe has to
+    /// happen somewhere, so a fully throttled set still pays one round trip.
+    /// An *auth*-locked set is different: [`Self::all_keys_auth_blocked`] is
+    /// what refuses those before the socket is spent (MW4).
     #[must_use]
     pub fn pick_key(&self) -> usize {
         let state = self.key_state.lock().expect("key state lock");
@@ -503,6 +507,16 @@ impl ProviderConfig {
         retry_after: Option<std::time::Duration>,
     ) {
         let mut state = self.key_state.lock().expect("key state lock");
+        let now = std::time::Instant::now();
+        let usable = |slot: &KeySlot| !slot.blocked_until.is_some_and(|t| t > now);
+        let is_auth = matches!(status.as_u16(), 401 | 403);
+        // Whether any *sibling* is still live before this verdict lands —
+        // computed before the mutable borrow, so the transition below reads
+        // "this key was the last one standing".
+        let sibling_live = state
+            .iter()
+            .enumerate()
+            .any(|(i, slot)| i != key && usable(slot));
         let Some(slot) = state.get_mut(key) else {
             return;
         };
@@ -510,7 +524,6 @@ impl ProviderConfig {
             *slot = KeySlot::default();
             return;
         }
-        let now = std::time::Instant::now();
         match status.as_u16() {
             429 => {
                 slot.blocked_until = Some(now + retry_after.unwrap_or(KEY_THROTTLE));
@@ -522,6 +535,38 @@ impl ProviderConfig {
             }
             _ => {}
         }
+        // The transition, not the steady state: warn exactly once, when the
+        // last live credential blocks. Every subsequent refusal while the set
+        // is fully locked is already covered by the one line above — and the
+        // operator it is for has the provider name and the status (MW4).
+        if is_auth && !sibling_live {
+            drop(state);
+            tracing::warn!(
+                provider = %self.id.as_str(),
+                status = status.as_u16(),
+                "every credential for this provider is now in auth lockout; \
+                 dispatches will be refused without a round trip until a lockout expires"
+            );
+        }
+    }
+
+    /// Whether every credential is in an auth lockout right now (MW4).
+    ///
+    /// The refusal gate for a fully dead key set: when this holds, a dispatch
+    /// can only spend a round trip on an account the credential layer already
+    /// knows is refused, so [`HttpExec::post_chat`] errors instead. Throttle
+    /// windows (429) do not count — they are seconds long and the lockout
+    /// probe must still happen; only auth strikes do. An empty or keyless row
+    /// never holds, and neither does a set with one usable sibling, so
+    /// rotation while any key answers is untouched.
+    #[must_use]
+    pub fn all_keys_auth_blocked(&self) -> bool {
+        let state = self.key_state.lock().expect("key state lock");
+        let now = std::time::Instant::now();
+        !state.is_empty()
+            && state.iter().all(|slot| {
+                slot.auth_strikes > 0 && slot.blocked_until.is_some_and(|t| t > now)
+            })
     }
 }
 
@@ -540,6 +585,59 @@ pub struct HttpExec {
     /// refresh mutex and the terminal slot are the point of it, so a per-request
     /// copy would be a per-request mutex and no circuit at all.
     oauth: HashMap<ProviderId, Arc<Connection<Connected>>>,
+}
+
+/// Strips the response envelope a gateway wraps its answers in, when the
+/// provider row says it dials that family.
+///
+/// Keyed on [`ProviderConfig::oauth_executor`] — the family the provider's
+/// *id* spells — rather than a live OAuth connection, because the live
+/// cline rows authenticate by API key and never touch the OAuth path. The
+/// gateway wraps every answer regardless of the credential's shape.
+///
+/// Non-streaming callers only: the body is small and the server buffers it
+/// for accounting anyway, so one drain here replaces two downstream
+/// confusions (an empty answer *and* a zero usage row). Streams relay
+/// untouched until the envelope's streaming shape is pinned by a probe.
+///
+/// Non-streaming attempts are drained exactly once, wherever they come
+/// from: the attempt loop must read the body to scan it for error-shaped
+/// 2xx replies (MW1), and holding the live socket open across that scan
+/// would keep a connection for bytes nobody is asking for. Draining here
+/// hands both the scan and the relay one buffer, and a streamed attempt
+/// never reaches this helper — `post_chat` short-circuits those to the
+/// chunk relay.
+async fn unwrap_response(
+    cfg: &ProviderConfig,
+    upstream: ar_exec::ChatStream,
+    status: StatusCode,
+    retry_after: Option<std::time::Duration>,
+) -> Upstream {
+    // Drained exactly once on every arm: a `ChatStream` holds the socket,
+    // and dropping it unread would close a connection the relay below
+    // still owes the client. Non-streaming replies cross the proxy in one
+    // buffer whether or not an envelope was claimed.
+    let body = drain_chat(upstream).await;
+    let single = |body: Bytes| Upstream {
+        status,
+        retry_after,
+        error_body: Bytes::new(),
+        stream: Box::pin(futures::stream::once(async move { body })),
+    };
+    if cfg.oauth_executor() != Some(OAuthKind::Cline) {
+        return single(body);
+    }
+    match ar_exec::unwrap_cline(&body) {
+        // A `success: false` envelope is a failure wearing a 200: hand the
+        // router a non-2xx verdict with the gateway's own payload, which
+        // is what the loop scans for its stop rows and charges for its
+        // cooldowns. The status override below converts it back.
+        Some(Err(failure_status)) => Upstream::failure(failure_status, body, retry_after),
+        Some(Ok(inner)) => single(inner),
+        // Not an envelope: the gateway answered bare, so relay the exact
+        // bytes rather than a re-encode of them.
+        None => single(body),
+    }
 }
 
 impl Clone for HttpExec {
@@ -690,6 +788,22 @@ impl ArRouteExec for HttpExec {
                 .get(provider)
                 .ok_or_else(|| ExecError(format!("no such provider: {provider}")))?;
 
+            // MW4: a fully auth-locked key set is refused here, before any
+            // socket is spent. The loop's transport arm charges this like any
+            // other dispatch failure — provider cooldown plus a breaker tick —
+            // so the provider leaves rotation without paying round trips for
+            // accounts the credential layer already knows are refused, and the
+            // lockout ladder's expiry still probes with a real dispatch.
+            // OAuth rows never strike `key_state` (they are exempt from
+            // `note_key_result`), so the gate cannot refuse a session row.
+            if !self.oauth.contains_key(provider) && cfg.all_keys_auth_blocked() {
+                return Err(ExecError(format!(
+                    "all {} credentials for {provider} are in auth lockout; \
+                     refusing without a round trip",
+                    cfg.api_keys.len()
+                )));
+            }
+
             // One fresh token per attempt. The tower `TimeoutLayer` already
             // bounds the handler future, and dropping it drops the `reqwest`
             // request — so this token is the belt to that suspenders, not the
@@ -776,14 +890,14 @@ impl ArRouteExec for HttpExec {
                 return Ok(Upstream::failure(status, body, retry_after));
             }
 
-            // Relay raw bytes, not decoded SSE events: `ar_route::Upstream`
-            // hands the router a `ChunkStream` of `Bytes` and the server writes
-            // them straight to the client, so upstream framing crosses the proxy
-            // untouched. A body read error terminates the stream rather than
-            // being dropped — see `ar_exec::ChatStream::into_bytes`.
-            let chunks = stream
-                .into_bytes()
-                .filter_map(|chunk| {
+            // A gateway's private envelope comes off before the router ever
+            // sees the body, on non-streaming attempts only: draining a stream
+            // here would serialize the relay the client is already reading.
+            // Non-streaming replies are drained exactly once (the loop's error
+            // scan and the accounting buffer share the one chunk); streams
+            // keep the raw relay.
+            if canonical.stream {
+                let chunks = stream.into_bytes().filter_map(|chunk| {
                     futures::future::ready(match chunk {
                         Ok(bytes) => Some(bytes),
                         Err(e) => {
@@ -791,19 +905,23 @@ impl ArRouteExec for HttpExec {
                             None
                         }
                     })
-                })
-                .boxed();
+                });
+                return Ok(Upstream {
+                    status,
+                    // A 2xx can still carry `Retry-After` (an overloaded
+                    // stream asking the *client* to slow down), and the router
+                    // reports it.
+                    retry_after,
+                    error_body: Bytes::new(),
+                    stream: chunks.boxed(),
+                });
+            }
+            return Ok(unwrap_response(cfg, stream, status, retry_after).await);
 
-            Ok(Upstream {
-                status,
-                // A 2xx can still carry `Retry-After` (an overloaded stream
-                // asking the *client* to slow down), and the router reports it.
-                retry_after,
-                error_body: Bytes::new(),
-                stream: chunks,
-            })
         })
     }
+
+
 
     /// POSTs a media body and reads the whole reply.
     ///
@@ -877,6 +995,30 @@ impl ArRouteExec for HttpExec {
             })
         })
     }
+}
+
+/// Drains a live upstream response into one buffer.
+///
+/// The single drain for non-streaming attempts: `post_chat` must read the
+/// body to strip a gateway envelope, and the attempt loop must read it again
+/// to scan for error-shaped 2xx replies — both work off buffers, never off
+/// the socket, so a read error here ends the relay rather than retrying it.
+async fn drain_chat(upstream: ar_exec::ChatStream) -> Bytes {
+    use futures::StreamExt as _;
+    let mut buffered = Vec::new();
+    // `into_bytes` returns an unnamed generator stream: `Unpin` is not
+    // implemented for it, so it is polled under `Box::pin`.
+    let mut chunks = Box::pin(upstream.into_bytes());
+    while let Some(chunk) = chunks.next().await {
+        match chunk {
+            Ok(bytes) => buffered.extend_from_slice(&bytes),
+            Err(e) => {
+                tracing::warn!(error = %e, "upstream stream ended early");
+                break;
+            }
+        }
+    }
+    Bytes::from(buffered)
 }
 
 /// Replaces the `model` field of a JSON body with `upstream_model`.
@@ -1478,5 +1620,70 @@ mod tests {
         // The wrapped rotation lands back on the cooled key only when it is
         // usable again — but it must not be stuck: the pick after 0 is 1.
         assert_eq!(p.pick_key(), 1);
+    }
+
+    #[test]
+    fn a_fully_auth_locked_set_is_refused() {
+        // MW4: the opencode-zen shape — every key 403, so the set is dead and
+        // a dispatch can only buy a refused round trip.
+        let p = ProviderConfig::with_keys(
+            ProviderId::new("two-keys"),
+            "https://x/v1",
+            vec!["a".to_owned(), "b".to_owned()],
+        );
+        p.note_key_result(0, StatusCode::FORBIDDEN, None);
+        p.note_key_result(1, StatusCode::FORBIDDEN, None);
+        assert!(
+            p.all_keys_auth_blocked(),
+            "every key struck and cooling means refuse"
+        );
+    }
+
+    #[test]
+    fn one_live_sibling_keeps_the_set_dispatchable() {
+        // Rotation while any key answers is untouched: the refusal gate must
+        // never fire on a partially healthy set.
+        let p = ProviderConfig::with_keys(
+            ProviderId::new("two-keys"),
+            "https://x/v1",
+            vec!["a".to_owned(), "b".to_owned()],
+        );
+        p.note_key_result(0, StatusCode::FORBIDDEN, None);
+        assert!(!p.all_keys_auth_blocked());
+    }
+
+    #[test]
+    fn a_throttled_set_is_not_auth_locked() {
+        // 429 windows are seconds long and the probe still has to happen —
+        // only auth strikes may refuse.
+        let p = ProviderConfig::with_keys(
+            ProviderId::new("two-keys"),
+            "https://x/v1",
+            vec!["a".to_owned(), "b".to_owned()],
+        );
+        p.note_key_result(0, StatusCode::TOO_MANY_REQUESTS, None);
+        p.note_key_result(1, StatusCode::TOO_MANY_REQUESTS, None);
+        assert!(!p.all_keys_auth_blocked());
+    }
+
+    #[test]
+    fn an_expired_lockout_is_dispatchable_again() {
+        // Backdate the lockouts: the ladder's expiry is the recovery probe,
+        // and a set whose windows have passed must answer for itself again.
+        let p = ProviderConfig::with_keys(
+            ProviderId::new("two-keys"),
+            "https://x/v1",
+            vec!["a".to_owned(), "b".to_owned()],
+        );
+        p.note_key_result(0, StatusCode::UNAUTHORIZED, None);
+        p.note_key_result(1, StatusCode::UNAUTHORIZED, None);
+        assert!(p.all_keys_auth_blocked());
+        {
+            let mut state = p.key_state.lock().expect("key state lock");
+            for slot in state.iter_mut() {
+                slot.blocked_until = Some(std::time::Instant::now());
+            }
+        }
+        assert!(!p.all_keys_auth_blocked());
     }
 }
