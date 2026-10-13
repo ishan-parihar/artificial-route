@@ -325,6 +325,19 @@ pub struct Price {
 pub struct ProviderDef {
     /// Upstream API root, without a trailing slash.
     pub base_url: String,
+    /// Endpoint this provider's dispatches POST to, when its dialect is not
+    /// served at the wire's own path.
+    ///
+    /// `None` — every compiled-in entry — keeps the wire's path rule
+    /// (`ar_exec::url::dispatch_url`): `/chat/completions` for most dialects,
+    /// the Gemini member method otherwise. `Some` carries either an absolute
+    /// path joined onto `base_url` or an absolute URL used as-is — how a
+    /// decisions-style endpoint (`/api/alpha/decisions`, `/v1/systemone`) is
+    /// addressable without pretending it is a chat collection. The body is
+    /// still the wire's: a custom provider with `openai-compatible` protocol
+    /// relays the client's JSON verbatim with the `model` field rewritten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<Strng>,
     /// Dialect label; the translation itself lives in `ar-translate`.
     pub wire_format: WireFormat,
     /// Credential kind required to call this provider.
@@ -429,6 +442,13 @@ pub struct CustomProvider {
     pub protocol: Protocol,
     /// Upstream API root. A trailing slash is trimmed at merge.
     pub base_url: String,
+    /// Endpoint this provider posts to instead of the wire's own path: an
+    /// absolute path (joined onto `base_url`) or an absolute URL. The one
+    /// spelling a non-chat endpoint needs — a decisions router answers at
+    /// `/api/alpha/decisions`, not at a chat collection, and a base URL
+    /// pointing there would still get `/chat/completions` appended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
     /// Name of the entry in `keys:` holding this node's credential.
     pub key_ref: String,
     /// Extra outbound headers, for gateways that need more than a bearer token.
@@ -445,6 +465,7 @@ impl CustomProvider {
     fn node(&self) -> ProviderDef {
         ProviderDef {
             base_url: self.base_url.trim_end_matches('/').to_owned(),
+            endpoint: self.endpoint.as_deref().map(Strng::from),
             wire_format: self.protocol.wire_format(),
             auth: AuthClass::ApiKey,
             env_hint: String::new(),
@@ -777,6 +798,7 @@ mod tests {
             id: id.to_owned(),
             protocol: Protocol::OpenaiCompatible,
             base_url: "https://api.example.invalid/v1/".to_owned(),
+            endpoint: None,
             key_ref: "k".to_owned(),
             headers: BTreeMap::from([("x-api-key".to_owned(), "$AR_TEST_X".to_owned())]),
         }

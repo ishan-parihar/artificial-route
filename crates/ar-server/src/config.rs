@@ -1501,6 +1501,7 @@ fn resolve_target(
                     ProviderConfig::with_keys(ProviderId::new(provider), &def.base_url, keys)
                         .with_wire_format(def.wire_format)
                         .with_headers(def.headers.clone())
+                        .with_endpoint(def.endpoint.as_deref().map(str::to_owned))
                         // The catalog's `authType`, carried so `is_dispatchable` can tell a
                         // provider that *needs* an OAuth executor from one that merely has a
                         // session configured. Without it, `oauth: None` would mean both
@@ -1553,6 +1554,7 @@ fn anonymous_entry(
         ProviderConfig::new(ProviderId::new(provider), &def.base_url, ANONYMOUS_API_KEY)
             .with_wire_format(def.wire_format)
             .with_headers(headers)
+            .with_endpoint(def.endpoint.as_deref().map(str::to_owned))
             .with_needs_oauth_executor(def.auth_kind.as_ref() == "oauth")
             .with_anonymous(true),
     )
@@ -2833,6 +2835,25 @@ combos:
             server.providers[0].base_url,
             "https://api.example.invalid/v1"
         );
+    }
+
+    #[test]
+    fn carries_a_custom_providers_endpoint_when_it_declares_one() {
+        // The full thread: a file-declared `endpoint:` must reach the dispatch
+        // row, because that is the field `dispatch_for_key` reads to replace
+        // the wire's own path.
+        let yaml = "keys:\n  k: v\ncustom_providers:\n  - id: or-decisions\n    protocol: openai-compatible\n    base_url: https://openrouter.ai\n    endpoint: /api/alpha/decisions\n    key_ref: k\ncombos:\n  - id: c\n    strategy: priority\n    targets:\n      - or-decisions/respan/span-01-lite:free\n";
+        let cfg = parse(yaml).expect("config parses");
+        let server =
+            ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("the node merges");
+        let row = server
+            .providers
+            .iter()
+            .find(|p| p.id.as_str() == "or-decisions")
+            .expect("the combo registered the provider");
+        assert_eq!(row.endpoint.as_deref(), Some("/api/alpha/decisions"));
+        let shape = row.dispatch_for_key(false, "respan/span-01-lite:free", 0);
+        assert_eq!(shape.endpoint, Some("/api/alpha/decisions"));
     }
 
     #[test]

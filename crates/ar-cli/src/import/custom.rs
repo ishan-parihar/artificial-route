@@ -111,6 +111,7 @@ pub(crate) fn read(path: &Path) -> Vec<CustomProvider> {
                 id: row.provider.trim().to_owned(),
                 protocol: NODE_PROTOCOL,
                 base_url: base_url.to_owned(),
+                endpoint: None,
                 // The env var is a *reference* into `keys:`, and the importer
                 // emits a key per provider id. The credential itself never
                 // leaves sqlite: `render_yaml` writes `$NAME`, never the value.

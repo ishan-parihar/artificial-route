@@ -81,6 +81,7 @@ async fn spawn_upstream(mock: Mock) -> (String, tokio::task::JoinHandle<()>) {
 fn provider(base_url: &str) -> ProviderDef {
     ProviderDef {
         base_url: base_url.to_owned(),
+        endpoint: None,
         wire_format: WireFormat::Openai,
         auth: AuthClass::ApiKey,
         env_hint: "TEST_API_KEY".to_owned(),
@@ -260,6 +261,7 @@ async fn carries_the_callers_bearer_on_an_oauth_dispatch() {
     let exec = ArExec::new().expect("client builds");
     let shape = Dispatch {
         base_url: &base_url,
+        endpoint: None,
         wire_format: WireFormat::Openai,
         api_key: "synthetic-oauth-access",
         upstream_model: "test-model",

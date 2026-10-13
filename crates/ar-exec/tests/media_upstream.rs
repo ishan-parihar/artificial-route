@@ -66,6 +66,7 @@ fn dispatch(base_url: &str) -> Dispatch<'_> {
     static NO_HEADERS: BTreeMap<String, String> = BTreeMap::new();
     Dispatch {
         base_url,
+        endpoint: None,
         wire_format: WireFormat::Openai,
         api_key: "sk-test",
         upstream_model: "",

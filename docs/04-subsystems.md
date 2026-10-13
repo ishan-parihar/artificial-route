@@ -146,9 +146,21 @@ would fail one provider at a time, at 3am. `aroute doctor` prints `pool/<id>` ro
 alongside `target/<id>` so an operator can see which half of the 7 is the 2.
 `MAX_ATTEMPTS` still caps the whole request, pool included — a pool widens *what
 is tried*, never *how long a request may spend being failed over*.
-
 Accept: a combo with `targets: [a, b]` and `pool: [c..g]` tries `a`, `b`, then
 `c` when both refuse; `pick` over a pool-only-cheaper bench still returns `a`.
+
+A provider's dispatch address is the wire's own path rule — `/chat/completions`
+for every dialect but Gemini's member-method — *unless* it declares `endpoint:`
+(`custom_providers:` field, threaded `CustomProvider` -> `ProviderDef` ->
+`ProviderConfig` -> `Dispatch`). An absolute path joins onto `base_url` under
+`endpoint_url`'s idempotent rule; an absolute URL replaces the base entirely;
+absent means the wire's rule, unchanged for every compiled-in entry. The body
+still rides the wire's renderer — for the OpenAI dialect that is a verbatim
+relay with the `model` field rewritten — so a non-chat, OpenAI-shaped endpoint
+(OpenRouter Decisions `/api/alpha/decisions`, SystemOne `/v1/systemone`) is
+served through the ordinary chat route with no second wire and no translation:
+the endpoint's own JSON crosses untouched, its reply relays untouched, and its
+`usage` (`input_tokens`/`output_tokens` spellings included) is counted.
 
 ## admission (`ar-admission`)
 

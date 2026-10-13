@@ -901,6 +901,7 @@ fn to_def(entry: &Entry, consts: &Consts, root: &Tree) -> Option<ProviderDef> {
 
     Some(ProviderDef {
         base_url: base_url.unwrap_or_default(),
+        endpoint: None,
         wire_format: wire_format(&format.unwrap_or_else(|| "openai".to_owned())),
         auth: AuthClass::ApiKey,
         env_hint: env_hint(&entry.id),

@@ -608,3 +608,100 @@ async fn e2e_stops_paying_round_trips_when_every_key_is_auth_locked() {
     );
     assert_eq!(status, 502, "the refusal surfaces as a gateway failure");
 }
+
+/// A decisions-style upstream: NOT a chat collection, only the one endpoint
+/// registered, so a wrongly appended `/chat/completions` is a 404 the test
+/// fails on. Captures the request it saw and answers the OpenRouter Decisions
+/// shape (`answers` + `usage{input_tokens,output_tokens}`, no `choices`).
+async fn decisions_upstream(
+    seen: Arc<std::sync::Mutex<Option<String>>>,
+) -> String {
+    let app = Router::new().route(
+        "/api/alpha/decisions",
+        post(move |body: Body| {
+            let seen = Arc::clone(&seen);
+            async move {
+                let bytes = axum::body::to_bytes(body, 64 * 1024)
+                    .await
+                    .unwrap_or_default();
+                *seen.lock().expect("capture") = Some(String::from_utf8_lossy(&bytes).into_owned());
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"answers":{"is_bug":{"noul":0.96,"type":"noul"}},"id":"gen-dec-1","model":"respan/span-01-lite:free","provider":"TypeSafe","usage":{"cost":0.000019992,"input_tokens":476,"output_tokens":70}}"#,
+                    ))
+                    .unwrap_or_else(|_| fallback(StatusCode::INTERNAL_SERVER_ERROR))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr: SocketAddr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn e2e_serves_a_decisions_endpoint_through_an_endpoint_override() {
+    // The Decisions shape rides the OpenAI dialect verbatim: the client posts
+    // `{model, state, questions}` — no `messages` — the body crosses untouched
+    // (bar the `model` rewrite), the URL is the provider's declared endpoint,
+    // and the reply's Anthropic-spelled usage is counted.
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let upstream = decisions_upstream(Arc::clone(&seen)).await;
+    let config = ServerConfig::single(
+        20128,
+        Strategy::Priority,
+        vec![ProviderConfig::new(
+            ProviderId::new("or-decisions"),
+            &upstream,
+            "sk-or",
+        )
+        .with_model("respan/span-01-lite:free")
+        .with_endpoint(Some("/api/alpha/decisions".to_owned()))],
+    );
+    let (router, _state) = boot_with(config, vec![]);
+
+    let (status, headers, text) = call(
+        &router,
+        post_chat(
+            r#"{"model":"respan/span-01-lite:free","state":"My checkout page shows a blank screen after I click Pay.","questions":{"is_bug":{"type":"noul","instructions":"Is the customer reporting a software defect?","criteria":{"true":"The customer describes broken or unexpected product behavior.","false":"The customer is asking a question or requesting a feature."}}}}"#,
+            // A decisions client is a JSON client: without this the e2e
+            // helper's default `Accept: text/event-stream` would force the
+            // streamed arm, whose usage headers stay zero by design.
+            &[("accept", "application/json")],
+        ),
+    )
+    .await;
+
+    assert_eq!(status, 200, "the decisions endpoint must serve: {text}");
+    assert!(
+        text.contains("\"answers\"") && text.contains("\"noul\":0.96"),
+        "the decisions reply must cross verbatim: {text}"
+    );
+    assert!(
+        !text.contains("choices"),
+        "no chat-shaped body was invented: {text}"
+    );
+    // Anthropic-spelled usage (input_tokens/output_tokens) is what the
+    // Decisions API reports; the reader normalizes it.
+    assert_eq!(
+        (header_of(&headers, "x-ar-tokens-in"), header_of(&headers, "x-ar-tokens-out")),
+        ("476".to_owned(), "70".to_owned()),
+        "usage headers were: {headers:?}"
+    );
+
+    let sent = seen.lock().expect("capture").clone().expect("request seen");
+    assert!(
+        sent.contains("\"questions\"") && sent.contains("blank screen"),
+        "the decisions body must arrive untouched: {sent}"
+    );
+    assert!(
+        sent.contains("\"model\":\"respan/span-01-lite:free\""),
+        "the model field must be rewritten to the provider spelling: {sent}"
+    );
+}

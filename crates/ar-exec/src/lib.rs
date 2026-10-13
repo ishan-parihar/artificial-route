@@ -65,6 +65,7 @@
 //! let exec = ArExec::new().unwrap();
 //! let provider = ProviderDef {
 //!     base_url: "https://api.openai.com/v1".into(),
+//!     endpoint: None,
 //!     wire_format: WireFormat::Openai,
 //!     auth: AuthClass::ApiKey,
 //!     env_hint: "OPENAI_API_KEY".into(),
@@ -320,6 +321,7 @@ impl ArExec {
     ) -> Result<ChatStream, ExecError> {
         let dispatch = Dispatch {
             base_url: &provider.base_url,
+            endpoint: provider.endpoint.as_deref(),
             wire_format: provider.wire_format,
             api_key: api_key.expose(),
             upstream_model: &chat.model,
@@ -409,6 +411,7 @@ impl ArExec {
                     d.wire_format,
                     d.base_url,
                     d.upstream_model,
+                    d.endpoint,
                 ))
                 .headers(build_headers(d.wire_format, d.api_key, d.stream, d.headers))
                 .body(body),
@@ -555,6 +558,10 @@ pub const fn outbound_wire(format: WireFormat) -> Option<OutboundWire> {
 pub struct Dispatch<'a> {
     /// Upstream API root, trailing slashes allowed ([`chat_url`] trims them).
     pub base_url: &'a str,
+    /// Endpoint this dispatch POSTs to, when the wire's own path is wrong for
+    /// it: an absolute path joined onto [`Self::base_url`] or an absolute URL.
+    /// `None` keeps the wire's path rule (see [`dispatch_url`]).
+    pub endpoint: Option<&'a str>,
     /// The provider's wire dialect. Anything this build has no renderer for is
     /// [`ExecError::UnsupportedWire`] rather than a wrong-wire POST.
     pub wire_format: WireFormat,
@@ -602,6 +609,7 @@ impl<'a> Dispatch<'a> {
     {
         Dispatch {
             base_url: self.base_url,
+            endpoint: self.endpoint,
             wire_format: self.wire_format,
             api_key,
             upstream_model: self.upstream_model,
@@ -1050,6 +1058,7 @@ mod tests {
     fn provider(stream_key: &str) -> ProviderDef {
         ProviderDef {
             base_url: "https://api.test/v1".into(),
+            endpoint: None,
             wire_format: WireFormat::Openai,
             auth: AuthClass::ApiKey,
             env_hint: stream_key.into(),
@@ -1178,6 +1187,7 @@ mod tests {
     fn dispatch_shape<'a>(dialect: WireFormat, model: &'a str) -> Dispatch<'a> {
         Dispatch {
             base_url: "https://api.test/v1",
+            endpoint: None,
             wire_format: dialect,
             api_key: "sk-x",
             upstream_model: model,

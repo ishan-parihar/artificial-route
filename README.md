@@ -315,6 +315,22 @@ custom_providers:
 
 `protocol` is `openai-compatible` or `anthropic-compatible`; only the OpenAI wire dispatches today, and `headers:` adds outbound headers for a gateway that wants something other than a bearer token. `aroute doctor` checks the base URL shape, the credential binding, and refuses an `id` that collides with a compiled-in one.
 
+An optional `endpoint:` overrides where dispatches POST — an absolute path joined onto `base_url`, or an absolute URL. Without it every non-Gemini wire goes to the wire's own path (`/chat/completions`); with it the body still rides the wire's renderer, only the URL changes. That is how a non-chat endpoint — OpenRouter's Decisions router (`respan/span-01-lite:free`, `inception/mercury-decide:free`) or SystemOne's gateway (`api.experientiallabs.ai/v1/systemone`) — is served without a second wire: the client posts the endpoint's own JSON to `/v1/chat/completions` and the relay carries it verbatim, `model` rewritten to the target's spelling, reply untouched, `usage` counted (`input_tokens`/`output_tokens` spellings included):
+
+```yaml
+custom_providers:
+  - { id: or-decisions, protocol: openai-compatible,
+      base_url: https://openrouter.ai, endpoint: /api/alpha/decisions,
+      key_ref: openrouter, headers: { HTTP-Referer: https://your.site, X-Title: aroute } }
+  - { id: exp-systemone, protocol: openai-compatible,
+      base_url: https://api.experientiallabs.ai, endpoint: /v1/systemone,
+      key_ref: experiential }
+
+combos:
+  - { id: decide, strategy: priority,
+      targets: [or-decisions/respan/span-01-lite:free, or-decisions/inception/mercury-decide:free] }
+```
+
 > [!WARNING]
 > `aroute doctor` and `aroute serve` share one target grammar: a config one accepts, the other accepts. If `serve` refuses a file, `doctor` says why.
 

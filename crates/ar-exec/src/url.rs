@@ -55,6 +55,13 @@ pub fn chat_url(base: &str) -> String {
 /// The URL a dispatch actually POSTs to, which is not always a chat-completions
 /// URL.
 ///
+/// `endpoint` overrides the wire's own path rule: an absolute path is joined
+/// onto `base` under [`endpoint_url`]'s idempotent rule, and an absolute URL
+/// replaces the whole thing. That is the one spelling a non-chat endpoint
+/// needs — a decisions router answers at `/api/alpha/decisions`, and pointing
+/// a provider's base URL there would still get `/chat/completions` appended.
+/// `None` — every compiled-in entry — keeps the rule below.
+///
 /// Every wire but Gemini's addresses a collection of models at one fixed path, so
 /// [`chat_url`] is right for all of them and for the 188 registry entries that
 /// already spell that path out. Gemini is the exception and the reason this
@@ -69,8 +76,22 @@ pub fn chat_url(base: &str) -> String {
 /// empty value to mean "send the caller's spelling", and a nameless member path
 /// cannot express that.
 #[must_use]
-pub fn dispatch_url(wire: crate::WireFormat, base: &str, model: &str) -> String {
+pub fn dispatch_url(
+    wire: crate::WireFormat,
+    base: &str,
+    model: &str,
+    endpoint: Option<&str>,
+) -> String {
     let stem = strip_trailing_slashes(base.trim());
+    if let Some(endpoint) = endpoint {
+        // An absolute endpoint is a whole URL: joining it onto anything would
+        // double the scheme. A path carries its own leading `/`, matching
+        // `endpoint_url`'s contract.
+        if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+            return endpoint.to_owned();
+        }
+        return endpoint_url(base, endpoint);
+    }
     match wire {
         crate::WireFormat::Gemini if !model.is_empty() => {
             let mut url = String::with_capacity(stem.len() + model.len() + 18);
@@ -216,6 +237,7 @@ mod tests {
                 WireFormat::Gemini,
                 "https://generativelanguage.googleapis.com/v1beta/models",
                 "gemini-3.8-flash",
+                None,
             ),
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
         );
@@ -225,6 +247,7 @@ mod tests {
                 WireFormat::Gemini,
                 "https://generativelanguage.googleapis.com/v1beta/models///",
                 "gemini-3.8-flash",
+                None,
             ),
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
         );
@@ -241,11 +264,75 @@ mod tests {
             WireFormat::Cursor,
         ] {
             assert_eq!(
-                dispatch_url(wire, "https://api.x.com/v1", "m-1"),
+                dispatch_url(wire, "https://api.x.com/v1", "m-1", None),
                 "https://api.x.com/v1/chat/completions",
                 "{wire:?} must not take the Gemini member path"
             );
         }
+    }
+
+    #[test]
+    fn an_endpoint_path_joins_onto_the_base() {
+        use crate::WireFormat;
+        // The decisions shape: a non-chat endpoint at a path the base does not
+        // carry. Appending the wire's path here is a 404 the journal would
+        // blame on the provider.
+        assert_eq!(
+            dispatch_url(
+                WireFormat::Openai,
+                "https://openrouter.ai",
+                "respan/span-01-lite:free",
+                Some("/api/alpha/decisions")
+            ),
+            "https://openrouter.ai/api/alpha/decisions"
+        );
+    }
+
+    #[test]
+    fn an_absolute_endpoint_url_replaces_the_base_entirely() {
+        use crate::WireFormat;
+        assert_eq!(
+            dispatch_url(
+                WireFormat::Openai,
+                "https://ignored.example/v1",
+                "m",
+                Some("https://api.experientiallabs.ai/v1/systemone")
+            ),
+            "https://api.experientiallabs.ai/v1/systemone"
+        );
+    }
+
+    #[test]
+    fn an_endpoint_path_that_the_base_already_carries_is_not_doubled() {
+        use crate::WireFormat;
+        // Same idempotence rule as the chat path: an operator who writes the
+        // full endpoint into both fields gets one endpoint, not two.
+        assert_eq!(
+            dispatch_url(
+                WireFormat::Openai,
+                "https://openrouter.ai/api/alpha/decisions",
+                "m",
+                Some("/api/alpha/decisions")
+            ),
+            "https://openrouter.ai/api/alpha/decisions"
+        );
+    }
+
+    #[test]
+    fn an_endpoint_overrides_even_the_gemini_member_path() {
+        // The override outranks every wire rule, including the one exception
+        // that predates it — an explicit endpoint is the operator saying the
+        // wire's addressing is wrong for this provider.
+        use crate::WireFormat;
+        assert_eq!(
+            dispatch_url(
+                WireFormat::Gemini,
+                "https://api.x.com",
+                "gemini-3.8-flash",
+                Some("/v1/systemone")
+            ),
+            "https://api.x.com/v1/systemone"
+        );
     }
 
     #[test]
@@ -255,7 +342,8 @@ mod tests {
             dispatch_url(
                 WireFormat::Gemini,
                 "https://generativelanguage.googleapis.com/v1beta/models",
-                ""
+                "",
+                None
             ),
             "https://generativelanguage.googleapis.com/v1beta/models/chat/completions"
         );

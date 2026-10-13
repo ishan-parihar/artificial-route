@@ -565,6 +565,7 @@ mod tests {
             ar_core::Strng::from("groq"),
             ar_registry::ProviderDef {
                 base_url: "https://api.groq.com".to_owned(),
+                endpoint: None,
                 wire_format: ar_registry::WireFormat::Openai,
                 auth: ar_registry::AuthClass::ApiKey,
                 env_hint: "AR_KEY_GROQ".to_owned(),

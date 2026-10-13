@@ -188,6 +188,17 @@ pub struct ProviderConfig {
     pub id: ProviderId,
     /// Base URL without a trailing slash, e.g. `https://api.openai.com/v1`.
     pub base_url: String,
+    /// Endpoint this provider POSTs to instead of the wire's own path: an
+    /// absolute path joined onto [`Self::base_url`], or an absolute URL.
+    ///
+    /// `None` — every compiled-in entry — keeps `/chat/completions` (or the
+    /// wire's member path). `Some` is how a file-declared provider serves a
+    /// non-chat endpoint: the client's JSON is still relayed by the wire's
+    /// renderer — byte-identical for the OpenAI dialect, with the `model`
+    /// field rewritten — only the URL changes. A decisions-style endpoint
+    /// (`/api/alpha/decisions`, `/v1/systemone`) is reachable this way without
+    /// a second wire.
+    pub endpoint: Option<String>,
     /// Bearer credentials this provider dispatches under, in try order. The
     /// first is the `key:` the config names; the rest are its `keys:` extras.
     /// An empty string means no auth header (a keyless provider), and each
@@ -268,6 +279,7 @@ impl ProviderConfig {
         Self {
             id,
             base_url: base_url.into().trim_end_matches('/').to_owned(),
+            endpoint: None,
             api_keys,
             key_state: std::sync::Arc::new(std::sync::Mutex::new(state)),
             key_cursor: std::sync::Arc::new(std::sync::Mutex::new(KeyCursor::default())),
@@ -288,6 +300,15 @@ impl ProviderConfig {
     #[must_use]
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.upstream_model = model.into();
+        self
+    }
+
+    /// Sets the non-chat endpoint this provider posts to (see
+    /// [`ProviderDef::endpoint`](ar_registry::ProviderDef::endpoint)); `None`
+    /// restores the wire's own path.
+    #[must_use]
+    pub fn with_endpoint(mut self, endpoint: Option<String>) -> Self {
+        self.endpoint = endpoint;
         self
     }
 
@@ -451,6 +472,7 @@ impl ProviderConfig {
     ) -> Dispatch<'a> {
         Dispatch {
             base_url: &self.base_url,
+            endpoint: self.endpoint.as_deref(),
             wire_format: self.wire_format,
             api_key: self.api_keys.get(key).map_or("", String::as_str),
             upstream_model,

@@ -3765,6 +3765,7 @@ mod tests {
 
         let shape = Dispatch {
             base_url: &format!("http://{addr}"),
+            endpoint: None,
             wire_format: WireFormat::Openai,
             api_key: "",
             upstream_model: "m",
@@ -3815,6 +3816,7 @@ mod tests {
 
         let shape = Dispatch {
             base_url: &format!("http://{addr}"),
+            endpoint: None,
             wire_format: WireFormat::Openai,
             api_key: "",
             upstream_model: "m",
@@ -3871,6 +3873,7 @@ mod tests {
 
         let shape = Dispatch {
             base_url: &format!("http://{addr}"),
+            endpoint: None,
             wire_format: WireFormat::Openai,
             api_key: "",
             upstream_model: "m",

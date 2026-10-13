@@ -2176,6 +2176,26 @@ combos:
     }
 
     #[test]
+    fn parses_an_endpoint_when_a_custom_provider_declares_one() {
+        // The decisions shape: a provider whose dialect is OpenAI-shaped but
+        // whose path is not the chat collection. Without the field there is
+        // no spelling for it at all.
+        let yaml = "keys:\n  k: v\ncustom_providers:\n  - id: or-decisions\n    protocol: openai-compatible\n    base_url: https://openrouter.ai\n    endpoint: /api/alpha/decisions\n    key_ref: k\n";
+        let cfg = Config::parse(yaml, stub_lookup).unwrap();
+        assert_eq!(
+            cfg.custom_providers[0].endpoint.as_deref(),
+            Some("/api/alpha/decisions")
+        );
+    }
+
+    #[test]
+    fn omits_the_endpoint_when_a_custom_provider_declares_none() {
+        let yaml = "keys:\n  k: v\ncustom_providers:\n  - id: mine\n    protocol: openai-compatible\n    base_url: https://api.example.invalid/v1\n    key_ref: k\n";
+        let cfg = Config::parse(yaml, stub_lookup).unwrap();
+        assert_eq!(cfg.custom_providers[0].endpoint, None);
+    }
+
+    #[test]
     fn round_trips_a_custom_provider_when_serialised_back() {
         let cfg = Config::parse(CUSTOM, stub_lookup).unwrap();
         let out = serde_yaml::to_string(&cfg).unwrap();

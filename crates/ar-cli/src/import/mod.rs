@@ -245,6 +245,7 @@ fn assemble(rows: Vec<Row>) -> anyhow::Result<Imported> {
             .entry(Strng::from(row.provider.as_str()))
             .or_insert_with(|| ProviderDef {
                 base_url,
+                endpoint: None,
                 wire_format: known.map_or(WireFormat::Openai, |d| d.wire_format),
                 auth: AuthClass::ApiKey,
                 env_hint: row
