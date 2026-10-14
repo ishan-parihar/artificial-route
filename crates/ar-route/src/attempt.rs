@@ -698,7 +698,29 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
                 } else {
                     drained
                 };
-                match classify_status(upstream.status.as_u16(), &scan) {
+                let mut step = classify_status(upstream.status.as_u16(), &scan);
+                // The first-byte gate: a streamed attempt is only committed
+                // once its first byte crosses (or the window gives up on it).
+                // The client's 200 + SSE headers are sent when this loop
+                // returns, so until then a 200 whose stream dies byte-less is
+                // still failover-able — and that is exactly the shape nvidia's
+                // transport drops produce (a 2xx, then a decode error on the
+                // first body read, swallowed to an early end at the exec
+                // boundary). Without the gate the client gets a zero-frame
+                // truncated stream and never learns another member existed.
+                if canonical.stream && matches!(step, Step::Success) {
+                    match gate_first_byte(&mut upstream, FIRST_BYTE_WINDOW).await {
+                        StreamGate::Byte | StreamGate::Elapsed => {}
+                        StreamGate::Empty => {
+                            tracing::warn!(
+                                provider = %provider,
+                                "2xx stream produced no bytes; failing over"
+                            );
+                            step = Step::Failover { status: 502 };
+                        }
+                    }
+                }
+                match step {
                     Step::Success => {
                         // Success clears all error state for this key
                         // (`connectionCooldown.ts`), so the next failure of an
@@ -839,6 +861,51 @@ fn terminate(
 /// gives a `Pin<&mut dyn Stream>`, which `StreamExt::next` polls in place.
 /// The caller re-wraps the returned bytes as the new stream — draining
 /// without re-wrapping would eat the relay the client is owed.
+/// How long a streamed attempt waits for its first upstream byte before the
+/// loop commits it blind ([`FIRST_BYTE_WINDOW`]).
+///
+/// The window is the load-bearing part of the first-byte gate: committing
+/// without it would hold the client's headers for a slow-to-elong provider
+/// whose first token can legitimately take tens of seconds, and routes'
+/// keepalive frames — the first-token watchdog cover — only flow after the
+/// response commits. 10s is far under every client watchdog the reference
+/// gateway documents, and far above the near-instant socket death the gate
+/// exists to catch.
+const FIRST_BYTE_WINDOW: Duration = Duration::from_secs(10);
+
+/// The first-byte gate's verdict for one streamed attempt.
+enum StreamGate {
+    /// A byte crossed; it is re-wrapped in front of the stream.
+    Byte,
+    /// The stream ended before producing anything: a dead attempt wearing 200.
+    Empty,
+    /// The window elapsed with no verdict; the attempt commits blind.
+    Elapsed,
+}
+
+/// Polls a streamed success for its first chunk within `window`.
+///
+/// `Ok(Some)` re-wraps the chunk in front of the remaining stream, so the
+/// relay stays byte-identical; `Ok(None)` is the zero-byte end that fails
+/// over; the timeout drops the poll mid-flight, and `StreamExt::next` is
+/// cancel-safe, so the blind commit loses nothing the upstream already sent.
+async fn gate_first_byte(upstream: &mut Upstream, window: Duration) -> StreamGate {
+    use futures::StreamExt as _;
+    match tokio::time::timeout(window, upstream.stream.next()).await {
+        Ok(Some(first)) => {
+            let rest = std::mem::replace(
+                &mut upstream.stream,
+                Box::pin(futures::stream::empty()),
+            );
+            upstream.stream =
+                Box::pin(futures::stream::iter([first]).chain(rest));
+            StreamGate::Byte
+        }
+        Ok(None) => StreamGate::Empty,
+        Err(_elapsed) => StreamGate::Elapsed,
+    }
+}
+
 async fn drain_success_body(upstream: &mut Upstream) -> Bytes {
     use futures::StreamExt as _;
     let mut buffered = Vec::new();
@@ -904,6 +971,7 @@ mod tests {
     enum Verdict {
         Ok,
         OkBody(&'static str),
+        OkChunks(&'static [&'static str]),
         RateLimited(Option<Duration>),
         Status(u16, &'static str),
         Transport(&'static str),
@@ -917,6 +985,13 @@ mod tests {
                 // executor relays for a non-streaming reply.
                 Self::OkBody(body) => Ok(Upstream::success(Box::pin(
                     futures::stream::once(async move { Bytes::from_static(body.as_bytes()) }),
+                ))),
+                // A 200 whose stream carries several frames, in order — what a
+                // live SSE relay looks like to the first-byte gate.
+                Self::OkChunks(chunks) => Ok(Upstream::success(Box::pin(
+                    futures::stream::iter(
+                        chunks.iter().map(|c| Bytes::from_static(c.as_bytes())),
+                    ),
                 ))),
                 Self::RateLimited(retry_after) => Ok(Upstream::failure(
                     StatusCode::TOO_MANY_REQUESTS,
@@ -1028,6 +1103,26 @@ mod tests {
         CanonicalRequest::new("m", Bytes::from_static(b"{}"))
     }
 
+    /// Drives a future on a minimal Tokio runtime, for the streamed tests:
+    /// the first-byte gate's timer needs a reactor, which the bare executor
+    /// [`block`] does not start.
+    fn block_rt<F: Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(f)
+    }
+
+    /// The same request, asked for as a stream: what a `"stream": true`
+    /// client produces.
+    fn req_stream() -> CanonicalRequest {
+        CanonicalRequest {
+            stream: true,
+            ..req()
+        }
+    }
+
     /// A chain of targets that all serve `m`, which is the model
     /// [`CanonicalRequest::new`] builds in [`req`]. Model-per-target behaviour is
     /// [`targets`]'s business.
@@ -1117,6 +1212,66 @@ mod tests {
     #[test]
     fn an_undecodable_body_is_not_a_failure() {
         assert_eq!(error_status_in_body("not json at all"), None);
+    }
+
+    #[test]
+    fn fails_over_when_a_2xx_stream_produces_no_bytes() {
+        // MW5: p1 answers 200 with a stream that dies before its first byte —
+        // the nvidia transport-drop shape. Nothing is committed yet, so the
+        // loop must fail over instead of handing the client a zero-frame
+        // truncated stream.
+        let exec = Scripted::new(vec![
+            Verdict::Ok,
+            Verdict::OkBody("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"),
+        ]);
+        let r = Resilience::new();
+        let got = block_rt(attempt_loop(&req_stream(), &chain(&["p1", "p2"]), &exec, &r));
+        let Ok(AttemptOutcome::Succeeded { provider, attempts, .. }) = got else {
+            panic!("expected success, got {got:?}");
+        };
+        assert_eq!((provider.as_str(), attempts), ("p2", 2));
+        assert!(r.is_cooling("p1"), "the empty stream must charge p1");
+    }
+
+    #[test]
+    fn commits_a_stream_once_its_first_byte_crosses() {
+        // The gate re-wraps the polled byte in front of the stream, so a live
+        // attempt loses nothing: the relay the client gets starts with the
+        // exact first chunk the upstream sent.
+        let exec = Scripted::new(vec![Verdict::OkChunks(&[
+            "data: first\n\n",
+            "data: second\n\n",
+        ])]);
+        let got = block_rt(attempt_loop(
+            &req_stream(),
+            &chain(&["p1"]),
+            &exec,
+            &Resilience::new(),
+        ));
+        let Ok(AttemptOutcome::Succeeded { upstream, .. }) = got else {
+            panic!("expected success, got {got:?}");
+        };
+        let collected = block_rt(async {
+            use futures::StreamExt as _;
+            upstream.stream.collect::<Vec<Bytes>>().await
+        });
+        let joined = collected.concat();
+        assert_eq!(joined, Bytes::from_static(b"data: first\n\ndata: second\n\n"));
+    }
+
+    #[test]
+    fn a_non_streaming_success_is_untouched_by_the_gate() {
+        // The gate is scoped to stream requests: a non-streaming 2xx with an
+        // empty body (already covered by the MW1 scan) still succeeds — the
+        // gate must not turn every bare-200 into a failover.
+        let exec = Scripted::new(vec![Verdict::Ok]);
+        let got = block(attempt_loop(
+            &req(),
+            &chain(&["p1"]),
+            &exec,
+            &Resilience::new(),
+        ));
+        assert!(matches!(got, Ok(AttemptOutcome::Succeeded { .. })));
     }
 
     #[test]

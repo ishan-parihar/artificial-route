@@ -705,3 +705,66 @@ async fn e2e_serves_a_decisions_endpoint_through_an_endpoint_override() {
         "the model field must be rewritten to the provider spelling: {sent}"
     );
 }
+
+/// An upstream that answers 200 and then closes without producing a single
+/// byte — the nvidia transport-drop shape (MW5): a success status wearing a
+/// dead socket, before anything has been committed to the client.
+async fn dead_stream_upstream() -> String {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::empty())
+                .unwrap_or_else(|_| fallback(StatusCode::INTERNAL_SERVER_ERROR))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr: SocketAddr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}/v1")
+}
+
+#[tokio::test]
+async fn e2e_fails_over_when_a_streamed_200_dies_before_its_first_byte() {
+    // p1 answers 200 with a zero-byte stream, p2 streams normally: the client
+    // asked to stream, nothing was committed when p1 died, so the proxy must
+    // hand the client p2's stream rather than a truncated empty one.
+    let dead = dead_stream_upstream().await;
+    let healthy = mock_upstream().await;
+    let config = ServerConfig::single(
+        20128,
+        Strategy::Priority,
+        vec![
+            ProviderConfig::new(ProviderId::new("p1"), &dead, "k").with_model("m1"),
+            ProviderConfig::new(ProviderId::new("p2"), &healthy, "k").with_model("m2"),
+        ],
+    );
+    let (router, _state) = boot_with(config, vec![]);
+    let (status, headers, text) = call(
+        &router,
+        post_chat(r#"{"model":"m1","stream":true}"#, &[]),
+    )
+    .await;
+
+    assert_eq!(status, 200, "the healthy member must serve: {text}");
+    assert!(
+        text.contains("\"delta\":{\"content\":\"Hel\"}"),
+        "p2's stream did not arrive: {text}"
+    );
+    assert!(text.contains("data: [DONE]"), "stream must finish cleanly: {text}");
+    let decision = header_of(&headers, "x-ar-decision");
+    assert!(
+        decision.contains("outcome=ok") && decision.contains("provider=p2"),
+        "decision was: {decision}"
+    );
+    assert!(
+        header_of(&headers, "x-ar-usage").contains("attempts=2"),
+        "decision was: {decision}"
+    );
+}

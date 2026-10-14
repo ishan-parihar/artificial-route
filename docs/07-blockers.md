@@ -180,7 +180,22 @@ non-stream success arm strips the envelope when the provider row's executor
 family is `OAuthKind::Cline` (keyed on `ProviderConfig::oauth_executor()`, not
 a live session — the live cline row is API-key, 6 keys). `success:false`
 becomes `Upstream::failure`; non-envelopes pass through. Stream unwrap is P2
-pending a gateway probe.
+  pending a gateway probe.
+- **MW5 (streaming, 2026-10-14): a 2xx whose stream produced no bytes committed
+  anyway.** The loop returned `Success` on status alone; routes then sent the
+  client a 200 with SSE headers, and the upstream (nvidia, this time: transport
+  decode errors on the first body read) died before a single byte crossed — a
+  zero-frame truncated stream the client reads as an interruption, though
+  nothing had been committed and failover was still possible. Fix: for streamed
+  attempts, the loop polls the first chunk within a 10s window before returning
+  `Success` — a byte arrives, it is re-wrapped in front of the stream and the
+  attempt commits; the stream ends byte-less, it is reclassified
+  `Failover { status: 502 }` through the ordinary charge path; the window
+  elapses, the attempt commits blind and routes' keepalive frames cover the
+  first-token wait exactly as before (slow-first-token providers lose nothing).
+  A stream that dies *after* content started flowing is still un-failable —
+  headers and bytes are out — and routes' in-band `stream_error` frame remains
+  the honest terminal for that class.
 - **MW3 (their B3): cline token/cost accounting reads 0.** Pure MW2 fallout:
 `read_and_record` reads top-level `usage`, hidden under `data`. No code fix;
 test pins non-zero `x-ar-tokens-in/out` and a matching ledger row once MW2

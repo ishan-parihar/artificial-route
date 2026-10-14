@@ -3077,7 +3077,15 @@ mod tests {
                 .lock()
                 .expect("recorder lock")
                 .push(canonical.body.clone());
-            Box::pin(async move { Ok(Upstream::success(Box::pin(futures::stream::empty()))) })
+            Box::pin(async move {
+                // One inert OpenAI chunk, not an empty stream: since the MW5
+                // first-byte gate, a 2xx whose stream yields no byte fails
+                // over, and an empty fixture stream would turn every streamed
+                // test into a 503.
+                Ok(Upstream::success(Box::pin(futures::stream::once(
+                    async { Bytes::from_static(b"data: {\"choices\":[{\"delta\":{}}]}\n\n") },
+                ))))
+            })
         }
 
         fn post_media<'a>(

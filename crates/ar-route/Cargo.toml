@@ -28,3 +28,11 @@ http = "1"
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# Only `time` — the first-byte gate's window in `attempt.rs`. The loop itself
+# stays runtime-agnostic; this is the one place the crate meets a timer.
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+# The first-byte gate's timer needs a reactor; the stream tests drive the
+# loop on a minimal current-thread runtime instead of the bare executor.
+tokio = { workspace = true, features = ["rt", "macros"] }
