@@ -174,7 +174,8 @@ fi
 
 # ── OS / distro detection ──────────────────────────────────────────────────────
 case "$(uname -s)" in
-  Linux) DISTRO="$(. /etc/os-release 2>/dev/null && echo "${ID:-unknown}")" ;;
+  Linux) # shellcheck disable=SC1091  # os-release is standard on Linux; the fallback below covers its absence
+    DISTRO="$(. /etc/os-release 2>/dev/null && echo "${ID:-unknown}")" ;;
   Darwin) DISTRO="macos" ;;
   *) die "no prebuilt binary for '$(uname -s)' (want Linux or macOS)" ;;
 esac
@@ -211,6 +212,8 @@ ensure_path() {
   local rc="$HOME/.bashrc"
   if [ -f "$HOME/.zshrc" ] || [ -n "${ZSH_VERSION:-}" ]; then rc="$HOME/.zshrc"; fi
   if ! grep -qs "export PATH=\"${dir}:\$PATH\"" "$rc"; then
+    # The literal \$PATH is the point: the rc file must re-expand it at login.
+    # shellcheck disable=SC2016
     printf '\n# added by aroute installer\nexport PATH="%s:$PATH"\n' "$dir" >> "$rc"
     printf '>>> generated: %s (PATH export) <<<\n' "$rc"
   fi
@@ -225,6 +228,7 @@ print_cta() {
   printf ' 💜  Support development:\n'
   printf '     GitHub Sponsors : https://github.com/sponsors/ishan-parihar\n'
   printf '     Razorpay (UPI)  : https://rzp.io/rzp/ishan-parihar\n'
+  # shellcheck disable=SC2016  # literal backticks in displayed copy, not a command substitution
   printf '     Or run `aroute donate` anytime.\n'
   printf '%s\n' "──────────────────────────────────────────────────────"
 }

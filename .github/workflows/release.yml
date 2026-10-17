@@ -83,7 +83,11 @@ jobs:
           curl -fsSL -o /tmp/sc.tar.xz \
             https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz
           tar -xJf /tmp/sc.tar.xz -C /tmp
-          /tmp/shellcheck-v0.11.0/shellcheck -s sh install.sh
+          # `-s bash`, not `-s sh`: the shebang is `#!/usr/bin/env bash` and
+          # the README's quick start runs `bash install.sh`. `-s sh` turned
+          # every bash idiom the script uses (local, pipefail, EUID) into a
+          # warning and failed the v0.1.16 run on sixteen false positives.
+          /tmp/shellcheck-v0.11.0/shellcheck -s bash install.sh
 
       - name: Smoke the installer
         run: |
