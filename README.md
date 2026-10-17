@@ -4,7 +4,7 @@
 
 [![release](https://img.shields.io/github/v/release/ishan-parihar/artificial-route)](https://github.com/ishan-parihar/artificial-route/releases) [![license](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE) [![musl](https://img.shields.io/badge/binary-static--musl-lightgrey)](https://github.com/ishan-parihar/artificial-route/releases) ![tests](https://img.shields.io/badge/tests-1927_passing-brightgreen)
 
-A minimal-RAM Rust port of the [OmniRoute](https://github.com/ishan-parihar/OmniRoute) gateway core: same combos, strategies and dialects, none of the desktop. File YAML in, SSE out — no control plane, no UI, no runtime dependencies.
+A minimal-RAM Rust port of the [OmniRoute](https://github.com/ishan-parihar/OmniRoute) gateway core: same combos, strategies and dialects, none of the desktop. File YAML in, SSE out — no runtime dependencies. A small built-in control page at [`/ui`](#control-page-ui) edits the same YAML; the full OmniRoute dashboard is an optional extra.
 
 ## Install
 
@@ -32,6 +32,8 @@ aroute serve      # loopback :20128
 curl -s localhost:20128/healthz && curl -s localhost:20128/v1/models
 ```
 
+Open **http://127.0.0.1:20128/ui/** for the control page: combos, providers, client keys and limits, a usage and failure log, and a playground. The installer prints this address (from your configured host and port) when it finishes.
+
 Full flag table, service details and `--uninstall` are further down under
 [Installation](#installation).
 
@@ -45,6 +47,7 @@ Full flag table, service details and `--uninstall` are further down under
 - **One terminal-status list** — 6 `(status, reason)` rows plus 1 carve-out-only row, generated into the store's CHECK clause; Cursor's `expired` and Claude's transient `invalid_grant` are carve-outs toward retry, grok-cli's `invalid_client` is a carve-out toward terminal, and a transient can never retire an account — the one remaining intentional divergence from OmniRoute's taxonomy is first-sighting timing on `(401, token_revoked)`: we retire it on the first sighting, OmniRoute on the third attempt
 - **Quota-aware failover** — per-key backoff, `Retry-After` wins, throttle anywhere outranks later transport failure. When every target in the chain is cooling before dispatch, the answer is a `429` with the soonest recovery window in `Retry-After` — never a bare 503 a client would read as "gateway broken" and retry into the same cooling chain. Since 0.1.13 the verdict also reads the body: a non-streaming 2xx that carries an `error` object fails over with its code instead of reaching the client as a 200, a fully auth-locked key set is refused without paying the round trip, and the Cline gateway's `{"success":…,"data":…}` reply skin is stripped (its usage is counted) rather than relayed
 - **Policy & gate** — a `limits:` block (per-key rpm + cumulative dollar/token ceilings + `refuse_unpriced`) enforced at the edge: `429` with `Retry-After` before any body work, `402` with the denying arm in `x-ar-deny-reason` before dispatch, spend checked against the same usage ledger the response path records into; a bearer gate armed by `aroute keys arm-gate` (master in the encrypted store, 30-day signed client tokens, `keys mint` for more, `aroute doctor` reports armed/unarmed); `aroute limits` views and edits the block, and `aroute sync` carries the dashboard's per-key rpm into it
+- **Built-in control page** — `/ui` on the proxy's own port: edit combos, providers and per-key limits, mint client keys, read the usage and failure log by date range, and try a combo in a playground. Vanilla JS embedded in the binary, no build step, no extra process ([details](#control-page-ui))
 - **Agent-native CLI** — TOON output, `--fields` narrowing, stdout data / stderr diagnostics, exit 0/1/2, fail-loud flags
 - **Hot-reload config** — `config.yaml` watched live; secrets stay in `$VAR`, never in the file
 
@@ -207,8 +210,13 @@ Static musl binary, checksum-verified, no runtime deps. Lands in `~/.local/bin/a
 | `--lite` | rust binary only — **the default**; the weekly update timer always runs this mode |
 | `--with-dashboard` | also install the web dashboard (see [Dashboard](#dashboard)): ~2 GiB of compiled Next.js with its traced `node_modules`, built locally by `dashboard/rebrand-dist.sh` and installed from that tree — nothing is fetched from npm. Writes an `aroute-dashboard.service` unit, **not started** |
 | `--dashboard-src <path>` | the dist to install: the `dashboard/dist` directory or a tarball of it; defaults to `dashboard/dist` beside the script |
+| `--no-cta` | skip the closing star/donate note (`SKIP_CTA=1`) |
+| `--all-harnesses` / `--no-harness` | register the MCP server (`aroute mcp`) in every detected AI harness without asking / skip it (`ALL_HARNESS=1` / `SKIP_HARNESS=1`). Claude Code and Codex are registered and verified; OpenCode gets its JSON printed. Non-interactive runs skip it unless `--all-harnesses` is given |
+| `--force-root` | allow running as root (default: refuse) |
 | `--check` | installed vs newest, config and dashboard presence, service and dashsvc state — changes nothing |
 | `--uninstall` | remove binary, unit, timer and dashboard dist; **keeps** config, credentials and the dashboard's data DB |
+
+The installer prints the portable `.mcp.json` entry for aroute's MCP server instead of writing it anywhere; paste it into a project root to use the tools there.
 
 Re-running it *is* the update path: it replaces the binary, leaves your config
 and credentials untouched, and refreshes the unit. `--check` tells you honestly
@@ -351,7 +359,32 @@ limits:
 
 Enforcement sits at the two points where refusing costs nothing. Past `rpm` the request is refused `429` with `Retry-After` before any body work — the wait is the bucket's own answer, rounded up one second so a client that waits exactly it is admitted. A projected spend at or past a ceiling is refused `402 Payment Required` with the arm named in `x-ar-deny-reason` (`usd_cap`, `token_cap`, `unpriced`, `unauditable`) and in the error envelope's `reason` — never the amounts, which the operator already knows. The projection prices the resolved model from the same pricing rows the response path bills against: input tokens are counted, output tokens are the request's own `max_tokens`, and the token ceiling counts both because the ledger records both. Cache hits skip the spend arm — a hit serves from memory and is never recorded as spend, so the cap does not deny it either. The spend arms read the usage ledger (`ar serve` opens one by default); without one they stay inert rather than pretending a ceiling they cannot evaluate, and a ledger that errors under the request fails closed. The mechanism is ported from agentgateway's local rate limiter minus its CEL bucket-keying and cache dependency; `crates/ar-limit`'s and `crates/ar-server/src/policy.rs`'s module docs name their source.
 
+A row may also carry `model:` — a combo id (or `provider/model`) — to apply only to requests for that model; the key is unrestricted for any other, falling through to `limits.default`. The scope gates *when* the row applies, not what it counts: the ledger records the serving provider's model rather than the combo asked for, so the spend arms still total the key's spend, and `rpm` stays key-wide because it is checked before the body is read.
+
+```yaml
+limits:
+  keys:
+    ci-runner: { tokens: 2000000, model: cheap }   # capped only when it asks for `cheap`
+```
+
 `aroute limits` prints the block as one row per key, `set` merges arms into a row (`--key` names a client key; the `default` row without it), and `clear` removes a row or the block. `aroute sync` updates each dashboard key's `rpm` — `api_keys.max_requests_per_minute`, the one dashboard column that maps 1:1 — and leaves every other arm as written: the dashboard's daily/weekly dollar and token windows are a different shape from these cumulative arms and are deliberately not carried.
+
+### Control page (/ui)
+
+`aroute serve` mounts a control page at `/ui/` on its own listener — same loopback bind as the proxy, nothing extra to run. It is a thin editor over `config.yaml`, `ar.env` and the usage ledger, so what it saves is what the proxy loads at its next start (a banner says when a restart is pending).
+
+| pane | what it does |
+| --- | --- |
+| Dashboard | providers, combos and keys at a glance, total spend |
+| Combos | add, reorder, edit and delete routing chains |
+| Providers | paste a key (goes to `ar.env`, never shown again), add a registry or custom provider, browse the 276-provider catalog and star favorites (kept in the browser) |
+| Client keys | mint a token (shown once; "Use in playground" hands it over in memory only) and set per-key `rpm`, dollar, token and `model` ceilings |
+| Usage | spend by day plus top models and providers over a 7/30/90-day range, and a request log filterable by model, provider and failed-only |
+| Playground | multi-turn chat with an optional system prompt through the real `/v1/chat/completions`, streaming |
+
+The request log shows answered requests from the usage ledger and failed ones from a separate `failures` table in the same SQLite file (last 10 000 kept). Failures are recorded from the build that added the table onward, authentication refusals (401/403) are not logged, and a stream that fails after it has already begun is not counted as a failure. The ledger's append-only usage rows are never touched, so spend sums and caps are unaffected.
+
+Endpoints behind it, if you want to script them: `GET /ui/api/state|usage|log|models`, `POST /ui/api/combos|provider-key|provider-custom|provider-remove|keys/mint|limits`. Plans and outcomes: [docs/19](docs/19-ui-upgrade-plan.md), [docs/23](docs/23-ui-round-two-plan.md).
 
 ### Dashboard
 
@@ -376,7 +409,7 @@ For the initial one-time import, `aroute import --from omniroute --combos <stora
 
 ## Documentation
 
-`docs/` 00–07 are the standing sources of truth (budgets, subsystems, roadmap, AXI/MCP); 11–15 are the port plans with their closeouts — 15 is the policy/security layer. `AGENTS.md` holds the enforced Rust disciplines. Detail lives there; this file stays a funnel.
+`docs/` 00–07 are the standing sources of truth (budgets, subsystems, roadmap, AXI/MCP); 11–15 are the port plans with their closeouts — 15 is the policy/security layer; [16](docs/16-dashboard-unity-plan.md) the dashboard plan, [19](docs/19-ui-upgrade-plan.md) and [23](docs/23-ui-round-two-plan.md) the `/ui` plans, [20](docs/20-model-attribution-plan.md) per-model attribution, [21](docs/21-remaining-gaps.md) the open-gaps register and [22](docs/22-stream-and-failover-repair.md) the stream and failover repair. `AGENTS.md` holds the enforced Rust disciplines. Detail lives there; this file stays a funnel.
 
 ## Contributing
 
@@ -392,3 +425,11 @@ Both green, minimal diffs, no `unwrap` outside tests. See [CONTRIBUTING.md](CONT
 ## License
 
 [Apache-2.0](LICENSE) — © 2026 Ishan Parihar.
+
+## ⭐ Support
+
+If aroute saved you time, star the repo — it helps others find it.
+
+Want to go further? Run `aroute donate`, or:
+
+[![Sponsor](https://img.shields.io/badge/Sponsor-💜-purple)](https://github.com/sponsors/ishan-parihar)
