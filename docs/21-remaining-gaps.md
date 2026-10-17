@@ -73,6 +73,17 @@ Owner: `docs/07-blockers.md` B3.
 - Cost: one config edit once the successor id is known; until then it is a
   monitoring task, not an implementation one.
 
+**Status 2026-10-18: no successor id exists in any reachable catalog.** Live
+cline model list (auth'd, 2026-10-18) carries no `bunny`/`space` id at all;
+the compiled registry has none either. kilocode.org is unreachable from this
+box (SSL handshake timeouts on every endpoint, curl included) so its live
+catalog could not be read — its serving path still works through aroute
+(small-stack 200s via laguna), which suggests the reachability failure is
+client-side or regional, not an outage. Current small-stack (both boxes) no
+longer references space-bunny targets — the config was pruned to two target
+ids at some point after B3 was written, so the retirement wall no longer
+bites. Re-open only if a future config edit reintroduces a `stealth/*` id.
+
 ## T5 — Gemini response translation (B4)
 
 **Status 2026-10-18: closed for the non-streamed arm** (docs/22, D6), verified against a live `gemini-2.5-flash` reply. The streamed relay is unchanged by contract.
@@ -91,44 +102,40 @@ Owner: `docs/07-blockers.md` B4.
 
 Owner: `docs/07-blockers.md` B1.
 
-- State: `nvidia/nemotron-3.5-content-safety:free` (a moderation model
-  exposed as chat) answers ~17% of small-stack requests with
-  "User Safety: safe". The blocker's retraction section fixed the
-  *attribution* story (gateways echo the requested id faithfully) but the
-  catalog still lists the model and the combo can still pick it.
-- **Gap:** a config-level deny list (combo targets may exclude catalog ids)
-  or a one-time prune of the safety model from small-stack. Implementation
-  is trivial; the open question is whether it belongs in config (operator
-  choice, per-combo) or in the registry (a `moderation: true` card flag).
-- Recommendation: config-side first, registry flag only if a second
-  guardrail model appears.
+**Status 2026-10-18: closed, no change needed.** `nemotron-3.5-content-safety:free`
+no longer appears in any combo on either box — local `~/.config/ar/config.yaml`
+and the VPS config both carry a small-stack of exactly two target ids (laguna,
+nemotron-super-vl) with no `content-safety` string anywhere in the file. The
+17% figure predates that prune. The registry-vs-config question is moot for
+one occurrence; if a second guardrail model appears, re-open with the
+`moderation:` card-flag proposal.
 
 ## T7 — modelRoles routing after the free-stack trim (operator config, not code)
 
 Owner: none in-repo; `~/.omp/agent/config.yml` is harness-side.
 
-- State: `default: nvidia/z-ai/glm-5.3` and `slow:
-  cline-pass/cline-free/mimo-v2.6-flash` now 400 `model_not_found` against
-  the routable set (free-stack is step-5-preview only as of 2026-10-17);
-  `task/smol/advisor` carry `aroute/…` double prefixes that also 400.
-- **Gap:** repoint the four roles at routable combo ids. This is the traced
-  root cause of the "agents hallucinate identical refusals" report — broken
-  role routing returns a JSON error body where the harness expects a
-  completion, and the model synthesizes continuations from context.
-- Cost: one config.yml edit + harness restart. Blocked only on the user's
-  choice of target combo per role.
+**Status 2026-10-18: closed.** Roles resolve against `models.yml` providers,
+not against aroute directly — `aroute/free-stack` is provider `aroute` + model
+`free-stack`, which routes. The user's own edits had already fixed
+`advisor/task/smol`; the two remaining broken roles were repointed and
+verified live (`web: aroute/small-stack`, `default: aroute/free-stack`;
+checkpoint `pre-t7-modelroles`). small-stack answers 200 with content;
+free-stack's transient 503s were nvidia-key cooldown state (direct upstream
+probe returned 200), not routing — self-healing per the resilience design.
 
 ## T8 — discovery scheduler cadence (partial reversal, recorded)
 
 Owner: `docs/02` deferred table, discovery row; `crates/ar-registry/src/discovery.rs:5`.
 
-- State: `DiscoveredCatalog` shipped, but the scheduler is a TTL tick, not
-  the reference's recorded 24-hour sweep. The drop row is honestly marked
-  only partially reversed.
-- **Gap:** decide whether the 24h sweep matters for a self-hosted proxy whose
-  catalog edits are rare, and either implement it or close the row with that
-  rationale. Leaning close-with-rationale: the TTL tick plus
-  `aroute models --refresh` covers the operator paths.
+**Status 2026-10-18: closed with rationale.** The 24-hour sweep is a
+hosted-service concern: there, one operator's catalog edit must reach every
+tenants' cache on a schedule. Here the proxy and the config are the same
+operator's machine — `DiscoveredCatalog`'s TTL tick keeps the union fresh
+during a long-lived serve, and `aroute models --refresh` covers the explicit
+path. A second, scheduled sweep would add a timer that can only race the
+tick for the same effect. The `docs/02` row should read "closed by
+decision" rather than "partially reversed"; the cadence difference is
+intentional, not pending work.
 
 ## Not gaps (re-litigation bait, recorded so they stay closed)
 
