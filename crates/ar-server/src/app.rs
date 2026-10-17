@@ -12,7 +12,7 @@
 //! generation is fine while a 20-minute *hang* is a 408. Wrapping the body
 //! instead (`.map_response_body()`) would cut every long answer off at 120s.
 //!
-//! It is set to [`ServerConfig::max_deadline`] rather than [`REQUEST_TIMEOUT`]:
+//! It is set to [`ServerConfig::max_deadline`] plus [`LAYER_GRACE`], rather than [`REQUEST_TIMEOUT`]:
 //! the layer is a per-router constant, so it has to be the widest deadline the
 //! config asks for, and the per-model narrowing happens one layer in
 //! ([`crate::routes::handle_chat`]) where the model is known. A model-aware
@@ -68,6 +68,20 @@ pub const MEDIA_BODY_BYTES: usize = 25 * 1024 * 1024;
 /// Ceiling on time-to-response-headers. Deliberately generous: it is a
 /// backstop against a dead upstream, not a latency budget.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How much longer the router-wide layer waits than the widest model deadline.
+///
+/// Both timers start at the same instant, and the layer's starts first. Equal
+/// deadlines therefore let the layer answer with a bare 504 before the
+/// model-aware timeout can write its JSON body (`upstream_timeout`,
+/// `model_deadline`), so the reason never reaches the client.
+const LAYER_GRACE: Duration = Duration::from_secs(5);
+
+/// The router-wide timeout: the widest model deadline plus [`LAYER_GRACE`], so
+/// the model-aware answer is always the one that fires.
+fn layer_timeout(config: &ServerConfig) -> Duration {
+    config.max_deadline() + LAYER_GRACE
+}
 
 /// Trace id echoed to the client and attached to every span.
 pub const TRACE_HEADER: &str = "x-ar-trace-id";
@@ -555,7 +569,7 @@ impl ArExec for NullExec {
 /// preflight, which is the point of hand-rolling it: a 404 without CORS headers
 /// reaches a browser as an opaque failure and the JSON body never gets read.
 pub fn app(state: AppState) -> Router {
-    let timeout = state.config.max_deadline();
+    let timeout = layer_timeout(&state.config);
     // The media family carries bodies the chat ceiling would refuse (audio),
     // so its routes are built on their own sub-router with their own body
     // limit and merged in — `route_layer` would have applied to the chat routes
@@ -945,7 +959,7 @@ mod tests {
 
     use super::{
         BindError, Components, MAX_BODY_BYTES, REQUEST_TIMEOUT, ServerConfig, TRACE_HEADER, app,
-        bind_addr, classify,
+        bind_addr, classify, layer_timeout,
     };
     use crate::metrics::Outcome;
 
@@ -1390,6 +1404,18 @@ mod tests {
                 "{model} would be cut off by the layer before its own timeout could fire"
             );
         }
+    }
+
+    #[test]
+    fn the_layer_outwaits_the_default_model_deadline() {
+        // Both are 120s by default. If they were equal the layer's timer would
+        // start first and answer with a bare 504, so the model-aware JSON body
+        // would never reach the client (docs/22, B10).
+        let config = ServerConfig::single(0, ar_route::Strategy::Priority, Vec::new());
+        assert!(
+            layer_timeout(&config) > config.stream_deadline("any-model"),
+            "the layer must outwait the model deadline it wraps"
+        );
     }
 
     #[tokio::test]

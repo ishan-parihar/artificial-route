@@ -1143,12 +1143,15 @@ impl UsageTee {
         if self.state.obs.is_none() {
             return;
         }
+        // Latency is the request's full wait, as the work metric reports it. The
+        // trace and audit rows read 0 for every stream without it.
         let meta = ResponseMeta::from_upstream(
             &self.state.config.prices,
             &self.provider,
-             &self.model,
+            &self.model,
             usage,
-        );
+        )
+        .with_latency(self.dispatched.elapsed());
         record_obs(
             &self.state,
             Some(&self.key_id),

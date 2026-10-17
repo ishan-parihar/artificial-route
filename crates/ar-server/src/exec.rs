@@ -941,7 +941,7 @@ impl ArRouteExec for HttpExec {
                     futures::future::ready(match chunk {
                         Ok(bytes) => Some(bytes),
                         Err(e) => {
-                            tracing::warn!(error = %e, "upstream stream ended early");
+                            tracing::warn!(error = ?e, "upstream stream ended early");
                             None
                         }
                     })
@@ -1055,7 +1055,7 @@ async fn drain_chat(upstream: ar_exec::ChatStream) -> Bytes {
         match chunk {
             Ok(bytes) => buffered.extend_from_slice(&bytes),
             Err(e) => {
-                tracing::warn!(error = %e, "upstream stream ended early");
+                tracing::warn!(error = ?e, "upstream stream ended early");
                 break;
             }
         }

@@ -26,7 +26,9 @@ this date; the mock harness lives outside the repo.
 | T5 | Gemini non-streaming bodies reach OpenAI clients as `candidates`, with no `choices`. | Non-streaming Gemini bodies translate to the OpenAI chat envelope through `CanonicalResponse`. | D6 |
 | B8 | Found while verifying T5: a non-streamed request without a `stream` field failed to encode on every non-OpenAI wire ("missing field `stream`"). `CanonicalChat.stream` had no serde default. | `#[serde(default)]`: absent means non-streaming. | D11 |
 | B9 | Found while verifying T5: a Gemini stream relayed raw ends in `finishReason`, which the OpenAI completion check did not recognise, so a complete answer got a false `stream_error`. | Completion also accepts a `finishReason` string (D2). | D2 |
-| B10 | Two stalls in one request exceed the router's 120s stream deadline, so the second is cut by `TimeoutLayer` and the client gets an empty 504. The same happens on multi-provider chains today. | **Not changed here.** Needs a decision on the start cap or the deadline. | D10 |
+| B10 | Two stalls in one request exceed the router's 120s stream deadline, so the second is cut by `TimeoutLayer` and the client gets an empty 504. The same happens on multi-provider chains today. | **Ordering fixed.** The router layer and the model deadline both started at 120s, and the layer's timer started first, so the model-aware JSON 504 (`upstream_timeout`, `model_deadline`) never reached the client. The layer now outwaits the model deadline by `LAYER_GRACE` (5s). The budget itself is unchanged. | D10, D12 |
+| B11 | Streamed requests wrote `latency_ms: 0` to the trace and audit rows. `UsageTee::record_obs` built its meta without a latency. | `with_latency(dispatched.elapsed())`, matching the work metric. | D12 |
+| B12 | A mid-stream upstream failure was logged as `error decoding response body` with no cause. | The warn lines log the error with `?`, which carries the reqwest source chain. | D12 |
 | T2 | Cline stream envelope. | **Not reproduced.** The API-key cline row streams plain OpenAI SSE (44 frames, usage, `[DONE]`). The unwrap stays unimplemented until an OAuth cline session streams the envelope. | D7 |
 
 ## Decisions
@@ -105,6 +107,25 @@ in time. A second stall in the same request is cut at 120s with an empty 504.
 Options, for an explicit choice: lower the per-attempt start cap, make the
 router deadline longer than the chain's start budgets, or give the attempt loop
 the deadline so it skips a target it cannot finish.
+
+**Measured on 2026-10-18, direct to nvidia, three samples each, streamed:**
+`z-ai/glm-5.3` sent headers in 1.37–2.09s and its first byte in 1.47–4.01s.
+`z-ai/glm-5.3-flash` sent headers in 19.51–28.93s. `free-stack` lists glm-5.3
+first and glm-5.3-flash second. One 110s stall on glm leaves flash 10s, which is
+short of its 19–29s, so `free-stack` cannot recover from a first-target stall
+under the 120s deadline. Two live probes on 2026-10-18 both returned 504 after
+120s; the journal shows one glm stall at 110s.
+
+The fix shipped for the ordering (B10). The budget is still open. The cheapest
+fix with the current code is a per-combo entry in `timeouts:` for `free-stack`
+(110 + 29 = 139s, so 150s covers it). The per-combo entry changes only that
+combo's deadline. A lower start cap would change every provider and could cut
+slow first bytes, so it needs more samples first.
+
+**D12 — Fixes that need no decision.** The router layer outwaits the model
+deadline by `LAYER_GRACE` (5s), so the model-aware JSON answer is what the
+client sees. Streamed trace and audit rows carry the request's latency. Warn
+lines carry the error's source chain.
 
 **D11 — `stream` defaults to false.** `CanonicalChat.stream` is `#[serde(default)]`.
 An OpenAI client that omits `stream` wants a whole reply, and every non-OpenAI
