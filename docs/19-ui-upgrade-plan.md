@@ -1,8 +1,16 @@
 # 19 — /ui upgrade plan: close the gap to the omniroute frontend
 
-Status: **Phases A+B+C+D shipped** (docs-before-code; E pending). Companion to docs/16 §5 (Skin plan) and the
+Status: **Phases A+B+C+D+E shipped 2026-10-17** — the staged roadmap below is complete. Open follow-ups live in docs/23-ui-round-two-plan.md. Companion to docs/16 §5 (Skin plan) and the
 shipped `ar-cli::webui` module. This doc states what the native /ui is still missing
 versus the vendored omni frontend, and the staged roadmap that closes it.
+
+### Phase E status (2026-10-17, shipped)
+
+Playground pane: same-origin POST /v1/chat/completions with native SSE parsing (delta accumulation,
+mid-stream error frames surfaced, [DONE] handled), usage counters from the include_usage final chunk,
+combo picker from state, optional bearer field, Stop via AbortController. Verified in-browser: mocked
+SSE happy path ("OK!", 9 in / 2 out) and real gateway 502 error surfacing (both free combos dead
+upstream that day — or-decisions free quota, nvidia failover). Probe 0 FAIL at 1440/1024/390.
 
 ### Phase D status (2026-10-17, shipped)
 `GET /ui/api/models` now serves the registry browser: all compiled-in providers
