@@ -1,0 +1,50 @@
+# The gate every change has to pass before it reaches `main`: the formatter,
+# clippy with warnings as errors, and the workspace test suite.
+#
+# `release.yml` runs the suite too, but only at tag time, so before this file
+# a broken `main` was caught by whoever ran the tests locally. AGENTS.md makes
+# `clippy -D warnings` the bar for every change; this is where that bar is
+# enforced rather than remembered.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A newer push to the same ref cancels the older run: only the latest tree is
+# worth the minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The toolchain file pins the channel and lists clippy and rustfmt, so
+      # this installs exactly what the release candidate was tested against.
+      - name: Install pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Test
+        run: cargo test --workspace --locked --no-fail-fast
