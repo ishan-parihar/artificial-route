@@ -169,7 +169,7 @@ pub async fn serve(cli: &Cli, args: &ServeArgs) -> anyhow::Result<()> {
     let addr = ar_server::app::bind_addr(&cfg.server.host, port, false).map_err(|e| {
         commands::fail(
             e,
-            "set `server.host` to a loopback address; P0 has no credential gate, so a routable bind would publish an unauthenticated proxy",
+            "set `server.host` to a loopback address; `aroute serve` binds loopback only in this build",
         )
     })?;
 

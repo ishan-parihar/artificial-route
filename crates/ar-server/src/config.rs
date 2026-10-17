@@ -1225,15 +1225,17 @@ impl ServerConfig {
     /// Sets whether this server may be reached off-host.
     ///
     /// Deliberately a builder rather than a `from_ar_config` field: the `public`
-    /// decision is a *deployment* choice (`ar serve --public`, `AR_PUBLIC`) and
-    /// not a routing fact, so it does not belong in the combo reader.
+    /// decision is a *deployment* choice and not a routing fact, so it does not
+    /// belong in the combo reader. Only [`ServerConfig::from_env`] sets it, and
+    /// the shipped `aroute serve` never does: it binds loopback only.
     ///
-    /// # TODO(#p1-config-public): `config.yaml`'s `server:` block should carry
-    /// this so a file-mode install does not need the environment variable. The
-    /// field belongs on `ar_config::Server`, which is another crate's file; until
-    /// it lands, `AR_PUBLIC` is the only way to say it, and `ar-config` silently
-    /// drops an unknown `public:` key because `Server` does not deny unknown
-    /// fields. The same is true of `auth_mode`, `http_master_key` and `timeouts`.
+    /// # TODO(#p1-config-public): a file-mode install needs a way to say
+    /// "routable" without the environment variable, which means a `public:`
+    /// field on `ar_config::Server` (another crate's file). Blocked on a ruling
+    /// first (docs/24 G2): whether a routable bind is allowed once the bearer
+    /// gate is armed. The original note also says `ar-config` drops unknown
+    /// `server:` keys silently, and names `auth_mode`, `http_master_key` and
+    /// `timeouts` as the same case; that is not probed.
     #[must_use]
     pub fn with_public(mut self, public: bool) -> Self {
         self.public = public;

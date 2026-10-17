@@ -776,7 +776,7 @@ fn classify(status: axum::http::StatusCode) -> Outcome {
 pub enum BindError {
     /// A routable address was requested without `server.public`.
     #[error(
-        "refusing to bind {host}: this proxy has no credential check by default, so a routable bind would publish it; set server.public (or AR_PUBLIC=1) to allow it"
+        "refusing to bind {host}: this proxy has no credential check by default, so a routable bind would publish it; bind a loopback address"
     )]
     NotPublic {
         /// The address that was refused.
