@@ -348,6 +348,9 @@ function paneProviders(root, st) {
         H("h2", { id: "catalog-head", text: "Registry catalog" }),
         H("span", { class: "hint", text: "Read-only. Use an id in the Registry id form above." }),
         H("input", { id: "catalog-filter", autocomplete: "off", spellcheck: "false", placeholder: "filter providers/models", style: "width:auto" })),
+      H("details", { class: "block-body fav", open: "open" },
+        H("summary", null, "\u2605 Favorites ", H("span", { id: "fav-count", class: "varname", text: "0" })),
+        H("div", { id: "fav-body" })),
       H("div", { class: "block-body", id: "catalog-body" })));
   renderProviders(st);
   wireProviderAdd();
@@ -359,6 +362,54 @@ function paneProviders(root, st) {
 
 /* The compiled-in registry: one GET, rendered per provider on demand. */
 
+const FAV_KEY = "ar-favorites";
+let CATALOG = [];
+
+/** Starred "provider/model" ids. Browser-local; storage may be blocked. */
+function favs() {
+  try { return JSON.parse(localStorage.getItem(FAV_KEY)) || []; } catch { return []; }
+}
+
+function toggleFav(id) {
+  const cur = favs();
+  const next = cur.includes(id) ? cur.filter((f) => f !== id) : [...cur, id];
+  try { localStorage.setItem(FAV_KEY, JSON.stringify(next)); } catch { /* unstarred next load */ }
+  paintFavs();
+}
+
+function priceText(m) {
+  return m.in == null ? "" : " $" + m.in + "/$" + m.out + " per mtok";
+}
+
+function starBtn(id, on) {
+  return H("button", { type: "button", class: "star" + (on ? " on" : ""),
+    "aria-pressed": on ? "true" : "false", "aria-label": (on ? "unstar " : "star ") + id,
+    text: on ? "\u2605" : "\u2606", dataset: { star: id } });
+}
+
+/** Favorites list, then sync every star in the catalog below it. */
+function paintFavs() {
+  const host = $("fav-body");
+  if (!host) return;
+  const on = new Set(favs());
+  host.textContent = "";
+  const rows = [];
+  for (const p of CATALOG) for (const m of p.models)
+    if (on.has(p.id + "/" + m.id)) rows.push([p.id + "/" + m.id, m]);
+  $("fav-count").textContent = String(rows.length);
+  if (!rows.length) {
+    host.append(H("p", { class: "hint", text: "No favorites yet. Star a model in the catalog below to pin it here." }));
+  }
+  for (const [id, m] of rows)
+    host.append(H("span", { class: "keycell" }, starBtn(id, true), H("span", { class: "varname", text: id + priceText(m) })));
+  for (const b of $("catalog-body").querySelectorAll("button.star")) {
+    const isOn = on.has(b.dataset.star);
+    b.classList.toggle("on", isOn);
+    b.setAttribute("aria-pressed", isOn ? "true" : "false");
+    b.textContent = isOn ? "\u2605" : "\u2606";
+  }
+}
+
 async function loadCatalog() {
   const host = $("catalog-body");
   let data;
@@ -368,18 +419,19 @@ async function loadCatalog() {
     host.append(H("p", { class: "error", text: err.message }));
     return;
   }
-  const providers = data.providers || [];
-  $("catalog-head").textContent = "Registry catalog (" + providers.length + ")";
-  const frag = providers.map((p) => H("details", { class: "catalog-row", dataset: { pid: p.id } },
+  CATALOG = data.providers || [];
+  $("catalog-head").textContent = "Registry catalog (" + CATALOG.length + ")";
+  host.append(...CATALOG.map((p) => H("details", { class: "catalog-row", dataset: { pid: p.id } },
     H("summary", null,
       H("span", { class: "cta", text: p.configured ? "configured" : "" }),
       H("strong", { text: p.id }),
-      H("span", { class: "varname", text: " " + p.wire + " · " + p.models.length + " models " }),
+      H("span", { class: "varname", text: " " + p.wire + " \u00b7 " + p.models.length + " models " }),
       H("button", { type: "button", class: "btn ghost small", text: "use",
         dataset: { useId: p.id } })),
     H("div", { class: "keycell" }, ...p.models.map((m) =>
-      H("span", { class: "varname", text: m.id + (m.in == null ? "" : " $" + m.in + "/$" + m.out + " per mtok") })))));
-  host.append(...frag);
+      H("span", { class: "keycell" }, starBtn(p.id + "/" + m.id, false),
+        H("span", { class: "varname", text: m.id + priceText(m) })))))));
+  paintFavs();
   $("catalog-filter").addEventListener("input", (e) => {
     const q = e.target.value.toLowerCase();
     for (const row of host.children) {
@@ -387,10 +439,14 @@ async function loadCatalog() {
       row.hidden = !hit;
     }
   });
-  $("catalog-body").addEventListener("click", (e) => {
-    const id = e.target && e.target.dataset ? e.target.dataset.useId : null;
-    if (id) { $("new-provider").value = id; }
-  });
+  // one delegate for both lists: star toggles, "use" fills the add form
+  const onClick = (e) => {
+    const d = e.target && e.target.dataset ? e.target.dataset : {};
+    if (d.star) toggleFav(d.star);
+    else if (d.useId) $("new-provider").value = d.useId;
+  };
+  host.addEventListener("click", onClick);
+  $("fav-body").addEventListener("click", onClick);
 }
 
 function renderProviders(st) {
