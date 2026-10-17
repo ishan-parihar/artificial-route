@@ -19,9 +19,10 @@ transcriptions, image-generations, OCR) and `/v1/audio/translations` landed
 afterwards, closing the modality scope; `import --from omniroute|litellm` shipped
 in v0.1.0 (`5cccd13`). The parity-closeout waves A–O are
 complete. **One row is still open: the 12-hour soak run itself** — the harness is
-`scripts/soak.sh`, a 3-minute proof is recorded, and a 12h run is in flight
-(relaunched post-`6fde400`, CSV `/tmp/ar-soak4.csv`, harness pid 293551), but 12
-hours is not yet claimed. Two prior attempts died before acceptance and are
+`scripts/soak.sh`, a 3-minute proof is recorded, and a 12h run was relaunched
+post-`6fde400` (CSV `/tmp/ar-soak4.csv`, harness pid 293551). As of 2026-10-18
+neither the process nor the CSV exists, so no 12h run is running and 12 hours
+is not claimed. Two prior attempts died before acceptance and are
 recorded in `docs/02`'s soak row, not as acceptance: one operator-killed at
 54 min, one host-wide SIGBUS at 1h52m that also felled unrelated processes.
 Landed since the last register update (`6a55836`):
