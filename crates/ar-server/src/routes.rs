@@ -858,13 +858,13 @@ async fn buffer_for_accounting(
         dialect,
         &body,
         attempts,
+        elapsed,
     ) else {
         // Unparseable replies (relay of a provider's HTML error page, say)
         // have no usage to count; the headers keep their zeros on purpose.
         return defaults();
     };
-    meta.with_latency(elapsed)
-        .with_savings_tokens(savings_tokens)
+    meta.with_savings_tokens(savings_tokens)
 }
 
 /// The price/latency class a completed request falls into.
@@ -902,6 +902,10 @@ fn epoch_now() -> i64 {
 /// is configured, writes it. Returns `None` when the body is not parseable
 /// JSON — that relay is the error path's own upstream message, which has no
 /// usage to count and no right to be recounted from.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is a distinct accounting field; a struct would only move them"
+)]
 fn read_and_record(
     state: &AppState,
     key_id: Option<&str>,
@@ -910,6 +914,7 @@ fn read_and_record(
     dialect: Dialect,
     body: &[u8],
     attempts: u16,
+    elapsed: Duration,
 ) -> Option<ResponseMeta> {
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
     let usage: &serde_json::Value = if matches!(dialect, Dialect::Ollama) {
@@ -921,7 +926,9 @@ fn read_and_record(
         value.get("usage").unwrap_or(&value)
     };
     let pricing = &state.config.prices;
-    let meta = ResponseMeta::from_upstream(pricing, provider, model, usage);
+    // The trace and audit rows are written here, so the latency has to be on
+    // the meta before `record_obs` reads it, not added to the return value.
+    let meta = ResponseMeta::from_upstream(pricing, provider, model, usage).with_latency(elapsed);
     // The observability half. Buffered replies pass here; streamed ones reach
     // the same observation through `UsageTee::observe` on the last poll, so
     // neither arm is counted twice and neither is missed.

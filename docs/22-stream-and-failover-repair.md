@@ -172,9 +172,13 @@ what a model-not-found on the last target should look like to a client.
 | live `gemini-2.5-flash`, streamed | false `stream_error` after the answer | ends at the final frame, no error |
 | live `cline` API-key row, streamed | plain SSE, 44 frames (probed before the change) | not re-probed after the change |
 
-- Not run: a 12-hour soak (T1), and any change to the live gateways on :20128
-  and :21199. Both are still running their old builds. Restarting them onto this
-  tree is an operator step.
+- Not run: a 12-hour soak (T1). The live gateway on :20128 runs this tree
+  (0.1.16, sha `af7f6c4e`) since 2026-10-18 05:22:03. Its `ar.env` sets
+  `AR_STREAM_TIMEOUT_SECS=free-stack=150` (D10). The weekly updater timer is
+  disabled, so the installer cannot replace this build. :21199 was not touched.
+- Live verification after deploy: `free-stack` non-stream and stream each
+  answered from `z-ai/glm-5.3` in about 1.6s. Streamed frames ended at `[DONE]`.
+  Trace rows carry latency for both the streamed and non-streamed paths.
 - Repo hygiene: the rustfmt drift in `ar-cli` and in the pre-existing hunks of
   `attempt.rs`, `routes.rs` and `exec.rs` was left alone, so the diff carries
   only this work.
