@@ -86,4 +86,35 @@ fn arms(row: &Limit, depth: usize, out: &mut Vec<String>) {
     if row.refuse_unpriced {
         out.push(format!("{pad}refuse_unpriced: true"));
     }
+    if let Some(model) = &row.model {
+        // JSON string syntax is valid YAML double-quoted, and survives a combo
+        // id with a colon or a leading symbol that a bare scalar would not.
+        out.push(format!("{pad}model: {}", serde_json::Value::from(model.as_str())));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_should_quote_the_model_scope_when_a_row_is_scoped() {
+        let mut limits = Limits::default();
+        limits.keys.insert(
+            "k".to_owned(),
+            Limit { tokens: Some(5), model: Some("jev".to_owned()), ..Limit::default() },
+        );
+        assert!(render(&limits).ends_with("      tokens: 5\n      model: \"jev\"\n"));
+    }
+
+    #[test]
+    fn render_should_round_trip_a_scoped_row_through_the_config_parser() {
+        let mut limits = Limits::default();
+        limits.keys.insert(
+            "k".to_owned(),
+            Limit { tokens: Some(5), model: Some("a: b".to_owned()), ..Limit::default() },
+        );
+        let cfg = ar_config::Config::parse(&render(&limits), |_| Ok(None)).expect("parses");
+        assert_eq!(cfg.limits, limits);
+    }
 }

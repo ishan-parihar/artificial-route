@@ -1121,6 +1121,18 @@ impl Limits {
     pub fn for_key(&self, key_id: &str) -> &Limit {
         self.keys.get(key_id).unwrap_or(&self.default)
     }
+
+    /// [`Limits::for_key`] for a request that asked for `asked`: a key row or
+    /// default scoped to a different model does not apply, and the request
+    /// falls through to the next row (key row, then `default`, then nothing).
+    #[must_use]
+    pub fn for_request(&self, key_id: &str, asked: &str) -> &Limit {
+        self.keys
+            .get(key_id)
+            .filter(|row| row.applies_to(asked))
+            .or_else(|| Some(&self.default).filter(|row| row.applies_to(asked)))
+            .unwrap_or(&NO_LIMIT)
+    }
 }
 
 /// One ceiling: any subset of the three arms. `None` means that arm is
@@ -1142,9 +1154,36 @@ pub struct Limit {
     /// `ar_tokens::Cap` carries: a budget cannot police an unknown cost.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub refuse_unpriced: bool,
+    /// Scope for the spend arms: the model (a combo id, or `provider/model`)
+    /// the client asked for. `None` governs every request. A scoped row is
+    /// skipped for any other model, so the key is unrestricted there.
+    ///
+    /// The spend measured is still the key's cumulative total — the ledger
+    /// records the provider-local model that served a request, not the combo
+    /// that was asked for — so this gates *when* the ceiling applies, not
+    /// *what* it counts. `rpm` is key-wide on purpose: it is checked before the
+    /// body (and so the model) is parsed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
+/// The limit of a key nothing applies to. Static so `for_request` can hand out
+/// a reference when a scoped row is skipped.
+static NO_LIMIT: Limit = Limit {
+    rpm: None,
+    usd_micros: None,
+    tokens: None,
+    refuse_unpriced: false,
+    model: None,
+};
+
 impl Limit {
+    /// Whether this row applies to a request for `asked`.
+    #[must_use]
+    pub fn applies_to(&self, asked: &str) -> bool {
+        self.model.as_deref().is_none_or(|scope| scope == asked)
+    }
+
     /// Whether this row limits anything.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -1656,6 +1695,27 @@ combos:
         // A key without its own row gets the default's ceiling, which is
         // what that row is for.
         assert_eq!(cfg.limits.for_key("other").rpm, Some(60));
+    }
+
+    #[test]
+    fn for_request_should_skip_a_scoped_row_when_another_model_is_asked() {
+        let yaml = "limits:\n  keys:\n    prod:\n      tokens: 100\n      model: jev\n";
+        let cfg = Config::parse(yaml, stub_lookup).unwrap();
+        assert!(cfg.limits.for_request("prod", "other").is_empty());
+    }
+
+    #[test]
+    fn for_request_should_apply_a_scoped_row_when_its_model_is_asked() {
+        let yaml = "limits:\n  keys:\n    prod:\n      tokens: 100\n      model: jev\n";
+        let cfg = Config::parse(yaml, stub_lookup).unwrap();
+        assert_eq!(cfg.limits.for_request("prod", "jev").tokens, Some(100));
+    }
+
+    #[test]
+    fn for_request_should_fall_back_to_default_when_the_key_row_is_scoped_away() {
+        let yaml = "limits:\n  default:\n    tokens: 7\n  keys:\n    prod:\n      tokens: 100\n      model: jev\n";
+        let cfg = Config::parse(yaml, stub_lookup).unwrap();
+        assert_eq!(cfg.limits.for_request("prod", "other").tokens, Some(7));
     }
 
     #[test]

@@ -754,7 +754,7 @@ fn arm_of(body: &Value, field: &str, max: u64) -> Result<Option<u64>, String> {
 }
 
 /// Sets one client key's ceiling row: any subset of the four arms `Limit`
-/// carries. Arms the body omits keep their current value; an explicit `null`
+/// carries, plus its `model` scope. Arms the body omits keep their current value; an explicit `null`
 /// clears the arm. A row that ends up empty is removed, which reads back as
 /// "no ceiling" — the state every config written before `limits:` existed has.
 async fn set_limits(State(ctx): State<Arc<Ctx>>, body: Result<Json<Value>, JsonRejection>) -> Response {
@@ -804,8 +804,30 @@ async fn set_limits(State(ctx): State<Arc<Ctx>>, body: Result<Json<Value>, JsonR
             _ => return bad_request("refuse_unpriced must be a boolean".into(), "true fails closed on a model with no pricing row"),
         };
     }
+    // Scope: omitted keeps, null or "" clears, a string sets. Checked against
+    // the config below, so a typo cannot arm a ceiling that never applies.
+    let scope_present = body.get("model").is_some();
+    let scope: Option<String> = match &body["model"] {
+        Value::Null => None,
+        Value::String(s) if s.trim().is_empty() => None,
+        Value::String(s) if s.trim().len() <= 128 && !s.chars().any(char::is_control) => Some(s.trim().to_owned()),
+        Value::String(_) => return bad_request("model scope is not a legal id".into(), "up to 128 characters, no control characters"),
+        _ => return bad_request("model must be a string or null".into(), "name a combo id, or null to scope the row to every model"),
+    };
     let (doc, mut cfg) = match load_cfg(&ctx) { Ok(v) => v, Err(resp) => return *resp };
+    if let Some(m) = &scope
+        && !m.contains('/')
+        && !cfg.combos.iter().any(|c| c.id == *m)
+    {
+        return bad_request(
+            format!("no combo named {m:?}"),
+            "scope a limit to a combo id from the Combos pane, or to provider/model",
+        );
+    }
     let row = cfg.limits.keys.entry(key).or_default();
+    if scope_present {
+        row.model = scope;
+    }
     if present[0] {
         row.rpm = rpm;
     }

@@ -515,12 +515,12 @@ function paneKeys(root, st) {
     H("section", { class: "block" },
       H("div", { class: "block-head" },
         H("h2", { text: "Limits" }),
-        H("span", { class: "hint", text: "Per-key ceilings in `limits:` — enforced at the edge. Blank an arm to clear it; all-clear removes the row (no ceiling)." })),
+        H("span", { class: "hint", text: "Per-key ceilings in `limits:`, enforced at the edge. Blank an arm to clear it; all-clear removes the row. A combo scope limits the spend arms to requests for that combo." })),
       H("div", { class: "block-body" },
         H("div", { class: "table-wrap" }, H("table", null,
           H("thead", null, H("tr", null,
             H("th", { text: "Key" }), H("th", { text: "rpm" }), H("th", { text: "$ cap" }),
-            H("th", { text: "token cap" }), H("th", { text: "unpriced" }), H("th", { text: "Spend, all time" }),
+            H("th", { text: "token cap" }), H("th", { text: "unpriced" }), H("th", { text: "scope" }), H("th", { text: "Spend, all time" }),
             H("th", { text: "Set ceilings" }))),
           H("tbody", { id: "key-rows" }))))));
   renderKeys(st);
@@ -542,7 +542,7 @@ function renderKeys(st) {
   body.textContent = "";
   const names = Object.keys(rows);
   if (!names.length) {
-    body.append(H("tr", null, H("td", { colspan: "7", class: "varname",
+    body.append(H("tr", null, H("td", { colspan: "8", class: "varname",
       text: "No limits rows yet. Mint a key to start." })));
   }
   for (const name of names) {
@@ -553,13 +553,22 @@ function renderKeys(st) {
     const rpmInput = num("rpm");
     const usdInput = num("usd_micros");
     const tokensInput = num("tokens");
+    // Prefilled with the row's current values: blank clears an arm, so a form
+    // that started empty would wipe every other arm on each Set.
+    rpmInput.value = cap.rpm == null ? "" : cap.rpm;
+    usdInput.value = cap.usd_micros == null ? "" : cap.usd_micros;
+    tokensInput.value = cap.tokens == null ? "" : cap.tokens;
     const unpriced = H("input", { type: "checkbox", "aria-label": "refuse_unpriced for " + name });
+    unpriced.checked = !!cap.refuse_unpriced;
+    const scope = H("input", { "aria-label": "combo scope for " + name, placeholder: "all combos", spellcheck: "false", autocomplete: "off", style: "width:110px" });
+    scope.value = cap.model || "";
     body.append(H("tr", null,
       H("td", { text: name }),
       H("td", { class: "num", text: cap.rpm == null ? "unset" : String(cap.rpm) }),
       H("td", { class: "num", text: cap.usd_micros == null ? "unset" : "$" + cap.usd_micros / 1000000 }),
       H("td", { class: "num", text: cap.tokens == null ? "unset" : String(cap.tokens) }),
       H("td", { class: "num", text: cap.refuse_unpriced ? "refuse" : "allow" }),
+      H("td", { class: "varname", text: cap.model || "all" }),
       H("td", { class: "num", text: "$" + spend.toFixed(6) }),
       H("td", null, H("form", { class: "row-form", onsubmit: async (e) => {
         e.preventDefault();
@@ -567,10 +576,10 @@ function renderKeys(st) {
         try {
           await api("/ui/api/limits", { key: name,
             rpm: send(rpmInput), usd_micros: send(usdInput), tokens: send(tokensInput),
-            refuse_unpriced: send(unpriced) });
+            refuse_unpriced: send(unpriced), model: scope.value.trim() || null });
           await refresh();
         } catch (err) { showError("keys-error", err); }
-      } }, rpmInput, usdInput, tokensInput, unpriced, H("button", { class: "btn small", type: "submit", text: "Set" })))));
+      } }, rpmInput, usdInput, tokensInput, unpriced, scope, H("button", { class: "btn small", type: "submit", text: "Set" })))));
   }
 }
 

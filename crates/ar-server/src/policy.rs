@@ -91,11 +91,11 @@ impl Policy {
     /// rather than as an error — a row that limits only requests per minute is
     /// a perfectly reasonable row.
     #[must_use]
-    pub fn cap(&self, key_id: &str) -> Option<Cap> {
+    pub fn cap(&self, key_id: &str, asked: &str) -> Option<Cap> {
         if !self.armed {
             return None;
         }
-        let limit = self.limits.for_key(key_id);
+        let limit = self.limits.for_request(key_id, asked);
         if limit.usd_micros.is_none() && limit.tokens.is_none() && !limit.refuse_unpriced {
             return None;
         }
@@ -119,7 +119,7 @@ impl Policy {
         ledger: &Ledger,
         projection: &Projection<'_>,
     ) -> Verdict {
-        let Some(cap) = self.cap(key_id) else {
+        let Some(cap) = self.cap(key_id, projection.asked) else {
             return Verdict::Allow;
         };
         let projected = project_cost(projection);
@@ -158,6 +158,9 @@ fn project_cost(projection: &Projection<'_>) -> Cost {
 /// The request as the projection needs it: the target that will serve it, its
 /// counted tokens, and the table that prices it.
 pub struct Projection<'a> {
+    /// The model the client asked for (a combo id), which a scoped `limits:`
+    /// row is matched against.
+    pub(crate) asked: &'a str,
     /// The provider the chain's first target names.
     pub(crate) provider: &'a str,
     /// The model that target serves — its own spelling, not the alias the
@@ -198,7 +201,7 @@ mod tests {
     fn disabled_answers_nothing_limited() {
         let p = Policy::disabled();
         assert!(p.rate_wait("anyone").is_none());
-        assert!(p.cap("anyone").is_none());
+        assert!(p.cap("anyone", "m").is_none());
     }
 
     #[test]
@@ -229,7 +232,7 @@ mod tests {
     #[test]
     fn a_response_only_row_arms_no_cap() {
         let p = Policy::from_limits(&limits_yaml("limits:\n  default:\n    rpm: 3\n"), true);
-        assert!(p.cap("k").is_none(), "rpm alone is not a spend ceiling");
+        assert!(p.cap("k", "m").is_none(), "rpm alone is not a spend ceiling");
     }
 
     #[test]
@@ -237,6 +240,7 @@ mod tests {
         let p = Policy::from_limits(&Limits::default(), true);
         let prices = prices_with(2_000_000); // $2 per MTok
         let projection = Projection {
+            asked: "m",
             provider: "provider",
             model: "model",
             tokens_in: 500_000,
@@ -254,6 +258,7 @@ mod tests {
     fn an_unpriced_model_projects_unpriced() {
         let prices = PricingTable::default();
         let projection = Projection {
+            asked: "m",
             provider: "provider",
             model: "no-row",
             tokens_in: 10,
@@ -265,21 +270,39 @@ mod tests {
     }
 
     #[test]
+    fn a_scoped_cap_is_none_when_another_model_is_asked() {
+        let p = Policy::from_limits(
+            &limits_yaml("limits:\n  keys:\n    k:\n      tokens: 100\n      model: jev\n"),
+            true,
+        );
+        assert!(p.cap("k", "other").is_none());
+    }
+
+    #[test]
+    fn a_scoped_cap_arms_when_its_model_is_asked() {
+        let p = Policy::from_limits(
+            &limits_yaml("limits:\n  keys:\n    k:\n      tokens: 100\n      model: jev\n"),
+            true,
+        );
+        assert_eq!(p.cap("k", "jev").and_then(|c| c.tokens), Some(100));
+    }
+
+    #[test]
     fn refuse_unpriced_alone_still_arms_a_cap() {
         let p = Policy::from_limits(
             &limits_yaml("limits:\n  default:\n    refuse_unpriced: true\n"),
             true,
         );
-        assert!(p.cap("k").is_some());
-        assert!(p.cap("k").unwrap().refuse_unpriced);
+        assert!(p.cap("k", "m").is_some());
+        assert!(p.cap("k", "m").unwrap().refuse_unpriced);
     }
 
     #[test]
     fn a_cap_without_a_ledger_is_not_a_cap() {
         let p = Policy::from_limits(&limits_yaml("limits:\n  default:\n    tokens: 10\n"), true);
-        assert!(p.cap("k").is_some(), "armed with a ledger behind it");
+        assert!(p.cap("k", "m").is_some(), "armed with a ledger behind it");
         let p = Policy::from_limits(&limits_yaml("limits:\n  default:\n    tokens: 10\n"), false);
-        assert!(p.cap("k").is_none());
+        assert!(p.cap("k", "m").is_none());
     }
 
     #[test]
@@ -290,7 +313,7 @@ mod tests {
             ),
             true,
         );
-        let cap = p.cap("k").expect("armed");
+        let cap = p.cap("k", "m").expect("armed");
         assert_eq!(cap.usd_micros, Some(7));
         assert_eq!(cap.tokens, Some(9));
         assert!(cap.refuse_unpriced);

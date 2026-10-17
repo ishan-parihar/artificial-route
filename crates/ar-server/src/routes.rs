@@ -641,6 +641,7 @@ async fn handle_chat_inner(
     // the eventual bill agree to the row.
     if let (Some(ledger), Some(target)) = (state.ledger.as_ref(), plan.chain.first()) {
         let projection = crate::policy::Projection {
+            asked: canonical.model.as_ref(),
             provider: target.provider.as_str(),
             model: &target.model,
             tokens_in: ar_tokens::count_text(&String::from_utf8_lossy(&canonical.body)),
