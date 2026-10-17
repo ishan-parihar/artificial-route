@@ -24,6 +24,10 @@ function H(tag, attrs, ...kids) {
 
 let STATE = null;
 let EDITING = null;
+/** Live secrets, memory only (never storage): the just-minted token, and the
+ *  bearer the playground sends. A reload drops both by design. */
+let MINTED = null;
+let PG_TOKEN = "";
 
 async function api(path, body) {
   const opts = body === undefined
@@ -76,6 +80,7 @@ function currentView() {
 
 async function route() {
   const view = currentView();
+  if (view !== "keys" && view !== "playground") MINTED = null; // shows once
   for (const a of $("nav").querySelectorAll("a"))
     a.classList.toggle("active", a.dataset.view === view);
   const root = $("view");
@@ -501,9 +506,11 @@ function paneKeys(root, st) {
           H("label", { for: "mint-rpm", text: "rpm" }),
           H("input", { id: "mint-rpm", type: "number", min: "1", max: "100000", placeholder: "unset", style: "width:90px" }),
           H("button", { type: "submit", class: "btn btn-primary", "data-cta": "primary", text: "Mint key" })),
-        H("details", { id: "minted", class: "minted", hidden: true },
+        H("details", { id: "minted", class: "minted", hidden: true, open: "open" },
           H("summary", null, "Token for ", H("span", { id: "minted-id" }), " - copy it now"),
-          H("code", { id: "minted-token" })),
+          H("code", { id: "minted-token" }),
+          H("button", { id: "minted-use", type: "button", class: "btn small ghost", text: "Use in playground",
+            onclick: () => { if (MINTED) { PG_TOKEN = MINTED.access; location.hash = "#/playground"; } } })),
         H("p", { id: "keys-error", class: "error", role: "alert", hidden: true }))),
     H("section", { class: "block" },
       H("div", { class: "block-head" },
@@ -518,6 +525,15 @@ function paneKeys(root, st) {
           H("tbody", { id: "key-rows" }))))));
   renderKeys(st);
   wireMint();
+  showMinted();
+}
+
+/* refresh() rebuilds this pane after a mint, so the token lives in MINTED */
+function showMinted() {
+  if (!MINTED) return;
+  $("minted").hidden = false;
+  $("minted-id").textContent = MINTED.key_id;
+  $("minted-token").textContent = MINTED.access;
 }
 
 function renderKeys(st) {
@@ -566,11 +582,8 @@ function wireMint() {
     try {
       const res = await api("/ui/api/keys/mint", { key_id });
       if (rpm != null) await api("/ui/api/limits", { key: key_id, rpm });
-      $("minted").hidden = false;
-      $("minted-id").textContent = res.key_id;
-      $("minted-token").textContent = res.access;
-      $("mint-id").value = "";
-      $("mint-rpm").value = "";
+      MINTED = { key_id: res.key_id, access: res.access };
+      showMinted();
       await refresh();
     } catch (err) { showError("keys-error", err); }
   });
@@ -816,45 +829,82 @@ refresh().catch(() => {
 
 let PG_ABORT = null;
 
+/** Conversation so far, sent whole each turn. Memory only: gone on reload. */
+let PG_MESSAGES = [];
+
+/** One transcript line: a role tag, then the text. */
+function pgTurn(role, content) {
+  return H("div", { class: "pg-turn " + role },
+    H("span", { class: "pg-role", text: role }),
+    H("span", { class: "pg-text", text: content }));
+}
+
+function pgRender() {
+  const out = $("pg-out");
+  if (!out) return;
+  out.textContent = "";
+  for (const m of PG_MESSAGES) out.append(pgTurn(m.role, m.content));
+}
+
 function panePlayground(root, st) {
   const ids = (st.combos || []).map((c) => c.id);
   root.append(
     H("section", { class: "block" },
       H("div", { class: "block-head" },
         H("h2", { text: "Playground" }),
-        H("span", { class: "hint", text: "Same-origin chat completions. No proxy, no storage." })),
+        H("span", { class: "hint", text: "Same-origin chat completions. History lives in this tab only." })),
       H("div", { class: "block-body" },
         H("form", { id: "pg-form", class: "row-form" },
           H("label", { for: "pg-combo", text: "Combo" }),
-          H("select", { id: "pg-combo" }, ids.map((id) => H("option", { value: id, text: id }))),
+          H("select", { id: "pg-combo" }, ...ids.map((id) => H("option", { value: id, text: id }))),
           H("label", { for: "pg-token", text: "Bearer" }),
           H("input", { id: "pg-token", type: "password", autocomplete: "off", placeholder: "minted token (optional)", style: "width:auto" }),
           H("label", { for: "pg-stream", text: "stream" }),
           H("input", { id: "pg-stream", type: "checkbox", checked: "checked" }),
           H("button", { type: "submit", class: "btn btn-primary", "data-cta": "primary", text: "Send" }),
-          H("button", { type: "button", class: "btn ghost small", id: "pg-stop", text: "Stop", disabled: "disabled" })),
-        H("textarea", { id: "pg-prompt", rows: "5", spellcheck: "false",
-          placeholder: "Ask the gateway something…", style: "width:100%;font-family:ui-monospace,monospace" }),
+          H("button", { type: "button", class: "btn ghost small", id: "pg-stop", text: "Stop", disabled: "disabled" }),
+          H("button", { type: "button", class: "btn ghost small", id: "pg-clear", text: "Clear" })),
+        H("label", { for: "pg-system", class: "pg-label", text: "System prompt (optional)" }),
+        H("textarea", { id: "pg-system", rows: "2", spellcheck: "false", class: "pg-area",
+          placeholder: "You are…" }),
+        H("label", { for: "pg-prompt", class: "pg-label", text: "Message" }),
+        H("textarea", { id: "pg-prompt", rows: "4", spellcheck: "false", class: "pg-area",
+          placeholder: "Ask the gateway something…" }),
         H("p", { id: "pg-error", class: "error", role: "alert", hidden: true }))),
     H("section", { class: "block" },
       H("div", { class: "block-head" },
-        H("h2", { text: "Reply" }),
+        H("h2", { text: "Conversation" }),
         H("span", { id: "pg-meta", class: "hint" })),
-      H("div", { class: "block-body pg-out", id: "pg-out" })));
+      H("div", { class: "block-body pg-out", id: "pg-out", "aria-live": "polite" })));
+  if (PG_TOKEN) $("pg-token").value = PG_TOKEN;
+  pgRender();
   wirePlayground();
 }
 
 function wirePlayground() {
+  $("pg-token").addEventListener("input", (e) => { PG_TOKEN = e.target.value; });
+  $("pg-clear").addEventListener("click", () => {
+    if (PG_ABORT) PG_ABORT.abort();
+    PG_MESSAGES = [];
+    pgRender();
+    $("pg-meta").textContent = "";
+    $("pg-error").hidden = true;
+  });
   $("pg-form").addEventListener("submit", async (e) => {
     e.preventDefault();
     const btn = e.target.querySelector("button[type=submit]");
     const combo = $("pg-combo").value;
     const prompt = $("pg-prompt").value.trim();
     if (!prompt) return;
+    const system = $("pg-system").value.trim();
     const wantStream = $("pg-stream").checked;
-    const out = $("pg-out");
     const meta = $("pg-meta");
-    out.textContent = "";
+    const turn = { role: "user", content: prompt };
+    pgRender();
+    const out = $("pg-out");
+    const live = pgTurn("assistant", "");
+    out.append(pgTurn("user", prompt), live);
+    const liveText = live.querySelector(".pg-text");
     meta.textContent = wantStream ? "streaming…" : "waiting…";
     $("pg-error").hidden = true;
     PG_ABORT = new AbortController();
@@ -862,14 +912,11 @@ function wirePlayground() {
     btn.disabled = true;
     const headers = { "content-type": "application/json" };
     if ($("pg-token").value.trim()) headers.authorization = "Bearer " + $("pg-token").value.trim();
-    const body = {
-      model: combo,
-      messages: [{ role: "user", content: prompt }],
-      stream: wantStream,
-    };
+    const messages = [...(system ? [{ role: "system", content: system }] : []), ...PG_MESSAGES, turn];
+    const body = { model: combo, messages, stream: wantStream };
     if (wantStream) body.stream_options = { include_usage: true };
     let text = "";
-    const push = (chunk) => { text += chunk; out.textContent = text; };
+    const push = (chunk) => { text += chunk; liveText.textContent = text; out.scrollTop = out.scrollHeight; };
     const finish = () => { btn.disabled = false; $("pg-stop").disabled = true; PG_ABORT = null; };
     try {
       const res = await fetch("/v1/chat/completions", {
@@ -877,14 +924,14 @@ function wirePlayground() {
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        throw Object.assign(new Error(data.error || res.statusText), { data });
+        const msg = typeof data.error === "object" && data.error ? data.error.message : data.error;
+        throw Object.assign(new Error(msg || res.statusText), { data });
       }
       if (!wantStream) {
         const data = await res.json();
         push(data.choices && data.choices[0] ? data.choices[0].message.content : "");
         const u = data.usage || {};
-        meta.textContent = data.model || combo + " · " + (u.prompt_tokens || 0) + " in / " + (u.completion_tokens || 0) + " out";
-        finish();
+        meta.textContent = (data.model || combo) + " · " + (u.prompt_tokens || 0) + " in / " + (u.completion_tokens || 0) + " out";
         return;
       }
       const reader = res.body.getReader();
@@ -904,6 +951,7 @@ function wirePlayground() {
             const payload = line.slice(5).trim();
             if (payload === "[DONE]") continue;
             const json = JSON.parse(payload);
+            if (json.error) throw new Error(json.error.message || JSON.stringify(json.error));
             if (json.usage) usage = json.usage;
             const choice = json.choices && json.choices[0];
             if (choice && choice.delta && choice.delta.content) push(choice.delta.content);
@@ -920,6 +968,15 @@ function wirePlayground() {
         $("pg-error").hidden = false;
       }
     } finally {
+      // Keep the turn only when something came back; a failed send leaves the
+      // prompt in the box for a retry and the history untouched.
+      if (text) {
+        PG_MESSAGES.push(turn, { role: "assistant", content: text });
+        $("pg-prompt").value = "";
+      } else {
+        live.remove();
+        out.lastElementChild && out.lastElementChild.remove();
+      }
       finish();
     }
   });
