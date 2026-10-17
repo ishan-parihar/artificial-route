@@ -807,23 +807,17 @@ async fn set_limits(State(ctx): State<Arc<Ctx>>, body: Result<Json<Value>, JsonR
     // Scope: omitted keeps, null or "" clears, a string sets. Checked against
     // the config below, so a typo cannot arm a ceiling that never applies.
     let scope_present = body.get("model").is_some();
-    let scope: Option<String> = match &body["model"] {
-        Value::Null => None,
-        Value::String(s) if s.trim().is_empty() => None,
-        Value::String(s) if s.trim().len() <= 128 && !s.chars().any(char::is_control) => Some(s.trim().to_owned()),
-        Value::String(_) => return bad_request("model scope is not a legal id".into(), "up to 128 characters, no control characters"),
+    let raw_scope = match &body["model"] {
+        Value::Null => String::new(),
+        Value::String(s) => s.clone(),
         _ => return bad_request("model must be a string or null".into(), "name a combo id, or null to scope the row to every model"),
     };
     let (doc, mut cfg) = match load_cfg(&ctx) { Ok(v) => v, Err(resp) => return *resp };
-    if let Some(m) = &scope
-        && !m.contains('/')
-        && !cfg.combos.iter().any(|c| c.id == *m)
-    {
-        return bad_request(
-            format!("no combo named {m:?}"),
-            "scope a limit to a combo id from the Combos pane, or to provider/model",
-        );
-    }
+    // Checked against the config, so a typo cannot arm a ceiling that never applies.
+    let scope = match commands::limit_scope(&raw_scope, &cfg.combos) {
+        Ok(scope) => scope,
+        Err((message, help)) => return bad_request(message, help),
+    };
     let row = cfg.limits.keys.entry(key).or_default();
     if scope_present {
         row.model = scope;
@@ -1204,5 +1198,110 @@ mod tests {
         let cfg = Config::parse(yaml, resolve_env).ok();
         let Some(cfg) = cfg else { panic!("fixture config must parse") };
         assert!(check_combos(&cfg.combos, &cfg).is_ok());
+    }
+}
+
+/// The `/ui` endpoints driven through the router, the way `serve` mounts them,
+/// with no socket: a request in, a status and JSON body out.
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Method, Request};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    const CONFIG: &str = "keys:\n  local: dummy\ncombos:\n  - id: c\n    strategy: priority\n    targets:\n      - openai/gpt-5.4\n";
+
+    /// A `/ui` router over a fresh config file, and that file's path.
+    fn ui(tag: &str, ledger: Option<ar_tokens::Ledger>) -> (Router, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ar-webui-http-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let config = dir.join("config.yaml");
+        std::fs::write(&config, CONFIG).expect("config");
+        let ledger = ledger.map(|l| Arc::new(Mutex::new(l)));
+        let app = mount(Router::new(), Ctx::new(config.clone(), ledger, None, false));
+        (app, config)
+    }
+
+    async fn call(app: &Router, method: Method, uri: &str, body: &str) -> (StatusCode, Value) {
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_owned()))
+            .expect("request");
+        let resp = app.clone().oneshot(req).await.expect("router answers");
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    #[tokio::test]
+    async fn the_log_should_answer_failures_inside_the_date_range() {
+        let ledger = ar_tokens::Ledger::open_in_memory().expect("ledger");
+        ledger.record_failure("ci", "c", 502, "every provider is down", 1_000_000).expect("row");
+        let (app, _) = ui("log", Some(ledger));
+        let (status, body) = call(&app, Method::GET, "/ui/api/log?days=30", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["rows"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["rows"][0]["status"], 502);
+        let (_, errors) = call(&app, Method::GET, "/ui/api/log?status=error", "").await;
+        assert_eq!(errors["rows"].as_array().map(Vec::len), Some(1), "the failed-only view keeps the failure");
+        let (_, other) = call(&app, Method::GET, "/ui/api/log?model=nope", "").await;
+        assert_eq!(other["rows"].as_array().map(Vec::len), Some(0), "a model filter narrows the rows");
+    }
+
+    #[tokio::test]
+    async fn the_log_should_say_it_is_closed_without_a_ledger() {
+        let (app, _) = ui("log-closed", None);
+        let (status, body) = call(&app, Method::GET, "/ui/api/log", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["open"], false);
+        assert_eq!(body["rows"].as_array().map(Vec::len), Some(0));
+    }
+
+    #[tokio::test]
+    async fn usage_should_answer_for_a_day_count_outside_the_range() {
+        let ledger = ar_tokens::Ledger::open_in_memory().expect("ledger");
+        let (app, _) = ui("usage-clamp", Some(ledger));
+        for days in ["0", "99999"] {
+            let (status, _) = call(&app, Method::GET, &format!("/ui/api/usage?days={days}"), "").await;
+            assert_eq!(status, StatusCode::OK, "days={days} must clamp, not fail");
+        }
+    }
+
+    #[tokio::test]
+    async fn limits_should_refuse_a_scope_that_names_no_combo_and_write_nothing() {
+        let (app, config) = ui("limits-unknown", None);
+        let (status, body) = call(&app, Method::POST, "/ui/api/limits", r#"{"key":"ci","rpm":5,"model":"nope"}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap_or_default().contains("no combo named"));
+        assert_eq!(std::fs::read_to_string(&config).expect("config"), CONFIG, "a refusal leaves the file alone");
+    }
+
+    #[tokio::test]
+    async fn limits_should_keep_a_scope_when_omitted_and_clear_it_on_null() {
+        let (app, config) = ui("limits-scope", None);
+        let (status, _) = call(&app, Method::POST, "/ui/api/limits", r#"{"key":"ci","rpm":5,"model":"c"}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(std::fs::read_to_string(&config).expect("config").contains("model: \"c\""));
+
+        let (status, _) = call(&app, Method::POST, "/ui/api/limits", r#"{"key":"ci","rpm":7}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        let kept = std::fs::read_to_string(&config).expect("config");
+        assert!(kept.contains("model: \"c\"") && kept.contains("rpm: 7"), "an omitted scope is kept: {kept}");
+
+        let (status, _) = call(&app, Method::POST, "/ui/api/limits", r#"{"key":"ci","model":null}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!std::fs::read_to_string(&config).expect("config").contains("model:"), "null clears the scope");
+    }
+
+    #[tokio::test]
+    async fn limits_should_refuse_a_scope_that_is_not_a_string() {
+        let (app, _) = ui("limits-type", None);
+        let (status, _) = call(&app, Method::POST, "/ui/api/limits", r#"{"key":"ci","rpm":5,"model":5}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 }

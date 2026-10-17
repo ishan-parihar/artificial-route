@@ -45,7 +45,7 @@ const COMBO_COLUMNS: [&str; 5] = ["id", "provider", "status", "strategy", "targe
 const SYNC_COLUMNS: [&str; 5] = ["id", "provider", "status", "strategy", "targets"];
 /// Columns of an `aroute limits` row. `key` leads but is not `id`: the
 /// `default` row is a row like any other here, and the column names it.
-const LIMIT_COLUMNS: [&str; 5] = ["key", "rpm", "usd_micros", "tokens", "refuse_unpriced"];
+const LIMIT_COLUMNS: [&str; 6] = ["key", "rpm", "usd_micros", "tokens", "refuse_unpriced", "model"];
 /// Columns of a `doctor` finding.
 const CHECK_COLUMNS: [&str; 3] = ["check", "status", "detail"];
 /// Columns of the `configure` dump.
@@ -518,6 +518,7 @@ pub fn limits_view(cli: &Cli) -> anyhow::Result<()> {
                 opt_cell(row.usd_micros),
                 opt_cell(row.tokens),
                 row.refuse_unpriced.to_string(),
+                opt_cell(row.model.as_deref()),
             ]
         })
         .collect();
@@ -538,6 +539,33 @@ pub fn limits_view(cli: &Cli) -> anyhow::Result<()> {
 /// The cell for an unset arm: `-`, because an empty cell reads as a broken row.
 fn opt_cell(value: Option<impl std::fmt::Display>) -> String {
     value.map_or_else(|| "-".to_owned(), |v| v.to_string())
+}
+
+/// The model scope a `model` value names, checked the way `/ui` checks it: at
+/// most 128 characters with no control characters, and, when the name has no
+/// `/`, a combo of that id must exist, so a typo cannot arm a ceiling that
+/// never applies. `Ok(None)` is the clear, for `""` or whitespace.
+pub(crate) fn limit_scope(
+    raw: &str,
+    combos: &[ar_config::Combo],
+) -> Result<Option<String>, (String, &'static str)> {
+    let scope = raw.trim();
+    if scope.is_empty() {
+        return Ok(None);
+    }
+    if scope.len() > 128 || scope.chars().any(char::is_control) {
+        return Err((
+            "model scope is not a legal id".to_owned(),
+            "up to 128 characters, no control characters",
+        ));
+    }
+    if !scope.contains('/') && !combos.iter().any(|c| c.id == scope) {
+        return Err((
+            format!("no combo named {scope:?}"),
+            "scope a limit to a combo id, or to provider/model",
+        ));
+    }
+    Ok(Some(scope.to_owned()))
 }
 
 /// `aroute limits set` — merge the named arms into one row, rewrite the section.
@@ -566,14 +594,21 @@ pub fn limits_set(cli: &Cli, args: &SetLimitsArgs) -> anyhow::Result<()> {
         && args.usd_micros.is_none()
         && args.tokens.is_none()
         && args.refuse_unpriced.is_none()
+        && args.model.is_none()
     {
         return Err(fail(
             "no arm given",
-            "pass at least one of --rpm, --usd-micros, --tokens, --refuse-unpriced",
+            "pass at least one of --rpm, --usd-micros, --tokens, --refuse-unpriced, --model",
         ));
     }
     let doc = read_config_text(cli)?;
     let mut cfg = load(cli)?;
+    // Resolved before the row is borrowed: a scope that names no combo is refused
+    // here, not written. `None` leaves the scope as it is.
+    let scope = match &args.model {
+        Some(raw) => Some(limit_scope(raw, &cfg.combos).map_err(|(m, h)| fail(m, h))?),
+        None => None,
+    };
     let label = args.key.clone().unwrap_or_else(|| "default".to_owned());
     // The merge is per arm: a named arm is set, an arm not passed stays as it
     // was — `set --rpm` must not quietly drop a ceiling the row already
@@ -588,6 +623,10 @@ pub fn limits_set(cli: &Cli, args: &SetLimitsArgs) -> anyhow::Result<()> {
     if let Some(refuse) = args.refuse_unpriced {
         row.refuse_unpriced = refuse;
     }
+    if let Some(scope) = scope {
+        row.model = scope;
+    }
+    // A scope alone limits nothing, so a row with only a scope is empty.
     if row.is_empty() {
         return Err(fail(
             format!("the {label} row would be empty"),
@@ -599,12 +638,13 @@ pub fn limits_set(cli: &Cli, args: &SetLimitsArgs) -> anyhow::Result<()> {
         opt_cell(row.usd_micros),
         opt_cell(row.tokens),
         row.refuse_unpriced,
+        opt_cell(row.model.as_deref()),
     );
     let next = splice_section(&doc, "limits", &import::limits::render(&cfg.limits));
     write_file(&cli.config, &next)?;
     println!(
-        "limits: {label} — rpm={} usd_micros={} tokens={} refuse_unpriced={}",
-        summary.0, summary.1, summary.2, summary.3
+        "limits: {label} — rpm={} usd_micros={} tokens={} refuse_unpriced={} model={}",
+        summary.0, summary.1, summary.2, summary.3, summary.4
     );
     Ok(())
 }
@@ -3337,6 +3377,7 @@ mod tests {
                 usd_micros: None,
                 tokens: Some(1000),
                 refuse_unpriced: None,
+            model: None,
             },
         )
         .unwrap();
@@ -3357,6 +3398,7 @@ mod tests {
                 usd_micros: Some(5_000_000),
                 tokens: None,
                 refuse_unpriced: Some(true),
+            model: None,
             },
         )
         .unwrap();
@@ -3376,10 +3418,58 @@ mod tests {
                 usd_micros: None,
                 tokens: None,
                 refuse_unpriced: None,
+            model: None,
             },
         )
         .unwrap();
         assert_eq!(load(&cli).unwrap().limits.default.rpm, Some(60));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn limits_set_scopes_a_row_to_one_combo_and_clears_it_with_an_empty_value() {
+        let dir = tmpdir("limits-scope");
+        let cli = limits_cli(&dir);
+        let set = |rpm: Option<u32>, model: Option<&str>| SetLimitsArgs {
+            key: Some("ci".to_owned()),
+            rpm,
+            usd_micros: None,
+            tokens: None,
+            refuse_unpriced: None,
+            model: model.map(str::to_owned),
+        };
+        limits_set(&cli, &set(Some(60), Some("c"))).unwrap();
+        assert_eq!(load(&cli).unwrap().limits.keys["ci"].model.as_deref(), Some("c"));
+
+        // A name with no `/` must be a combo that exists, and a refused scope
+        // writes nothing, so the row keeps the scope it had.
+        assert!(limits_set(&cli, &set(None, Some("nope"))).is_err());
+        assert_eq!(load(&cli).unwrap().limits.keys["ci"].model.as_deref(), Some("c"));
+
+        // A `provider/model` name needs no combo, and `""` clears the scope.
+        limits_set(&cli, &set(None, Some("openai/gpt-5.4"))).unwrap();
+        assert_eq!(load(&cli).unwrap().limits.keys["ci"].model.as_deref(), Some("openai/gpt-5.4"));
+        limits_set(&cli, &set(None, Some(""))).unwrap();
+        let row = &load(&cli).unwrap().limits.keys["ci"];
+        assert_eq!(row.model, None);
+        assert_eq!(row.rpm, Some(60), "clearing the scope keeps the arms");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn limits_set_refuses_a_scope_alone_on_a_row_with_no_arms() {
+        let dir = tmpdir("limits-scope-alone");
+        let cli = limits_cli(&dir);
+        let scope_only = SetLimitsArgs {
+            key: Some("fresh".to_owned()),
+            rpm: None,
+            usd_micros: None,
+            tokens: None,
+            refuse_unpriced: None,
+            model: Some("c".to_owned()),
+        };
+        assert!(limits_set(&cli, &scope_only).is_err(), "a scope limits nothing by itself");
+        assert!(!load(&cli).unwrap().limits.keys.contains_key("fresh"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3395,6 +3485,7 @@ mod tests {
                 usd_micros: None,
                 tokens: None,
                 refuse_unpriced: None,
+            model: None,
             },
         );
         assert!(
@@ -3409,6 +3500,7 @@ mod tests {
                 usd_micros: None,
                 tokens: None,
                 refuse_unpriced: None,
+            model: None,
             },
         );
         assert!(empty.is_err(), "nothing to set");
@@ -3429,6 +3521,7 @@ mod tests {
                 usd_micros: None,
                 tokens: None,
                 refuse_unpriced: None,
+            model: None,
             },
         )
         .unwrap();
@@ -3440,6 +3533,7 @@ mod tests {
                 usd_micros: None,
                 tokens: None,
                 refuse_unpriced: None,
+            model: None,
             },
         )
         .unwrap();

@@ -393,6 +393,11 @@ pub struct SetLimitsArgs {
         value_parser = clap::value_parser!(bool)
     )]
     pub refuse_unpriced: Option<bool>,
+    /// Scope the row to one combo id or `provider/model`, so its arms apply
+    /// only to that model. `--model ""` clears the scope. The ledger still
+    /// totals the key's whole spend (docs/23 G3).
+    #[arg(long)]
+    pub model: Option<String>,
 }
 
 /// Options for `aroute limits clear`.
