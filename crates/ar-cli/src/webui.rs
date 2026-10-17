@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{State, Json};
+use axum::extract::{Json, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
@@ -130,6 +130,7 @@ pub fn mount(proxy: Router, ctx: Ctx) -> Router {
         .route("/ui/fonts/sora-var-latin.woff2", get(font_sora))
         .route("/ui/api/state", get(state))
         .route("/ui/api/usage", get(usage))
+        .route("/ui/api/log", get(request_log))
         .route("/ui/api/models", get(models))
         .route("/ui/api/combos", post(save_combos))
         .route("/ui/api/provider-key", post(provider_key))
@@ -355,7 +356,7 @@ fn env_vars_set(path: &std::path::Path) -> BTreeSet<String> {
 
 /// Recent usage from the ledger the response path writes to: the same rows
 /// `aroute cost-report` prints.
-async fn usage(State(ctx): State<Arc<Ctx>>) -> Response {
+async fn usage(State(ctx): State<Arc<Ctx>>, Query(q): Query<UsageQuery>) -> Response {
     let Some(ledger) = ctx.ledger.clone() else {
         return Json(json!({ "rows": [], "totals": { "usd": 0.0, "tokens": 0 }, "open": false, "analytics": { "days": [], "models": [], "providers": [] } })).into_response();
     };
@@ -373,8 +374,9 @@ async fn usage(State(ctx): State<Arc<Ctx>>) -> Response {
     };
     // Analytics is best-effort beside the report: a full chart grid failing
     // with the request rows would blank the bill table on a broken query.
-    let analytics = guard
-        .analytics(10)
+    let analytics = q
+        .days
+        .map_or_else(|| guard.analytics(10), |d| guard.analytics_range(d.clamp(1, 365), 10))
         .map(|a| json!({
             "days": a.days.iter().map(|d| json!({
                 "name": d.name, "requests": d.requests, "tokens": d.tokens,
@@ -407,6 +409,57 @@ async fn usage(State(ctx): State<Arc<Ctx>>) -> Response {
         "analytics": analytics,
     }))
     .into_response()
+}
+
+/// `?days=` on the usage endpoint: absent keeps the bill-style all-time ranks.
+#[derive(serde::Deserialize)]
+struct UsageQuery {
+    days: Option<u32>,
+}
+
+/// The request-log filter bar's query string.
+#[derive(serde::Deserialize)]
+struct LogQuery {
+    days: Option<u32>,
+    model: Option<String>,
+    provider: Option<String>,
+    /// `error` shows failed requests only; anything else shows all.
+    status: Option<String>,
+}
+
+/// Most log rows one response carries; the page shows a window, not a dump.
+const LOG_LIMIT: usize = 200;
+
+/// `GET /ui/api/log` — answered and failed requests, newest first, inside a
+/// date range, optionally narrowed by model, provider or failure-only.
+async fn request_log(State(ctx): State<Arc<Ctx>>, Query(q): Query<LogQuery>) -> Response {
+    let Some(ledger) = ctx.ledger.clone() else {
+        return Json(json!({ "rows": [], "open": false })).into_response();
+    };
+    // Empty strings are the filter bar's "any": treat them as absent.
+    let pick = |v: &Option<String>| v.as_deref().filter(|s| !s.is_empty()).map(str::to_owned);
+    let (model, provider) = (pick(&q.model), pick(&q.provider));
+    let filter = ar_tokens::LogFilter {
+        days: q.days.unwrap_or(30).clamp(1, 365),
+        model: model.as_deref(),
+        provider: provider.as_deref(),
+        errors_only: q.status.as_deref() == Some("error"),
+        limit: LOG_LIMIT,
+    };
+    let guard = ledger.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    match guard.log(&filter) {
+        Ok(rows) => Json(json!({
+            "open": true,
+            "limit": LOG_LIMIT,
+            "rows": rows.iter().map(|r| json!({
+                "at": r.created_at, "key": r.key_id, "provider": r.provider, "model": r.model,
+                "tokens": r.tokens, "usd": r.cost_usd.micros as f64 / 1_000_000.0,
+                "priced": r.priced, "status": r.status, "error": r.error,
+            })).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(e) => Json(json!({ "open": true, "rows": [], "error": e.to_string() })).into_response(),
+    }
 }
 
 // ── writes ──────────────────────────────────────────────────────────────────

@@ -63,7 +63,7 @@ const TITLES = {
   combos: ["Routing combos", "A combo is the model name a client asks for. Targets are tried in the strategy's order."],
   providers: ["Providers", "Credentials go to the env file the service loads. The value never appears on this page again."],
   keys: ["Client keys", "Tokens minted from the gate master, verified on every request. The token shows once."],
-  usage: ["Usage", "Straight from the ledger the proxy bills against. Most recent 50 rows."],
+  usage: ["Usage", "Straight from the ledger the proxy bills against, with the requests that failed beside it."],
   playground: ["Playground", "Chat completions through the real gateway, same origin. Streams natively; no proxy in between."],
 };
 
@@ -101,7 +101,6 @@ async function fillUsage() {
   USAGE = await api("/ui/api/usage").catch(() => null);
   const el = $("st-spend");
   if (el && USAGE) el.textContent = "$" + Number(USAGE.totals.usd).toFixed(4);
-  paintUsagePane();
 }
 
 /* ── pane: dashboard ──────────────────────────────────────────────────────── */
@@ -579,12 +578,53 @@ function wireMint() {
 
 /* ── pane: usage ──────────────────────────────────────────────────────────── */
 
+/** The filter bar's state; survives a refresh() so a rebuilt pane keeps its view. */
+const LOGQ = { days: 30, model: "", provider: "", error: false };
+const RANGES = [7, 30, 90];
+
+function logQuery() {
+  const q = new URLSearchParams({ days: String(LOGQ.days) });
+  if (LOGQ.model) q.set("model", LOGQ.model);
+  if (LOGQ.provider) q.set("provider", LOGQ.provider);
+  if (LOGQ.error) q.set("status", "error");
+  return q;
+}
+
+function filterActive() {
+  return LOGQ.model !== "" || LOGQ.provider !== "" || LOGQ.error || LOGQ.days !== 30;
+}
+
 function paneUsage(root) {
+  const field = (label, control) => H("div", { class: "fl" }, H("label", { for: control.id, text: label }), control);
+  const range = H("select", { id: "lg-days" },
+    ...RANGES.map((d) => H("option", { value: String(d), text: "last " + d + " days" })));
+  range.value = String(LOGQ.days);
+  const model = H("input", { id: "lg-model", list: "lg-models", autocomplete: "off", spellcheck: "false", placeholder: "any", value: LOGQ.model });
+  const provider = H("input", { id: "lg-provider", list: "lg-providers", autocomplete: "off", spellcheck: "false", placeholder: "any", value: LOGQ.provider });
+  const errs = H("input", { id: "lg-error", type: "checkbox" });
+  errs.checked = LOGQ.error;
+  const apply = () => {
+    LOGQ.days = Number(range.value);
+    LOGQ.model = model.value.trim();
+    LOGQ.provider = provider.value.trim();
+    LOGQ.error = errs.checked;
+    loadUsageView();
+  };
+  for (const el of [range, errs]) el.addEventListener("change", apply);
+  for (const el of [model, provider]) el.addEventListener("change", apply);
   root.append(
+    H("section", { class: "block" },
+      H("form", { id: "lg-form", class: "filters", onsubmit: (e) => { e.preventDefault(); apply(); } },
+        field("Range", range), field("Model", model), field("Provider", provider),
+        H("div", { class: "fl check" }, errs, H("label", { for: "lg-error", text: "Failed requests only" })),
+        H("button", { id: "lg-clear", class: "btn ghost small", type: "button", text: "Clear filters", hidden: true,
+          onclick: () => { Object.assign(LOGQ, { days: 30, model: "", provider: "", error: false }); route(); } }),
+        H("datalist", { id: "lg-models" }), H("datalist", { id: "lg-providers" }))),
+    H("p", { id: "usage-error", class: "error", role: "alert", hidden: true }),
     H("section", { class: "block" },
       H("div", { class: "block-head" },
         H("h2", { text: "Spend by day" }),
-        H("span", { class: "hint", text: "last 30 days, newest right" })),
+        H("span", { id: "usage-asof", class: "hint" })),
       H("div", { class: "block-body" },
         H("div", { class: "chart", id: "usage-days", role: "img", "aria-label": "daily spend bar chart" }),
         H("p", { class: "chart-caption", id: "usage-days-caption" }))),
@@ -593,15 +633,18 @@ function paneUsage(root) {
       rankBlock("Top providers", "usage-providers")),
     H("section", { class: "block" },
       H("div", { class: "block-head" },
-        H("h2", { text: "Ledger" }),
+        H("h2", { text: "Request log" }),
         H("span", { id: "usage-totals", class: "hint" })),
       H("div", { class: "block-body", style: "padding:0" },
         H("div", { class: "table-wrap" }, H("table", null,
           H("thead", null, H("tr", null,
-            H("th", { text: "Key" }), H("th", { text: "Provider" }), H("th", { text: "Model" }),
-            H("th", { text: "Tokens" }), H("th", { text: "USD" }))),
+            H("th", { scope: "col", text: "Time" }), H("th", { scope: "col", text: "Key" }),
+            H("th", { scope: "col", text: "Provider" }), H("th", { scope: "col", text: "Model" }),
+            H("th", { scope: "col", text: "Status" }),
+            H("th", { scope: "col", class: "num", text: "Tokens" }), H("th", { scope: "col", class: "num", text: "USD" }),
+            H("th", { scope: "col", text: "Detail" }))),
           H("tbody", { id: "usage-rows" }))))));
-  paintUsagePane();
+  loadUsageView();
 }
 
 function rankBlock(title, tbodyId) {
@@ -610,45 +653,112 @@ function rankBlock(title, tbodyId) {
     H("div", { class: "block-body", style: "padding:0" },
       H("div", { class: "table-wrap" }, H("table", null,
         H("thead", null, H("tr", null,
-          H("th", { text: "Name" }), H("th", { text: "Req" }), H("th", { text: "Tokens" }), H("th", { text: "USD" }))),
+          H("th", { scope: "col", text: "Name" }), H("th", { scope: "col", class: "num", text: "Req" }),
+          H("th", { scope: "col", class: "num", text: "Tokens" }), H("th", { scope: "col", class: "num", text: "USD" }))),
         H("tbody", { id: tbodyId })))));
 }
 
-function paintUsagePane() {
-  const totals = $("usage-totals");
-  if (!totals || !USAGE) return;
-  totals.textContent = "$" + Number(USAGE.totals.usd).toFixed(6) +
-    " across " + Number(USAGE.totals.tokens).toLocaleString() + " tokens";
-  paintUsageChart();
-  paintRank("usage-models");
-  paintRank("usage-providers");
+/** One cell-wide message row: the loading, empty and error states share it. */
+function stateRow(cols, text, cls) {
+  return H("tr", null, H("td", { colspan: String(cols), class: "state " + cls, text }));
+}
+
+let USAGE_SEQ = 0;
+
+/** Loads chart + ranks + log for the current filter. Last request wins, so a
+ *  slow earlier answer cannot overwrite a newer filter. */
+async function loadUsageView() {
+  const seq = ++USAGE_SEQ;
   const body = $("usage-rows");
   if (!body) return;
+  $("usage-error").hidden = true;
+  $("lg-clear").hidden = !filterActive();
   body.textContent = "";
-  if (!USAGE.rows.length) {
-    body.append(H("tr", null, H("td", { colspan: "5", class: "varname",
-      text: "No rows yet. Traffic through the proxy lands here." })));
+  body.append(stateRow(8, "Loading…", "loading"));
+  let usage, log;
+  try {
+    [usage, log] = await Promise.all([
+      api("/ui/api/usage?days=" + LOGQ.days),
+      api("/ui/api/log?" + logQuery()),
+    ]);
+  } catch (err) {
+    if (seq !== USAGE_SEQ || !$("usage-rows")) return;
+    body.textContent = "";
+    body.append(stateRow(8, "Could not load the log.", "failed"));
+    const box = $("usage-error");
+    box.textContent = "";
+    box.append(err.message + " ", H("button", { class: "btn small", type: "button", text: "Retry", onclick: loadUsageView }));
+    box.hidden = false;
     return;
   }
-  for (const r of USAGE.rows) {
-    body.append(H("tr", null,
+  if (seq !== USAGE_SEQ || !$("usage-rows")) return;
+  if (usage.error || log.error) {
+    body.textContent = "";
+    body.append(stateRow(8, "The ledger could not be read.", "failed"));
+    $("usage-error").textContent = usage.error || log.error;
+    $("usage-error").hidden = false;
+    return;
+  }
+  paintUsageChart(usage.analytics);
+  paintRank("usage-models", usage.analytics);
+  paintRank("usage-providers", usage.analytics);
+  paintSuggestions(usage.analytics, log.rows);
+  paintLog(log);
+}
+
+function paintSuggestions(analytics, rows) {
+  const fill = (id, names) => {
+    const dl = $(id);
+    dl.textContent = "";
+    for (const n of new Set(names)) if (n && n !== "-") dl.append(H("option", { value: n }));
+  };
+  fill("lg-models", [...(analytics.models || []).map((m) => m.name), ...rows.map((r) => r.model)]);
+  fill("lg-providers", [...(analytics.providers || []).map((p) => p.name), ...rows.map((r) => r.provider)]);
+}
+
+const TIME_FMT = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+
+function paintLog(log) {
+  const body = $("usage-rows");
+  body.textContent = "";
+  const failed = log.rows.filter((r) => r.status >= 400).length;
+  $("usage-totals").textContent = log.rows.length
+    ? "Showing " + log.rows.length + (log.rows.length >= log.limit ? " (newest " + log.limit + ")" : "") +
+      " · " + failed + " failed"
+    : "";
+  if (!log.rows.length) {
+    body.append(stateRow(8, LOGQ.error || LOGQ.model || LOGQ.provider
+      ? "No requests match these filters. Clear them to see the whole range."
+      : "No requests yet. Traffic through the proxy lands here.", "empty"));
+    return;
+  }
+  for (const r of log.rows) {
+    const when = new Date(r.at * 1000);
+    const bad = r.status >= 400;
+    body.append(H("tr", { class: bad ? "failed" : "" },
+      H("td", { class: "num", text: TIME_FMT.format(when), title: when.toISOString() }),
       H("td", { text: r.key }),
       H("td", { text: r.provider }),
       H("td", { text: r.model }),
+      H("td", null, H("span", { class: "status " + (bad ? "bad" : "good"), text: bad ? r.status + " error" : "ok" })),
       H("td", { class: "num", text: Number(r.tokens).toLocaleString() }),
-      H("td", { class: "num", text: r.priced ? "$" + Number(r.usd).toFixed(6) : "unpriced" })));
+      H("td", { class: "num", text: bad ? "-" : r.priced ? "$" + Number(r.usd).toFixed(6) : "unpriced" }),
+      H("td", { class: "detail", text: r.error, title: r.error })));
   }
 }
 
 /* Pure-div bars, max-normalized; heights carry the data, title carries detail. */
-function paintUsageChart() {
-  const days = (USAGE.analytics && USAGE.analytics.days) || [];
+function paintUsageChart(analytics) {
+  const days = (analytics && analytics.days) || [];
   const chart = $("usage-days");
   if (!chart) return;
   chart.textContent = "";
+  $("usage-days-caption").textContent = "";
+  $("usage-asof").textContent = days.length
+    ? "last " + LOGQ.days + " days, as of " + days[days.length - 1].name
+    : "last " + LOGQ.days + " days";
   if (!days.length) {
-    chart.append(H("p", { class: "chart-empty", text: "No usage in ledger yet." }));
-    $("usage-days-caption").textContent = "";
+    chart.append(H("p", { class: "chart-empty", text: "No usage in this range yet." }));
     return;
   }
   const max = Math.max(...days.map((d) => Number(d.usd)), 1e-9);
@@ -656,25 +766,24 @@ function paintUsageChart() {
     const pct = Math.max(Number(d.usd) / max * 100, Number(d.usd) > 0 ? 2 : 0.8);
     chart.append(H("div", { class: "bar",
       style: "height:" + pct.toFixed(1) + "%",
-      title: d.name + " \u00b7 $" + Number(d.usd).toFixed(6) + " \u00b7 " +
+      title: d.name + " · $" + Number(d.usd).toFixed(6) + " · " +
         Number(d.requests).toLocaleString() + " req, " +
         Number(d.tokens).toLocaleString() + " tok" }));
   }
-  $("usage-days-caption").textContent = "";
   $("usage-days-caption").append(
     H("span", { text: days[0].name }),
     H("span", { text: "max $" + max.toFixed(2) }),
     H("span", { text: days[days.length - 1].name }));
 }
 
-function paintRank(tbodyId) {
+function paintRank(tbodyId, analytics) {
   const body = $(tbodyId);
-  if (!body || !USAGE.analytics) return;
-  const rows = USAGE.analytics[tbodyId.replace("usage-", "")]; // models | providers
+  if (!body || !analytics) return;
+  const rows = analytics[tbodyId.replace("usage-", "")]; // models | providers
   if (!rows) return;
   body.textContent = "";
   if (!rows.length) {
-    body.append(H("tr", null, H("td", { colspan: "4", class: "varname", text: "No usage yet." })));
+    body.append(stateRow(4, "No usage in this range.", "empty"));
     return;
   }
   for (const r of rows) {

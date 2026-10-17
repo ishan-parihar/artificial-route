@@ -46,7 +46,23 @@ CREATE TABLE IF NOT EXISTS key_caps (
     token_cap  INTEGER,
     refuse_unpriced INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS failures (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    key_id     TEXT    NOT NULL,
+    model      TEXT    NOT NULL,
+    status     INTEGER NOT NULL,
+    error      TEXT    NOT NULL,
+    created_at INTEGER NOT NULL
+);
 ";
+
+/// Failed requests kept for the /ui request log. A table of its own, beside
+/// `usage` rather than in it: a refusal costs nothing, so it must never reach
+/// the spend sums, the caps or the bill the append-only rows exist to protect.
+/// Trimmed on write, so a flood of bad requests cannot grow the file.
+const FAILURE_KEEP: i64 = 10_000;
+/// Longest error text kept per failure, in characters.
+const FAILURE_TEXT_MAX: usize = 300;
 
 /// Column added after the first release of the schema. `CREATE TABLE IF NOT
 /// EXISTS` skips a table that already exists, so an existing ledger file keeps
@@ -338,7 +354,7 @@ const ANALYTICS_DAYS: &str = "
 SELECT STRFTIME('%Y-%m-%d', created_at, 'unixepoch'), COUNT(*),
        COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost_micros), 0)
 FROM usage
-WHERE created_at >= STRFTIME('%s', (SELECT MAX(created_at) FROM usage), 'unixepoch', '-29 days')
+WHERE created_at >= ?1
 GROUP BY 1 ORDER BY 1
 ";
 
@@ -346,12 +362,73 @@ GROUP BY 1 ORDER BY 1
 // as tiebreak so equal-cost rows do not shuffle between polls.
 const ANALYTICS_MODELS: &str = "
 SELECT model, COUNT(*), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost_micros), 0)
-FROM usage GROUP BY model ORDER BY 4 DESC, 1 ASC LIMIT ?1
+FROM usage WHERE created_at >= ?1 GROUP BY model ORDER BY 4 DESC, 1 ASC LIMIT ?2
 ";
 const ANALYTICS_PROVIDERS: &str = "
 SELECT provider, COUNT(*), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost_micros), 0)
-FROM usage GROUP BY provider ORDER BY 4 DESC, 1 ASC LIMIT ?1
+FROM usage WHERE created_at >= ?1 GROUP BY provider ORDER BY 4 DESC, 1 ASC LIMIT ?2
 ";
+
+/// Newest row across both tables: the anchor a date range counts back from, so
+/// an idle ledger shows its last active window instead of an empty one.
+const NEWEST: &str = "
+SELECT MAX(m) FROM (SELECT MAX(created_at) AS m FROM usage
+                    UNION ALL SELECT MAX(created_at) FROM failures)
+";
+
+// Answered rows and failures as one stream. A failure has no provider (the
+// chain never settled on one), so it is `-`, and `200` marks an answered row.
+const LOG: &str = "
+SELECT * FROM (
+    SELECT created_at, key_id, provider, model, total_tokens, cost_micros, priced,
+           200 AS status, '' AS error FROM usage
+    UNION ALL
+    SELECT created_at, key_id, '-', model, 0, 0, 1, status, error FROM failures
+)
+WHERE created_at >= ?1
+  AND (?2 IS NULL OR model = ?2)
+  AND (?3 IS NULL OR provider = ?3)
+  AND (?4 = 0 OR status >= 400)
+ORDER BY created_at DESC LIMIT ?5
+";
+
+/// What the /ui request log asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogFilter<'a> {
+    /// Window length in days, counted back from the newest row.
+    pub days: u32,
+    /// Only this model (the combo id for a failure).
+    pub model: Option<&'a str>,
+    /// Only this provider.
+    pub provider: Option<&'a str>,
+    /// Only failed requests.
+    pub errors_only: bool,
+    /// Most rows returned, newest first.
+    pub limit: usize,
+}
+
+/// One line of the request log: an answered request or a failed one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogRow {
+    /// Unix seconds.
+    pub created_at: i64,
+    /// Key that made the request.
+    pub key_id: String,
+    /// Provider that served it, `-` for a failure.
+    pub provider: String,
+    /// Model served, or the model asked for on a failure.
+    pub model: String,
+    /// Prompt + completion tokens.
+    pub tokens: u32,
+    /// Dollars charged.
+    pub cost_usd: Usd,
+    /// `false` when the row had no pricing row behind it.
+    pub priced: bool,
+    /// HTTP status: `200` for an answered row, the error status otherwise.
+    pub status: u16,
+    /// Why it failed; empty for an answered row.
+    pub error: String,
+}
 
 /// SQLite-backed usage ledger.
 ///
@@ -609,11 +686,101 @@ impl Ledger {
     ///
     /// Returns [`TokenError::Sqlite`] on a read failure.
     pub fn analytics(&self, rank_cap: usize) -> Result<Analytics, TokenError> {
-        let days = self.named_buckets(ANALYTICS_DAYS, [])?;
-        let cap = [i64::try_from(rank_cap).unwrap_or(i64::MAX)];
-        let models = self.named_buckets(ANALYTICS_MODELS, cap)?;
-        let providers = self.named_buckets(ANALYTICS_PROVIDERS, cap)?;
-        Ok(Analytics { days, models, providers })
+        self.analytics_since(30, None, rank_cap)
+    }
+
+    /// [`Ledger::analytics`] over a chosen window: the daily buckets and both
+    /// ranks cover only the last `days` days (counted back from the newest
+    /// row), which is what a /ui range picker asks for.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TokenError::Sqlite`] on a read failure.
+    pub fn analytics_range(&self, days: u32, rank_cap: usize) -> Result<Analytics, TokenError> {
+        self.analytics_since(days, Some(days), rank_cap)
+    }
+
+    // `rank_days` of `None` ranks over all time, the bill-style view.
+    fn analytics_since(
+        &self,
+        days: u32,
+        rank_days: Option<u32>,
+        rank_cap: usize,
+    ) -> Result<Analytics, TokenError> {
+        let Some(newest) = self.conn.query_row("SELECT MAX(created_at) FROM usage", [], |r| {
+            r.get::<_, Option<i64>>(0)
+        })?
+        else {
+            return Ok(Analytics::default());
+        };
+        let cap = i64::try_from(rank_cap).unwrap_or(i64::MAX);
+        let rank_since = rank_days.map_or(0, |d| window_start(newest, d));
+        Ok(Analytics {
+            days: self.named_buckets(ANALYTICS_DAYS, params![window_start(newest, days)])?,
+            models: self.named_buckets(ANALYTICS_MODELS, params![rank_since, cap])?,
+            providers: self.named_buckets(ANALYTICS_PROVIDERS, params![rank_since, cap])?,
+        })
+    }
+
+    /// Records one failed request for the /ui log. Never touches `usage`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TokenError::Sqlite`] on a write failure.
+    pub fn record_failure(
+        &self,
+        key_id: &str,
+        model: &str,
+        status: u16,
+        error: &str,
+        created_at: i64,
+    ) -> Result<(), TokenError> {
+        let error: String = error.chars().take(FAILURE_TEXT_MAX).collect();
+        self.conn.execute(
+            "INSERT INTO failures (key_id, model, status, error, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![key_id, model, i64::from(status), error, created_at],
+        )?;
+        self.conn.execute(
+            "DELETE FROM failures WHERE id <= (SELECT MAX(id) FROM failures) - ?1",
+            params![FAILURE_KEEP],
+        )?;
+        Ok(())
+    }
+
+    /// The request log: answered and failed requests, newest first, inside the
+    /// filter's window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TokenError::Sqlite`] on a read failure.
+    pub fn log(&self, filter: &LogFilter<'_>) -> Result<Vec<LogRow>, TokenError> {
+        let Some(newest) = self.conn.query_row(NEWEST, [], |r| r.get::<_, Option<i64>>(0))?
+        else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = self.conn.prepare(LOG)?;
+        let mut rows = stmt.query(params![
+            window_start(newest, filter.days),
+            filter.model,
+            filter.provider,
+            i64::from(filter.errors_only),
+            i64::try_from(filter.limit).unwrap_or(i64::MAX),
+        ])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(LogRow {
+                created_at: row.get(0)?,
+                key_id: row.get(1)?,
+                provider: row.get(2)?,
+                model: row.get(3)?,
+                tokens: to_u32(row.get::<_, i64>(4)?),
+                cost_usd: Usd { micros: to_u64(row.get::<_, i64>(5)?) },
+                priced: row.get::<_, i64>(6)? != 0,
+                status: u16::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
+                error: row.get(8)?,
+            });
+        }
+        Ok(out)
     }
 
     // One SQL over the usage table mapped to [`SpendBucket`] rows. Constants
@@ -680,6 +847,12 @@ impl Ledger {
     }
 }
 
+/// First second of a `days`-day window ending at `newest` (inclusive of the
+/// newest day, so `days = 1` is the last 24 hours).
+fn window_start(newest: i64, days: u32) -> i64 {
+    newest.saturating_sub(i64::from(days.max(1) - 1).saturating_mul(86_400))
+}
+
 fn to_u64(n: i64) -> u64 {
     u64::try_from(n).unwrap_or(0)
 }
@@ -712,7 +885,7 @@ fn has_column(conn: &Connection, column: &str) -> Result<bool, TokenError> {
 #[cfg(test)]
 mod tests {
     use super::{Cap, CostReport, DenyReason, Entry, Ledger, Verdict};
-    use super::{Analytics, SpendBucket};
+    use super::{Analytics, LogFilter, SpendBucket};
     use crate::pricing::{Cost, Prices, PricingTable, Usd};
     use crate::usage::NormalizedUsage;
     use rusqlite::Connection;
@@ -803,6 +976,57 @@ mod tests {
         assert_eq!(a.models.len(), 1, "rank_cap bounds the rank list");
         assert_eq!(a.models[0].name, "gpt-4o");
         assert_eq!(a.models[0].requests, 3);
+    }
+
+    fn all_rows() -> LogFilter<'static> {
+        LogFilter { days: 30, model: None, provider: None, errors_only: false, limit: 50 }
+    }
+
+    #[test]
+    fn log_should_merge_failures_and_answered_rows_newest_first() {
+        let ledger = Ledger::open_in_memory().expect("open");
+        ledger.record(&entry("k1", "openai", "gpt-4o", 100)).expect("record");
+        ledger
+            .record_failure("k1", "jev", 502, "all providers failed", 1_700_000_100)
+            .expect("failure");
+        let statuses: Vec<u16> =
+            ledger.log(&all_rows()).expect("log").iter().map(|r| r.status).collect();
+        assert_eq!(statuses, [502, 200]);
+    }
+
+    #[test]
+    fn log_should_keep_only_failures_when_errors_only() {
+        let ledger = Ledger::open_in_memory().expect("open");
+        ledger.record(&entry("k1", "openai", "gpt-4o", 100)).expect("record");
+        ledger.record_failure("k1", "jev", 429, "throttled", 1_700_000_100).expect("failure");
+        let filter = LogFilter { errors_only: true, ..all_rows() };
+        assert_eq!(ledger.log(&filter).expect("log").len(), 1);
+    }
+
+    #[test]
+    fn log_should_filter_by_model_when_one_is_named() {
+        let ledger = Ledger::open_in_memory().expect("open");
+        ledger.record(&entry("k1", "openai", "gpt-4o", 100)).expect("record");
+        ledger.record(&entry("k1", "anthropic", "claude-sonnet-4", 5)).expect("record");
+        let filter = LogFilter { model: Some("gpt-4o"), ..all_rows() };
+        assert_eq!(ledger.log(&filter).expect("log")[0].provider, "openai");
+    }
+
+    #[test]
+    fn record_failure_should_leave_the_spend_report_untouched_when_it_writes() {
+        let ledger = Ledger::open_in_memory().expect("open");
+        ledger.record_failure("k1", "jev", 502, "down", 1_700_000_100).expect("failure");
+        assert_eq!(ledger.report(10).expect("report").rows.len(), 0);
+    }
+
+    #[test]
+    fn analytics_range_should_drop_older_days_when_the_window_is_one_day() {
+        let ledger = Ledger::open_in_memory().expect("open");
+        ledger.record(&entry("k1", "openai", "gpt-4o", 100)).expect("record");
+        let mut later = entry("k3", "anthropic", "claude-sonnet-4", 5);
+        later.created_at = 1_700_086_400;
+        ledger.record(&later).expect("record");
+        assert_eq!(ledger.analytics_range(1, 10).expect("range").days.len(), 1);
     }
 
     #[test]

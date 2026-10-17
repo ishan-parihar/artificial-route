@@ -403,6 +403,64 @@ impl Dialect {
     }
 }
 
+/// The one entry every inbound dialect shares: serves the request, then logs
+/// it for the /ui request log when it failed.
+async fn handle_chat(
+    state: &AppState,
+    headers: &HeaderMap,
+    path: &str,
+    body: Bytes,
+    dialect: Dialect,
+) -> Response {
+    // `Bytes` clones by refcount; the copy is only parsed on a failure.
+    let asked = body.clone();
+    let mut seen_key = None;
+    let resp = handle_chat_inner(state, headers, path, body, dialect, &mut seen_key).await;
+    note_failure(state, &resp, seen_key.as_deref(), &asked);
+    resp
+}
+
+/// Why a failed response failed, in one line, for the /ui request log.
+///
+/// Rides on the response as an extension so the log never re-reads a body.
+#[derive(Clone)]
+struct FailNote(String);
+
+/// Writes a failed request to the usage ledger's `failures` table, when a
+/// ledger is configured. Auth refusals (401/403) are skipped: they are probes,
+/// not routed requests, and would let anyone fill the log.
+fn note_failure(state: &AppState, resp: &Response, key_id: Option<&str>, asked: &[u8]) {
+    let status = resp.status();
+    if status.as_u16() < 400 || matches!(status.as_u16(), 401 | 403) {
+        return;
+    }
+    let Some(ledger) = state.ledger.as_ref() else {
+        return;
+    };
+    #[derive(serde::Deserialize)]
+    struct Asked {
+        model: Option<String>,
+    }
+    let model = serde_json::from_slice::<Asked>(asked)
+        .ok()
+        .and_then(|a| a.model)
+        .unwrap_or_default();
+    let why = resp.extensions().get::<FailNote>().map_or_else(
+        || status.canonical_reason().unwrap_or("error"),
+        |note| note.0.as_str(),
+    );
+    if let Err(e) = ledger.lock().expect("ledger lock").record_failure(
+        key_id.unwrap_or("anonymous"),
+        &model,
+        status.as_u16(),
+        why,
+        epoch_now(),
+    ) {
+        // A log write must not turn a failed request into a different failure.
+        tracing::warn!(error = %e, "failure log write failed");
+    }
+}
+
 /// The one chat pipeline, for every inbound dialect.
 ///
 /// Order is the module doc's seven steps, and each is where it is because the
@@ -412,17 +470,20 @@ impl Dialect {
 /// turns, the route resolution before the cache so the key covers what is
 /// dispatched, and the deadline only around the attempt loop because everything
 /// before it is local work that cannot hang on a socket.
-async fn handle_chat(
+async fn handle_chat_inner(
     state: &AppState,
     headers: &HeaderMap,
     path: &str,
     body: Bytes,
     dialect: Dialect,
+    seen_key: &mut Option<String>,
 ) -> Response {
     let key_id = match authorize(state, headers, path) {
         Ok(key_id) => key_id,
         Err(reason) => return *reason,
     };
+    // Handed back so a failure the wrapper logs names the key that made it.
+    seen_key.clone_from(&key_id);
     // The policy layer's 429 arm, before any body work: a key past its
     // requests-per-minute bucket is told when its next token lands and
     // nothing else happens. Checked before the parse because a rate-limited
@@ -2112,6 +2173,7 @@ fn decorate(
             builder
                 .header(header::RETRY_AFTER, secs.to_string())
                 .header(header::CONTENT_TYPE, "application/json")
+                .extension(FailNote("every provider in the chain is throttled".to_owned()))
                 .status(StatusCode::TOO_MANY_REQUESTS)
                 .body(json_body(
                     ErrorSpec::of(
@@ -2151,11 +2213,13 @@ fn decorate(
             }
             builder
                 .header(header::CONTENT_TYPE, "application/json")
+                .extension(FailNote(format!("{message} ({code})")))
                 .status(status)
                 .body(json_body(ErrorSpec::of(status, code, &message)))
         }
         AttemptOutcome::Abort(report) => builder
             .header(header::CONTENT_TYPE, "application/json")
+            .extension(FailNote(report.reason.to_string()))
             .status(report.status)
             .body(json_body(ErrorSpec::of(
                 report.status,
@@ -2588,6 +2652,7 @@ pub(crate) fn error_because(
 fn error_spec(status: StatusCode, spec: ErrorSpec<'_>) -> Response {
     let mut resp = json_body(spec).into_response();
     *resp.status_mut() = status;
+    resp.extensions_mut().insert(FailNote(spec.message.to_owned()));
     resp.headers_mut().insert(
         HeaderName::from_static(DECISION_HEADER),
         HeaderValue::from_static("strategy=none"),
@@ -5502,6 +5567,32 @@ mod tests {
         let body = body_of(resp).await;
         assert_eq!(body["error"]["code"], "insufficient_quota");
         assert_eq!(body["error"]["type"], "server_error");
+    }
+
+    #[tokio::test]
+    async fn a_failed_request_lands_in_the_failure_log_with_the_model_asked_for() {
+        let ledger = Arc::new(Mutex::new(
+            ar_tokens::Ledger::open_in_memory().expect("in-memory ledger"),
+        ));
+        let exec = Arc::new(FailingExec(502, r#"{"error":{"message":"down"}}"#));
+        let router = crate::app::app(routed_with_ledger(exec, Arc::clone(&ledger)));
+        let _ = drive(
+            &router,
+            chat(
+                r#"{"model":"jev","messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ),
+        )
+        .await;
+        let filter = ar_tokens::LogFilter {
+            days: 30,
+            model: Some("jev"),
+            provider: None,
+            errors_only: true,
+            limit: 10,
+        };
+        let rows = ledger.lock().expect("ledger lock").log(&filter).expect("log");
+        assert_eq!(rows.len(), 1);
     }
 
     #[tokio::test]
