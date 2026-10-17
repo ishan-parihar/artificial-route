@@ -9,16 +9,16 @@ A minimal-RAM Rust port of the [OmniRoute](https://github.com/ishan-parihar/Omni
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ishan-parihar/artificial-route/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/ishan-parihar/artificial-route/main/install.sh | bash
 ```
 
 That one command installs the newest release, writes a working `~/.config/ar/config.yaml`, writes a `600` credential env file, and installs and starts a **systemd unit** so the proxy comes up on boot.
 
-It does **not** add the weekly update timer when piped. The timer runs a saved copy of the installer, and a piped `curl | sh` has no file to copy — `$0` is `sh`. For unattended updates, save it first:
+It does **not** add the weekly update timer when piped. The timer runs a saved copy of the installer, and a piped `curl | bash` has no file to copy — `$0` is `bash`. For unattended updates, save it first:
 
 ```sh
 curl -fsSL -o install.sh https://raw.githubusercontent.com/ishan-parihar/artificial-route/main/install.sh
-sh install.sh
+bash install.sh
 ```
 
 The default install is **lite**: the rust binary only. The web dashboard — ~2 GiB of compiled Next.js built locally by `dashboard/rebrand-dist.sh`, too large to ship as a release asset — installs from that local tree with `--with-dashboard`; every flag is in the table under [Installation](#installation).
@@ -193,7 +193,7 @@ OAuth login flow and its `$VAR`-must-be-exported rule under
 ## Installation
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ishan-parihar/artificial-route/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/ishan-parihar/artificial-route/main/install.sh | bash
 ```
 
 Static musl binary, checksum-verified, no runtime deps. Lands in `~/.local/bin/aroute` and does the whole job in one command: installs the newest release, writes a working `config.yaml` under `~/.config/ar/` (never overwriting an existing one), writes a `600` env file for credentials, installs a **systemd unit** so the proxy starts on boot, and finishes by running `aroute doctor` so the result is proved rather than asserted.
@@ -367,7 +367,7 @@ When the dashboard *is* installed it comes up as its own unit, **stopped by defa
 systemctl --user start aroute-dashboard   # UI up; the Node child holds ~700 MB RSS
 systemctl --user stop  aroute-dashboard   # RSS reclaimed, port 20149 freed
 systemctl --user enable aroute-dashboard  # optional: bring it up at boot instead
-sh install.sh --check                    # reports dashboard + dashsvc state
+bash install.sh --check                    # reports dashboard + dashsvc state
 ```
 
 The proxy has never needed the dashboard: `serve` reads config and env only, so on a memory-tight box the UI is a deliberate, reversible choice. An update while the unit is running stops it for the binary swap and restarts it on the new build (`dashsvc: restarted on aroute <version>`), so unattended updates never leave a stale dashboard or a half-swapped binary.

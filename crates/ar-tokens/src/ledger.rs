@@ -306,6 +306,53 @@ fn format_usd(usd: Usd) -> String {
     usd.as_decimal_string()
 }
 
+/// One spend slice on the /ui analytics charts: a calendar day, a model, or a
+/// provider with its summary over that slice.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SpendBucket {
+    /// Which slice this totals: `YYYY-MM-DD`, a model name, or a provider name.
+    pub name: String,
+    /// Completed requests in the slice.
+    pub requests: u64,
+    /// Prompt + completion tokens.
+    pub tokens: u64,
+    /// Micro-dollars charged.
+    pub cost_usd_micros: u64,
+}
+
+/// The /ui usage pane's lens over the ledger: spend by calendar day (anchored
+/// on the newest row so an idle ledger stays non-empty), by model, and by
+/// provider. [`Ledger::report`] stays wholesale; this is the aggregation.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Analytics {
+    /// One bucket per calendar day with usage, oldest first, last 30 days.
+    pub days: Vec<SpendBucket>,
+    /// Per-model buckets, most expensive first, capped at the requested limit.
+    pub models: Vec<SpendBucket>,
+    /// Per-provider buckets, most expensive first, capped at the requested
+    /// limit.
+    pub providers: Vec<SpendBucket>,
+}
+
+const ANALYTICS_DAYS: &str = "
+SELECT STRFTIME('%Y-%m-%d', created_at, 'unixepoch'), COUNT(*),
+       COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost_micros), 0)
+FROM usage
+WHERE created_at >= STRFTIME('%s', (SELECT MAX(created_at) FROM usage), 'unixepoch', '-29 days')
+GROUP BY 1 ORDER BY 1
+";
+
+// Ranked by dollars so a /ui table reads top-down like a bill, with the name
+// as tiebreak so equal-cost rows do not shuffle between polls.
+const ANALYTICS_MODELS: &str = "
+SELECT model, COUNT(*), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost_micros), 0)
+FROM usage GROUP BY model ORDER BY 4 DESC, 1 ASC LIMIT ?1
+";
+const ANALYTICS_PROVIDERS: &str = "
+SELECT provider, COUNT(*), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost_micros), 0)
+FROM usage GROUP BY provider ORDER BY 4 DESC, 1 ASC LIMIT ?1
+";
+
 /// SQLite-backed usage ledger.
 ///
 /// Blocking: `rusqlite` is synchronous. Hold it behind a mutex or hand work to
@@ -554,6 +601,43 @@ impl Ledger {
         Ok(Verdict::Allow)
     }
 
+    /// Aggregates the ledger into the /ui analytics shape: last 30 days of
+    /// daily spend, plus per-model and per-provider ranks (most expensive
+    /// first, capped at `rank_cap` rows each).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TokenError::Sqlite`] on a read failure.
+    pub fn analytics(&self, rank_cap: usize) -> Result<Analytics, TokenError> {
+        let days = self.named_buckets(ANALYTICS_DAYS, [])?;
+        let cap = [i64::try_from(rank_cap).unwrap_or(i64::MAX)];
+        let models = self.named_buckets(ANALYTICS_MODELS, cap)?;
+        let providers = self.named_buckets(ANALYTICS_PROVIDERS, cap)?;
+        Ok(Analytics { days, models, providers })
+    }
+
+    // One SQL over the usage table mapped to [`SpendBucket`] rows. Constants
+    // name their own group column (a bound '?' would be a constant there and
+    // collapse every row into one bucket); the ranked SQL binds only its cap.
+    fn named_buckets<P: rusqlite::Params>(
+        &self,
+        sql: &str,
+        params: P,
+    ) -> Result<Vec<SpendBucket>, TokenError> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut rows = stmt.query(params)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(SpendBucket {
+                name: row.get(0)?,
+                requests: to_u64(row.get::<_, i64>(1)?),
+                tokens: to_u64(row.get::<_, i64>(2)?),
+                cost_usd_micros: to_u64(row.get::<_, i64>(3)?),
+            });
+        }
+        Ok(out)
+    }
+
     /// Most recent `limit` usage rows plus the all-key totals, for
     /// `ar cost-report`.
     ///
@@ -628,6 +712,7 @@ fn has_column(conn: &Connection, column: &str) -> Result<bool, TokenError> {
 #[cfg(test)]
 mod tests {
     use super::{Cap, CostReport, DenyReason, Entry, Ledger, Verdict};
+    use super::{Analytics, SpendBucket};
     use crate::pricing::{Cost, Prices, PricingTable, Usd};
     use crate::usage::NormalizedUsage;
     use rusqlite::Connection;
@@ -677,6 +762,53 @@ mod tests {
             .record(&entry("k1", "openai", "gpt-4o", 1_200))
             .expect("record");
         assert_eq!(ledger.spend("k1").expect("spend").tokens, 1_200);
+    }
+
+    #[test]
+    fn analytics_should_bucket_days_models_and_providers_when_rows_exist() {
+        let ledger = Ledger::open_in_memory().expect("open");
+        ledger.record(&entry("k1", "openai", "gpt-4o", 100)).expect("record");
+        // Same day, different key: the day bucket must merge them (2 requests).
+        ledger.record(&entry("k2", "openai", "gpt-4o", 10)).expect("record");
+        // Different day and provider, higher cost per test fixture is flat, so
+        // order the model rank by that two-row provider instead.
+        let mut later = entry("k3", "anthropic", "claude-sonnet-4", 5);
+        later.created_at = 1_700_086_400; // fixture day + 1.
+        ledger.record(&later).expect("record");
+
+        let a = ledger.analytics(10).expect("analytics");
+        assert_eq!(a.days.len(), 2, "one bucket per calendar day");
+        assert_eq!(a.days[0].name, "2023-11-14");
+        assert_eq!(a.days[0].requests, 2);
+        assert_eq!(a.days[1].name, "2023-11-15");
+        assert_eq!(
+            a.providers[0],
+            SpendBucket {
+                name: "openai".into(),
+                requests: 2,
+                tokens: 110,
+                cost_usd_micros: 2_000,
+            }
+        );
+        assert_eq!(a.models[0].name, "gpt-4o");
+    }
+
+    #[test]
+    fn analytics_should_rank_models_by_dollars_then_cap_the_list() {
+        let ledger = Ledger::open_in_memory().expect("open");
+        for (model, tokens) in [("gpt-4o", 100), ("gpt-4o", 100), ("gpt-4o", 100), ("cheap", 5), ("cheap", 5)] {
+            ledger.record(&entry("k1", "openai", model, tokens)).expect("record");
+        }
+        let a = ledger.analytics(1).expect("analytics");
+        assert_eq!(a.models.len(), 1, "rank_cap bounds the rank list");
+        assert_eq!(a.models[0].name, "gpt-4o");
+        assert_eq!(a.models[0].requests, 3);
+    }
+
+    #[test]
+    fn analytics_should_return_empty_buckets_when_the_ledger_is_new() {
+        let ledger = Ledger::open_in_memory().expect("open");
+        assert_eq!(ledger.analytics(10).expect("analytics"), Analytics::default());
     }
 
     #[test]

@@ -203,6 +203,9 @@ pub enum Command {
     ///   aroute dashboard --port 20150 --path ./dashboard/dist
     #[command(verbatim_doc_comment)]
     Dashboard(DashboardArgs),
+
+    /// Support development 💜
+    Donate,
 }
 
 /// Options for `aroute dashboard`.

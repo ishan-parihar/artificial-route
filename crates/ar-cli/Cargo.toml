@@ -86,3 +86,6 @@ insta = { workspace = true }
 # is the only way to prove a logout removed the right rows. Already a normal
 # dependency of this crate, so this names a dev consumer rather than a new crate.
 ar-keys = { path = "../ar-keys" }
+# The combo-renderer round-trip tests build a `Compression` value directly; the
+# compression enums are private to `ar-config`, so the tests import from the crate.
+ar-compress = { path = "../ar-compress" }

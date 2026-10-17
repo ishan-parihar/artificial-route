@@ -1,8 +1,8 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Install, update, or remove `ar` (artificial-route) — a static musl binary with
 # no runtime dependencies.
 #
-#   curl -fsSL https://raw.githubusercontent.com/ishan-parihar/artificial-route/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/ishan-parihar/artificial-route/main/install.sh | bash
 #
 # One command does the whole job: installs the newest release, writes a working
 # config, installs and starts a systemd unit so the proxy comes up on boot, and
@@ -29,6 +29,10 @@
 #   --check                report installed vs newest and service state; change nothing
 #   --uninstall            remove the binary, unit, autostart, and dashboard dist;
 #                          keep the config, credentials, and dashboard data
+#   --force-root           allow running as root (default: refuse)
+#   --no-cta               suppress the star/donate CTA
+#   --all-harnesses        register the MCP server in every detected harness
+#   --no-harness           skip harness/MCP registration (set SKIP_HARNESS=1)
 #   --help
 # Unknown flags fail loudly (exit 2).
 #
@@ -36,13 +40,15 @@
 #            AR_SERVICE (unit scope), AR_CONFIG (config path for the unit),
 #            AR_DASHBOARD (1 = --with-dashboard), AR_DASHBOARD_SRC (dist source),
 #            AR_DASHBOARD_PORT (the dashboard unit's port, default 20149).
+#            SKIP_CTA=1, FORCE_ROOT=1, SKIP_HARNESS=1, ALL_HARNESS=1.
 #
 # Runtime on/off, once installed: the dashboard is its own systemd unit so the
 # ~700 MB Node child is started only on demand —
 #   systemctl --user start aroute-dashboard   # bring the UI up
 #   systemctl --user stop  aroute-dashboard   # reclaim the RSS
 # and it is deliberately NOT started at install time; the proxy never needs it.
-set -eu
+set -euo pipefail
+IFS=$'\n\t'
 
 REPO="ishan-parihar/artificial-route"
 API="https://api.github.com/repos/$REPO/releases/latest"
@@ -75,6 +81,10 @@ DASH_SRC="${AR_DASHBOARD_SRC:-}"
 DASH_PORT="${AR_DASHBOARD_PORT:-20149}"
 CHECK_ONLY=0
 UNINSTALL=0
+SKIP_CTA="${SKIP_CTA:-0}"
+FORCE_ROOT="${FORCE_ROOT:-0}"
+SKIP_HARNESS="${SKIP_HARNESS:-0}"
+ALL_HARNESS="${ALL_HARNESS:-0}"
 
 # Absolute, resolved before anything cd's away from the caller's directory.
 # A relative $0 stops existing the moment the script does `cd "$TMP"`, which
@@ -99,7 +109,7 @@ TIMER=""
 # loop silently points at the default dir, so --check reports the wrong install.
 TARGET=""
 
-usage() { sed -n '2,/^set -eu$/p' "$0" | sed '$d' | sed 's/^#\{0,1\} \{0,1\}//'; }
+usage() { sed -n '2,/^set -euo pipefail$/p' "$0" | sed '$d' | sed 's/^#\{0,1\} \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -112,6 +122,10 @@ while [ $# -gt 0 ]; do
     --dashboard-src) DASH_SRC="$2"; shift 2 ;;
     --check) CHECK_ONLY=1; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
+    --force-root) FORCE_ROOT=1; shift ;;
+    --no-cta) SKIP_CTA=1; shift ;;
+    --all-harnesses) ALL_HARNESS=1; shift ;;
+    --no-harness) SKIP_HARNESS=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "error: unknown flag '$1' (see --help)" >&2; exit 2 ;;
   esac
@@ -153,17 +167,135 @@ ENV_DIR="${ENV_FILE%/*}"
 
 die() { echo "error: $*" >&2; exit 1; }
 
-# The proxy is loopback-only by default. A unit that binds every interface would
-# publish an unauthenticated LLM gateway to the network, so the unit pins
-# loopback rather than inheriting whatever the config happens to say.
+# ── Root guard ───────────────────────────────────────────────────────────────
+if [ "${EUID:-$(id -u)}" -eq 0 ] && [ "${FORCE_ROOT:-0}" != "1" ]; then
+  die "Don't run as root — installs to \$HOME. Re-run as your user (override: --force-root)."
+fi
+
+# ── OS / distro detection ──────────────────────────────────────────────────────
 case "$(uname -s)" in
-  Linux) ;;
-  *) die "no prebuilt binary for '$(uname -s)' (want Linux)" ;;
+  Linux) DISTRO="$(. /etc/os-release 2>/dev/null && echo "${ID:-unknown}")" ;;
+  Darwin) DISTRO="macos" ;;
+  *) die "no prebuilt binary for '$(uname -s)' (want Linux or macOS)" ;;
 esac
 case "$(uname -m)" in
   x86_64|amd64) ;;
   *) die "no prebuilt binary for arch '$(uname -m)' (want x86_64)" ;;
 esac
+
+# ── Package-manager matrix ═══════════════════════════════════════════════════
+pm_install() {
+  case "$DISTRO" in
+    ubuntu|debian|linuxmint|pop)      sudo apt-get update -qq && sudo apt-get install -y "$@" ;;
+    fedora|rhel|centos|rocky|alma)     sudo dnf install -y "$@" ;;
+    arch|manjaro|cachyos|endeavouros) sudo pacman -Sy --needed --noconfirm "$@" ;;
+    opensuse*)                        sudo zypper -n install "$@" ;;
+    alpine)                           sudo apk add "$@" ;;
+    macos)
+      command -v brew >/dev/null || die "Homebrew required: https://brew.sh (install it, re-run)"
+      brew install "$@" ;;
+    *) die "Unknown distro '$DISTRO' — install manually: $*" ;;
+  esac
+}
+need() {
+  command -v "$1" >/dev/null 2>&1 && return 0
+  echo "error: installing prerequisite: $1" >&2
+  pm_install "${@:2}"
+  command -v "$1" >/dev/null 2>&1 || die "$1 still missing after install — install it, re-run"
+}
+
+# ── Idempotent PATH injection ──────────────────────────────────────────────────
+ensure_path() {
+  local dir="$1"; mkdir -p "$dir"
+  case ":$PATH:" in *":$dir:"*) return 0 ;; esac
+  local rc="$HOME/.bashrc"
+  if [ -f "$HOME/.zshrc" ] || [ -n "${ZSH_VERSION:-}" ]; then rc="$HOME/.zshrc"; fi
+  if ! grep -qs "export PATH=\"${dir}:\$PATH\"" "$rc"; then
+    printf '\n# added by aroute installer\nexport PATH="%s:$PATH"\n' "$dir" >> "$rc"
+    printf '>>> generated: %s (PATH export) <<<\n' "$rc"
+  fi
+  export PATH="$dir:$PATH"
+}
+
+# ── CTA epilogue ───────────────────────────────────────────────────────────────
+print_cta() {
+  [ "${SKIP_CTA:-0}" = "1" ] && return 0
+  printf '\n%s\n' "──────────────────────────────────────────────────────"
+  printf ' ⭐  Found aroute useful? Star it:  https://github.com/ishan-parihar/artificial-route\n'
+  printf ' 💜  Support development:\n'
+  printf '     GitHub Sponsors : https://github.com/sponsors/ishan-parihar\n'
+  printf '     Razorpay (UPI)  : https://rzp.io/rzp/ishan-parihar\n'
+  printf '     Or run `aroute donate` anytime.\n'
+  printf '%s\n' "──────────────────────────────────────────────────────"
+}
+
+# ── Harness integration (MCP registration) ─────────────────────────────────────
+detect_harnesses() {
+  local found=""
+  for h in claude codex opencode gemini qwen grok goose hermes zeroclaw omp omo pi droid; do
+    command -v "$h" >/dev/null 2>&1 && found="$found $h"
+  done
+  echo "$found"
+}
+run_harness_integration() {
+  [ "${SKIP_HARNESS:-0}" = "1" ] && { echo "Harness integration: skipped (SKIP_HARNESS)"; return 0; }
+  local found; found="$(detect_harnesses)"
+  [ -z "${found// /}" ] && { echo "No AI harnesses detected — skipping agent integration"; return 0; }
+  if ! [ -t 0 ] && [ "${ALL_HARNESS:-0}" != "1" ]; then
+    echo "Detected harnesses:${found} — non-interactive, skipping (re-run with --all-harnesses)"
+    return 0
+  fi
+  if [ "${ALL_HARNESS:-0}" = "1" ]; then local answer="y"
+  else read -rp "Configure MCP server in harnesses?${found} [Y/n] " answer || answer="y"; fi
+  case "$answer" in n|N) return 0 ;; esac
+  # Claude Code
+  if command -v claude >/dev/null 2>&1; then
+    claude mcp add aroute -s user -- "$TARGET" mcp 2>/dev/null \
+      && echo "  registered: claude mcp add aroute" || echo "  (claude mcp add skipped — register by hand)"
+    claude mcp list 2>/dev/null | grep -q aroute && echo "  verified: claude mcp list" || true
+  fi
+  # OpenCode
+  if command -v opencode >/dev/null 2>&1; then
+    local oc_conf="$HOME/.config/opencode/opencode.json"
+    mkdir -p "$(dirname "$oc_conf")"
+    echo "  OpenCode: add this to $oc_conf:"
+    printf '    { "mcp": { "aroute": { "type": "local", "command": ["%s","mcp"], "enabled": true } } }\n' "$TARGET"
+  fi
+  # Codex
+  if command -v codex >/dev/null 2>&1; then
+    echo "  Codex: add to ~/.codex/config.toml: [mcp_servers.aroute] command = \"$TARGET\" args = [\"mcp\"]"
+  fi
+  echo "Harness integration complete"
+}
+
+# ── Write portable .mcp.json ────────────────────────────────────────────────────
+write_mcp_json() {
+  local repo_root="${SCRIPT_SRC%/*}"
+  if [ -n "$repo_root" ] && [ -d "$repo_root" ] && [ -w "$repo_root" ]; then
+    cat > "${repo_root}/.mcp.json" <<MCPEOF
+{
+  "mcpServers": {
+    "artificial-route": {
+      "command": "$TARGET",
+      "args": ["mcp"]
+    }
+  }
+}
+MCPEOF
+    printf '>>> generated: %s/.mcp.json <<<\n' "$repo_root"
+  fi
+  echo "Portable .mcp.json (paste into your project root):"
+  cat <<MCPEOF2
+{
+  "mcpServers": {
+    "artificial-route": {
+      "command": "$TARGET",
+      "args": ["mcp"]
+    }
+  }
+}
+MCPEOF2
+}
 
 have_systemd() { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }
 
@@ -285,9 +417,7 @@ fi
 # this machine (dashboard/rebrand-dist.sh) and installed from that local tree.
 # Nothing is fetched from npm: the dist carries every dependency it needs.
 install_dashboard() {
-  if ! command -v node >/dev/null 2>&1; then
-    die "--with-dashboard needs Node.js >= 18 on PATH (the compiled server runs on node)"
-  fi
+  need node nodejs
   NODE_MAJOR="$(node --version 2>/dev/null | sed 's/^v\([0-9][0-9]*\).*/\1/')"
   case "$NODE_MAJOR" in
     ''|*[!0-9]*) die "cannot read the node version" ;;
@@ -403,6 +533,7 @@ else
 fi
 
 cd "$TMP"
+need curl curl
 echo "downloading aroute $VERSION ..."
 # The release workflow renames the binary from `ar` to `aroute`, but the latest
 # published release may still ship the old asset name. Try the new name first,
@@ -419,16 +550,22 @@ done
 ASSET="$ASSET_FILE"
 curl -fsSL -o SHA256SUMS "$BASE/SHA256SUMS"
 
+# Ensure a checksum tool is available before verifying.
+if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+  echo "error: installing prerequisite: coreutils (for sha256sum/shasum)" >&2
+  pm_install coreutils 2>/dev/null || true
+fi
+
 # Verified before the binary is ever executable, so a corrupt or substituted
 # download cannot run. Missing tooling is a warning, not a skip: an install that
 # quietly gives up verification is the one that should not.
 if command -v sha256sum >/dev/null 2>&1; then
   grep " $ASSET\$" SHA256SUMS | sha256sum -c - >/dev/null 2>&1 \
-    || die "checksum mismatch for $ASSET"
+    || die "checksum mismatch for $ASSET — report at github.com/${REPO}/issues"
 elif command -v shasum >/dev/null 2>&1; then
   EXPECTED="$(grep " $ASSET\$" SHA256SUMS | cut -d' ' -f1)"
   ACTUAL="$(shasum -a 256 "$ASSET" | cut -d' ' -f1)"
-  [ -n "$EXPECTED" ] && [ "$EXPECTED" = "$ACTUAL" ] || die "checksum mismatch for $ASSET"
+  [ -n "$EXPECTED" ] && [ "$EXPECTED" = "$ACTUAL" ] || die "checksum mismatch for $ASSET — report at github.com/${REPO}/issues"
 else
   echo "warning: no sha256sum/shasum found, skipping checksum verify" >&2
 fi
@@ -520,7 +657,7 @@ fi
 # artifact rather than re-fetching a URL that could change under it.
 SCRIPT_COPY="$HOME/.config/ar/install.sh"
 mkdir -p "$ENV_DIR"
-if [ ! -f "$ENV_FILE" ]; then
+if [ ! -f "${ENV_FILE:-$HOME/.config/ar/ar.env}" ]; then
   cat > "$ENV_FILE" <<ENVEOF
 # Credentials for ar. chmod 600 this file before filling it in.
 #
@@ -696,13 +833,18 @@ installed to $TARGET
   $TARGET doctor      # re-check at any time
   $TARGET serve       # foreground; the unit already runs it as a service
 
-Upgrade:  curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | sh
-Check:    curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | sh -s -- --check
-Remove:   curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | sh -s -- --uninstall
-Dashboard: sh install.sh --with-dashboard --dashboard-src <dashboard/dist-or-tarball>
+Upgrade:  curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | bash
+  Check:    curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | bash -s -- --check
+  Remove:   curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | bash -s -- --uninstall
+  Dashboard: bash install.sh --with-dashboard --dashboard-src <dashboard/dist-or-tarball>
 EOF
 
-case ":$PATH:" in
-  *":$DIR:"*) ;;
-  *) echo "note: $DIR is not on PATH — add it with: export PATH=\"\$HOME/.local/bin:\$PATH\"" >&2 ;;
-esac
+# ── PATH injection ─────────────────────────────────────────────────────────────
+ensure_path "$DIR"
+
+# ── Write portable .mcp.json + offer harness registration ────────────────────
+write_mcp_json
+run_harness_integration
+
+# ── CTA ────────────────────────────────────────────────────────────────────────
+print_cta

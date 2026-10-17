@@ -440,7 +440,7 @@ pub fn keys_mint(cli: &Cli, key_id: &str) -> anyhow::Result<()> {
 /// `Tokens::new` (no audience) is the same engine `AuthGate::new` builds — the
 /// pairing that makes a CLI-minted token pass the server's gate is structural,
 /// not tested-in.
-fn mint_from(master: &ar_keys::Secret, key_id: &str) -> anyhow::Result<ar_keys::Issued> {
+pub(crate) fn mint_from(master: &ar_keys::Secret, key_id: &str) -> anyhow::Result<ar_keys::Issued> {
     let tokens = ar_keys::Tokens::new(&ar_keys::MasterKey::new(
         master.to_owned_secret(),
         ar_keys::KeyMeta::generate(),
@@ -664,6 +664,12 @@ pub fn dispatch(cli: &Cli) -> anyhow::Result<()> {
         #[cfg(feature = "mcp")]
         Some(Command::Mcp(a)) => block_on(crate::mcp::run(cli, a)),
         Some(Command::Dashboard(a)) => crate::dashboard::run(a),
+        Some(Command::Donate) => {
+            println!("Star the repo  : https://github.com/ishan-parihar/artificial-route");
+            println!("GitHub Sponsors: https://github.com/sponsors/ishan-parihar");
+            println!("Razorpay (UPI) : https://rzp.io/rzp/ishan-parihar");
+            Ok(())
+        },
         Some(Command::Keys(a)) => match &a.command {
             crate::cli::KeysCommand::ArmGate(args) => {
                 arm_gate(cli, &args.key_id, args.key.as_deref())
@@ -1923,7 +1929,7 @@ fn remove_section(content: &str, name: &str) -> String {
 /// Replaces one top-level `name:` section with `rendered`, which carries its
 /// own header line. A section that is not present is inserted before
 /// `combos:` — definition before use — or appended when there is none.
-fn splice_section(content: &str, name: &str, rendered: &str) -> String {
+pub(crate) fn splice_section(content: &str, name: &str, rendered: &str) -> String {
     let header = format!("{name}:");
     let mut out: Vec<String> = Vec::new();
     let mut skipping = false;
@@ -2250,7 +2256,7 @@ const BACKUP_DEPTH: usize = 3;
 /// one rotation covers config.yaml, registry.json, freeBudgets.json and
 /// providerMeta.json together — and `registry.json` is `include_str!`d into
 /// `ar-registry`, so a bad regeneration is a rebuild away from being live.
-fn write_file(path: &Path, body: &str) -> anyhow::Result<()> {
+pub(crate) fn write_file(path: &Path, body: &str) -> anyhow::Result<()> {
     rotate_backups(path)?;
     std::fs::write(path, body).map_err(|e| {
         fail(

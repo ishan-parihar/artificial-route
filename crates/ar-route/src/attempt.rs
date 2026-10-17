@@ -27,6 +27,7 @@ use crate::resilience::{
     quota_cooldown,
 };
 use crate::simulate::ChainTarget;
+use crate::Strng;
 
 /// Upper bound on providers tried for one request.
 ///
@@ -39,10 +40,18 @@ pub const MAX_ATTEMPTS: usize = 3;
 #[derive(Debug)]
 pub enum AttemptOutcome {
     /// A provider answered 2xx. The upstream response travels with the verdict
-    /// because the loop is the only place that knows *which* provider won.
+    /// because the loop is the only place that knows *which* provider and model
+    /// won.
     Succeeded {
         /// Provider that served the request.
         provider: ProviderId,
+        /// The target's own model name, which is what the provider was asked
+        /// for — not the combo id the client spelled. Carried so every
+        /// accounting and diagnostic surface can name what served, which the
+        /// combo name alone cannot: a combo holding three models on one
+        /// provider reports one ledger row per member when this field is
+        /// stamped.
+        model: Strng,
         /// How many providers were tried before it succeeded.
         attempts: u16,
         /// The upstream response, ready to relay.
@@ -115,6 +124,20 @@ impl AttemptOutcome {
             | Self::Retry { provider, .. }
             | Self::Failover { provider, .. } => Some(provider),
             Self::Abort(_) => None,
+        }
+    }
+
+    /// The model that served the request, for the `x-ar-decision` header.
+    ///
+    /// Only a success names one: a retry or a failover never had a target
+    /// answer, and reporting the last *tried* model as "what served" would be
+    /// the very ambiguity this field exists to remove. `None` on those arms and
+    /// on an abort, which is honest: nothing served the request.
+    #[must_use]
+    pub fn serving_model(&self) -> Option<&str> {
+        match self {
+            Self::Succeeded { model, .. } => Some(model.as_ref()),
+            _ => None,
         }
     }
 
@@ -712,10 +735,11 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
                     match gate_first_byte(&mut upstream, FIRST_BYTE_WINDOW).await {
                         StreamGate::Byte | StreamGate::Elapsed => {}
                         StreamGate::Empty => {
-                            tracing::warn!(
-                                provider = %provider,
-                                "2xx stream produced no bytes; failing over"
-                            );
+                        tracing::warn!(
+                            provider = %provider,
+                            model,
+                            "2xx stream produced no bytes; failing over"
+                        );
                             step = Step::Failover { status: 502 };
                         }
                     }
@@ -731,6 +755,13 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
                         resilience.record_provider_success(provider.as_str());
                         return Ok(AttemptOutcome::Succeeded {
                             provider: provider.clone(),
+                            // One allocation, on the request path, at most
+                            // once per request: converting `&str` to
+                            // `Arc<str>` copies the model name. Cheaper than
+                            // making the loop hold a `Strng` borrow across
+                            // the `exec.call` await, and the name is a few
+                            // dozen bytes.
+                            model: Strng::from(model),
                             attempts: tried,
                             upstream,
                         });
@@ -753,6 +784,7 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
                         );
                         tracing::warn!(
                             provider = %provider,
+                            model,
                             status,
                             cooldown_ms = cooldown.as_millis() as u64,
                             "attempt failed over"
@@ -773,7 +805,7 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
                 // next request does not walk into the same dead socket, and a
                 // breaker tick so enough dead sockets take the provider out.
                 let (cooldown, _) = charge_failure(resilience, provider, model, 502, "", None);
-                tracing::warn!(provider = %provider, error = %msg, "transport failure, failing over");
+                tracing::warn!(provider = %provider, model, error = %msg, "transport failure, failing over");
                 (502, provider.clone(), cooldown, false, Bytes::new(), None)
             }
         };

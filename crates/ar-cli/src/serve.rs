@@ -11,6 +11,8 @@
 //! does not carry: the port override and the prices, which come from the
 //! compiled-in registry rather than from a config the user hand-edits.
 
+use std::time::Duration;
+
 use ar_config::Config;
 use ar_route::ArExec;
 
@@ -19,6 +21,7 @@ use ar_tokens::PricingTable;
 
 use crate::cli::{Cli, RunArgs, ServeArgs};
 use crate::commands;
+use crate::webui;
 use crate::toon;
 
 /// Names the directory the observability write path uses: `ar-trace-*.jsonl`
@@ -142,7 +145,25 @@ fn components(
 /// Boots the listener and blocks until interrupted.
 pub async fn serve(cli: &Cli, args: &ServeArgs) -> anyhow::Result<()> {
     let cfg = commands::load(cli)?;
-    let server = ar_server::server(components(cli, &cfg, args.port, None)?);
+    let built = components(cli, &cfg, args.port, None)?;
+
+    // The control page (docs/16 Option B): the ledger Arc is cloned before the
+    // server consumes `Components`, and the credential store is a second
+    // sqlite connection — `components` keeps its own, and sqlite takes
+    // concurrent readers. `gate_armed` is read the same way `components`
+    // reads it, so the badge and the gate can never disagree.
+    let gate_armed = commands::credential_store(cli)
+        .as_ref()
+        .and_then(|s| commands::gate_master(s).ok().flatten())
+        .is_some();
+    let ui_ctx = webui::Ctx::new(
+        cli.config.clone(),
+        built.ledger.clone(),
+        commands::credential_store(cli),
+        gate_armed,
+    );
+
+    let server = ar_server::server(built);
     let count = server.state.config.providers.len();
     let port = server.state.config.port;
     let addr = ar_server::app::bind_addr(&cfg.server.host, port, false).map_err(|e| {
@@ -182,7 +203,13 @@ pub async fn serve(cli: &Cli, args: &ServeArgs) -> anyhow::Result<()> {
         eprintln!("observability write path armed ({OBS_DIR_VAR}={dir})");
     }
 
-    axum::serve(listener, server.router)
+    // Mounted last: `mount` takes the router by value, and `spawn_discovery_refresh`
+    // borrows the whole `Server`, so every borrow of `server` happens above this
+    // line. The page is loopback-only by inheritance — `bind_addr` above refuses
+    // a routable bind, so nothing outside this machine reaches `/ui`.
+    let router = webui::mount(server.router, ui_ctx);
+
+    axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|e| commands::fail(e, "the listener stopped unexpectedly"))?;
@@ -195,8 +222,25 @@ pub async fn serve(cli: &Cli, args: &ServeArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How long a signal-initiated shutdown waits for in-flight responses before
+/// the listener is allowed to drop the connections they ride on.
+///
+/// The proxy's own request timeout is the only other deadline in the stack, and
+/// it deliberately bounds the *request* rather than the response body
+/// (`ar-server`'s `TimeoutLayer`), so a streamed generation can hold a
+/// connection open for its whole run. A drain with no bound therefore never
+/// ends under load: the update flow stops this unit, finds the process still
+/// alive after `TimeoutStopSec`, and escalates to SIGKILL — a `stop-sigterm'
+/// timed out` line and an unclean exit every time.
+const DRAIN_WINDOW: Duration = Duration::from_secs(10);
+
 /// Resolves on SIGINT/SIGTERM so a Ctrl-C drains rather than cutting a streamed
 /// answer in half.
+///
+/// The signal only *starts* the drain; it does not wait for every connection to
+/// close, because a live stream can outlive any sane stop deadline. When the
+/// window expires this future resolves anyway and `axum::serve` returns, which
+/// is what lets the process exit cleanly instead of being killed.
 async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -213,9 +257,13 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 
+    // A signal arms the drain; the window bounds it. Racing them means a
+    // stop under load still completes: `axum::serve` returns once this future
+    // resolves, and whether the in-flight streams finished is the drain's
+    // business, not the process's.
     tokio::select! {
-        () = ctrl_c => {}
-        () = terminate => {}
+        () = ctrl_c => { tokio::time::sleep(DRAIN_WINDOW).await }
+        () = terminate => { tokio::time::sleep(DRAIN_WINDOW).await }
     }
 }
 

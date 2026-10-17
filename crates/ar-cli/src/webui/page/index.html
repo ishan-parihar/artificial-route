@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>aroute</title>
+<link rel="stylesheet" href="/ui/app.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<div class="shell">
+
+  <aside class="side">
+    <div class="side-brand">
+      <span class="brand-mark">ar</span>
+      <span class="brand-name">aroute</span>
+    </div>
+
+    <nav class="nav" id="nav" aria-label="Main">
+      <a href="#/dashboard" data-view="dashboard"><span class="nv-icon" aria-hidden="true">◈</span>Dashboard</a>
+      <a href="#/combos" data-view="combos"><span class="nv-icon" aria-hidden="true">⇶</span>Combos</a>
+      <a href="#/providers" data-view="providers"><span class="nv-icon" aria-hidden="true">⌁</span>Providers</a>
+      <a href="#/keys" data-view="keys"><span class="nv-icon" aria-hidden="true">⌘</span>Client keys</a>
+      <a href="#/usage" data-view="usage"><span class="nv-icon" aria-hidden="true">▦</span>Usage</a>
+      <a href="#/playground" data-view="playground"><span class="nv-icon" aria-hidden="true">▶</span>Playground</a>
+    </nav>
+
+    <div class="side-foot">
+      <span id="gate-badge" class="badge"></span>
+      <p class="side-ver" id="ver"></p>
+      <p class="side-config" id="foot-config"></p>
+      <p class="side-config" id="foot-env"></p>
+    </div>
+  </aside>
+
+  <div class="main">
+    <div id="banner" class="banner" hidden>
+      <p>Config changed. The proxy applies it at boot.</p>
+      <code id="banner-cmd">systemctl --user restart aroute</code>
+      <button id="copy-restart" type="button" class="btn small ghost">Copy command</button>
+    </div>
+
+    <main id="main">
+      <div id="view" class="view"></div>
+    </main>
+  </div>
+
+</div>
+
+<script src="/ui/app.js"></script>
+</body>
+</html>

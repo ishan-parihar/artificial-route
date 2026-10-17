@@ -37,3 +37,7 @@ perf.data*
 # node_modules, built .next). A release artifact, not source — regenerate with
 # dashboard/rebrand-dist.sh.
 /dashboard/dist/
+
+# Local run artifacts, never part of a release
+/serve.pid
+/xd:/

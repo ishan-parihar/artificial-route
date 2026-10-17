@@ -92,6 +92,11 @@ perl -pi -e 's/(?<![A-Za-z0-9_\/@-])OmniRoute(?![A-Za-z0-9_\/])/Artificial Route
 log "scrubbing sponsor branding"
 node "$AR_ROOT/dashboard/scrub-sponsors.cjs" "$DST"
 
+# ── 3.5 Artificial closeout: the user-visible "omni" wording the passes
+# above leave (key sentinel copy, repo refs) — docs/16 §4.
+log "artificial closeout"
+"$AR_ROOT/dashboard/patch-artificial.sh" "$DST"
+
 # ── 4. Parse gate: baseline pass-set, patch, re-check ───────────────────────
 log "baseline node --check over compiled JS"
 mapfile -t JS_FILES < <(find "$DST/.build" "$DST/public" -type d -name node_modules -prune -o \

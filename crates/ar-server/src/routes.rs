@@ -701,7 +701,6 @@ async fn handle_chat(
             state,
             dialect,
             key_id.as_deref(),
-            &canonical.model,
             dispatched,
         );
         ResponseMeta::default()
@@ -711,7 +710,6 @@ async fn handle_chat(
         buffer_for_accounting(
             state,
             &mut outcome,
-            &canonical,
             dialect,
             key_id.as_deref(),
             dispatched.elapsed(),
@@ -757,7 +755,6 @@ async fn handle_chat(
 async fn buffer_for_accounting(
     state: &AppState,
     outcome: &mut AttemptOutcome,
-    canonical: &CanonicalRequest,
     dialect: Dialect,
     key_id: Option<&str>,
     elapsed: Duration,
@@ -774,11 +771,14 @@ async fn buffer_for_accounting(
     // Before the destructure below, which holds the outcome's borrow.
     let attempts = outcome.attempts();
     let AttemptOutcome::Succeeded {
-        upstream, provider, ..
+        upstream, provider, model, ..
     } = outcome
     else {
         return defaults();
     };
+    // The serving target's own model, not the client's combo spelling: the
+    // ledger row and its pricing lookup describe what the provider answered.
+    let model = model.clone();
 
     let mut buffered = Vec::new();
     while let Some(chunk) = upstream.stream.next().await {
@@ -795,7 +795,7 @@ async fn buffer_for_accounting(
         state,
         key_id,
         provider.as_str(),
-        &canonical.model,
+        &model,
         dialect,
         &body,
         attempts,
@@ -995,7 +995,7 @@ struct UsageTee {
     /// sentinel — the same spelling the non-streaming arm records under.
     key_id: String,
     provider: String,
-    model: String,
+    model: Strng,
     dialect: Dialect,
     /// Carried so the observation reports what the router actually spent, the
     /// same figure `ar_upstream_attempts_total` counts.
@@ -1053,7 +1053,7 @@ impl UsageTee {
         let meta = ResponseMeta::from_upstream(
             &self.state.config.prices,
             &self.provider,
-            &self.model,
+             &self.model,
             usage,
         );
         self.record_obs(usage);
@@ -1084,14 +1084,14 @@ impl UsageTee {
         let meta = ResponseMeta::from_upstream(
             &self.state.config.prices,
             &self.provider,
-            &self.model,
+             &self.model,
             usage,
         );
         record_obs(
             &self.state,
             Some(&self.key_id),
             &self.provider,
-            &self.model,
+             &self.model,
             &meta,
             self.attempts,
         );
@@ -1111,7 +1111,7 @@ impl UsageTee {
         if let Err(e) = ledger.lock().expect("ledger lock").record_response(
             &self.key_id,
             &self.provider,
-            &self.model,
+             &self.model,
             &usage,
             epoch_now(),
             &self.state.config.prices,
@@ -1127,19 +1127,21 @@ impl UsageTee {
 ///
 /// Only the arm that can carry usage is touched: a non-stream outcome is
 /// buffered and recorded by [`read_and_record`] before this runs, and a failed
-/// dispatch has no usage to count.
+/// dispatch has no usage to count. The model the ledger rows for this stream
+/// carry is the target's own, read off the outcome before it moves: a provider
+/// serving several models needs its rows separated, and the combo name the
+/// client spelled cannot separate them.
 fn account_stream(
     outcome: &mut AttemptOutcome,
     state: &AppState,
     dialect: Dialect,
     key_id: Option<&str>,
-    model: &str,
     dispatched: Instant,
 ) {
     // Before the destructure below, which holds the outcome's borrow.
     let attempts = outcome.attempts();
     let AttemptOutcome::Succeeded {
-        provider, upstream, ..
+        provider, model, upstream, ..
     } = outcome
     else {
         return;
@@ -1157,7 +1159,9 @@ fn account_stream(
         state: state.clone(),
         key_id: key_id.unwrap_or("anonymous").to_owned(),
         provider: provider.as_str().to_owned(),
-        model: model.to_owned(),
+        // `Arc<str>` copy is a refcount bump; `to_owned` on the borrowed tail
+        // of the destructure would allocate a second one for nothing.
+        model: model.clone(),
         dialect,
         attempts,
         dispatched,
@@ -1349,6 +1353,12 @@ async fn fusion_response(
 
     let outcome = AttemptOutcome::Succeeded {
         provider: provider.unwrap_or_else(|| ProviderId::new("unknown")),
+        // The fusion panel's judge or winner is the serving target. Its provider
+        // is resolved above, but the model stays whatever the request carried:
+        // `synthesize` dispatches the judge with the request's own canonical
+        // body, and a panel member's answer is not a model this outcome can
+        // name. Stamping the combo keeps the header honest.
+        model: Strng::from(canonical.model.as_ref()),
         attempts,
         upstream,
     };
@@ -1996,9 +2006,10 @@ fn decorate(
     stages: Stages,
 ) -> Response {
     let decision = format!(
-        "strategy={strategy};outcome={};provider={};attempts={}",
+        "strategy={strategy};outcome={};provider={};model={};attempts={}",
         outcome_label(&outcome),
         outcome.provider().map_or("-", ProviderId::as_str),
+        outcome.serving_model().unwrap_or("-"),
         outcome.attempts()
     );
 
@@ -2875,12 +2886,13 @@ mod tests {
         models_head, not_found, outcome_label, require_json, terminator_seen, unknown_model,
         usage_from_frames,
     };
+    use super::DECISION_HEADER;
     use crate::app::{AppState, Components};
     use crate::config::{ComboTarget, ServerConfig};
     use crate::models::ModelCard;
     use ar_route::{
         AbortReport, ArExec, AttemptOutcome, CanonicalRequest, ExecError, MediaReply, ProviderId,
-        Strategy, Upstream,
+        Strategy, Strng, Upstream,
     };
     use axum::extract::{Path, State};
     use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -3182,6 +3194,7 @@ mod tests {
         assert_eq!(
             outcome_label(&AttemptOutcome::Succeeded {
                 provider: ProviderId::new("p"),
+                model: Strng::from("m"),
                 attempts: 1,
                 upstream: Upstream::success(Box::pin(futures::stream::empty())),
             }),
@@ -3204,6 +3217,7 @@ mod tests {
     fn succeeded(attempts: u16) -> AttemptOutcome {
         AttemptOutcome::Succeeded {
             provider: ProviderId::new("openai"),
+            model: Strng::from("gpt-5.4"),
             attempts,
             upstream: Upstream::success(Box::pin(futures::stream::empty())),
         }
@@ -3285,6 +3299,49 @@ mod tests {
     fn stamps_the_fallback_attempts_the_attempt_loop_spent() {
         let headers = headers_for(ar_tokens::ResponseMeta::default(), 3);
         assert_eq!(header_of(&headers, FALLBACK_ATTEMPTS_HEADER), "3");
+    }
+
+    #[test]
+    fn names_the_serving_model_when_a_dispatcher_resolved_one() {
+        // The combo the client spelled cannot identify which member answered:
+        // a combo holding three models on one provider dispatches each of them
+        // in turn, and only the target's own name separates the rows. The
+        // fixture's `succeeded` carries `gpt-5.4` for exactly the case where
+        // the client asked for something else.
+        let headers = headers_for(ar_tokens::ResponseMeta::default(), 1);
+        assert!(
+            header_of(&headers, DECISION_HEADER).contains("model=gpt-5.4"),
+            "the decision header names the target the loop resolved, not the request's spelling"
+        );
+    }
+
+    #[test]
+    fn omits_a_model_from_the_decision_when_nothing_served() {
+        // A retry exhausted its chain: no target answered, so naming one would
+        // be a guess. `-` is the honest placeholder the provider field uses.
+        let resp = decorate(
+            AttemptOutcome::Retry {
+                after: Duration::from_secs(3),
+                provider: ProviderId::new("nvidia"),
+                tried: 3,
+            },
+            false,
+            Dialect::OpenAi,
+            Strategy::Priority,
+            Stages {
+                compression: "default;engines=-".to_owned(),
+                cache_state: ar_cache::CacheState::Miss,
+                cache_key: None,
+                cache: None,
+                model: ar_route::Strng::from("free-stack"),
+                cache_control: CacheControl::default(),
+                meta: ar_tokens::ResponseMeta::default(),
+            },
+        );
+        assert!(
+            header_of(resp.headers(), DECISION_HEADER).contains("model=-"),
+            "nothing served, so the field is the same placeholder the provider field uses"
+        );
     }
 
     #[test]
@@ -4387,7 +4444,7 @@ mod tests {
             state,
             key_id: "anonymous".to_owned(),
             provider: "soak-stub".to_owned(),
-            model: "m".to_owned(),
+            model: Strng::from("m"),
             dialect: Dialect::OpenAi,
             attempts: 2,
             dispatched: Instant::now(),
@@ -4434,7 +4491,7 @@ mod tests {
             state,
             key_id: "anonymous".to_owned(),
             provider: "p".to_owned(),
-            model: "m".to_owned(),
+            model: Strng::from("m"),
             dialect: Dialect::OpenAi,
             attempts: 1,
             dispatched: Instant::now(),

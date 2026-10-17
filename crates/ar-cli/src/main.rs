@@ -21,6 +21,7 @@ mod mcp;
 mod serve;
 mod toon;
 mod version;
+mod webui;
 
 use std::ffi::OsString;
 use std::process::ExitCode;

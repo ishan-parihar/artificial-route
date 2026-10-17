@@ -480,6 +480,29 @@ pub(crate) fn render_combos_section(combos: &[Combo]) -> String {
         if let Some(ctx) = c.context_length {
             out.push(format!("    context_length: {ctx}"));
         }
+        // A bench the combo carries is a routing fact, not editor state: dropping
+        // it would silently narrow what happens once the targets refuse.
+        if !c.pool.is_empty() {
+            out.push("    pool:".to_owned());
+            for p in &c.pool {
+                out.push(format!("      - {p}"));
+            }
+        }
+        // Compression and judge follow the same rule: emitted only when set, so
+        // a combo that never named them stays byte-for-byte what it was.
+        if let Some(comp) = &c.compression {
+            out.push("    compression:".to_owned());
+            for line in serde_yaml::to_string(comp)
+                .expect("compression serialises to a two-string map")
+                .trim_end()
+                .lines()
+            {
+                out.push(format!("      {line}"));
+            }
+        }
+        if let Some(judge) = &c.judge_model {
+            out.push(format!("    judge_model: {judge}"));
+        }
     }
     out.join("\n")
 }
@@ -499,6 +522,22 @@ pub(crate) fn render_custom_section(custom: &[ar_registry::CustomProvider]) -> S
             c.base_url,
             c.key_ref
         ));
+        // The endpoint override and extra headers are live wire facts: dropping
+        // them on a splice would make the next save rewrite the provider into a
+        // default-shaped one without anyone editing that field.
+        if let Some(endpoint) = &c.endpoint {
+            out.push(format!("    endpoint: {endpoint}"));
+        }
+        if !c.headers.is_empty() {
+            out.push("    headers:".to_owned());
+            for line in serde_yaml::to_string(&c.headers)
+                .expect("a string map serializes")
+                .trim_end()
+                .lines()
+            {
+                out.push(format!("      {line}"));
+            }
+        }
     }
     out.join("\n")
 }
@@ -668,6 +707,7 @@ async fn fetch_models_dev() -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ar_compress::{Engine, Intensity};
 
     /// Two providers answering one alias (a failover chain), one standalone, and
     /// one entry whose `api_key` is a literal that must not be written.
@@ -768,6 +808,58 @@ model_list:
         let parsed = ar_config::Config::parse(&yaml, |n| Ok(Some(format!("<{n}>"))))
             .expect("steps serialize to loadable YAML");
         assert_eq!(parsed.combos, vec![combo]);
+    }
+
+    #[test]
+    fn renders_pool_compression_and_judge_that_round_trip_through_the_config_loader() {
+        let combo = Combo {
+            id: "gated".to_owned(),
+            strategy: Strategy::Priority,
+            targets: vec!["groq/llama-3.3-70b".to_owned()],
+            weights: BTreeMap::new(),
+            pool: vec!["openai/gpt-4o-mini".to_owned(), "openrouter".to_owned()],
+            steps: vec![],
+            compression: Some(ar_config::Compression {
+                engine: Engine::Rtk,
+                level: Some(Intensity::Aggressive),
+            }),
+            judge_model: Some("openai/gpt-4o".to_owned()),
+            context_length: Some(128_000),
+        };
+        let yaml = render_yaml(&BTreeMap::new(), std::slice::from_ref(&combo), &[]);
+        // The bench, the compressor and the fusion judge are all live routing
+        // facts: a renderer that dropped any of them would silently narrow a
+        // combo on the next save.
+        assert!(yaml.contains("\n      - openai/gpt-4o-mini"), "{yaml}");
+        assert!(yaml.contains("engine: rtk"), "{yaml}");
+        assert!(yaml.contains("intensity: aggressive"), "{yaml}");
+        assert!(yaml.contains("judge_model: openai/gpt-4o"), "{yaml}");
+        let parsed = ar_config::Config::parse(&yaml, |n| Ok(Some(format!("<{n}>"))))
+            .expect("pool/compression/judge serialize to loadable YAML");
+        assert_eq!(parsed.combos, vec![combo]);
+    }
+
+    #[test]
+    fn renders_endpoint_and_headers_that_round_trip_through_the_config_loader() {
+        let custom = ar_registry::CustomProvider {
+            id: "my-gw".to_owned(),
+            protocol: ar_registry::Protocol::OpenaiCompatible,
+            base_url: "https://api.example.invalid/v1/".to_owned(),
+            endpoint: Some("chat/completions2".to_owned()),
+            key_ref: "my-gw-key".to_owned(),
+            headers: BTreeMap::from([("x-api-key".to_owned(), "$AR_KEY_MY_GW".to_owned())]),
+        };
+        let yaml = render_yaml(&BTreeMap::new(), &[], std::slice::from_ref(&custom));
+        assert!(yaml.contains("endpoint: chat/completions2"), "{yaml}");
+        assert!(yaml.contains("x-api-key: $AR_KEY_MY_GW"), "{yaml}");
+        let parsed = ar_config::Config::parse(&yaml, |n| Ok(Some(format!("<{n}>"))))
+            .expect("endpoint/headers serialize to loadable YAML");
+        // Headers carry $VAR bindings that the loader resolves through the
+        // closure, exactly like a catalog import writes them.
+        assert_eq!(
+            parsed.custom_providers[0].headers.get("x-api-key").map(String::as_str),
+            Some("<AR_KEY_MY_GW>")
+        );
     }
 
     #[test]
