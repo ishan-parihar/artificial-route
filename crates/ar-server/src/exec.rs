@@ -617,6 +617,9 @@ pub struct HttpExec {
 /// cline rows authenticate by API key and never touch the OAuth path. The
 /// gateway wraps every answer regardless of the credential's shape.
 ///
+/// A Gemini wire is rendered the same way, to the OpenAI completion it answers
+/// (docs/22, D6).
+///
 /// Non-streaming callers only: the body is small and the server buffers it
 /// for accounting anyway, so one drain here replaces two downstream
 /// confusions (an empty answer *and* a zero usage row). Streams relay
@@ -634,6 +637,7 @@ async fn unwrap_response(
     upstream: ar_exec::ChatStream,
     status: StatusCode,
     retry_after: Option<std::time::Duration>,
+    model: &str,
 ) -> Upstream {
     // Drained exactly once on every arm: a `ChatStream` holds the socket,
     // and dropping it unread would close a connection the relay below
@@ -646,6 +650,20 @@ async fn unwrap_response(
         error_body: Bytes::new(),
         stream: Box::pin(futures::stream::once(async move { body })),
     };
+    // A Gemini reply is Google's own envelope, which neither the router nor an
+    // OpenAI client can read as a completion (docs/22, D6). A text reply is
+    // rendered as the OpenAI completion it answers; anything else relays as it
+    // arrived. Streams never reach this helper.
+    if cfg.wire_format == WireFormat::Gemini {
+        let rendered = serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| ar_translate::gemini_response_to_openai(&value, model))
+            .and_then(|value| serde_json::to_vec(&value).ok());
+        return match rendered {
+            Some(bytes) => single(Bytes::from(bytes)),
+            None => single(body),
+        };
+    }
     if cfg.oauth_executor() != Some(OAuthKind::Cline) {
         return single(body);
     }
@@ -938,7 +956,9 @@ impl ArRouteExec for HttpExec {
                     stream: chunks.boxed(),
                 });
             }
-            return Ok(unwrap_response(cfg, stream, status, retry_after).await);
+            return Ok(
+                unwrap_response(cfg, stream, status, retry_after, canonical.model.as_ref()).await,
+            );
 
         })
     }

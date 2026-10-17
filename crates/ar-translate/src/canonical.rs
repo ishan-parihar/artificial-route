@@ -158,7 +158,10 @@ pub struct CanonicalChat {
     /// Output token ceiling, when the caller set one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
-    /// Whether the caller asked for incremental delivery.
+    /// Whether the caller asked for incremental delivery. Absent means no: an
+    /// OpenAI client that omits `stream` is asking for a whole reply, and the
+    /// non-OpenAI renderers must decode that the same way.
+    #[serde(default)]
     pub stream: bool,
 }
 

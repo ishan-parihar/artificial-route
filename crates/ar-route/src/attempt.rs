@@ -411,6 +411,73 @@ fn has_content(value: &serde_json::Value) -> bool {
         .is_some_and(NON_EMPTY_STR)
 }
 
+/// Whether a non-streamed 2xx body is an empty completion (docs/22, D5).
+///
+/// Empty means: no tool call, no reasoning that carries text, and content
+/// that is blank or degenerate ([`is_degenerate_text`]). A body that is not
+/// OpenAI-shaped is not judged here: an unknown shape is not an empty answer,
+/// and the error scan already handles the shapes that are failures.
+fn is_empty_completion(body: &str) -> bool {
+    if body.trim().is_empty() {
+        return true;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let Some(choices) = value.get("choices").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    let Some(message) = choices.first().and_then(|c| c.get("message")) else {
+        return true;
+    };
+    let has_tool = message
+        .get("tool_calls")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|calls| !calls.is_empty())
+        || message.get("function_call").is_some_and(|f| !f.is_null());
+    if has_tool {
+        return false;
+    }
+    let reasoned = ["reasoning_content", "reasoning"].iter().any(|key| {
+        message
+            .get(*key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty())
+    });
+    if reasoned {
+        return false;
+    }
+    match message.get("content") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(text)) => is_degenerate_text(text),
+        // Structured content (a parts array) is an answer shape this check does
+        // not read; it is not claimed as empty.
+        Some(_) => false,
+    }
+}
+
+/// Blank, or nothing but `<|…|>` special tokens and punctuation of at most
+/// three characters, such as `'<|close|>!'` (docs/07, B2).
+fn is_degenerate_text(content: &str) -> bool {
+    let mut stripped = String::with_capacity(content.len());
+    let mut rest = content;
+    while let Some(start) = rest.find("<|") {
+        stripped.push_str(&rest[..start]);
+        match rest[start..].find("|>") {
+            Some(end) => rest = &rest[start + end + 2..],
+            // An unclosed marker is ordinary text, not a special token.
+            None => {
+                rest = &rest[start..];
+                break;
+            }
+        }
+    }
+    stripped.push_str(rest);
+    let trimmed = stripped.trim();
+    trimmed.is_empty()
+        || (trimmed.chars().count() <= 3 && !trimmed.chars().any(char::is_alphanumeric))
+}
+
 /// Maps an `error` value to the status the attempt fails over with.
 ///
 /// A numeric `code` that is itself an HTTP status is projected through, so a
@@ -546,19 +613,20 @@ fn charge_failure(
             );
             (cooldown, true)
         }
-        // Everything else — 5xx, transport, an auth refusal — is the key's
-        // problem and the provider breaker's to count. Here the layering
-        // collapses on purpose for a single-credential provider: with one key
-        // there is nothing for a dead credential to fall back to, so an auth
-        // refusal *is* the provider's failure. A multi-credential provider
-        // splits the cases: an auth refusal is one credential's (the
-        // executor's doubling lockout already isolates it) and cools nothing,
-        // while 5xx and transport remain the endpoint's and keep every charge.
+        // Everything else — 5xx, transport, a stall, an auth refusal — is one
+        // model's failure until proven otherwise. The cooldown lands on
+        // `provider:model`: a sibling model on the same provider is a fallback
+        // target, and skipping it because this one hung is how a two-target
+        // combo degrades to one target (docs/22, B1). The breaker below still
+        // counts the failure endpoint-wide, so a dead endpoint leaves rotation
+        // at its threshold. An auth refusal on a multi-credential provider is
+        // one credential's and cools nothing (the executor's lockout owns it).
         Fault::Transient => {
             if multi && (status == UNAUTHORIZED || status == FORBIDDEN) {
                 return (Duration::ZERO, false);
             }
-            let cooldown = resilience.record_failure(provider, retry_after);
+            let base = retry_after.map_or(DEFAULT_BASE_BACKOFF, |r| r.max(DEFAULT_BASE_BACKOFF));
+            let cooldown = resilience.lock_model(provider, model, LockReason::Unavailable, base);
             // A 400 the request itself provoked is the key's cooldown and
             // nothing more: after a dozen oversized prompts, a breaker that
             // counted them would be blaming the endpoint for our request.
@@ -616,6 +684,10 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
     }
 
     let mut tried: u16 = 0;
+    // Classified-empty failovers spent on this request. One is allowed (docs/22,
+    // D5): a second empty answer is relayed, so an empty-but-valid reply cannot
+    // loop the chain.
+    let mut empty_failovers: u8 = 0;
     // Last verdict: status, provider, cooldown, was_rate_limit, the
     // upstream's own error body, and the window it asked for. Transport
     // failures record 502 so the Failover arm never has to invent a status;
@@ -637,7 +709,7 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
     let mut earliest_skipped: Option<Duration> = None;
     let mut skipped_by: Option<ProviderId> = None;
 
-    for target in fallback_chain {
+    for (index, target) in fallback_chain.iter().enumerate() {
         if tried as usize >= MAX_ATTEMPTS {
             break;
         }
@@ -722,6 +794,19 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
                     drained
                 };
                 let mut step = classify_status(upstream.status.as_u16(), &scan);
+                // Empty-completion classifier (docs/22, D5). Only fails over when
+                // another target exists: a single-target chain relays its empty
+                // answer as it always did, rather than turning it into a 502.
+                if !canonical.stream
+                    && matches!(step, Step::Success)
+                    && empty_failovers == 0
+                    && index + 1 < fallback_chain.len()
+                    && is_empty_completion(&scan)
+                {
+                    empty_failovers += 1;
+                    tracing::warn!(provider = %provider, model, "2xx completion is empty; failing over");
+                    step = Step::Failover { status: 502 };
+                }
                 // The first-byte gate: a streamed attempt is only committed
                 // once its first byte crosses (or the window gives up on it).
                 // The client's 200 + SSE headers are sent when this loop
@@ -981,7 +1066,7 @@ mod tests {
 
     use super::{
         Fault, MAX_ATTEMPTS, Step, Terminal, attempt_loop, classify_fault, classify_status,
-        error_status_in_body,
+        error_status_in_body, is_degenerate_text,
     };
     use crate::AttemptOutcome;
     use crate::contract::{CanonicalRequest, ExecError, Executor, ProviderId, Strng, Upstream};
@@ -1262,7 +1347,10 @@ mod tests {
             panic!("expected success, got {got:?}");
         };
         assert_eq!((provider.as_str(), attempts), ("p2", 2));
-        assert!(r.is_cooling("p1"), "the empty stream must charge p1");
+        assert!(
+            r.is_cooling_for("p1", "m"),
+            "the empty stream must lock p1's model"
+        );
     }
 
     #[test]
@@ -1319,6 +1407,150 @@ mod tests {
             panic!("expected success, got {got:?}");
         };
         assert_eq!(provider.as_str(), "p2");
+    }
+
+    #[test]
+    fn fails_over_when_a_completion_has_null_content() {
+        // docs/07 B2: `content: null` with no reasoning is an empty answer
+        // wearing a 200. The next target serves it.
+        let exec = Scripted::new(vec![
+            Verdict::OkBody(r#"{"choices":[{"message":{"role":"assistant","content":null}}]}"#),
+            Verdict::OkBody(r#"{"choices":[{"message":{"content":"hi"}}]}"#),
+        ]);
+        let r = Resilience::new();
+        let got = block(attempt_loop(&req(), &chain(&["p1", "p2"]), &exec, &r));
+        let Ok(AttemptOutcome::Succeeded { provider, .. }) = got else {
+            panic!("expected success, got {got:?}");
+        };
+        assert_eq!(provider.as_str(), "p2");
+    }
+
+    #[test]
+    fn keeps_a_blank_content_reply_that_carries_reasoning() {
+        let exec = Scripted::new(vec![Verdict::OkBody(
+            r#"{"choices":[{"message":{"content":"","reasoning_content":"4"}}]}"#,
+        )]);
+        let r = Resilience::new();
+        let got = block(attempt_loop(&req(), &chain(&["p1", "p2"]), &exec, &r));
+        let Ok(AttemptOutcome::Succeeded {
+            provider, attempts, ..
+        }) = got
+        else {
+            panic!("expected success, got {got:?}");
+        };
+        assert_eq!((provider.as_str(), attempts), ("p1", 1));
+    }
+
+    #[test]
+    fn keeps_a_genuinely_short_answer() {
+        let exec = Scripted::new(vec![Verdict::OkBody(
+            r#"{"choices":[{"message":{"content":"OK"}}]}"#,
+        )]);
+        let r = Resilience::new();
+        let got = block(attempt_loop(&req(), &chain(&["p1", "p2"]), &exec, &r));
+        let Ok(AttemptOutcome::Succeeded { attempts, .. }) = got else {
+            panic!("expected success, got {got:?}");
+        };
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn keeps_a_tool_call_with_no_text() {
+        let exec = Scripted::new(vec![Verdict::OkBody(
+            r#"{"choices":[{"message":{"content":null,"tool_calls":[{"id":"c1"}]}}]}"#,
+        )]);
+        let r = Resilience::new();
+        let got = block(attempt_loop(&req(), &chain(&["p1", "p2"]), &exec, &r));
+        let Ok(AttemptOutcome::Succeeded { attempts, .. }) = got else {
+            panic!("expected success, got {got:?}");
+        };
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn relays_a_second_empty_answer_so_the_chain_cannot_loop() {
+        let empty = r#"{"choices":[{"message":{"content":""}}]}"#;
+        let exec = Scripted::new(vec![
+            Verdict::OkBody(empty),
+            Verdict::OkBody(empty),
+            Verdict::OkBody(r#"{"choices":[{"message":{"content":"hi"}}]}"#),
+        ]);
+        let r = Resilience::new();
+        let got = block(attempt_loop(&req(), &chain(&["p1", "p2", "p3"]), &exec, &r));
+        let Ok(AttemptOutcome::Succeeded {
+            provider, attempts, ..
+        }) = got
+        else {
+            panic!("expected success, got {got:?}");
+        };
+        assert_eq!((provider.as_str(), attempts), ("p2", 2));
+    }
+
+    #[test]
+    fn relays_an_empty_answer_from_a_single_target_chain() {
+        let exec = Scripted::new(vec![Verdict::OkBody(
+            r#"{"choices":[{"message":{"content":""}}]}"#,
+        )]);
+        let r = Resilience::new();
+        let got = block(attempt_loop(&req(), &chain(&["p1"]), &exec, &r));
+        assert!(
+            matches!(got, Ok(AttemptOutcome::Succeeded { .. })),
+            "a lone target's empty answer is relayed, not turned into a 502: {got:?}"
+        );
+    }
+
+    #[test]
+    fn degenerate_text_is_only_special_tokens_and_punctuation() {
+        assert!(is_degenerate_text(""));
+        assert!(is_degenerate_text("   "));
+        assert!(is_degenerate_text("<|close|>!"));
+        assert!(!is_degenerate_text("OK"));
+        assert!(!is_degenerate_text("<|close|>done"));
+    }
+
+    #[test]
+    fn a_transient_stall_on_one_model_leaves_its_sibling_serving() {
+        // free-stack's shape: one provider, two models. The first model stalls
+        // (no headers inside the start budget); the sibling is tried in the same
+        // request rather than skipped as "cooling" (docs/22, B1).
+        let exec = Scripted::new(vec![
+            Verdict::Transport("upstream produced no headers within 110s"),
+            Verdict::Ok,
+        ]);
+        let r = Resilience::new();
+        let got = block(attempt_loop(
+            &req(),
+            &targets(&[("nvidia", "glm-5.3"), ("nvidia", "glm-5.3-flash")]),
+            &exec,
+            &r,
+        ));
+        let Ok(AttemptOutcome::Succeeded { attempts, .. }) = got else {
+            panic!("expected the sibling to serve, got {got:?}");
+        };
+        assert_eq!(attempts, 2, "models: {:?}", exec.models());
+        assert!(r.is_cooling_for("nvidia", "glm-5.3"));
+        assert!(
+            !r.is_cooling("nvidia"),
+            "a stall must not cool the provider"
+        );
+    }
+
+    #[test]
+    fn the_breaker_still_counts_a_dead_endpoint_across_its_models() {
+        // Model-scoped cooldowns must not blind the endpoint-wide breaker: a
+        // provider failing on every model it serves leaves rotation at threshold.
+        let r = Resilience::new();
+        for i in 0..BreakerClass::default().threshold() {
+            let exec = Scripted::new(vec![Verdict::Status(502, "upstream down")]);
+            let model = format!("m{i}");
+            let _ = block(attempt_loop(
+                &req(),
+                &targets(&[("p1", model.as_str())]),
+                &exec,
+                &r,
+            ));
+        }
+        assert!(!r.is_usable("p1"), "the breaker must open at its threshold");
     }
 
     #[test]
@@ -1396,7 +1628,10 @@ mod tests {
             panic!("expected success, got {got:?}");
         };
         assert_eq!(provider.as_str(), "p2");
-        assert!(r.is_cooling("p1"), "the error-shaped 200 must charge p1");
+        assert!(
+            r.is_cooling_for("p1", "m"),
+            "the error-shaped 200 must lock p1's model"
+        );
     }
 
     #[test]
@@ -1792,11 +2027,16 @@ mod tests {
         let rounds = BreakerClass::Key.threshold() + 4;
         let r = Resilience::new();
         let exec = Scripted::new(vec![OVERFLOW; rounds as usize]);
-        for _ in 0..rounds {
-            let _ = block(attempt_loop(&req(), &chain(&["p1"]), &exec, &r));
-            // Clear the key cooldown between rounds so each one really
-            // dispatches; the breaker is what is under test here.
-            r.record_success("p1");
+        for i in 0..rounds {
+            // A fresh model per round: each 400 locks the model it was sent to,
+            // and the breaker is what is under test here (docs/22, D1).
+            let model = format!("m{i}");
+            let _ = block(attempt_loop(
+                &req(),
+                &targets(&[("p1", model.as_str())]),
+                &exec,
+                &r,
+            ));
         }
         assert_eq!(exec.seen().len() as u32, rounds, "every round dispatched");
         assert!(r.is_usable("p1"), "an oversized prompt is not an outage");
@@ -1942,26 +2182,28 @@ mod tests {
     }
 
     #[test]
-    fn multi_credential_endpoint_faults_still_stop_the_provider() {
-        // A 5xx is the endpoint's, not one credential's: every charge stays,
-        // and the sibling model is skipped for the cooldown's width.
+    fn multi_credential_endpoint_faults_lock_the_model_and_serve_the_sibling() {
+        // A 5xx on one model locks that model (docs/22, D1). The sibling is
+        // tried in the same request, and the provider itself is not cooled.
         let r = Resilience::new();
         r.mark_multi("nvidia");
         let exec = Scripted::new(vec![Verdict::Status(500, "boom"), Verdict::Ok]);
-        // A transient fault with no throttle anywhere reports Failover — a
-        // retry would just hit the same cooling endpoint — and the loop's own
-        // attempt count is the witness that the sibling was skipped.
-        let Ok(AttemptOutcome::Failover { status, tried, .. }) = block(attempt_loop(
+        let got = block(attempt_loop(
             &req(),
             &targets(&[("nvidia", "glm-5.3"), ("nvidia", "kimi-k3")]),
             &exec,
             &r,
-        )) else {
-            panic!("expected failover");
-        };
-        assert_eq!(status, 500);
-        assert_eq!(tried, 1, "the endpoint is cooling — sibling skipped");
-        assert_eq!(exec.seen().len(), 1);
+        ));
+        assert!(
+            matches!(got, Ok(AttemptOutcome::Succeeded { attempts: 2, .. })),
+            "expected the sibling to serve: {got:?}"
+        );
+        assert_eq!(exec.models(), ["glm-5.3", "kimi-k3"]);
+        assert!(r.is_cooling_for("nvidia", "glm-5.3"));
+        assert!(
+            !r.is_cooling("nvidia"),
+            "a 5xx is one model's, not the provider's"
+        );
     }
 
     #[test]

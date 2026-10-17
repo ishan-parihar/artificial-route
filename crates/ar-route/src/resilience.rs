@@ -130,6 +130,10 @@ pub enum LockReason {
     /// a quota-exhausted provider re-selected every few seconds until the money
     /// arrives is exactly the failure mode a long lockout removes.
     QuotaExhausted,
+    /// One model's transient failure: a 5xx, a stall, a transport drop, or an
+    /// empty 2xx. Exponential lockout on this model alone; the provider's
+    /// breaker counts the same failure endpoint-wide (docs/22, D1).
+    Unavailable,
     /// Nothing recovers on a timer. The model (or the account) is retired, not
     /// cooled: no cooldown is long enough, so any of them is just latency.
     Terminal,
@@ -381,6 +385,9 @@ impl Resilience {
         });
         let max = match reason {
             LockReason::QuotaExhausted => QUOTA_COOLDOWN_CAP,
+            // A transient refusal keeps the ceiling the provider-scope cooldown had
+            // before it moved to the model (docs/22, D1): five minutes, not thirty.
+            LockReason::Unavailable => DEFAULT_MAX_BACKOFF,
             _ => LOCKOUT_MAX_COOLDOWN,
         };
         let applied = cooldown
@@ -719,8 +726,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        BreakerClass, BreakerState, LockReason, NOON_TEST, QUOTA_COOLDOWN_CAP, QuotaClockGuard,
-        Resilience, quota_cooldown, quota_cooldown_at,
+        BreakerClass, BreakerState, DEFAULT_BASE_BACKOFF, DEFAULT_MAX_BACKOFF, LockReason,
+        NOON_TEST, QUOTA_COOLDOWN_CAP, QuotaClockGuard, Resilience, quota_cooldown,
+        quota_cooldown_at,
     };
 
     /// Noon UTC: half a day of allowance left, so the "waits for the day"
@@ -1025,5 +1033,17 @@ mod tests {
         r.mark_multi("nvidia");
         assert!(r.is_multi("nvidia"));
         assert!(!r.is_multi("kimi"), "unmarked providers stay P0-scoped");
+    }
+
+    #[test]
+    fn an_unavailable_lockout_is_capped_at_the_provider_backoff_ceiling() {
+        // docs/22, D1: a flaky model escalates per model, but never past the
+        // ceiling the provider cooldown had, so it is not locked for thirty minutes.
+        let r = Resilience::new();
+        let mut last = Duration::ZERO;
+        for _ in 0..20 {
+            last = r.lock_model("p", "m", LockReason::Unavailable, DEFAULT_BASE_BACKOFF);
+        }
+        assert_eq!(last, DEFAULT_MAX_BACKOFF);
     }
 }

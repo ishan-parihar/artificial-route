@@ -22,6 +22,8 @@ Owner: `docs/05-roadmap.md` P6 accept line, `docs/02` soak row.
 
 ## T2 — stream-envelope unwrap + mid-stream error peek (MW2's P2 tail)
 
+**Status 2026-10-18: open.** A probe of the API-key cline row found plain OpenAI SSE (44 frames, usage, `[DONE]`) and no `{success,data}` envelope. The unwrap waits for an OAuth cline session that streams the envelope. See docs/22 (T2, D7).
+
 Owner: `docs/07-blockers.md` MW2 row ("Stream unwrap is P2 pending a gateway
 probe").
 
@@ -35,6 +37,8 @@ probe").
   `data` payload as the envelope — needs the probe first, not guesswork.
 
 ## T3 — empty/degenerate 200 detection in the attempt loop (B2)
+
+**Status 2026-10-18: closed for the non-streamed arm** (docs/22, D5, one classified-empty failover per request). The streamed arm stays open: the first-byte gate sees bytes, not content, and a stream cannot fail over after it commits.
 
 Owner: `docs/07-blockers.md` B2 (kimi-k3 5/10 empty; "highest-value item
 here").
@@ -70,6 +74,8 @@ Owner: `docs/07-blockers.md` B3.
   monitoring task, not an implementation one.
 
 ## T5 — Gemini response translation (B4)
+
+**Status 2026-10-18: closed for the non-streamed arm** (docs/22, D6), verified against a live `gemini-2.5-flash` reply. The streamed relay is unchanged by contract.
 
 Owner: `docs/07-blockers.md` B4.
 

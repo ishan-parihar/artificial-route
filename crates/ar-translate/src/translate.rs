@@ -52,7 +52,9 @@ use serde_json::json;
 use crate::anthropic::{
     AnthropicBlock, AnthropicBlockContent, AnthropicContent, AnthropicMessages,
 };
-use crate::canonical::{CanonicalChat, CanonicalResponse, MediaPart, Msg, Role};
+use crate::canonical::{
+    CanonicalChat, CanonicalResponse, FinishReason, MediaPart, Msg, Role, Usage,
+};
 use crate::gemini::{GeminiChat, GeminiContent, GeminiPart};
 use crate::media::Modality;
 use crate::ollama::OllamaChat;
@@ -772,6 +774,73 @@ pub fn to_openai(response: &CanonicalResponse) -> serde_json::Value {
     })
 }
 
+/// Renders a non-streamed Gemini `generateContent` reply as the OpenAI chat
+/// completion it answers (docs/22, D6).
+///
+/// `None` when the body has no text candidate to render: a function call, a
+/// blocked prompt, or an error object. Those relay unchanged. Thought parts are
+/// the model's reasoning rather than its answer, so they stay out of the content.
+/// An empty text reply is still rendered, so the caller's empty-completion check
+/// can judge it.
+pub fn gemini_response_to_openai(
+    body: &serde_json::Value,
+    model: &str,
+) -> Option<serde_json::Value> {
+    let candidate = body.pointer("/candidates/0")?;
+    let parts = candidate.pointer("/content/parts")?.as_array()?;
+    if parts.iter().any(|part| part.get("functionCall").is_some()) {
+        return None;
+    }
+    let content: String = parts
+        .iter()
+        .filter(|part| {
+            !part
+                .get("thought")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        })
+        .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+        .collect();
+    let finish_reason = match candidate
+        .get("finishReason")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("MAX_TOKENS") => FinishReason::Length,
+        Some(
+            "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" | "LANGUAGE",
+        ) => FinishReason::ContentFilter,
+        _ => FinishReason::Stop,
+    };
+    let count = |key: &str| {
+        body.pointer(&format!("/usageMetadata/{key}"))
+            .and_then(serde_json::Value::as_u64)
+            .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX))
+    };
+    let response = CanonicalResponse {
+        id: body
+            .get("responseId")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        model: body
+            .get("modelVersion")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(model)
+            .to_owned(),
+        created: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs()),
+        message: Msg::new(Role::Assistant, content),
+        finish_reason,
+        usage: Usage {
+            prompt_tokens: count("promptTokenCount"),
+            completion_tokens: count("candidatesTokenCount"),
+            total_tokens: count("totalTokenCount"),
+        },
+    };
+    Some(to_openai(&response))
+}
+
 /// Rejects a blank model, shared by all three new adapters.
 fn require_model(model: &str) -> Result<(), TranslateError> {
     if model.trim().is_empty() {
@@ -1470,5 +1539,83 @@ mod tests {
             pair_named("canonical-to-antigravity").is_err(),
             "the twin is one cell, not two"
         );
+    }
+
+    // --- Gemini non-streamed replies (docs/22, D6) ---------------------------
+
+    fn gemini_reply(parts: &str, finish: &str) -> serde_json::Value {
+        serde_json::from_str(&format!(
+            r#"{{"candidates":[{{"content":{{"role":"model","parts":{parts}}},"finishReason":"{finish}"}}],"usageMetadata":{{"promptTokenCount":5,"candidatesTokenCount":1,"totalTokenCount":6}},"modelVersion":"gemini-3-pro"}}"#
+        ))
+        .expect("a test body")
+    }
+
+    #[test]
+    fn renders_a_gemini_text_reply_as_an_openai_completion() {
+        let value = gemini_reply(r#"[{"text":"64"}]"#, "STOP");
+        let out = gemini_response_to_openai(&value, "requested").expect("text renders");
+        assert_eq!(out["object"], "chat.completion");
+        assert_eq!(
+            out["model"], "gemini-3-pro",
+            "the served model, not the request"
+        );
+        assert_eq!(out["choices"][0]["message"]["content"], "64");
+        assert_eq!(out["choices"][0]["finish_reason"], "stop");
+        assert_eq!(out["usage"]["prompt_tokens"], 5);
+        assert_eq!(out["usage"]["completion_tokens"], 1);
+        assert_eq!(out["usage"]["total_tokens"], 6);
+    }
+
+    #[test]
+    fn joins_text_parts_and_leaves_thoughts_out_of_the_answer() {
+        let value = gemini_reply(
+            r#"[{"text":"reasoning","thought":true},{"text":"4"},{"text":" four"}]"#,
+            "STOP",
+        );
+        let out = gemini_response_to_openai(&value, "m").expect("text renders");
+        assert_eq!(out["choices"][0]["message"]["content"], "4 four");
+    }
+
+    #[test]
+    fn maps_gemini_finish_reasons_onto_openai_ones() {
+        let cut = gemini_response_to_openai(&gemini_reply(r#"[{"text":"x"}]"#, "MAX_TOKENS"), "m");
+        assert_eq!(
+            cut.expect("renders")["choices"][0]["finish_reason"],
+            "length"
+        );
+        let blocked = gemini_response_to_openai(&gemini_reply(r#"[{"text":"x"}]"#, "SAFETY"), "m");
+        assert_eq!(
+            blocked.expect("renders")["choices"][0]["finish_reason"],
+            "content_filter"
+        );
+    }
+
+    #[test]
+    fn keeps_an_empty_text_reply_so_the_empty_check_can_judge_it() {
+        let value = gemini_reply(r#"[{"text":""}]"#, "STOP");
+        let out = gemini_response_to_openai(&value, "m").expect("an empty reply still renders");
+        assert_eq!(out["choices"][0]["message"]["content"], "");
+    }
+
+    #[test]
+    fn leaves_a_function_call_or_a_blocked_prompt_untranslated() {
+        let call = gemini_reply(r#"[{"functionCall":{"name":"f","args":{}}}]"#, "STOP");
+        assert!(
+            gemini_response_to_openai(&call, "m").is_none(),
+            "tool calls are not rendered yet"
+        );
+        let blocked = serde_json::json!({"promptFeedback": {"blockReason": "SAFETY"}});
+        assert!(gemini_response_to_openai(&blocked, "m").is_none());
+        let error = serde_json::json!({"error": {"code": 400, "message": "bad"}});
+        assert!(gemini_response_to_openai(&error, "m").is_none());
+    }
+
+    #[test]
+    fn a_chat_without_stream_decodes_as_non_streaming() {
+        // A client that omits `stream` wants the whole reply. Before this default,
+        // every non-OpenAI renderer refused such a request as "missing field stream".
+        let chat: CanonicalChat =
+            serde_json::from_str(r#"{"model":"m","messages":[]}"#).expect("a chat body");
+        assert!(!chat.stream);
     }
 }

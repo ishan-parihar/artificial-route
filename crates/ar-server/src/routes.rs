@@ -2055,7 +2055,12 @@ fn decorate(
     }
 
     let resp = match outcome {
-        AttemptOutcome::Succeeded { upstream, .. } => {
+        AttemptOutcome::Succeeded {
+            upstream,
+            provider,
+            model,
+            ..
+        } => {
             // Pass upstream framing through untouched. A `stream: true` request
             // gets `text/event-stream`; a non-stream completion is one JSON
             // chunk and gets `application/json`.
@@ -2086,7 +2091,9 @@ fn decorate(
                 _ => {
                     let stream = upstream.stream;
                     let body = match keepalive.filter(|k| !k.is_noop()) {
-                        Some(k) => Body::from_stream(k.relay(stream)),
+                        Some(k) => {
+                            Body::from_stream(k.relay(stream, provider.as_str(), model.as_ref()))
+                        }
                         None => {
                             Body::from_stream(stream.map(Ok::<Bytes, std::convert::Infallible>))
                         }
@@ -2104,6 +2111,7 @@ fn decorate(
             let secs = after.as_secs().max(1);
             builder
                 .header(header::RETRY_AFTER, secs.to_string())
+                .header(header::CONTENT_TYPE, "application/json")
                 .status(StatusCode::TOO_MANY_REQUESTS)
                 .body(json_body(
                     ErrorSpec::of(
@@ -2142,12 +2150,18 @@ fn decorate(
                 );
             }
             builder
+                .header(header::CONTENT_TYPE, "application/json")
                 .status(status)
                 .body(json_body(ErrorSpec::of(status, code, &message)))
         }
-        AttemptOutcome::Abort(report) => builder.status(report.status).body(json_body(
-            ErrorSpec::of(report.status, "aborted", &report.reason),
-        )),
+        AttemptOutcome::Abort(report) => builder
+            .header(header::CONTENT_TYPE, "application/json")
+            .status(report.status)
+            .body(json_body(ErrorSpec::of(
+                report.status,
+                "aborted",
+                &report.reason,
+            ))),
     };
 
     resp.unwrap_or_else(|_| {
@@ -2238,9 +2252,8 @@ struct Keepalive {
     /// The frame naming a truncated stream. `None` for the same dialect as
     /// `frame`, so no dialect can get a keepalive and no truncation signal.
     truncated: Option<&'static str>,
-    /// The terminator whose absence means "truncated". `None` for the same
-    /// dialect as `frame`.
-    terminator: Option<&'static [u8]>,
+    /// The dialect whose completion marker [`completion_seen`] looks for.
+    dialect: Dialect,
     /// How long a wait may be before a keepalive goes out.
     ///
     /// [`KEEPALIVE_INTERVAL`] in production; a test passes its own so the idle
@@ -2259,7 +2272,7 @@ impl Keepalive {
         Self {
             frame: dialect.keepalive(),
             truncated: dialect.stream_error(),
-            terminator: dialect.terminator(),
+            dialect,
             interval,
             last_terminated: None,
         }
@@ -2274,19 +2287,21 @@ impl Keepalive {
     }
 
     /// Relays `stream`, emitting a keepalive on every idle interval and a
-    /// truncation error if the stream ends without its terminator.
+    /// truncation error if the stream ends without a completion marker.
     ///
-    /// The terminator check is on the *last* frame only rather than accumulated
-    /// over the whole stream: a stream that sent `[DONE]` and then held the
-    /// connection open is terminated, and scanning every chunk to prove a
-    /// negative is work proportional to the answer for a case that cannot happen
-    /// on a well-behaved upstream. A client that reconnects mid-stream gets a
-    /// fresh request anyway.
+    /// The completion check reads a window that spans chunk boundaries (docs/22,
+    /// B3) and latches: once a marker is seen, no later chunk can retract it, and
+    /// nothing is emitted after the stream's own terminator. `provider` and `model`
+    /// are the serving target, named in the truncation log so a real cut and a
+    /// missing marker can be told apart (docs/22, B6).
     fn relay(
         self,
         mut stream: ar_route::ChunkStream,
+        provider: &str,
+        model: &str,
     ) -> impl futures::Stream<Item = Result<Bytes, std::convert::Infallible>> + Send + use<> {
         let mut keepalive = self;
+        let (provider, model) = (provider.to_owned(), model.to_owned());
         async_stream::stream! {
             if keepalive.is_noop() {
                 while let Some(chunk) = stream.next().await {
@@ -2294,31 +2309,39 @@ impl Keepalive {
                 }
                 return;
             }
+            // The last TERMINATOR_WINDOW bytes relayed, kept only while no marker
+            // has been seen: once latched, nothing reads them again.
+            let mut tail: Vec<u8> = Vec::new();
+            let mut relayed: u64 = 0;
             loop {
                 let next = tokio::time::timeout(keepalive.interval, stream.next()).await;
                 match next {
                     Ok(Some(chunk)) => {
-                        // Latches. A stream that carried its terminator is not a
-                        // truncated one, and several upstreams send a trailing
-                        // chunk after it — an empty keep-alive or a usage-only
-                        // frame. Reading the flag off the *last* chunk alone let
-                        // that trailing chunk retract the terminator and made
-                        // ar emit its truncation error AFTER `data: [DONE]`,
-                        // which is a frame a client is told not to expect after
-                        // the end of a stream.
+                        relayed += 1;
                         if keepalive.last_terminated != Some(true) {
+                            let mut window = std::mem::take(&mut tail);
+                            window.extend_from_slice(&chunk);
                             keepalive.last_terminated =
-                                Some(terminator_seen(&chunk, keepalive.terminator));
+                                Some(completion_seen(keepalive.dialect, &window));
+                            let keep = window.len().saturating_sub(TERMINATOR_WINDOW);
+                            tail = window.split_off(keep);
                         }
                         yield Ok(chunk);
                     }
-                    // The upstream finished. If its last frame was not a
-                    // terminator, the client is now waiting on a frame that
-                    // will never arrive, so name that in-band.
+                    // The upstream finished. If no completion marker crossed, the
+                    // client is waiting on a frame that will never arrive, so name
+                    // that in-band and say so in the log.
                     Ok(None) => {
                         if keepalive.last_terminated == Some(false)
                             && let Some(frame) = keepalive.truncated
                         {
+                            tracing::warn!(
+                                dialect = ?keepalive.dialect,
+                                provider = %provider,
+                                model = %model,
+                                relayed,
+                                "upstream stream ended without a completion marker; named in-band"
+                            );
                             yield Ok(Bytes::from_static(frame.as_bytes()));
                         }
                         return;
@@ -2335,13 +2358,58 @@ impl Keepalive {
     }
 }
 
-/// Whether `chunk` carries the stream's terminator.
+/// Bytes of relayed stream kept between chunks for the completion check. Sized
+/// for the longest marker plus the whitespace an encoder may place around
+/// `"finish_reason"`, with room to spare.
+const TERMINATOR_WINDOW: usize = 128;
+
+/// Whether `window` holds the completion marker for `dialect` (docs/22, D2).
 ///
-/// `false` also covers a dialect with no terminator to look for, which is the
-/// answer the caller wants anyway: there is nothing to assert, so nothing is
-/// claimed.
-fn terminator_seen(chunk: &Bytes, terminator: Option<&'static [u8]>) -> bool {
-    terminator.is_some_and(|t| chunk.windows(t.len()).any(|w| w == t))
+/// OpenAI completes on `data: [DONE]` or on a `finish_reason` string. Anthropic
+/// and Responses keep their own terminators. Ollama has none to look for.
+fn completion_seen(dialect: Dialect, window: &[u8]) -> bool {
+    match dialect {
+        Dialect::OpenAi => openai_done_seen(window) || finish_reason_seen(window),
+        Dialect::Anthropic | Dialect::Responses => dialect
+            .terminator()
+            .is_some_and(|t| window.windows(t.len()).any(|w| w == t)),
+        Dialect::Ollama => false,
+    }
+}
+
+/// `data: [DONE]` opening a line.
+///
+/// Escaped JSON never puts a raw newline inside a string, so a `\n` before the
+/// marker separates a real frame from answer text that spells the same bytes.
+fn openai_done_seen(window: &[u8]) -> bool {
+    const DONE: &[u8] = b"data: [DONE]";
+    window
+        .windows(DONE.len())
+        .enumerate()
+        .any(|(i, w)| w == DONE && (i == 0 || window[i - 1] == b'\n'))
+}
+
+/// A `finish_reason` key whose value is a JSON string.
+///
+/// OpenAI spells the key `finish_reason`. A Gemini stream, relayed raw on the
+/// streaming path (docs/22, D6), spells it `finishReason`. Intermediate chunks
+/// carry `null`, which does not count. Answer text that spells the key arrives
+/// escaped (`\"finish_reason\"`), which does not match the unescaped key.
+fn finish_reason_seen(window: &[u8]) -> bool {
+    [&b"\"finish_reason\""[..], &b"\"finishReason\""[..]]
+        .iter()
+        .any(|key| key_with_string_value(window, key))
+}
+
+/// Whether `key` occurs in `window` followed by `:` and a JSON string.
+fn key_with_string_value(window: &[u8], key: &[u8]) -> bool {
+    window.windows(key.len()).enumerate().any(|(i, w)| {
+        w == key
+            && window[i + key.len()..]
+                .trim_ascii_start()
+                .strip_prefix(b":")
+                .is_some_and(|after| after.trim_ascii_start().first() == Some(&b'"'))
+    })
 }
 
 /// A short outcome word for the decision header. One token, no spaces, so an
@@ -2882,8 +2950,8 @@ mod tests {
         FALLBACK_ATTEMPTS_HEADER, Keepalive, LATENCY_MS_HEADER, MODEL_HEADER, PROVIDER_HEADER,
         RESPONSE_COST_HEADER, SAVINGS_TOKENS_HEADER, Stages, TOKENS_IN_HEADER, TOKENS_OUT_HEADER,
         TOKENS_PER_SECOND_HEADER, USAGE_FRAME_CAP, UsageTee, VERSION_HEADER, accept_forces_stream,
-        build_chain, card_json, declares_stream, decorate, error, error_because, kind_for, model,
-        models_head, not_found, outcome_label, require_json, terminator_seen, unknown_model,
+        build_chain, card_json, completion_seen, declares_stream, decorate, error, error_because,
+        kind_for, model, models_head, not_found, outcome_label, require_json, unknown_model,
         usage_from_frames,
     };
     use super::DECISION_HEADER;
@@ -3800,14 +3868,10 @@ mod tests {
     fn the_responses_terminator_is_its_own_completed_event() {
         // Responses discriminates on a `type` inside the payload, so the
         // terminator is the completed event rather than a terminator line.
-        let terminator = Dialect::Responses.terminator().expect("responses has one");
-        assert!(!terminator_seen(
-            &Bytes::from_static(b"data: [DONE]\n\n"),
-            Some(terminator)
-        ));
-        assert!(terminator_seen(
-            &Bytes::from_static(b"data: {\"type\":\"response.completed\"}\n\n"),
-            Some(terminator)
+        assert!(!completion_seen(Dialect::Responses, b"data: [DONE]\n\n"));
+        assert!(completion_seen(
+            Dialect::Responses,
+            b"data: {\"type\":\"response.completed\"}\n\n"
         ));
     }
 
@@ -3815,15 +3879,11 @@ mod tests {
     fn the_anthropic_terminator_is_its_own_stop_event() {
         // Not `data: [DONE]`, which is the OpenAI spelling: an Anthropic stream
         // that ends on the wrong terminator is a stream that ended wrong.
-        let terminator = Dialect::Anthropic.terminator().expect("anthropic has one");
-        assert!(terminator_seen(
-            &Bytes::from_static(b"event: message_stop\ndata: {}\n\n"),
-            Some(terminator)
+        assert!(completion_seen(
+            Dialect::Anthropic,
+            b"event: message_stop\ndata: {}\n\n"
         ));
-        assert!(!terminator_seen(
-            &Bytes::from_static(b"data: [DONE]\n\n"),
-            Some(terminator)
-        ));
+        assert!(!completion_seen(Dialect::Anthropic, b"data: [DONE]\n\n"));
     }
 
     #[test]
@@ -3978,20 +4038,64 @@ mod tests {
     }
 
     #[test]
-    fn a_terminator_is_recognised_inside_a_frame() {
-        assert!(terminator_seen(
-            &Bytes::from_static(b"data: [DONE]\n\n"),
-            Dialect::OpenAi.terminator()
+    fn a_done_marker_is_recognised_inside_a_frame() {
+        assert!(completion_seen(Dialect::OpenAi, b"data: [DONE]\n\n"));
+        assert!(!completion_seen(Dialect::OpenAi, b"data: {}\n\n"));
+        // A partial marker is not a completion on its own; the window in the
+        // relay is what joins it to the bytes that follow (docs/22, B3).
+        assert!(!completion_seen(Dialect::OpenAi, b"data: [DO"));
+        // Answer text that spells the marker is preceded by its own text, not a
+        // line break, so it is not a frame boundary.
+        assert!(!completion_seen(
+            Dialect::OpenAi,
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"x data: [DONE]\"}}]}\n\n"
         ));
-        assert!(!terminator_seen(
-            &Bytes::from_static(b"data: {}\n\n"),
-            Dialect::OpenAi.terminator()
+    }
+
+    #[test]
+    fn a_finish_reason_string_completes_an_openai_stream() {
+        // docs/22, B2: a completed answer that closes without `[DONE]`.
+        assert!(completion_seen(
+            Dialect::OpenAi,
+            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
         ));
-        // Split across chunks is not claimed either way: the relay checks the
-        // last frame, so a partial frame is a frame without a terminator.
-        assert!(!terminator_seen(
-            &Bytes::from_static(b"data: [DO"),
-            Dialect::OpenAi.terminator()
+        // `json.dumps` writes a space after the colon; the marker must not depend
+        // on the encoder.
+        assert!(completion_seen(
+            Dialect::OpenAi,
+            b"data: {\"choices\": [{\"finish_reason\": \"length\"}]}\n\n"
+        ));
+    }
+
+    #[test]
+    fn a_gemini_finish_reason_completes_a_raw_relayed_stream() {
+        // A Gemini stream is relayed as Google sends it (docs/22, D6); its final
+        // frame carries `finishReason` as a string.
+        assert!(completion_seen(
+            Dialect::OpenAi,
+            b"data: {\"candidates\":[{\"finishReason\": \"STOP\"}]}\n\n"
+        ));
+        assert!(!completion_seen(
+            Dialect::OpenAi,
+            b"data: {\"candidates\":[{\"finishReason\":null}]}\n\n"
+        ));
+    }
+
+    #[test]
+    fn a_null_finish_reason_is_not_a_completion() {
+        assert!(!completion_seen(
+            Dialect::OpenAi,
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n"
+        ));
+    }
+
+    #[test]
+    fn an_escaped_finish_reason_in_answer_text_is_not_a_completion() {
+        // The answer spells the key; JSON writes the quotes as `\"`, which never
+        // matches the unescaped key.
+        assert!(!completion_seen(
+            Dialect::OpenAi,
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"\\\"finish_reason\\\":\\\"stop\\\"\"}}]}\n\n"
         ));
     }
 
@@ -4000,12 +4104,85 @@ mod tests {
         use futures::StreamExt;
         let stream: ar_route::ChunkStream = Box::pin(futures::stream::iter(chunks));
         keepalive
-            .relay(stream)
+            .relay(stream, "p", "m")
             .map(|item| {
                 String::from_utf8(item.expect("infallible").to_vec()).expect("frames are UTF-8")
             })
             .collect()
             .await
+    }
+
+    #[tokio::test]
+    async fn a_finished_answer_without_done_is_not_named_truncated() {
+        // docs/22, B2: the upstream sent its finish frame and closed. Nothing is
+        // added after the answer.
+        let frames = drain(
+            Keepalive::new(Dialect::OpenAi, NOWAIT),
+            vec![
+                Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n"),
+                Bytes::from_static(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            frames.len(),
+            2,
+            "no error after a finished answer: {frames:?}"
+        );
+        assert!(!frames.iter().any(|f| f.contains("stream_error")));
+    }
+
+    #[tokio::test]
+    async fn a_done_marker_split_across_chunks_names_nothing() {
+        // docs/22, B3: `[DONE]` arrives as two writes. The relay must see the
+        // whole marker, so no error follows it.
+        let frames = drain(
+            Keepalive::new(Dialect::OpenAi, NOWAIT),
+            vec![
+                Bytes::from_static(
+                    b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                ),
+                Bytes::from_static(b"data: [DO"),
+                Bytes::from_static(b"NE]\n\n"),
+            ],
+        )
+        .await;
+        assert_eq!(frames.len(), 3, "{frames:?}");
+        assert!(
+            !frames.iter().any(|f| f.contains("stream_error")),
+            "{frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finish_reason_split_across_chunks_completes_the_stream() {
+        let frames = drain(
+            Keepalive::new(Dialect::OpenAi, NOWAIT),
+            vec![
+                Bytes::from_static(b"data: {\"choices\":[{\"finish_reason\":\""),
+                Bytes::from_static(b"stop\"}]}\n\n"),
+            ],
+        )
+        .await;
+        assert!(
+            !frames.iter().any(|f| f.contains("stream_error")),
+            "{frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_real_cut_mid_answer_is_still_named_in_band() {
+        // Nothing marks the end: no `[DONE]`, no finish reason. The client must
+        // still learn the stream was cut.
+        let frames = drain(
+            Keepalive::new(Dialect::OpenAi, NOWAIT),
+            vec![Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"part\"}}]}\n\n",
+            )],
+        )
+        .await;
+        assert_eq!(frames.len(), 2, "{frames:?}");
+        assert!(frames[1].contains("stream_error"), "{frames:?}");
     }
 
     /// An interval long enough that a relay over an already-complete stream
@@ -4794,7 +4971,7 @@ mod tests {
     async fn idle_frames(keepalive: Keepalive) -> Vec<String> {
         use futures::StreamExt;
         keepalive
-            .relay(stalled())
+            .relay(stalled(), "p", "m")
             .take(2)
             .map(|item| {
                 String::from_utf8(item.expect("infallible").to_vec()).expect("frames are UTF-8")
@@ -5317,9 +5494,35 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()[axum::http::header::CONTENT_TYPE],
+            "application/json",
+            "a JSON error must say so (docs/22, B5)"
+        );
         let body = body_of(resp).await;
         assert_eq!(body["error"]["code"], "insufficient_quota");
         assert_eq!(body["error"]["type"], "server_error");
+    }
+
+    #[tokio::test]
+    async fn a_streamed_failure_is_json_not_an_event_stream() {
+        // docs/22, B5: an SSE client that gets a JSON 502 must be able to tell it
+        // is not a stream, so the content type says what the body is.
+        let exec = Arc::new(FailingExec(502, r#"{"error":{"message":"down"}}"#));
+        let router = crate::app::app(routed_under(exec));
+        let resp = drive(
+            &router,
+            chat(
+                r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            resp.headers()[axum::http::header::CONTENT_TYPE],
+            "application/json"
+        );
     }
 
     #[tokio::test]

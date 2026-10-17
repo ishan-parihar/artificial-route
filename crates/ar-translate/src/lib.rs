@@ -166,7 +166,7 @@ pub use responses::{
 };
 pub use translate::{
     AnthropicInbound, ArTranslate, GeminiInbound, MissingPair, OllamaInbound, OpenAiInbound, Pair,
-    ResponsesInbound, TranslateError, anthropic_to_canonical, chat_modality, gemini_to_canonical,
-    missing_pairs, ollama_to_canonical, pair_named, responses_to_canonical, supported_pairs,
-    to_canonical, to_openai,
+    ResponsesInbound, TranslateError, anthropic_to_canonical, chat_modality,
+    gemini_response_to_openai, gemini_to_canonical, missing_pairs, ollama_to_canonical, pair_named,
+    responses_to_canonical, supported_pairs, to_canonical, to_openai,
 };
