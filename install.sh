@@ -47,8 +47,15 @@
 #   systemctl --user start aroute-dashboard   # bring the UI up
 #   systemctl --user stop  aroute-dashboard   # reclaim the RSS
 # and it is deliberately NOT started at install time; the proxy never needs it.
-set -euo pipefail
-IFS=$'\n\t'
+set -eu
+# pipefail is a bash/ksh extension, not POSIX: this script installs via
+# `curl … | sh` where sh is dash, and `set -o pipefail` is an illegal
+# option there. Every pipeline's failure path is guarded explicitly
+# instead (`latest_tag || true`, `grep -q … || true`).
+# `usage()` greps this header up to the marker line below — keep both
+# lines in sync if this block moves.
+IFS='
+	'
 
 REPO="ishan-parihar/artificial-route"
 API="https://api.github.com/repos/$REPO/releases/latest"
@@ -109,7 +116,7 @@ TIMER=""
 # loop silently points at the default dir, so --check reports the wrong install.
 TARGET=""
 
-usage() { sed -n '2,/^set -euo pipefail$/p' "$0" | sed '$d' | sed 's/^#\{0,1\} \{0,1\}//'; }
+usage() { sed -n '2,/^set -eu$/p' "$0" | sed '$d' | sed 's/^#\{0,1\} \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -168,7 +175,7 @@ ENV_DIR="${ENV_FILE%/*}"
 die() { echo "error: $*" >&2; exit 1; }
 
 # ── Root guard ───────────────────────────────────────────────────────────────
-if [ "${EUID:-$(id -u)}" -eq 0 ] && [ "${FORCE_ROOT:-0}" != "1" ]; then
+if [ "$(id -u)" -eq 0 ] && [ "${FORCE_ROOT:-0}" != "1" ]; then
   die "Don't run as root — installs to \$HOME. Re-run as your user (override: --force-root)."
 fi
 
@@ -201,15 +208,18 @@ pm_install() {
 need() {
   command -v "$1" >/dev/null 2>&1 && return 0
   echo "error: installing prerequisite: $1" >&2
-  pm_install "${@:2}"
-  command -v "$1" >/dev/null 2>&1 || die "$1 still missing after install — install it, re-run"
+  # POSIX has no ${@:2} slicing: shift past the tool name and pass the rest.
+  _tool="$1"
+  shift
+  pm_install "$@"
+  command -v "$_tool" >/dev/null 2>&1 || die "$_tool still missing after install — install it, re-run"
 }
 
 # ── Idempotent PATH injection ──────────────────────────────────────────────────
 ensure_path() {
-  local dir="$1"; mkdir -p "$dir"
+  dir="$1"; mkdir -p "$dir"
   case ":$PATH:" in *":$dir:"*) return 0 ;; esac
-  local rc="$HOME/.bashrc"
+  rc="$HOME/.bashrc"
   if [ -f "$HOME/.zshrc" ] || [ -n "${ZSH_VERSION:-}" ]; then rc="$HOME/.zshrc"; fi
   if ! grep -qs "export PATH=\"${dir}:\$PATH\"" "$rc"; then
     # The literal \$PATH is the point: the rc file must re-expand it at login.
@@ -235,7 +245,7 @@ print_cta() {
 
 # ── Harness integration (MCP registration) ─────────────────────────────────────
 detect_harnesses() {
-  local found=""
+  found=""
   for h in claude codex opencode gemini qwen grok goose hermes zeroclaw omp omo pi droid; do
     command -v "$h" >/dev/null 2>&1 && found="$found $h"
   done
@@ -243,14 +253,18 @@ detect_harnesses() {
 }
 run_harness_integration() {
   [ "${SKIP_HARNESS:-0}" = "1" ] && { echo "Harness integration: skipped (SKIP_HARNESS)"; return 0; }
-  local found; found="$(detect_harnesses)"
-  [ -z "${found// /}" ] && { echo "No AI harnesses detected — skipping agent integration"; return 0; }
+  found="$(detect_harnesses)"
+  # POSIX has no ${var//pat/rep}: test for any non-space via a case glob.
+  case "$found" in *[!\ ]*) : ;; *) echo "No AI harnesses detected — skipping agent integration"; return 0 ;; esac
   if ! [ -t 0 ] && [ "${ALL_HARNESS:-0}" != "1" ]; then
     echo "Detected harnesses:${found} — non-interactive, skipping (re-run with --all-harnesses)"
     return 0
   fi
-  if [ "${ALL_HARNESS:-0}" = "1" ]; then local answer="y"
-  else read -rp "Configure MCP server in harnesses?${found} [Y/n] " answer || answer="y"; fi
+  if [ "${ALL_HARNESS:-0}" = "1" ]; then answer="y"
+  else
+    printf '%s' "Configure MCP server in harnesses?${found} [Y/n] "
+    read -r answer || answer="y"
+  fi
   case "$answer" in n|N) return 0 ;; esac
   # Claude Code
   if command -v claude >/dev/null 2>&1; then
@@ -260,7 +274,7 @@ run_harness_integration() {
   fi
   # OpenCode
   if command -v opencode >/dev/null 2>&1; then
-    local oc_conf="$HOME/.config/opencode/opencode.json"
+    oc_conf="$HOME/.config/opencode/opencode.json"
     mkdir -p "$(dirname "$oc_conf")"
     echo "  OpenCode: add this to $oc_conf:"
     printf '    { "mcp": { "aroute": { "type": "local", "command": ["%s","mcp"], "enabled": true } } }\n' "$TARGET"
@@ -274,7 +288,7 @@ run_harness_integration() {
 
 # ── Write portable .mcp.json ────────────────────────────────────────────────────
 write_mcp_json() {
-  local repo_root="${SCRIPT_SRC%/*}"
+  repo_root="${SCRIPT_SRC%/*}"
   if [ -n "$repo_root" ] && [ -d "$repo_root" ] && [ -w "$repo_root" ]; then
     cat > "${repo_root}/.mcp.json" <<MCPEOF
 {

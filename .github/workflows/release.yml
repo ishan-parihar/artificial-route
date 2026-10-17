@@ -83,11 +83,14 @@ jobs:
           curl -fsSL -o /tmp/sc.tar.xz \
             https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz
           tar -xJf /tmp/sc.tar.xz -C /tmp
-          # `-s bash`, not `-s sh`: the shebang is `#!/usr/bin/env bash` and
-          # the README's quick start runs `bash install.sh`. `-s sh` turned
-          # every bash idiom the script uses (local, pipefail, EUID) into a
-          # warning and failed the v0.1.16 run on sixteen false positives.
-          /tmp/shellcheck-v0.11.0/shellcheck -s bash install.sh
+          # `-s sh`, not bash: the documented install is `curl … | sh`, which
+          # runs dash on Debian/Ubuntu runners — the installer must stay
+          # POSIX-clean or it dies at `set -o pipefail` before printing
+          # anything. The v0.1.16 run failed here on sixteen bashisms; the
+          # script was converted instead of the gate loosened. `sh -n` above
+          # is the same check the Smoke step exercises by running `sh
+          # install.sh`.
+          /tmp/shellcheck-v0.11.0/shellcheck -s sh install.sh
 
       - name: Smoke the installer
         run: |
