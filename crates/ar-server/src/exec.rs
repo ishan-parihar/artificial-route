@@ -586,9 +586,9 @@ impl ProviderConfig {
         let state = self.key_state.lock().expect("key state lock");
         let now = std::time::Instant::now();
         !state.is_empty()
-            && state.iter().all(|slot| {
-                slot.auth_strikes > 0 && slot.blocked_until.is_some_and(|t| t > now)
-            })
+            && state
+                .iter()
+                .all(|slot| slot.auth_strikes > 0 && slot.blocked_until.is_some_and(|t| t > now))
     }
 }
 
@@ -959,11 +959,8 @@ impl ArRouteExec for HttpExec {
             return Ok(
                 unwrap_response(cfg, stream, status, retry_after, canonical.model.as_ref()).await,
             );
-
         })
     }
-
-
 
     /// POSTs a media body and reads the whole reply.
     ///

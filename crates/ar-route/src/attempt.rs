@@ -20,6 +20,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use http::StatusCode;
 
+use crate::Strng;
 use crate::contract::{CanonicalRequest, ExecError, Executor, ProviderId, Upstream};
 use crate::error::RouteError;
 use crate::resilience::{
@@ -27,7 +28,6 @@ use crate::resilience::{
     quota_cooldown,
 };
 use crate::simulate::ChainTarget;
-use crate::Strng;
 
 /// Upper bound on providers tried for one request.
 ///
@@ -373,8 +373,7 @@ fn error_status_in_sse(body: &str) -> Option<u16> {
         let Some(payload) = line.strip_prefix("data:") else {
             continue;
         };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(payload.trim_start())
-        else {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(payload.trim_start()) else {
             continue;
         };
         if has_content(&value) {
@@ -733,8 +732,7 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
                 // The provider attribution tracks the *minimum*, so the Retry
                 // names the target whose window the client is actually waiting
                 // for — not merely the last one walked.
-                let is_new_min =
-                    earliest_skipped.is_none_or(|prev: Duration| remaining < prev);
+                let is_new_min = earliest_skipped.is_none_or(|prev: Duration| remaining < prev);
                 if is_new_min {
                     earliest_skipped = Some(remaining);
                     skipped_by = Some(provider.clone());
@@ -820,11 +818,11 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
                     match gate_first_byte(&mut upstream, FIRST_BYTE_WINDOW).await {
                         StreamGate::Byte | StreamGate::Elapsed => {}
                         StreamGate::Empty => {
-                        tracing::warn!(
-                            provider = %provider,
-                            model,
-                            "2xx stream produced no bytes; failing over"
-                        );
+                            tracing::warn!(
+                                provider = %provider,
+                                model,
+                                "2xx stream produced no bytes; failing over"
+                            );
                             step = Step::Failover { status: 502 };
                         }
                     }
@@ -1010,12 +1008,8 @@ async fn gate_first_byte(upstream: &mut Upstream, window: Duration) -> StreamGat
     use futures::StreamExt as _;
     match tokio::time::timeout(window, upstream.stream.next()).await {
         Ok(Some(first)) => {
-            let rest = std::mem::replace(
-                &mut upstream.stream,
-                Box::pin(futures::stream::empty()),
-            );
-            upstream.stream =
-                Box::pin(futures::stream::iter([first]).chain(rest));
+            let rest = std::mem::replace(&mut upstream.stream, Box::pin(futures::stream::empty()));
+            upstream.stream = Box::pin(futures::stream::iter([first]).chain(rest));
             StreamGate::Byte
         }
         Ok(None) => StreamGate::Empty,
@@ -1100,16 +1094,14 @@ mod tests {
                 Self::Ok => Ok(Upstream::success(Box::pin(futures::stream::empty()))),
                 // A 200 whose body the loop drains: one chunk, exactly what an
                 // executor relays for a non-streaming reply.
-                Self::OkBody(body) => Ok(Upstream::success(Box::pin(
-                    futures::stream::once(async move { Bytes::from_static(body.as_bytes()) }),
-                ))),
+                Self::OkBody(body) => Ok(Upstream::success(Box::pin(futures::stream::once(
+                    async move { Bytes::from_static(body.as_bytes()) },
+                )))),
                 // A 200 whose stream carries several frames, in order — what a
                 // live SSE relay looks like to the first-byte gate.
-                Self::OkChunks(chunks) => Ok(Upstream::success(Box::pin(
-                    futures::stream::iter(
-                        chunks.iter().map(|c| Bytes::from_static(c.as_bytes())),
-                    ),
-                ))),
+                Self::OkChunks(chunks) => Ok(Upstream::success(Box::pin(futures::stream::iter(
+                    chunks.iter().map(|c| Bytes::from_static(c.as_bytes())),
+                )))),
                 Self::RateLimited(retry_after) => Ok(Upstream::failure(
                     StatusCode::TOO_MANY_REQUESTS,
                     Bytes::from_static(b"slow down"),
@@ -1342,8 +1334,16 @@ mod tests {
             Verdict::OkBody("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"),
         ]);
         let r = Resilience::new();
-        let got = block_rt(attempt_loop(&req_stream(), &chain(&["p1", "p2"]), &exec, &r));
-        let Ok(AttemptOutcome::Succeeded { provider, attempts, .. }) = got else {
+        let got = block_rt(attempt_loop(
+            &req_stream(),
+            &chain(&["p1", "p2"]),
+            &exec,
+            &r,
+        ));
+        let Ok(AttemptOutcome::Succeeded {
+            provider, attempts, ..
+        }) = got
+        else {
             panic!("expected success, got {got:?}");
         };
         assert_eq!((provider.as_str(), attempts), ("p2", 2));
@@ -1376,7 +1376,10 @@ mod tests {
             upstream.stream.collect::<Vec<Bytes>>().await
         });
         let joined = collected.concat();
-        assert_eq!(joined, Bytes::from_static(b"data: first\n\ndata: second\n\n"));
+        assert_eq!(
+            joined,
+            Bytes::from_static(b"data: first\n\ndata: second\n\n")
+        );
     }
 
     #[test]
@@ -1753,11 +1756,18 @@ mod tests {
         r.record_failure("p1", Some(Duration::from_secs(30)));
         r.record_failure("p2", Some(Duration::from_secs(60)));
         let got = block(attempt_loop(&req(), &chain(&["p1", "p2"]), &exec, &r));
-        let Ok(AttemptOutcome::Retry { after, provider, .. }) = got else {
+        let Ok(AttemptOutcome::Retry {
+            after, provider, ..
+        }) = got
+        else {
             panic!("expected retry, got {got:?}");
         };
         assert!(exec.seen().is_empty(), "no dispatch happened");
-        assert_eq!(provider.as_str(), "p1", "the soonest window names the provider");
+        assert_eq!(
+            provider.as_str(),
+            "p1",
+            "the soonest window names the provider"
+        );
         assert!(
             after <= Duration::from_secs(30) && after > Duration::from_secs(25),
             "the window is the min recovery, not the max: {after:?}"

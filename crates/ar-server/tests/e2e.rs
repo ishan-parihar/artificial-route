@@ -324,11 +324,8 @@ async fn e2e_fails_over_when_a_200_carries_an_error_body() {
     let healthy = mock_upstream().await;
     let config = error_shaped_config(&broken, &healthy);
     let (router, _state) = boot_with(config, vec![]);
-    let (status, headers, text) = call(
-        &router,
-        post_chat(r#"{"model":"m1","stream":false}"#, &[]),
-    )
-    .await;
+    let (status, headers, text) =
+        call(&router, post_chat(r#"{"model":"m1","stream":false}"#, &[])).await;
 
     assert_eq!(status, 200, "the healthy member must serve: {text}");
     assert!(
@@ -354,11 +351,8 @@ async fn e2e_fails_over_when_a_200_stream_carries_only_an_error() {
     let healthy = mock_upstream().await;
     let config = error_shaped_config(&broken, &healthy);
     let (router, _state) = boot_with(config, vec![]);
-    let (status, headers, text) = call(
-        &router,
-        post_chat(r#"{"model":"m1","stream":false}"#, &[]),
-    )
-    .await;
+    let (status, headers, text) =
+        call(&router, post_chat(r#"{"model":"m1","stream":false}"#, &[])).await;
 
     assert_eq!(status, 200, "the healthy member must serve: {text}");
     assert!(
@@ -578,12 +572,14 @@ async fn e2e_stops_paying_round_trips_when_every_key_is_auth_locked() {
     let config = ServerConfig::single(
         20128,
         Strategy::Priority,
-        vec![ProviderConfig::with_keys(
-            ProviderId::new("deadkeys"),
-            &upstream,
-            vec!["k1".to_owned(), "k2".to_owned()],
-        )
-        .with_model("m")],
+        vec![
+            ProviderConfig::with_keys(
+                ProviderId::new("deadkeys"),
+                &upstream,
+                vec!["k1".to_owned(), "k2".to_owned()],
+            )
+            .with_model("m"),
+        ],
     );
     let (router, _state) = boot_with(config, vec![]);
 
@@ -613,9 +609,7 @@ async fn e2e_stops_paying_round_trips_when_every_key_is_auth_locked() {
 /// registered, so a wrongly appended `/chat/completions` is a 404 the test
 /// fails on. Captures the request it saw and answers the OpenRouter Decisions
 /// shape (`answers` + `usage{input_tokens,output_tokens}`, no `choices`).
-async fn decisions_upstream(
-    seen: Arc<std::sync::Mutex<Option<String>>>,
-) -> String {
+async fn decisions_upstream(seen: Arc<std::sync::Mutex<Option<String>>>) -> String {
     let app = Router::new().route(
         "/api/alpha/decisions",
         post(move |body: Body| {
@@ -656,13 +650,11 @@ async fn e2e_serves_a_decisions_endpoint_through_an_endpoint_override() {
     let config = ServerConfig::single(
         20128,
         Strategy::Priority,
-        vec![ProviderConfig::new(
-            ProviderId::new("or-decisions"),
-            &upstream,
-            "sk-or",
-        )
-        .with_model("respan/span-01-lite:free")
-        .with_endpoint(Some("/api/alpha/decisions".to_owned()))],
+        vec![
+            ProviderConfig::new(ProviderId::new("or-decisions"), &upstream, "sk-or")
+                .with_model("respan/span-01-lite:free")
+                .with_endpoint(Some("/api/alpha/decisions".to_owned())),
+        ],
     );
     let (router, _state) = boot_with(config, vec![]);
 
@@ -690,7 +682,10 @@ async fn e2e_serves_a_decisions_endpoint_through_an_endpoint_override() {
     // Anthropic-spelled usage (input_tokens/output_tokens) is what the
     // Decisions API reports; the reader normalizes it.
     assert_eq!(
-        (header_of(&headers, "x-ar-tokens-in"), header_of(&headers, "x-ar-tokens-out")),
+        (
+            header_of(&headers, "x-ar-tokens-in"),
+            header_of(&headers, "x-ar-tokens-out")
+        ),
         ("476".to_owned(), "70".to_owned()),
         "usage headers were: {headers:?}"
     );
@@ -746,18 +741,18 @@ async fn e2e_fails_over_when_a_streamed_200_dies_before_its_first_byte() {
         ],
     );
     let (router, _state) = boot_with(config, vec![]);
-    let (status, headers, text) = call(
-        &router,
-        post_chat(r#"{"model":"m1","stream":true}"#, &[]),
-    )
-    .await;
+    let (status, headers, text) =
+        call(&router, post_chat(r#"{"model":"m1","stream":true}"#, &[])).await;
 
     assert_eq!(status, 200, "the healthy member must serve: {text}");
     assert!(
         text.contains("\"delta\":{\"content\":\"Hel\"}"),
         "p2's stream did not arrive: {text}"
     );
-    assert!(text.contains("data: [DONE]"), "stream must finish cleanly: {text}");
+    assert!(
+        text.contains("data: [DONE]"),
+        "stream must finish cleanly: {text}"
+    );
     let decision = header_of(&headers, "x-ar-decision");
     assert!(
         decision.contains("outcome=ok") && decision.contains("provider=p2"),

@@ -89,7 +89,10 @@ fn arms(row: &Limit, depth: usize, out: &mut Vec<String>) {
     if let Some(model) = &row.model {
         // JSON string syntax is valid YAML double-quoted, and survives a combo
         // id with a colon or a leading symbol that a bare scalar would not.
-        out.push(format!("{pad}model: {}", serde_json::Value::from(model.as_str())));
+        out.push(format!(
+            "{pad}model: {}",
+            serde_json::Value::from(model.as_str())
+        ));
     }
 }
 
@@ -102,7 +105,11 @@ mod tests {
         let mut limits = Limits::default();
         limits.keys.insert(
             "k".to_owned(),
-            Limit { tokens: Some(5), model: Some("jev".to_owned()), ..Limit::default() },
+            Limit {
+                tokens: Some(5),
+                model: Some("jev".to_owned()),
+                ..Limit::default()
+            },
         );
         assert!(render(&limits).ends_with("      tokens: 5\n      model: \"jev\"\n"));
     }
@@ -112,7 +119,11 @@ mod tests {
         let mut limits = Limits::default();
         limits.keys.insert(
             "k".to_owned(),
-            Limit { tokens: Some(5), model: Some("a: b".to_owned()), ..Limit::default() },
+            Limit {
+                tokens: Some(5),
+                model: Some("a: b".to_owned()),
+                ..Limit::default()
+            },
         );
         let cfg = ar_config::Config::parse(&render(&limits), |_| Ok(None)).expect("parses");
         assert_eq!(cfg.limits, limits);

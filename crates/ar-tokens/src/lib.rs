@@ -46,7 +46,9 @@ pub use count::{
     DEFAULT_OUTPUT_ALLOWANCE, Estimate, MAX_EXACT_TOKEN_COUNT_CHARS, count_text, estimate_request,
 };
 pub use error::TokenError;
-pub use ledger::{Cap, CostReport, DenyReason, Entry, Ledger, LedgerRow, LogFilter, LogRow, Spend, Verdict};
+pub use ledger::{
+    Cap, CostReport, DenyReason, Entry, Ledger, LedgerRow, LogFilter, LogRow, Spend, Verdict,
+};
 pub use meta::{ResponseMeta, usage_from_body};
 pub use pricing::{Cost, Prices, PricingTable, Usd, cost_micros};
 pub use usage::NormalizedUsage;

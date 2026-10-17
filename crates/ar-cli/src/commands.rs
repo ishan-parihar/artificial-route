@@ -45,7 +45,14 @@ const COMBO_COLUMNS: [&str; 5] = ["id", "provider", "status", "strategy", "targe
 const SYNC_COLUMNS: [&str; 5] = ["id", "provider", "status", "strategy", "targets"];
 /// Columns of an `aroute limits` row. `key` leads but is not `id`: the
 /// `default` row is a row like any other here, and the column names it.
-const LIMIT_COLUMNS: [&str; 6] = ["key", "rpm", "usd_micros", "tokens", "refuse_unpriced", "model"];
+const LIMIT_COLUMNS: [&str; 6] = [
+    "key",
+    "rpm",
+    "usd_micros",
+    "tokens",
+    "refuse_unpriced",
+    "model",
+];
 /// Columns of a `doctor` finding.
 const CHECK_COLUMNS: [&str; 3] = ["check", "status", "detail"];
 /// Columns of the `configure` dump.
@@ -709,7 +716,7 @@ pub fn dispatch(cli: &Cli) -> anyhow::Result<()> {
             println!("GitHub Sponsors: https://github.com/sponsors/ishan-parihar");
             println!("Razorpay (UPI) : https://rzp.io/rzp/ishan-parihar");
             Ok(())
-        },
+        }
         Some(Command::Keys(a)) => match &a.command {
             crate::cli::KeysCommand::ArmGate(args) => {
                 arm_gate(cli, &args.key_id, args.key.as_deref())
@@ -3377,7 +3384,7 @@ mod tests {
                 usd_micros: None,
                 tokens: Some(1000),
                 refuse_unpriced: None,
-            model: None,
+                model: None,
             },
         )
         .unwrap();
@@ -3398,7 +3405,7 @@ mod tests {
                 usd_micros: Some(5_000_000),
                 tokens: None,
                 refuse_unpriced: Some(true),
-            model: None,
+                model: None,
             },
         )
         .unwrap();
@@ -3418,7 +3425,7 @@ mod tests {
                 usd_micros: None,
                 tokens: None,
                 refuse_unpriced: None,
-            model: None,
+                model: None,
             },
         )
         .unwrap();
@@ -3439,16 +3446,25 @@ mod tests {
             model: model.map(str::to_owned),
         };
         limits_set(&cli, &set(Some(60), Some("c"))).unwrap();
-        assert_eq!(load(&cli).unwrap().limits.keys["ci"].model.as_deref(), Some("c"));
+        assert_eq!(
+            load(&cli).unwrap().limits.keys["ci"].model.as_deref(),
+            Some("c")
+        );
 
         // A name with no `/` must be a combo that exists, and a refused scope
         // writes nothing, so the row keeps the scope it had.
         assert!(limits_set(&cli, &set(None, Some("nope"))).is_err());
-        assert_eq!(load(&cli).unwrap().limits.keys["ci"].model.as_deref(), Some("c"));
+        assert_eq!(
+            load(&cli).unwrap().limits.keys["ci"].model.as_deref(),
+            Some("c")
+        );
 
         // A `provider/model` name needs no combo, and `""` clears the scope.
         limits_set(&cli, &set(None, Some("openai/gpt-5.4"))).unwrap();
-        assert_eq!(load(&cli).unwrap().limits.keys["ci"].model.as_deref(), Some("openai/gpt-5.4"));
+        assert_eq!(
+            load(&cli).unwrap().limits.keys["ci"].model.as_deref(),
+            Some("openai/gpt-5.4")
+        );
         limits_set(&cli, &set(None, Some(""))).unwrap();
         let row = &load(&cli).unwrap().limits.keys["ci"];
         assert_eq!(row.model, None);
@@ -3468,7 +3484,10 @@ mod tests {
             refuse_unpriced: None,
             model: Some("c".to_owned()),
         };
-        assert!(limits_set(&cli, &scope_only).is_err(), "a scope limits nothing by itself");
+        assert!(
+            limits_set(&cli, &scope_only).is_err(),
+            "a scope limits nothing by itself"
+        );
         assert!(!load(&cli).unwrap().limits.keys.contains_key("fresh"));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3485,7 +3504,7 @@ mod tests {
                 usd_micros: None,
                 tokens: None,
                 refuse_unpriced: None,
-            model: None,
+                model: None,
             },
         );
         assert!(
@@ -3500,7 +3519,7 @@ mod tests {
                 usd_micros: None,
                 tokens: None,
                 refuse_unpriced: None,
-            model: None,
+                model: None,
             },
         );
         assert!(empty.is_err(), "nothing to set");
@@ -3521,7 +3540,7 @@ mod tests {
                 usd_micros: None,
                 tokens: None,
                 refuse_unpriced: None,
-            model: None,
+                model: None,
             },
         )
         .unwrap();
@@ -3533,7 +3552,7 @@ mod tests {
                 usd_micros: None,
                 tokens: None,
                 refuse_unpriced: None,
-            model: None,
+                model: None,
             },
         )
         .unwrap();

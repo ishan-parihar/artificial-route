@@ -707,9 +707,11 @@ impl Ledger {
         rank_days: Option<u32>,
         rank_cap: usize,
     ) -> Result<Analytics, TokenError> {
-        let Some(newest) = self.conn.query_row("SELECT MAX(created_at) FROM usage", [], |r| {
-            r.get::<_, Option<i64>>(0)
-        })?
+        let Some(newest) = self
+            .conn
+            .query_row("SELECT MAX(created_at) FROM usage", [], |r| {
+                r.get::<_, Option<i64>>(0)
+            })?
         else {
             return Ok(Analytics::default());
         };
@@ -754,7 +756,9 @@ impl Ledger {
     ///
     /// Returns [`TokenError::Sqlite`] on a read failure.
     pub fn log(&self, filter: &LogFilter<'_>) -> Result<Vec<LogRow>, TokenError> {
-        let Some(newest) = self.conn.query_row(NEWEST, [], |r| r.get::<_, Option<i64>>(0))?
+        let Some(newest) = self
+            .conn
+            .query_row(NEWEST, [], |r| r.get::<_, Option<i64>>(0))?
         else {
             return Ok(Vec::new());
         };
@@ -774,7 +778,9 @@ impl Ledger {
                 provider: row.get(2)?,
                 model: row.get(3)?,
                 tokens: to_u32(row.get::<_, i64>(4)?),
-                cost_usd: Usd { micros: to_u64(row.get::<_, i64>(5)?) },
+                cost_usd: Usd {
+                    micros: to_u64(row.get::<_, i64>(5)?),
+                },
                 priced: row.get::<_, i64>(6)? != 0,
                 status: u16::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
                 error: row.get(8)?,
@@ -884,8 +890,8 @@ fn has_column(conn: &Connection, column: &str) -> Result<bool, TokenError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cap, CostReport, DenyReason, Entry, Ledger, Verdict};
     use super::{Analytics, LogFilter, SpendBucket};
+    use super::{Cap, CostReport, DenyReason, Entry, Ledger, Verdict};
     use crate::pricing::{Cost, Prices, PricingTable, Usd};
     use crate::usage::NormalizedUsage;
     use rusqlite::Connection;
@@ -940,9 +946,13 @@ mod tests {
     #[test]
     fn analytics_should_bucket_days_models_and_providers_when_rows_exist() {
         let ledger = Ledger::open_in_memory().expect("open");
-        ledger.record(&entry("k1", "openai", "gpt-4o", 100)).expect("record");
+        ledger
+            .record(&entry("k1", "openai", "gpt-4o", 100))
+            .expect("record");
         // Same day, different key: the day bucket must merge them (2 requests).
-        ledger.record(&entry("k2", "openai", "gpt-4o", 10)).expect("record");
+        ledger
+            .record(&entry("k2", "openai", "gpt-4o", 10))
+            .expect("record");
         // Different day and provider, higher cost per test fixture is flat, so
         // order the model rank by that two-row provider instead.
         let mut later = entry("k3", "anthropic", "claude-sonnet-4", 5);
@@ -969,8 +979,16 @@ mod tests {
     #[test]
     fn analytics_should_rank_models_by_dollars_then_cap_the_list() {
         let ledger = Ledger::open_in_memory().expect("open");
-        for (model, tokens) in [("gpt-4o", 100), ("gpt-4o", 100), ("gpt-4o", 100), ("cheap", 5), ("cheap", 5)] {
-            ledger.record(&entry("k1", "openai", model, tokens)).expect("record");
+        for (model, tokens) in [
+            ("gpt-4o", 100),
+            ("gpt-4o", 100),
+            ("gpt-4o", 100),
+            ("cheap", 5),
+            ("cheap", 5),
+        ] {
+            ledger
+                .record(&entry("k1", "openai", model, tokens))
+                .expect("record");
         }
         let a = ledger.analytics(1).expect("analytics");
         assert_eq!(a.models.len(), 1, "rank_cap bounds the rank list");
@@ -979,50 +997,80 @@ mod tests {
     }
 
     fn all_rows() -> LogFilter<'static> {
-        LogFilter { days: 30, model: None, provider: None, errors_only: false, limit: 50 }
+        LogFilter {
+            days: 30,
+            model: None,
+            provider: None,
+            errors_only: false,
+            limit: 50,
+        }
     }
 
     #[test]
     fn log_should_merge_failures_and_answered_rows_newest_first() {
         let ledger = Ledger::open_in_memory().expect("open");
-        ledger.record(&entry("k1", "openai", "gpt-4o", 100)).expect("record");
+        ledger
+            .record(&entry("k1", "openai", "gpt-4o", 100))
+            .expect("record");
         ledger
             .record_failure("k1", "jev", 502, "all providers failed", 1_700_000_100)
             .expect("failure");
-        let statuses: Vec<u16> =
-            ledger.log(&all_rows()).expect("log").iter().map(|r| r.status).collect();
+        let statuses: Vec<u16> = ledger
+            .log(&all_rows())
+            .expect("log")
+            .iter()
+            .map(|r| r.status)
+            .collect();
         assert_eq!(statuses, [502, 200]);
     }
 
     #[test]
     fn log_should_keep_only_failures_when_errors_only() {
         let ledger = Ledger::open_in_memory().expect("open");
-        ledger.record(&entry("k1", "openai", "gpt-4o", 100)).expect("record");
-        ledger.record_failure("k1", "jev", 429, "throttled", 1_700_000_100).expect("failure");
-        let filter = LogFilter { errors_only: true, ..all_rows() };
+        ledger
+            .record(&entry("k1", "openai", "gpt-4o", 100))
+            .expect("record");
+        ledger
+            .record_failure("k1", "jev", 429, "throttled", 1_700_000_100)
+            .expect("failure");
+        let filter = LogFilter {
+            errors_only: true,
+            ..all_rows()
+        };
         assert_eq!(ledger.log(&filter).expect("log").len(), 1);
     }
 
     #[test]
     fn log_should_filter_by_model_when_one_is_named() {
         let ledger = Ledger::open_in_memory().expect("open");
-        ledger.record(&entry("k1", "openai", "gpt-4o", 100)).expect("record");
-        ledger.record(&entry("k1", "anthropic", "claude-sonnet-4", 5)).expect("record");
-        let filter = LogFilter { model: Some("gpt-4o"), ..all_rows() };
+        ledger
+            .record(&entry("k1", "openai", "gpt-4o", 100))
+            .expect("record");
+        ledger
+            .record(&entry("k1", "anthropic", "claude-sonnet-4", 5))
+            .expect("record");
+        let filter = LogFilter {
+            model: Some("gpt-4o"),
+            ..all_rows()
+        };
         assert_eq!(ledger.log(&filter).expect("log")[0].provider, "openai");
     }
 
     #[test]
     fn record_failure_should_leave_the_spend_report_untouched_when_it_writes() {
         let ledger = Ledger::open_in_memory().expect("open");
-        ledger.record_failure("k1", "jev", 502, "down", 1_700_000_100).expect("failure");
+        ledger
+            .record_failure("k1", "jev", 502, "down", 1_700_000_100)
+            .expect("failure");
         assert_eq!(ledger.report(10).expect("report").rows.len(), 0);
     }
 
     #[test]
     fn analytics_range_should_drop_older_days_when_the_window_is_one_day() {
         let ledger = Ledger::open_in_memory().expect("open");
-        ledger.record(&entry("k1", "openai", "gpt-4o", 100)).expect("record");
+        ledger
+            .record(&entry("k1", "openai", "gpt-4o", 100))
+            .expect("record");
         let mut later = entry("k3", "anthropic", "claude-sonnet-4", 5);
         later.created_at = 1_700_086_400;
         ledger.record(&later).expect("record");
@@ -1032,7 +1080,10 @@ mod tests {
     #[test]
     fn analytics_should_return_empty_buckets_when_the_ledger_is_new() {
         let ledger = Ledger::open_in_memory().expect("open");
-        assert_eq!(ledger.analytics(10).expect("analytics"), Analytics::default());
+        assert_eq!(
+            ledger.analytics(10).expect("analytics"),
+            Analytics::default()
+        );
     }
 
     #[test]

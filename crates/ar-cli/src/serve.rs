@@ -21,8 +21,8 @@ use ar_tokens::PricingTable;
 
 use crate::cli::{Cli, RunArgs, ServeArgs};
 use crate::commands;
-use crate::webui;
 use crate::toon;
+use crate::webui;
 
 /// Names the directory the observability write path uses: `ar-trace-*.jsonl`
 /// and `audit.redb`, side by side.

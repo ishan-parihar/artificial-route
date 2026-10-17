@@ -758,13 +758,7 @@ async fn handle_chat_inner(
     // whatever the dialect's final frames carried. See `docs/07` (wave D) for
     // the split this half closes.
     let meta = if canonical.stream {
-        account_stream(
-            &mut outcome,
-            state,
-            dialect,
-            key_id.as_deref(),
-            dispatched,
-        );
+        account_stream(&mut outcome, state, dialect, key_id.as_deref(), dispatched);
         ResponseMeta::default()
             .with_latency(dispatched.elapsed())
             .with_savings_tokens(savings_tokens)
@@ -833,7 +827,10 @@ async fn buffer_for_accounting(
     // Before the destructure below, which holds the outcome's borrow.
     let attempts = outcome.attempts();
     let AttemptOutcome::Succeeded {
-        upstream, provider, model, ..
+        upstream,
+        provider,
+        model,
+        ..
     } = outcome
     else {
         return defaults();
@@ -1115,7 +1112,7 @@ impl UsageTee {
         let meta = ResponseMeta::from_upstream(
             &self.state.config.prices,
             &self.provider,
-             &self.model,
+            &self.model,
             usage,
         );
         self.record_obs(usage);
@@ -1156,7 +1153,7 @@ impl UsageTee {
             &self.state,
             Some(&self.key_id),
             &self.provider,
-             &self.model,
+            &self.model,
             &meta,
             self.attempts,
         );
@@ -1176,7 +1173,7 @@ impl UsageTee {
         if let Err(e) = ledger.lock().expect("ledger lock").record_response(
             &self.key_id,
             &self.provider,
-             &self.model,
+            &self.model,
             &usage,
             epoch_now(),
             &self.state.config.prices,
@@ -1206,7 +1203,10 @@ fn account_stream(
     // Before the destructure below, which holds the outcome's borrow.
     let attempts = outcome.attempts();
     let AttemptOutcome::Succeeded {
-        provider, model, upstream, ..
+        provider,
+        model,
+        upstream,
+        ..
     } = outcome
     else {
         return;
@@ -1867,11 +1867,7 @@ fn judge(state: &AppState, combo: &RouteCombo) -> Option<ProviderId> {
 /// A pool provider already in the chain is skipped: the loop must not spend two
 /// of its three attempt slots on one endpoint.
 fn chain(state: &AppState, combo: &RouteCombo) -> Vec<ChainTarget> {
-    let mut chain = order(
-        state,
-        combo.strategy,
-        state.config.candidates(Some(combo)),
-    );
+    let mut chain = order(state, combo.strategy, state.config.candidates(Some(combo)));
     for target in state.config.pool(combo) {
         if !chain.iter().any(|t| t.provider == target.provider) {
             chain.push(ChainTarget::new(
@@ -1893,13 +1889,7 @@ fn order(state: &AppState, strategy: Strategy, candidates: Vec<Candidate>) -> Ve
     if candidates.is_empty() {
         return Vec::new();
     }
-    match pick(
-        strategy,
-        None,
-        &candidates,
-        &state.rr,
-        Some(&state.lkgp),
-    ) {
+    match pick(strategy, None, &candidates, &state.rr, Some(&state.lkgp)) {
         Ok(picked) => build_chain(&picked, &candidates),
         Err(e) => {
             // `pick` refuses an empty list, which is checked above; anything else
@@ -2177,7 +2167,9 @@ fn decorate(
             builder
                 .header(header::RETRY_AFTER, secs.to_string())
                 .header(header::CONTENT_TYPE, "application/json")
-                .extension(FailNote("every provider in the chain is throttled".to_owned()))
+                .extension(FailNote(
+                    "every provider in the chain is throttled".to_owned(),
+                ))
                 .status(StatusCode::TOO_MANY_REQUESTS)
                 .body(json_body(
                     ErrorSpec::of(
@@ -2656,7 +2648,8 @@ pub(crate) fn error_because(
 fn error_spec(status: StatusCode, spec: ErrorSpec<'_>) -> Response {
     let mut resp = json_body(spec).into_response();
     *resp.status_mut() = status;
-    resp.extensions_mut().insert(FailNote(spec.message.to_owned()));
+    resp.extensions_mut()
+        .insert(FailNote(spec.message.to_owned()));
     resp.headers_mut().insert(
         HeaderName::from_static(DECISION_HEADER),
         HeaderValue::from_static("strategy=none"),
@@ -3014,6 +3007,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
+    use super::DECISION_HEADER;
     use super::{
         CACHE_HEADER, COMPRESSION_ECHO, CacheControl, DENY_HEADER, Dialect,
         FALLBACK_ATTEMPTS_HEADER, Keepalive, LATENCY_MS_HEADER, MODEL_HEADER, PROVIDER_HEADER,
@@ -3023,7 +3017,6 @@ mod tests {
         kind_for, model, models_head, not_found, outcome_label, require_json, unknown_model,
         usage_from_frames,
     };
-    use super::DECISION_HEADER;
     use crate::app::{AppState, Components};
     use crate::config::{ComboTarget, ServerConfig};
     use crate::models::ModelCard;
@@ -3231,9 +3224,9 @@ mod tests {
                 // first-byte gate, a 2xx whose stream yields no byte fails
                 // over, and an empty fixture stream would turn every streamed
                 // test into a 503.
-                Ok(Upstream::success(Box::pin(futures::stream::once(
-                    async { Bytes::from_static(b"data: {\"choices\":[{\"delta\":{}}]}\n\n") },
-                ))))
+                Ok(Upstream::success(Box::pin(futures::stream::once(async {
+                    Bytes::from_static(b"data: {\"choices\":[{\"delta\":{}}]}\n\n")
+                }))))
             })
         }
 
@@ -5595,7 +5588,11 @@ mod tests {
             errors_only: true,
             limit: 10,
         };
-        let rows = ledger.lock().expect("ledger lock").log(&filter).expect("log");
+        let rows = ledger
+            .lock()
+            .expect("ledger lock")
+            .log(&filter)
+            .expect("log");
         assert_eq!(rows.len(), 1);
     }
 

@@ -1306,18 +1306,16 @@ mod tests {
 
     #[test]
     fn refuses_a_cline_envelope_that_reported_failure() {
-        let verdict = unwrap_cline(
-            br#"{"success":false,"data":{"error":{"code":503,"message":"busy"}}}"#,
-        )
-        .expect("an envelope");
+        let verdict =
+            unwrap_cline(br#"{"success":false,"data":{"error":{"code":503,"message":"busy"}}}"#)
+                .expect("an envelope");
         assert_eq!(verdict.expect_err("a failure").as_u16(), 503);
     }
 
     #[test]
     fn a_refused_envelope_with_no_usable_code_is_a_502() {
         let verdict =
-            unwrap_cline(br#"{"success":false,"data":{"error":"nope"}}"#)
-                .expect("an envelope");
+            unwrap_cline(br#"{"success":false,"data":{"error":"nope"}}"#).expect("an envelope");
         assert_eq!(verdict.expect_err("a failure").as_u16(), 502);
     }
 

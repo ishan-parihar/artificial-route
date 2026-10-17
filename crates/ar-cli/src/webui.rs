@@ -24,13 +24,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Json, Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
-use axum::Router;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use ar_config::{Combo, Config, ProviderCfg};
 use ar_registry::global as registry;
@@ -155,11 +155,17 @@ async fn page_slash() -> impl IntoResponse {
 }
 
 async fn css() -> Response {
-    asset(include_str!("webui/page/app.css"), "text/css; charset=utf-8")
+    asset(
+        include_str!("webui/page/app.css"),
+        "text/css; charset=utf-8",
+    )
 }
 
 async fn js() -> Response {
-    asset(include_str!("webui/page/app.js"), "text/javascript; charset=utf-8")
+    asset(
+        include_str!("webui/page/app.js"),
+        "text/javascript; charset=utf-8",
+    )
 }
 
 /// The page's two faces, embedded at compile time: Sora for display, Inter
@@ -189,7 +195,10 @@ fn font(body: &'static [u8]) -> Response {
 fn asset(body: &'static str, content_type: &'static str) -> Response {
     (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, content_type), (header::CACHE_CONTROL, "no-store")],
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
         body,
     )
         .into_response()
@@ -199,17 +208,28 @@ fn asset(body: &'static str, content_type: &'static str) -> Response {
 
 /// The envelope every refusal uses, so the page renders one error shape.
 fn bad_request(error: String, help: &str) -> Response {
-    (StatusCode::BAD_REQUEST, Json(json!({ "error": error, "help": help }))).into_response()
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": error, "help": help })),
+    )
+        .into_response()
 }
 
 fn conflict(error: String, help: &str) -> Response {
-    (StatusCode::CONFLICT, Json(json!({ "error": error, "help": help }))).into_response()
+    (
+        StatusCode::CONFLICT,
+        Json(json!({ "error": error, "help": help })),
+    )
+        .into_response()
 }
 
 /// A body that did not parse is a 400 with the rejection's own words; the
 /// page never sees a bare axum rejection.
 fn body_error(rejection: JsonRejection) -> Response {
-    bad_request(rejection.body_text(), "send JSON with the shape the page posts")
+    bad_request(
+        rejection.body_text(),
+        "send JSON with the shape the page posts",
+    )
 }
 
 // ── reads ────────────────────────────────────────────────────────────────────
@@ -248,7 +268,7 @@ async fn state(State(ctx): State<Arc<Ctx>>) -> Response {
             return bad_request(
                 format!("cannot read {}: {e}", ctx.config.display()),
                 "the config file disappeared; restore it and reload",
-            )
+            );
         }
     };
     let cfg = match Config::parse(&doc, resolve_env) {
@@ -257,7 +277,7 @@ async fn state(State(ctx): State<Arc<Ctx>>) -> Response {
             return bad_request(
                 format!("the config did not parse: {e}"),
                 "fix the file by hand; the page refuses to render a config it cannot load",
-            )
+            );
         }
     };
     let env_set = env_vars_set(&ctx.env);
@@ -328,7 +348,9 @@ fn provider_json(
     let vars: Vec<Value> = key_refs
         .iter()
         .map(|name| {
-            let var = keys.get(*name).map(|v| v.trim_start_matches('$').to_owned());
+            let var = keys
+                .get(*name)
+                .map(|v| v.trim_start_matches('$').to_owned());
             json!({
                 "ref": name,
                 "var": var.clone().unwrap_or_default(),
@@ -362,7 +384,9 @@ async fn usage(State(ctx): State<Arc<Ctx>>, Query(q): Query<UsageQuery>) -> Resp
     };
     // Poison recovery rather than `expect`: the ledger is read-only here, and
     // a writer that panicked elsewhere must not take the page down with it.
-    let guard = ledger.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let guard = ledger
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let report = match guard.report(50) {
         Ok(r) => r,
         Err(e) => {
@@ -446,7 +470,9 @@ async fn request_log(State(ctx): State<Arc<Ctx>>, Query(q): Query<LogQuery>) -> 
         errors_only: q.status.as_deref() == Some("error"),
         limit: LOG_LIMIT,
     };
-    let guard = ledger.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let guard = ledger
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     match guard.log(&filter) {
         Ok(rows) => Json(json!({
             "open": true,
@@ -475,7 +501,7 @@ fn load_cfg(ctx: &Ctx) -> Result<(String, Config), Box<Response>> {
             return Err(Box::new(bad_request(
                 format!("cannot read {}: {e}", ctx.config.display()),
                 "restore the config and retry",
-            )))
+            )));
         }
     };
     let cfg = match Config::parse(&doc, resolve_env) {
@@ -484,7 +510,7 @@ fn load_cfg(ctx: &Ctx) -> Result<(String, Config), Box<Response>> {
             return Err(Box::new(bad_request(
                 format!("the config did not parse: {e}"),
                 "fix the file by hand and retry",
-            )))
+            )));
         }
     };
     Ok((doc, cfg))
@@ -530,21 +556,35 @@ async fn models(State(ctx): State<Arc<Ctx>>) -> Response {
 /// Replaces the whole `combos:` section. The page round-trips the full
 /// `Combo` objects the state endpoint handed it, so a save cannot lose a
 /// field the editor does not show.
-async fn save_combos(State(ctx): State<Arc<Ctx>>, body: Result<Json<Vec<Combo>>, JsonRejection>) -> Response {
+async fn save_combos(
+    State(ctx): State<Arc<Ctx>>,
+    body: Result<Json<Vec<Combo>>, JsonRejection>,
+) -> Response {
     let combos = match body {
         Ok(Json(v)) => v,
         Err(r) => return body_error(r),
     };
-    let (doc, cfg) = match load_cfg(&ctx) { Ok(v) => v, Err(resp) => return *resp };
+    let (doc, cfg) = match load_cfg(&ctx) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
     if let Err(msg) = check_combos(&combos, &cfg) {
         return bad_request(msg, "fix the fields the error names; nothing was written");
     }
-    let next = commands::splice_section(&doc, "combos", &crate::import::render_combos_section(&combos));
+    let next = commands::splice_section(
+        &doc,
+        "combos",
+        &crate::import::render_combos_section(&combos),
+    );
     if next == doc {
-        return Json(json!({ "ok": true, "pending_restart": false, "note": "identical" })).into_response();
+        return Json(json!({ "ok": true, "pending_restart": false, "note": "identical" }))
+            .into_response();
     }
     if let Err(e) = commands::write_file(&ctx.config, &next) {
-        return bad_request(format!("cannot write {}: {e}", ctx.config.display()), "check permissions on the config directory");
+        return bad_request(
+            format!("cannot write {}: {e}", ctx.config.display()),
+            "check permissions on the config directory",
+        );
     }
     Json(json!({ "ok": true, "pending_restart": true })).into_response()
 }
@@ -555,7 +595,11 @@ async fn save_combos(State(ctx): State<Arc<Ctx>>, body: Result<Json<Vec<Combo>>,
 /// in the file are exempt: a save must round-trip a config this page did
 /// not write.
 fn check_combos(combos: &[Combo], current: &Config) -> Result<(), String> {
-    let custom: Vec<&str> = current.custom_providers.iter().map(|c| c.id.as_str()).collect();
+    let custom: Vec<&str> = current
+        .custom_providers
+        .iter()
+        .map(|c| c.id.as_str())
+        .collect();
     let known_provider = |id: &str| registry().get(id).is_some() || custom.contains(&id);
     let mut ids = BTreeSet::new();
     let allowed: BTreeSet<&str> = STRATEGIES
@@ -566,9 +610,14 @@ fn check_combos(combos: &[Combo], current: &Config) -> Result<(), String> {
     for c in combos {
         let id_legal = !c.id.is_empty()
             && c.id.len() <= 64
-            && c.id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+            && c.id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
         if !id_legal {
-            return Err(format!("combo id {:?} is not a legal model name (1-64 of a-z 0-9 . _ -)", c.id));
+            return Err(format!(
+                "combo id {:?} is not a legal model name (1-64 of a-z 0-9 . _ -)",
+                c.id
+            ));
         }
         if !ids.insert(c.id.clone()) {
             return Err(format!("combo id {:?} appears twice", c.id));
@@ -584,22 +633,42 @@ fn check_combos(combos: &[Combo], current: &Config) -> Result<(), String> {
                     }
                 }
                 _ if known_provider(t) => {}
-                _ => return Err(format!("combo {:?} has a malformed target {t:?} (expected provider/model)", c.id)),
+                _ => {
+                    return Err(format!(
+                        "combo {:?} has a malformed target {t:?} (expected provider/model)",
+                        c.id
+                    ));
+                }
             }
         }
         if !allowed.contains(c.strategy.as_str()) {
-            return Err(format!("combo {:?} names strategy {:?}, which this build does not route", c.id, c.strategy.as_str()));
+            return Err(format!(
+                "combo {:?} names strategy {:?}, which this build does not route",
+                c.id,
+                c.strategy.as_str()
+            ));
         }
         for (target, w) in &c.weights {
             if !c.targets.contains(target) {
-                return Err(format!("combo {:?} weights target {target:?} it does not list", c.id));
+                return Err(format!(
+                    "combo {:?} weights target {target:?} it does not list",
+                    c.id
+                ));
             }
             if *w == 0 {
-                return Err(format!("combo {:?} weights target {target:?} at zero", c.id));
+                return Err(format!(
+                    "combo {:?} weights target {target:?} at zero",
+                    c.id
+                ));
             }
         }
         if !c.steps.is_empty() && c.steps.len() != c.targets.len() {
-            return Err(format!("combo {:?} carries {} steps for {} targets", c.id, c.steps.len(), c.targets.len()));
+            return Err(format!(
+                "combo {:?} carries {} steps for {} targets",
+                c.id,
+                c.steps.len(),
+                c.targets.len()
+            ));
         }
     }
     Ok(())
@@ -610,25 +679,43 @@ fn check_combos(combos: &[Combo], current: &Config) -> Result<(), String> {
 /// hand-wired `$AR_KEY_MINE` is written, never re-pointed. A registry
 /// provider the config does not list is added whole: row, `keys:` ref and
 /// env value land together, so the save cannot leave it half-configured.
-async fn provider_key(State(ctx): State<Arc<Ctx>>, body: Result<Json<Value>, JsonRejection>) -> Response {
+async fn provider_key(
+    State(ctx): State<Arc<Ctx>>,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Response {
     let body = match body {
         Ok(Json(v)) => v,
         Err(r) => return body_error(r),
     };
     let Some(id) = body["id"].as_str().map(|s: &str| s.to_owned()) else {
-        return bad_request("missing provider id".into(), "send { \"id\": \"...\", \"key\": \"...\" }");
+        return bad_request(
+            "missing provider id".into(),
+            "send { \"id\": \"...\", \"key\": \"...\" }",
+        );
     };
     let Some(key) = body["key"].as_str() else {
-        return bad_request("missing provider key".into(), "send { \"id\": \"...\", \"key\": \"...\" }");
+        return bad_request(
+            "missing provider key".into(),
+            "send { \"id\": \"...\", \"key\": \"...\" }",
+        );
     };
     if key.is_empty() {
-        return bad_request("the key is empty".into(), "paste the credential the provider issued");
+        return bad_request(
+            "the key is empty".into(),
+            "paste the credential the provider issued",
+        );
     }
     if registry().get(&id).is_none() {
-        return bad_request(format!("unknown provider {id:?}"), "the id must name a registry provider (see `aroute providers`)");
+        return bad_request(
+            format!("unknown provider {id:?}"),
+            "the id must name a registry provider (see `aroute providers`)",
+        );
     }
 
-    let (doc, cfg) = match load_cfg(&ctx) { Ok(v) => v, Err(resp) => return *resp };
+    let (doc, cfg) = match load_cfg(&ctx) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
     let keys = raw_keys(&doc);
 
     let (next, var) = match cfg.providers.iter().find(|row| row.id == id) {
@@ -646,7 +733,7 @@ async fn provider_key(State(ctx): State<Arc<Ctx>>, body: Result<Json<Value>, Jso
                     return bad_request(
                         format!("provider {id:?} has no AR_KEY_* binding for its credential"),
                         "give its `key:` entry an `$AR_KEY_*` value in config.yaml, or remove the provider row and re-add it here",
-                    )
+                    );
                 }
             }
         }
@@ -655,20 +742,33 @@ async fn provider_key(State(ctx): State<Arc<Ctx>>, body: Result<Json<Value>, Jso
             // matching what `aroute import` generates (entry name = id).
             let var = format!("AR_KEY_{}", crate::import::env_name(&id));
             let mut rows = cfg.providers.clone();
-            rows.push(ProviderCfg { id: id.clone(), key: id.clone(), keys: None });
-            let next =
-                commands::splice_section(&doc, "providers", &crate::import::render_providers_section(&rows));
+            rows.push(ProviderCfg {
+                id: id.clone(),
+                key: id.clone(),
+                keys: None,
+            });
+            let next = commands::splice_section(
+                &doc,
+                "providers",
+                &crate::import::render_providers_section(&rows),
+            );
             (with_key_binding(&next, &id, var.as_str()), var)
         }
     };
 
     if let Err(e) = set_env_var(&ctx.env, &var, key) {
-        return bad_request(format!("cannot write {}: {e}", ctx.env.display()), "check permissions on the env file");
+        return bad_request(
+            format!("cannot write {}: {e}", ctx.env.display()),
+            "check permissions on the env file",
+        );
     }
     if next != doc
         && let Err(e) = commands::write_file(&ctx.config, &next)
     {
-        return bad_request(format!("cannot write {}: {e}", ctx.config.display()), "the env value was set; fix the config write and retry");
+        return bad_request(
+            format!("cannot write {}: {e}", ctx.config.display()),
+            "the env value was set; fix the config write and retry",
+        );
     }
     Json(json!({ "ok": true, "var": var, "pending_restart": true })).into_response()
 }
@@ -679,7 +779,10 @@ fn set_env_var(path: &std::path::Path, name: &str, value: &str) -> std::io::Resu
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let entry = format!("{name}={value}");
     let mut lines: Vec<String> = text.lines().map(|s: &str| s.to_owned()).collect();
-    match lines.iter().position(|l| l.starts_with(&format!("{name}="))) {
+    match lines
+        .iter()
+        .position(|l| l.starts_with(&format!("{name}=")))
+    {
         Some(i) => lines[i] = entry,
         None => lines.push(entry),
     }
@@ -693,13 +796,19 @@ fn set_env_var(path: &std::path::Path, name: &str, value: &str) -> std::io::Resu
 }
 
 /// Mints a client token through the same gate the proxy verifies against.
-async fn mint_key(State(ctx): State<Arc<Ctx>>, body: Result<Json<Value>, JsonRejection>) -> Response {
+async fn mint_key(
+    State(ctx): State<Arc<Ctx>>,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Response {
     let body = match body {
         Ok(Json(v)) => v,
         Err(r) => return body_error(r),
     };
     let Some(key_id) = body["key_id"].as_str().map(|s: &str| s.to_owned()) else {
-        return bad_request("missing key_id".into(), "send { \"key_id\": \"ci-runner\" }");
+        return bad_request(
+            "missing key_id".into(),
+            "send { \"key_id\": \"ci-runner\" }",
+        );
     };
     let legal = !key_id.is_empty()
         && key_id.len() <= 64
@@ -713,9 +822,14 @@ async fn mint_key(State(ctx): State<Arc<Ctx>>, body: Result<Json<Value>, JsonRej
         );
     }
     let Some(store) = ctx.store.as_ref() else {
-        return conflict("no credential store".into(), "the store lives beside the config; check `aroute doctor`");
+        return conflict(
+            "no credential store".into(),
+            "the store lives beside the config; check `aroute doctor`",
+        );
     };
-    let guard = store.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let guard = store
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let Some(master) = commands::gate_master(&guard).ok().flatten() else {
         return conflict(
             "the gate is not armed".into(),
@@ -731,7 +845,10 @@ async fn mint_key(State(ctx): State<Arc<Ctx>>, body: Result<Json<Value>, JsonRej
             "expires_at": issued.expires_at,
         }))
         .into_response(),
-        Err(e) => bad_request(format!("minting failed: {e}"), "this is an ar-keys failure; `aroute doctor` names the cause"),
+        Err(e) => bad_request(
+            format!("minting failed: {e}"),
+            "this is an ar-keys failure; `aroute doctor` names the cause",
+        ),
     }
 }
 
@@ -757,13 +874,19 @@ fn arm_of(body: &Value, field: &str, max: u64) -> Result<Option<u64>, String> {
 /// carries, plus its `model` scope. Arms the body omits keep their current value; an explicit `null`
 /// clears the arm. A row that ends up empty is removed, which reads back as
 /// "no ceiling" — the state every config written before `limits:` existed has.
-async fn set_limits(State(ctx): State<Arc<Ctx>>, body: Result<Json<Value>, JsonRejection>) -> Response {
+async fn set_limits(
+    State(ctx): State<Arc<Ctx>>,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Response {
     let body = match body {
         Ok(Json(v)) => v,
         Err(r) => return body_error(r),
     };
     let Some(key) = body["key"].as_str().map(|s: &str| s.to_owned()) else {
-        return bad_request("missing key".into(), "send { \"key\": \"ci-runner\", \"rpm\": 600 }");
+        return bad_request(
+            "missing key".into(),
+            "send { \"key\": \"ci-runner\", \"rpm\": 600 }",
+        );
     };
     if key.len() > 64 {
         return bad_request("key name too long".into(), "keep it under 64 characters");
@@ -780,14 +903,22 @@ async fn set_limits(State(ctx): State<Arc<Ctx>>, body: Result<Json<Value>, JsonR
             Err(e) => return bad_request(e, "rpm is a requests-per-minute ceiling"),
         }
         if rpm == Some(0) {
-            return bad_request("rpm must be 1-100000, or null to clear".into(), "a zero ceiling denies every request");
+            return bad_request(
+                "rpm must be 1-100000, or null to clear".into(),
+                "a zero ceiling denies every request",
+            );
         }
     }
     if present[1] {
         match arm_of(&body, "usd_micros", 1_000_000_000) {
             Ok(v) => usd_micros = v,
             Err(e) if e == "keep" => {}
-            Err(e) => return bad_request(e, "usd_micros is a spend ceiling in micro-dollars (1000000 = $1)"),
+            Err(e) => {
+                return bad_request(
+                    e,
+                    "usd_micros is a spend ceiling in micro-dollars (1000000 = $1)",
+                );
+            }
         }
     }
     if present[2] {
@@ -801,7 +932,12 @@ async fn set_limits(State(ctx): State<Arc<Ctx>>, body: Result<Json<Value>, JsonR
         refuse_unpriced = match &body["refuse_unpriced"] {
             Value::Bool(b) => *b,
             Value::Null => false,
-            _ => return bad_request("refuse_unpriced must be a boolean".into(), "true fails closed on a model with no pricing row"),
+            _ => {
+                return bad_request(
+                    "refuse_unpriced must be a boolean".into(),
+                    "true fails closed on a model with no pricing row",
+                );
+            }
         };
     }
     // Scope: omitted keeps, null or "" clears, a string sets. Checked against
@@ -810,9 +946,17 @@ async fn set_limits(State(ctx): State<Arc<Ctx>>, body: Result<Json<Value>, JsonR
     let raw_scope = match &body["model"] {
         Value::Null => String::new(),
         Value::String(s) => s.clone(),
-        _ => return bad_request("model must be a string or null".into(), "name a combo id, or null to scope the row to every model"),
+        _ => {
+            return bad_request(
+                "model must be a string or null".into(),
+                "name a combo id, or null to scope the row to every model",
+            );
+        }
     };
-    let (doc, mut cfg) = match load_cfg(&ctx) { Ok(v) => v, Err(resp) => return *resp };
+    let (doc, mut cfg) = match load_cfg(&ctx) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
     // Checked against the config, so a typo cannot arm a ceiling that never applies.
     let scope = match commands::limit_scope(&raw_scope, &cfg.combos) {
         Ok(scope) => scope,
@@ -837,12 +981,17 @@ async fn set_limits(State(ctx): State<Arc<Ctx>>, body: Result<Json<Value>, JsonR
     if row.is_empty() {
         cfg.limits.keys.retain(|_, r| !r.is_empty());
     }
-    let next = commands::splice_section(&doc, "limits", &crate::import::limits::render(&cfg.limits));
+    let next =
+        commands::splice_section(&doc, "limits", &crate::import::limits::render(&cfg.limits));
     if next == doc {
-        return Json(json!({ "ok": true, "pending_restart": false, "note": "identical" })).into_response();
+        return Json(json!({ "ok": true, "pending_restart": false, "note": "identical" }))
+            .into_response();
     }
     if let Err(e) = commands::write_file(&ctx.config, &next) {
-        return bad_request(format!("cannot write {}: {e}", ctx.config.display()), "check permissions on the config directory");
+        return bad_request(
+            format!("cannot write {}: {e}", ctx.config.display()),
+            "check permissions on the config directory",
+        );
     }
     Json(json!({ "ok": true, "pending_restart": true })).into_response()
 }
@@ -857,18 +1006,27 @@ async fn set_limits(State(ctx): State<Arc<Ctx>>, body: Result<Json<Value>, JsonR
 /// `base_url`, optional `endpoint` (a relative path overriding the protocol's
 /// default one), `key` — required on create, optional on edit, where an empty
 /// key means “rewrite nothing” (the binding keeps its variable).
-async fn provider_custom(State(ctx): State<Arc<Ctx>>, body: Result<Json<Value>, JsonRejection>) -> Response {
+async fn provider_custom(
+    State(ctx): State<Arc<Ctx>>,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Response {
     let body = match body {
         Ok(Json(v)) => v,
         Err(r) => return body_error(r),
     };
-    let trim = |v: Option<&str>| v.map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+    let trim = |v: Option<&str>| {
+        v.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
     const SHAPE: &str = "send { \"id\", \"protocol\", \"base_url\" [, \"endpoint\", \"key\"] }";
     let Some(id) = trim(body["id"].as_str()) else {
         return bad_request("missing provider id".into(), SHAPE);
     };
     let legal = id.len() <= 64
-        && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
     if !legal {
         return bad_request(
             format!("provider id {id:?} is not legal (1-64 of a-z 0-9 . _ -)"),
@@ -888,7 +1046,7 @@ async fn provider_custom(State(ctx): State<Arc<Ctx>>, body: Result<Json<Value>, 
             return bad_request(
                 format!("unknown protocol {other:?}"),
                 "protocol is openai-compatible or anthropic-compatible",
-            )
+            );
         }
     };
     let Some(base_url) = trim(body["base_url"].as_str())
@@ -900,7 +1058,10 @@ async fn provider_custom(State(ctx): State<Arc<Ctx>>, body: Result<Json<Value>, 
         );
     };
     let endpoint = trim(body["endpoint"].as_str());
-    if endpoint.as_ref().is_some_and(|e| e.starts_with('/') || e.contains("://")) {
+    if endpoint
+        .as_ref()
+        .is_some_and(|e| e.starts_with('/') || e.contains("://"))
+    {
         return bad_request(
             format!("endpoint {endpoint:?} is not a relative path"),
             "the endpoint overrides the protocol's default path joined to base_url, e.g. chat/completions2",
@@ -908,7 +1069,10 @@ async fn provider_custom(State(ctx): State<Arc<Ctx>>, body: Result<Json<Value>, 
     }
     let key = body["key"].as_str().unwrap_or_default().trim().to_owned();
 
-    let (doc, cfg) = match load_cfg(&ctx) { Ok(v) => v, Err(resp) => return *resp };
+    let (doc, cfg) = match load_cfg(&ctx) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
     let existed = cfg.custom_providers.iter().any(|c| c.id == id);
     if key.is_empty() && !existed {
         return bad_request(
@@ -935,15 +1099,22 @@ async fn provider_custom(State(ctx): State<Arc<Ctx>>, body: Result<Json<Value>, 
     } else {
         &canonical
     };
-    let rows = upsert_custom_rows(cfg.custom_providers, ar_registry::CustomProvider {
-        id: id.clone(),
-        protocol,
-        base_url,
-        endpoint,
-        key_ref: id.clone(),
-        headers: BTreeMap::new(),
-    });
-    let mut next = commands::splice_section(&doc, "custom_providers", &crate::import::render_custom_section(&rows));
+    let rows = upsert_custom_rows(
+        cfg.custom_providers,
+        ar_registry::CustomProvider {
+            id: id.clone(),
+            protocol,
+            base_url,
+            endpoint,
+            key_ref: id.clone(),
+            headers: BTreeMap::new(),
+        },
+    );
+    let mut next = commands::splice_section(
+        &doc,
+        "custom_providers",
+        &crate::import::render_custom_section(&rows),
+    );
     if !key.is_empty() {
         // Env first: the config write below is the one that publishes it.
         if let Err(e) = set_env_var(&ctx.env, var, &key) {
@@ -955,7 +1126,8 @@ async fn provider_custom(State(ctx): State<Arc<Ctx>>, body: Result<Json<Value>, 
         next = with_key_binding(&next, &id, var);
     }
     if next == doc {
-        return Json(json!({ "ok": true, "pending_restart": false, "note": "identical" })).into_response();
+        return Json(json!({ "ok": true, "pending_restart": false, "note": "identical" }))
+            .into_response();
     }
     if let Err(e) = commands::write_file(&ctx.config, &next) {
         return bad_request(
@@ -986,8 +1158,7 @@ fn upsert_custom_rows(
 /// The `ar.env` line is never touched: an unset `$AR_KEY_*` is harmless, and
 /// the same variable may still back a row that stays.
 fn splice_remove_provider(doc: &str, cfg: &Config, id: &str) -> Option<String> {
-    if !cfg.providers.iter().any(|p| p.id == id)
-        && !cfg.custom_providers.iter().any(|c| c.id == id)
+    if !cfg.providers.iter().any(|p| p.id == id) && !cfg.custom_providers.iter().any(|c| c.id == id)
     {
         return None;
     }
@@ -995,7 +1166,11 @@ fn splice_remove_provider(doc: &str, cfg: &Config, id: &str) -> Option<String> {
         doc,
         "providers",
         &crate::import::render_providers_section(
-            &cfg.providers.iter().filter(|p| p.id != id).cloned().collect::<Vec<_>>(),
+            &cfg.providers
+                .iter()
+                .filter(|p| p.id != id)
+                .cloned()
+                .collect::<Vec<_>>(),
         ),
     );
     let kept: BTreeSet<String> = cfg
@@ -1014,7 +1189,11 @@ fn splice_remove_provider(doc: &str, cfg: &Config, id: &str) -> Option<String> {
         &next,
         "custom_providers",
         &crate::import::render_custom_section(
-            &cfg.custom_providers.iter().filter(|c| c.id != id).cloned().collect::<Vec<_>>(),
+            &cfg.custom_providers
+                .iter()
+                .filter(|c| c.id != id)
+                .cloned()
+                .collect::<Vec<_>>(),
         ),
     );
     // Keys entries the removed rows alone held: every entry the removed rows
@@ -1040,7 +1219,11 @@ fn splice_remove_provider(doc: &str, cfg: &Config, id: &str) -> Option<String> {
         .into_iter()
         .filter(|(name, _)| !orphaned.contains(name))
         .collect();
-    Some(commands::splice_section(&next, "keys", &crate::import::render_keys_section(&keys)))
+    Some(commands::splice_section(
+        &next,
+        "keys",
+        &crate::import::render_keys_section(&keys),
+    ))
 }
 
 /// Removes one provider: refuses while any combo still references it, refuses
@@ -1049,7 +1232,10 @@ fn splice_remove_provider(doc: &str, cfg: &Config, id: &str) -> Option<String> {
 ///
 /// Body: { "id": "..." }. The `ar.env` line is never touched (see
 /// [`splice_remove_provider`]).
-async fn provider_remove(State(ctx): State<Arc<Ctx>>, body: Result<Json<Value>, JsonRejection>) -> Response {
+async fn provider_remove(
+    State(ctx): State<Arc<Ctx>>,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Response {
     let body = match body {
         Ok(Json(v)) => v,
         Err(r) => return body_error(r),
@@ -1062,7 +1248,10 @@ async fn provider_remove(State(ctx): State<Arc<Ctx>>, body: Result<Json<Value>, 
     else {
         return bad_request("missing provider id".into(), "send { \"id\": \"...\" }");
     };
-    let (doc, cfg) = match load_cfg(&ctx) { Ok(v) => v, Err(resp) => return *resp };
+    let (doc, cfg) = match load_cfg(&ctx) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
     let referencing = |c: &Combo| {
         c.targets
             .iter()
@@ -1071,7 +1260,12 @@ async fn provider_remove(State(ctx): State<Arc<Ctx>>, body: Result<Json<Value>, 
             .chain(c.judge_model.iter())
             .any(|t| commands::target_provider(t) == id.as_str())
     };
-    let users: Vec<&str> = cfg.combos.iter().filter(|c| referencing(c)).map(|c| c.id.as_str()).collect();
+    let users: Vec<&str> = cfg
+        .combos
+        .iter()
+        .filter(|c| referencing(c))
+        .map(|c| c.id.as_str())
+        .collect();
     if !users.is_empty() {
         return conflict(
             format!("{id:?} is still referenced by: {}", users.join(", ")),
@@ -1102,10 +1296,21 @@ mod tests {
         let body: Value =
             serde_json::from_str(r#"{"rpm": 600, "tokens": null}"#).expect("fixture parses");
         assert_eq!(arm_of(&body, "rpm", 100_000), Ok(Some(600)));
-        assert_eq!(arm_of(&body, "tokens", 1_000_000_000_000), Ok(None), "an explicit null clears");
-        assert_eq!(arm_of(&body, "usd_micros", 1_000_000), Err("keep".to_owned()), "an absent field keeps the row's value");
+        assert_eq!(
+            arm_of(&body, "tokens", 1_000_000_000_000),
+            Ok(None),
+            "an explicit null clears"
+        );
+        assert_eq!(
+            arm_of(&body, "usd_micros", 1_000_000),
+            Err("keep".to_owned()),
+            "an absent field keeps the row's value"
+        );
         let over: Value = serde_json::from_str(r#"{"rpm": 999999}"#).expect("fixture parses");
-        assert!(arm_of(&over, "rpm", 100_000).is_err(), "a ceiling past max is refused");
+        assert!(
+            arm_of(&over, "rpm", 100_000).is_err(),
+            "a ceiling past max is refused"
+        );
     }
 
     #[test]
@@ -1126,7 +1331,10 @@ mod tests {
             ["a", "b", "c"]
         );
         assert_eq!(
-            ids(upsert_custom_rows(vec![row("a"), row("b"), row("c")], row("b"))),
+            ids(upsert_custom_rows(
+                vec![row("a"), row("b"), row("c")],
+                row("b")
+            )),
             ["a", "b", "c"],
             "an existing id is replaced, not duplicated"
         );
@@ -1150,7 +1358,10 @@ mod tests {
             "    key_ref: dkey\n",
         );
         let cfg = Config::parse(doc, resolve_env).expect("fixture must parse");
-        assert!(splice_remove_provider(doc, &cfg, "zzz").is_none(), "an unknown id is a refusal, not an edit");
+        assert!(
+            splice_remove_provider(doc, &cfg, "zzz").is_none(),
+            "an unknown id is a refusal, not an edit"
+        );
 
         // pd alone holds `dkey`, so the row and its binding go together.
         let next = splice_remove_provider(doc, &cfg, "pd").expect("pd is configured");
@@ -1163,7 +1374,11 @@ mod tests {
         // pa shares `shared` with pc, so the binding — and therefore the
         // keys section — is untouched.
         let next2 = splice_remove_provider(&next, &cfg2, "pa").expect("pa is configured");
-        assert_eq!(raw_keys(&next2), keys, "a shared binding survives a row's removal");
+        assert_eq!(
+            raw_keys(&next2),
+            keys,
+            "a shared binding survives a row's removal"
+        );
     }
 
     #[test]
@@ -1181,22 +1396,24 @@ mod tests {
 
     #[test]
     fn check_combos_rejects_a_target_the_catalog_does_not_know() {
-        let yaml =
-        "keys:\n  k: v\ncombos:\n  - id: c\n    strategy: priority\n    targets: [openai/gpt-5.4]\n";
-    let cfg = Config::parse(yaml, resolve_env).ok();
-    let Some(cfg) = cfg else { panic!("fixture config must parse") };
-    let mut combo = cfg.combos[0].clone();
-    combo.id = "bad".into();
-    combo.targets = vec!["nobody/model".into()];
-    assert!(check_combos(&[combo], &cfg).is_err());
-}
+        let yaml = "keys:\n  k: v\ncombos:\n  - id: c\n    strategy: priority\n    targets: [openai/gpt-5.4]\n";
+        let cfg = Config::parse(yaml, resolve_env).ok();
+        let Some(cfg) = cfg else {
+            panic!("fixture config must parse")
+        };
+        let mut combo = cfg.combos[0].clone();
+        combo.id = "bad".into();
+        combo.targets = vec!["nobody/model".into()];
+        assert!(check_combos(&[combo], &cfg).is_err());
+    }
 
     #[test]
     fn check_combos_accepts_a_round_trip_of_the_fixture() {
-        let yaml =
-            "keys:\n  k: v\ncombos:\n  - id: c\n    strategy: priority\n    targets: [openai/gpt-5.4]\n";
+        let yaml = "keys:\n  k: v\ncombos:\n  - id: c\n    strategy: priority\n    targets: [openai/gpt-5.4]\n";
         let cfg = Config::parse(yaml, resolve_env).ok();
-        let Some(cfg) = cfg else { panic!("fixture config must parse") };
+        let Some(cfg) = cfg else {
+            panic!("fixture config must parse")
+        };
         assert!(check_combos(&cfg.combos, &cfg).is_ok());
     }
 }
@@ -1235,22 +1452,35 @@ mod http_tests {
         let resp = app.clone().oneshot(req).await.expect("router answers");
         let status = resp.status();
         let bytes = resp.into_body().collect().await.expect("body").to_bytes();
-        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
     }
 
     #[tokio::test]
     async fn the_log_should_answer_failures_inside_the_date_range() {
         let ledger = ar_tokens::Ledger::open_in_memory().expect("ledger");
-        ledger.record_failure("ci", "c", 502, "every provider is down", 1_000_000).expect("row");
+        ledger
+            .record_failure("ci", "c", 502, "every provider is down", 1_000_000)
+            .expect("row");
         let (app, _) = ui("log", Some(ledger));
         let (status, body) = call(&app, Method::GET, "/ui/api/log?days=30", "").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["rows"].as_array().map(Vec::len), Some(1));
         assert_eq!(body["rows"][0]["status"], 502);
         let (_, errors) = call(&app, Method::GET, "/ui/api/log?status=error", "").await;
-        assert_eq!(errors["rows"].as_array().map(Vec::len), Some(1), "the failed-only view keeps the failure");
+        assert_eq!(
+            errors["rows"].as_array().map(Vec::len),
+            Some(1),
+            "the failed-only view keeps the failure"
+        );
         let (_, other) = call(&app, Method::GET, "/ui/api/log?model=nope", "").await;
-        assert_eq!(other["rows"].as_array().map(Vec::len), Some(0), "a model filter narrows the rows");
+        assert_eq!(
+            other["rows"].as_array().map(Vec::len),
+            Some(0),
+            "a model filter narrows the rows"
+        );
     }
 
     #[tokio::test]
@@ -1267,7 +1497,8 @@ mod http_tests {
         let ledger = ar_tokens::Ledger::open_in_memory().expect("ledger");
         let (app, _) = ui("usage-clamp", Some(ledger));
         for days in ["0", "99999"] {
-            let (status, _) = call(&app, Method::GET, &format!("/ui/api/usage?days={days}"), "").await;
+            let (status, _) =
+                call(&app, Method::GET, &format!("/ui/api/usage?days={days}"), "").await;
             assert_eq!(status, StatusCode::OK, "days={days} must clamp, not fail");
         }
     }
@@ -1275,33 +1506,84 @@ mod http_tests {
     #[tokio::test]
     async fn limits_should_refuse_a_scope_that_names_no_combo_and_write_nothing() {
         let (app, config) = ui("limits-unknown", None);
-        let (status, body) = call(&app, Method::POST, "/ui/api/limits", r#"{"key":"ci","rpm":5,"model":"nope"}"#).await;
+        let (status, body) = call(
+            &app,
+            Method::POST,
+            "/ui/api/limits",
+            r#"{"key":"ci","rpm":5,"model":"nope"}"#,
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body["error"].as_str().unwrap_or_default().contains("no combo named"));
-        assert_eq!(std::fs::read_to_string(&config).expect("config"), CONFIG, "a refusal leaves the file alone");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no combo named")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("config"),
+            CONFIG,
+            "a refusal leaves the file alone"
+        );
     }
 
     #[tokio::test]
     async fn limits_should_keep_a_scope_when_omitted_and_clear_it_on_null() {
         let (app, config) = ui("limits-scope", None);
-        let (status, _) = call(&app, Method::POST, "/ui/api/limits", r#"{"key":"ci","rpm":5,"model":"c"}"#).await;
+        let (status, _) = call(
+            &app,
+            Method::POST,
+            "/ui/api/limits",
+            r#"{"key":"ci","rpm":5,"model":"c"}"#,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
-        assert!(std::fs::read_to_string(&config).expect("config").contains("model: \"c\""));
+        assert!(
+            std::fs::read_to_string(&config)
+                .expect("config")
+                .contains("model: \"c\"")
+        );
 
-        let (status, _) = call(&app, Method::POST, "/ui/api/limits", r#"{"key":"ci","rpm":7}"#).await;
+        let (status, _) = call(
+            &app,
+            Method::POST,
+            "/ui/api/limits",
+            r#"{"key":"ci","rpm":7}"#,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         let kept = std::fs::read_to_string(&config).expect("config");
-        assert!(kept.contains("model: \"c\"") && kept.contains("rpm: 7"), "an omitted scope is kept: {kept}");
+        assert!(
+            kept.contains("model: \"c\"") && kept.contains("rpm: 7"),
+            "an omitted scope is kept: {kept}"
+        );
 
-        let (status, _) = call(&app, Method::POST, "/ui/api/limits", r#"{"key":"ci","model":null}"#).await;
+        let (status, _) = call(
+            &app,
+            Method::POST,
+            "/ui/api/limits",
+            r#"{"key":"ci","model":null}"#,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
-        assert!(!std::fs::read_to_string(&config).expect("config").contains("model:"), "null clears the scope");
+        assert!(
+            !std::fs::read_to_string(&config)
+                .expect("config")
+                .contains("model:"),
+            "null clears the scope"
+        );
     }
 
     #[tokio::test]
     async fn limits_should_refuse_a_scope_that_is_not_a_string() {
         let (app, _) = ui("limits-type", None);
-        let (status, _) = call(&app, Method::POST, "/ui/api/limits", r#"{"key":"ci","rpm":5,"model":5}"#).await;
+        let (status, _) = call(
+            &app,
+            Method::POST,
+            "/ui/api/limits",
+            r#"{"key":"ci","rpm":5,"model":5}"#,
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 }

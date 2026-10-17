@@ -857,7 +857,10 @@ model_list:
         // Headers carry $VAR bindings that the loader resolves through the
         // closure, exactly like a catalog import writes them.
         assert_eq!(
-            parsed.custom_providers[0].headers.get("x-api-key").map(String::as_str),
+            parsed.custom_providers[0]
+                .headers
+                .get("x-api-key")
+                .map(String::as_str),
             Some("<AR_KEY_MY_GW>")
         );
     }

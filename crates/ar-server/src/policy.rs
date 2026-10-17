@@ -232,7 +232,10 @@ mod tests {
     #[test]
     fn a_response_only_row_arms_no_cap() {
         let p = Policy::from_limits(&limits_yaml("limits:\n  default:\n    rpm: 3\n"), true);
-        assert!(p.cap("k", "m").is_none(), "rpm alone is not a spend ceiling");
+        assert!(
+            p.cap("k", "m").is_none(),
+            "rpm alone is not a spend ceiling"
+        );
     }
 
     #[test]
