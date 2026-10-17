@@ -32,6 +32,7 @@
 #   --force-root           allow running as root (default: refuse)
 #   --no-cta               suppress the star/donate CTA
 #   --all-harnesses        register the MCP server in every detected harness
+#                          (claude and codex are registered; opencode gets its JSON printed)
 #   --no-harness           skip harness/MCP registration (set SKIP_HARNESS=1)
 #   --help
 # Unknown flags fail loudly (exit 2).
@@ -281,16 +282,27 @@ run_harness_integration() {
   fi
   # Codex
   if command -v codex >/dev/null 2>&1; then
-    echo "  Codex: add to ~/.codex/config.toml: [mcp_servers.aroute] command = \"$TARGET\" args = [\"mcp\"]"
+    # `codex mcp add` is the supported writer on current builds; an older codex
+    # lacks it, and then the TOML is printed rather than edited by hand here.
+    if codex mcp add aroute -- "$TARGET" mcp >/dev/null 2>&1; then
+      echo "  registered: codex mcp add aroute"
+      codex mcp list 2>/dev/null | grep -q aroute && echo "  verified: codex mcp list" || true
+    else
+      echo "  Codex: add to ~/.codex/config.toml: [mcp_servers.aroute] command = \"$TARGET\" args = [\"mcp\"]"
+    fi
   fi
   echo "Harness integration complete"
 }
 
-# ── Write portable .mcp.json ────────────────────────────────────────────────────
-write_mcp_json() {
-  repo_root="${SCRIPT_SRC%/*}"
-  if [ -n "$repo_root" ] && [ -d "$repo_root" ] && [ -w "$repo_root" ]; then
-    cat > "${repo_root}/.mcp.json" <<MCPEOF
+# ── Portable .mcp.json (printed, never written) ───────────────────────────────
+# Printed rather than saved: the file used to be written beside this script, so
+# a checkout (or ~/Downloads) picked up an untracked `.mcp.json` whose absolute
+# command pointed at wherever the binary landed that run — a stale path the
+# moment the install dir changed, and a broken server entry for every harness
+# that reads project-root `.mcp.json`.
+print_mcp_json() {
+  echo "Portable .mcp.json (paste into a project root to use aroute's MCP tools there):"
+  cat <<MCPEOF
 {
   "mcpServers": {
     "artificial-route": {
@@ -300,19 +312,6 @@ write_mcp_json() {
   }
 }
 MCPEOF
-    printf '>>> generated: %s/.mcp.json <<<\n' "$repo_root"
-  fi
-  echo "Portable .mcp.json (paste into your project root):"
-  cat <<MCPEOF2
-{
-  "mcpServers": {
-    "artificial-route": {
-      "command": "$TARGET",
-      "args": ["mcp"]
-    }
-  }
-}
-MCPEOF2
 }
 
 have_systemd() { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }
@@ -837,6 +836,13 @@ else
   echo "verify:    doctor -> $(printf '%s' "$DOCTOR_OUT" | head -1)"
 fi
 
+# The control page rides the proxy's own listener, so its address is the
+# configured one. Read from the file rather than assumed: the sample config
+# binds 127.0.0.1:20128 but an operator may have changed either.
+UI_HOST="$(sed -n 's/^[[:space:]]*host:[[:space:]]*\([^ ,}]*\).*/\1/p' "$CONFIG" | head -1)"
+UI_PORT="$(sed -n 's/.*port:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$CONFIG" | head -1)"
+UI_URL="http://${UI_HOST:-127.0.0.1}:${UI_PORT:-20128}/ui/"
+
 cat <<EOF
 
 installed to $TARGET
@@ -847,6 +853,7 @@ installed to $TARGET
   updater:   $UPDATE_STATE
   dashboard: $DASH_STATE
   dashsvc:   $DASH_UNIT_STATE
+  /ui:       $UI_URL   (combos, keys, limits, usage log, playground; edits config.yaml)
 
   $TARGET doctor      # re-check at any time
   $TARGET serve       # foreground; the unit already runs it as a service
@@ -860,8 +867,8 @@ EOF
 # ── PATH injection ─────────────────────────────────────────────────────────────
 ensure_path "$DIR"
 
-# ── Write portable .mcp.json + offer harness registration ────────────────────
-write_mcp_json
+# ── Print portable .mcp.json + offer harness registration ────────────────────
+print_mcp_json
 run_harness_integration
 
 # ── CTA ────────────────────────────────────────────────────────────────────────
