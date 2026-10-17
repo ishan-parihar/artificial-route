@@ -2,7 +2,7 @@
 
 **One OpenAI-compatible endpoint over 276 providers — a static binary that idles at ~28 MiB serving the full catalog.**
 
-[![release](https://img.shields.io/github/v/release/ishan-parihar/artificial-route)](https://github.com/ishan-parihar/artificial-route/releases) [![license](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE) [![musl](https://img.shields.io/badge/binary-static--musl-lightgrey)](https://github.com/ishan-parihar/artificial-route/releases) ![tests](https://img.shields.io/badge/tests-1927_passing-brightgreen)
+[![release](https://img.shields.io/github/v/release/ishan-parihar/artificial-route)](https://github.com/ishan-parihar/artificial-route/releases) [![license](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE) [![musl](https://img.shields.io/badge/binary-static--musl-lightgrey)](https://github.com/ishan-parihar/artificial-route/releases) ![tests](https://img.shields.io/badge/tests-2021_passing-brightgreen)
 
 A minimal-RAM Rust port of the [OmniRoute](https://github.com/ishan-parihar/OmniRoute) gateway core: same combos, strategies and dialects, none of the desktop. File YAML in, SSE out — no runtime dependencies. A small built-in control page at [`/ui`](#control-page-ui) edits the same YAML; the full OmniRoute dashboard is an optional extra.
 
@@ -164,7 +164,7 @@ Measured 2026-10-01, `aroute` 0.1.1 against a live OmniRoute v16.3.1, both on lo
 | CLI verbs | 13: `serve`, `models`, `providers`, `combo`, `doctor`, `run`, `configure`, `auth`, `keys`, `limits`, `import`, `sync`, `dashboard`, plus `mcp` behind `--features mcp` | ~78 |
 | MCP tools | 12-tool catalog + `tool_search`, behind the default-off `mcp` feature | 110 tools + A2A |
 | terminal-status list | 6 rows + 1 carve-out-only, generated into the store's CHECK | taxonomy it was reconciled against |
-| test gate | 44 suites, 1927 passed, 0 failed; clippy `-D warnings` clean | not measured |
+| test gate | 44 suites, 2021 passed, 0 failed; clippy `-D warnings` clean | not measured |
 
 No upstream chat call was made in either column, so the shared-route row is a
 surface match, not verified call parity. The classifiers agree except for one
@@ -383,6 +383,8 @@ limits:
 | Playground | multi-turn chat with an optional system prompt through the real `/v1/chat/completions`, streaming |
 
 The request log shows answered requests from the usage ledger and failed ones from a separate `failures` table in the same SQLite file (last 10 000 kept). Failures are recorded from the build that added the table onward, authentication refusals (401/403) are not logged, and a stream that fails after it has already begun is not counted as a failure. The ledger's append-only usage rows are never touched, so spend sums and caps are unaffected.
+
+The page's behavior has a browser check, `scripts/ui/behave.mjs` (Playwright, 13 checks, run by hand against a demo `serve`; not in CI).
 
 Endpoints behind it, if you want to script them: `GET /ui/api/state|usage|log|models`, `POST /ui/api/combos|provider-key|provider-custom|provider-remove|keys/mint|limits`. Plans and outcomes: [docs/19](docs/19-ui-upgrade-plan.md), [docs/23](docs/23-ui-round-two-plan.md).
 
