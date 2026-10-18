@@ -47,7 +47,7 @@ on-demand rows (D4–D8, E2–E8), which the outline says not to start on specul
 | B5 | README test badge and test line stale | code | done `150d27b` | Now 44 suites, 2021 passed (the figure from the full run above). Update again when the count moves. |
 | B6 | docs-check warnings | code | unverified | Located: `.git/hooks/pre-commit` runs `docs-check` in warn mode and does not gate. At this pass it reported 14 `D003` orphan pages (the earlier figure of 17 was wrong) and README-contract failures for 12 crates. Decide whether to gate it. |
 | B7 | No CI gate ran fmt, clippy or tests on push | code | done `7ae39ce` | `.github/workflows/ci.yml`: a `lint` job (fmt, clippy with `-D warnings`) and a `test` job, on push to `main` and on pull request, against the pinned toolchain. Verified on `HEAD` as above. Disclosure: I committed this file before its lint step was checked. My `\| tail` hid a clippy failure, which came from another session's uncommitted `routes.rs` and not from this commit. That was fixed in `c7a841a`. |
-| B8 | **new** — seven dead-code warnings in `ar-mcp` in the default test build | code | open | `crates/ar-mcp/src/tools.rs`: `list_combos`, `switch_combo`, `check_quota`, `route_request`, and three more `pub(crate)` helpers, unused outside the `mcp` feature. Clippy with all features is clean, and CI does not fail on them, so this is hygiene. Fix: gate the helpers on the feature, or remove them. |
+| B8 | **new** — seven dead-code warnings in `ar-mcp` in the default build | code | done (this commit) | `crates/ar-mcp/src/tools.rs`: `list_combos`, `switch_combo`, `check_quota`, `route_request`, and three more `pub(crate)` helpers, unused outside the `mcp` feature. Clippy with all features is clean, and CI does not fail on them, so this is hygiene. Done: a module-level `expect(dead_code)` scoped to non-test builds without the `mcp` feature. A cfg gate would break the module's own tests in the default build. |
 
 ## C. Request log and scoping
 
@@ -108,7 +108,7 @@ on-demand rows (D4–D8, E2–E8), which the outline says not to start on specul
 
 ## Suggested order from here
 
-1. **B8**: gate or remove the `ar-mcp` helpers. Small, and it clears the default-build warnings.
+1. ~~B8~~ done.
 2. **Rulings, in one session**: D1–D3 (the two-stall case is the same question as D1), and G2 (routable bind with an armed gate).
 3. **A1 release**, once you say to cut it: version, tag, build, the local binary and the VPS. A2 goes into the release notes.
 4. **E1 soak** on the released binary, started right after A1 and left alone. It is wall-clock only.
