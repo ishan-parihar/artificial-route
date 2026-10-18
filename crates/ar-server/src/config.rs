@@ -1502,7 +1502,7 @@ fn resolve_target(
                 let mut entry =
                     ProviderConfig::with_keys(ProviderId::new(provider), &def.base_url, keys)
                         .with_wire_format(def.wire_format)
-                        .with_headers(def.headers.clone())
+                        .with_headers(provider_headers(def, cfg.oauth_for(provider)))
                         .with_endpoint(def.endpoint.as_deref().map(str::to_owned))
                         // The catalog's `authType`, carried so `is_dispatchable` can tell a
                         // provider that *needs* an OAuth executor from one that merely has a
@@ -1526,6 +1526,26 @@ fn resolve_target(
     Ok(ComboTarget::new(ProviderId::new(provider), model).with_weight(weight))
 }
 
+/// The outbound headers a catalogued provider dispatches with.
+///
+/// The catalog's own headers, with the operator's editor name laid over the
+/// gateway's editor header when the OAuth declaration names one. The free tier and
+/// a signed-in session take this one merge, so a request names the same client
+/// whichever credential it carries.
+fn provider_headers(
+    def: &ar_registry::ProviderDef,
+    declared: Option<&ar_config::OAuthSession>,
+) -> BTreeMap<String, String> {
+    let mut headers = def.headers.clone();
+    if let Some(editor) = declared
+        .and_then(|s| s.anonymous_editor.as_deref())
+        .filter(|e| !e.is_empty())
+    {
+        headers.insert(ANONYMOUS_EDITOR_HEADER.to_owned(), editor.to_owned());
+    }
+    headers
+}
+
 /// The dispatch row for an anonymous free-tier session, when the config asks for one.
 ///
 /// Built whole rather than patched onto an existing row, because the ordering is
@@ -1545,18 +1565,10 @@ fn anonymous_entry(
     if !declared.anonymous {
         return None;
     }
-    let mut headers = def.headers.clone();
-    if let Some(editor) = declared
-        .anonymous_editor
-        .as_deref()
-        .filter(|e| !e.is_empty())
-    {
-        headers.insert(ANONYMOUS_EDITOR_HEADER.to_owned(), editor.to_owned());
-    }
     Some(
         ProviderConfig::new(ProviderId::new(provider), &def.base_url, ANONYMOUS_API_KEY)
             .with_wire_format(def.wire_format)
-            .with_headers(headers)
+            .with_headers(provider_headers(def, Some(declared)))
             .with_endpoint(def.endpoint.as_deref().map(str::to_owned))
             .with_needs_oauth_executor(def.auth_kind.as_ref() == "oauth")
             .with_anonymous(true),
@@ -1734,7 +1746,8 @@ mod tests {
 
     use super::{
         AUTH_MODE_VAR, AuthMode, ComboError, ComboTarget, DISCOVERY_VAR, DefaultChain,
-        HTTP_MASTER_KEY_VAR, RouteCombo, STREAM_TIMEOUT_VAR, ServerConfig, split_target,
+        HTTP_MASTER_KEY_VAR, RouteCombo, STREAM_TIMEOUT_VAR, ServerConfig, provider_headers,
+        split_target,
     };
     use crate::exec::ProviderConfig;
 
@@ -2857,6 +2870,33 @@ combos:
         assert_eq!(row.endpoint.as_deref(), Some("/api/alpha/decisions"));
         let shape = row.dispatch_for_key(false, "respan/span-01-lite:free", 0);
         assert_eq!(shape.endpoint, Some("/api/alpha/decisions"));
+    }
+
+    #[test]
+    fn provider_headers_should_name_the_operators_editor_over_the_catalog() {
+        let def: ar_registry::ProviderDef = serde_json::from_value(serde_json::json!({
+            "base_url": "https://api.kilo.ai/api/openrouter/chat/completions",
+            "wire_format": "openai",
+            "auth": "ApiKey",
+            "env_hint": "AR_KEY_KILOCODE",
+            "models": [],
+            "executor": "default",
+            "auth_kind": "oauth",
+            "headers": { "X-KILOCODE-EDITORNAME": "OmniRoute" },
+        }))
+        .expect("a catalog row parses");
+        let declared: ar_config::OAuthSession = serde_json::from_value(serde_json::json!({
+            "provider": "kilocode",
+            "anonymous_editor": "artificial-route",
+        }))
+        .expect("an oauth declaration parses");
+
+        assert_eq!(
+            provider_headers(&def, Some(&declared))
+                .get("X-KILOCODE-EDITORNAME")
+                .map(String::as_str),
+            Some("artificial-route"),
+        );
     }
 
     #[test]

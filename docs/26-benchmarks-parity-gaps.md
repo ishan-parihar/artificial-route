@@ -86,7 +86,9 @@ explanation is [AUDIT-REPORT.md](AUDIT-REPORT.md).
   per-user headers are not (see docs/24 E3).
 - **`kilocode` has neither mechanism declared**, so its `oauth/` row is a `fail`
   whose fix names the YAML for either one. Its device flow and anonymous dispatch
-  are both ported; the dispatch wire is not.
+  are both ported; the editor header now reaches the wire from the catalog row
+  (docs/24 E4). The reference has no kilocode-specific executor, so there is no
+  further wire to port.
 - **Multi-provider `auto/*` pools fall back to config order.** Single-provider pools score identically; bare `auto` maps to `least-used` since 0.1.12, and the auto scoring engages for literal `auto/*` names.
 - **Custom providers dispatch the OpenAI wire only.** An `anthropic-compatible`
   node is accepted and named by `aroute doctor`, then refused at dispatch.

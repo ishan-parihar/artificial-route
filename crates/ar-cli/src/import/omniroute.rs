@@ -883,6 +883,7 @@ fn to_def(entry: &Entry, consts: &Consts, root: &Tree) -> Option<ProviderDef> {
     let mut auth = None;
     let mut base_url = None;
     let mut models: Vec<Strng> = Vec::new();
+    let mut headers = BTreeMap::new();
 
     // The builder's defaults, then the object's own fields, then any spread.
     // `resolve_field` walks the const chain, so `...KIMI_CODING_SHARED` in one
@@ -895,6 +896,7 @@ fn to_def(entry: &Entry, consts: &Consts, root: &Tree) -> Option<ProviderDef> {
             "baseUrl" => base_url = resolve_str(raw, consts),
             "baseUrls" => base_url = first_of_array(raw, consts),
             "models" => models = model_ids(raw, consts, root),
+            "headers" => headers = header_map(raw, consts),
             _ => {}
         }
     }
@@ -910,11 +912,38 @@ fn to_def(entry: &Entry, consts: &Consts, root: &Tree) -> Option<ProviderDef> {
         executor: Strng::from(executor.unwrap_or_else(|| "default".to_owned()).as_str()),
         auth_kind: Strng::from(auth.unwrap_or_else(|| "apikey".to_owned()).as_str()),
         flat_rate: false,
-        // `RegistryEntry.headers` is read into the layered entry above; the
-        // generated catalog carries them so a custom node and an imported one
-        // dispatch through the same merge.
-        headers: BTreeMap::new(),
+        // The gateway's own headers, which an imported node and a custom node
+        // both dispatch with through the same merge.
+        headers,
     })
+}
+
+/// The `headers` object an entry declares, as name → value.
+///
+/// Spread entries are skipped, and a value that does not resolve is left out
+/// rather than sent empty. Before this read the field, the catalog dropped every
+/// header, which is how `kilocode` lost its `X-KILOCODE-EDITORNAME`.
+fn header_map(raw: &str, consts: &Consts) -> BTreeMap<String, String> {
+    let trimmed = raw.trim();
+    let object = if trimmed.starts_with('{') {
+        trimmed.to_owned()
+    } else {
+        match consts.get(trimmed) {
+            Some(value) if value.trim().starts_with('{') => value.trim().to_owned(),
+            _ => return BTreeMap::new(),
+        }
+    };
+    let mut out = BTreeMap::new();
+    for (key, value) in fields(&object) {
+        if key.starts_with("..") {
+            continue;
+        }
+        let name = as_literal(&key).unwrap_or(key);
+        if let Some(value) = resolve_str(&value, consts) {
+            out.insert(name, value);
+        }
+    }
+    out
 }
 
 /// Reads an entry's metadata: its short id, its auth header, its window, the
@@ -2033,6 +2062,19 @@ mod tests {
         assert_eq!(
             strip_comments("const A = \"https://x/y\";"),
             "const A = \"https://x/y\";"
+        );
+    }
+
+    #[test]
+    fn header_map_should_read_the_headers_an_entry_declares() {
+        let headers = header_map(
+            r#"{ "X-KILOCODE-EDITORNAME": "OmniRoute" }"#,
+            &Consts::of(""),
+        );
+
+        assert_eq!(
+            headers.get("X-KILOCODE-EDITORNAME").map(String::as_str),
+            Some("OmniRoute"),
         );
     }
 
