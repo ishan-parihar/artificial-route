@@ -1,6 +1,6 @@
 # Plan: aroute on racknerd behind a public endpoint
 
-Status: deployed to the VPS and gated; the tunnel restart and harness switch are pending (2026-10-18). Owner: operator request ("deploy aroute to hermes-vps, update the instance, expose it as aroute.ishanparihar.com, point local harnesses at it").
+Status: **complete** (2026-10-19). Local-only proxy removed; all harnesses use `https://aroute.ishanparihar.com/v1` with the gate JWT. Owner: operator request ("deploy aroute to hermes-vps, update the instance, expose it as aroute.ishanparihar.com, point local harnesses at it"; extended 2026-10-19: "remove the local machine aroute, and only use the remote endpoint for all intents and purposes").
 
 ## Facts gathered (read-only)
 
@@ -32,9 +32,11 @@ Status: deployed to the VPS and gated; the tunnel restart and harness switch are
 | 7 | Local | **Done**: `~/.config/ar/racknerd-gate-token`, mode 600. `scp` the token file to `~/.config/ar/racknerd-gate-token` (mode 600) | file exists |
 | 8 | VPS | **Done** (validated; `Matched rule #3`). Backup `hermes-config.yml.bak-aroute-20261018`. Add `aroute.ishanparihar.com` → `http://127.0.0.1:20128` before the catch-all in `hermes-config.yml` (backup first); `cloudflared tunnel ingress validate` | validate passes |
 | 9 | VPS | **Done** (CNAME added). `cloudflared tunnel --origincert ~/.cloudflared/cert.pem route dns 8938b025-… aroute.ishanparihar.com` | DNS record created |
-| 10 | Operator | **Pending.** Needs root: `sudo systemctl restart cloudflared` | unit active |
-| 11 | Local | **Pending**; applied only after step 12 passes. Point opencode, jcode and omp at `https://aroute.ishanparihar.com/v1`, token from `racknerd-gate-token` | harness smoke test |
-| 12 | Both | Public `healthz`, authenticated `/v1/models`, one small non-stream chat | 200 and content |
+| 10 | Operator | **Done** (evidenced 2026-10-19: public hostname routes to the proxy; cloudflared active). Needed root: `sudo systemctl restart cloudflared` | unit active |
+| 11 | Local | **Done** (2026-10-19): opencode `ar` provider → remote URL + JWT (lane `free-stack`→`large-stack`, dead `nvidia/z-ai/glm-5.3` passthrough lane dropped); omp `aroute` → remote URL + JWT (`free-stack`→`large-stack`, stale `paper-stack` lane dropped; `config.yml` roles `advisor`/`task` → `aroute/large-stack`); jcode `omniroute` → remote URL + `provider-omniroute.env` holds the JWT (lane renamed). Backups: `*.bak-pre-remote-20261019` beside each config | all four harness configs parse; no live config references :20128 |
+| 12 | Both | **Done** (2026-10-18/19): Public `healthz` 200; `/v1/models` 401 anonymous / 200 with JWT; `large-stack` non-stream chat returns correct content (2026-10-19 after rename) | status codes + content |
+| 13 | Local | **Done** (2026-10-19): local `aroute.service`, `aroute.update.timer`, `aroute-dashboard.service`, `omniroute`, `omniroute-disk-guard.timer` stopped + disabled. No local proxy port listens. Binary `~/.local/bin/aroute` kept as CLI/MCP + rollback path; local config + `usage.sqlite` kept as archive | `systemctl --user is-active` all inactive; `ss` shows no :20128/:20129/:20149 |
+| 14 | Both | **Done** (2026-10-19): post-decommission remote smoke — healthz 200, `/v1/models` 200 with JWT, `large-stack` non-stream serves `stepfun-ai/step-5-preview` (correct answer), `large-stack`+`small-stack` SSE streams 32/6 frames | status codes + frames |
 
 ## Rollback
 
@@ -45,13 +47,22 @@ Status: deployed to the VPS and gated; the tunnel restart and harness switch are
 
 ## Harness targets (to change in step 11)
 
-- opencode `~/.config/opencode/opencode.json`, provider `ar`: `baseURL` and `apiKey`.
-- omp `~/.omp/agent/models.yml`, provider `aroute`: `baseUrl` (currently `dummy` key, which only worked with the gate open).
-- jcode `~/.jcode/config.toml`, `[providers.omniroute]`: `base_url`; its env file holds the key.
+- opencode `~/.config/opencode/opencode.json`, provider `ar`: `baseURL` → `https://aroute.ishanparihar.com/v1`, `apiKey` → gate JWT. Rename lane `free-stack` → `large-stack`; drop `nvidia/z-ai/glm-5.3` passthrough lane.
+- omp `~/.omp/agent/models.yml`, provider `aroute`: `baseUrl` → remote (currently `dummy` key, which only worked with the gate open). Rename lane `free-stack` → `large-stack`; drop stale `paper-stack` lane (undefined on both sides).
+- jcode `~/.jcode/config.toml`, `[providers.omniroute]`: `base_url` → remote; its env file holds the key. Rename lanes.
+
+## Combo rename + repair (2026-10-19, remote-only migration)
+
+- `free-stack` → `large-stack` on VPS config first, then local config + all harness lanes. Clean cutover: no alias, old id 404s.
+- `large-stack` targets: `nvidia/stepfun-ai/step-5-preview` (verified 2026-10-19: correct answers, 1–9s wall, needs max_tokens ≥ 500 — heavy reasoner, null content below that) + `nvidia/nvidia/nemotron-3-super-120b-a12b` second (verified: correct, ~1s). Both probed live against integrate.api.nvidia.com; nearly every other nvidia free model is 410 EOL (kimi-k3, deepseek-v4-flash/pro, nemotron-3-nano, gpt-oss-120b, llama-3.3-70b, llama-4-maverick).
+- Removed: `nvidia/z-ai/glm-5.3` (429 dead on all keys), `nvidia/z-ai/glm-5.3-flash` (TTFT 99–124s, crosses 110s stream-start cap).
+- `browser-stack-2` still targets dead `nvidia/z-ai/glm-5.3` — left as-is (out of scope; harness lanes don't use it as default).
 
 ## Known caveats
 
-- `free-stack` returned 504 "produced no response within 150s" on the local swap check. The VPS has the same combo, so a public smoke test may time out for the same reason. Use a combo that answers if that happens.
+- `free-stack` returned 504 "produced no response within 150s" on the local swap check. The VPS has the same combo, so a public smoke test may time out for the same reason. Use a combo that answers if that happens. **Resolved 2026-10-19**: `free-stack` was renamed `large-stack` and repointed at live targets (see above); the broken nvidia GLM targets are gone.
+- **Token rotation**: the gate JWT expires 2026-11-17 (`exp` in the JWT). Rotate with `aroute keys mint --key-id racknerd-harness` on the VPS (service env via `systemd-run -p EnvironmentFile=$HOME/.config/ar/ar.env`), then copy the new token into the three harness configs (`opencode.json` `provider.ar.options.apiKey`, `models.yml` `aroute.apiKey`, `~/.jcode/provider-omniroute.env`) and `~/.config/ar/racknerd-gate-token.jwt`.
+- **`scripts/sync-harness-lanes.py` removed** (2026-10-19): it pointed harness lanes at the local :20128 gateway, which no longer exists; running it would have undone the migration.
 - The public name returns `403 error code: 1010` to the default Python user agent; probes must set a `User-Agent`.
 - The VPS doctor failures are OAuth providers with no executor in this build. They are not caused by this change.
 - Standing constraint "do not touch hermes-vps" is lifted for this plan by the operator's explicit request.
