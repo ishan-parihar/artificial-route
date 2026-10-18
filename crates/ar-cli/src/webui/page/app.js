@@ -819,33 +819,77 @@ function paintSuggestions(analytics, rows) {
 
 const TIME_FMT = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 
+/** Rows shown so far for the current filter; older pages append to them. */
+let LOG_SHOWN = 0;
+let LOG_FAILED = 0;
+
+function logRow(r) {
+  const when = new Date(r.at * 1000);
+  const bad = r.status >= 400;
+  return H("tr", { class: bad ? "failed" : "" },
+    H("td", { class: "num", text: TIME_FMT.format(when), title: when.toISOString() }),
+    H("td", { text: r.key }),
+    H("td", { text: r.provider }),
+    H("td", { text: r.model }),
+    H("td", null, H("span", { class: "status " + (bad ? "bad" : "good"), text: bad ? r.status + " error" : "ok" })),
+    H("td", { class: "num", text: Number(r.tokens).toLocaleString() }),
+    H("td", { class: "num", text: bad ? "-" : r.priced ? "$" + Number(r.usd).toFixed(6) : "unpriced" }),
+    H("td", { class: "detail", text: r.error, title: r.error }));
+}
+
+function logMoreRow(offset) {
+  return H("tr", { class: "more" },
+    H("td", { colspan: "8" },
+      H("button", { class: "btn small", type: "button", text: "Load older", onclick: () => loadOlderLog(offset) })));
+}
+
+function paintLogTotals() {
+  $("usage-totals").textContent = LOG_SHOWN ? "Showing " + LOG_SHOWN + " · " + LOG_FAILED + " failed" : "";
+}
+
 function paintLog(log) {
   const body = $("usage-rows");
   body.textContent = "";
-  const failed = log.rows.filter((r) => r.status >= 400).length;
-  $("usage-totals").textContent = log.rows.length
-    ? "Showing " + log.rows.length + (log.rows.length >= log.limit ? " (newest " + log.limit + ")" : "") +
-      " · " + failed + " failed"
-    : "";
+  LOG_SHOWN = log.rows.length;
+  LOG_FAILED = log.rows.filter((r) => r.status >= 400).length;
+  paintLogTotals();
   if (!log.rows.length) {
     body.append(stateRow(8, LOGQ.error || LOGQ.model || LOGQ.provider
       ? "No requests match these filters. Clear them to see the whole range."
       : "No requests yet. Traffic through the proxy lands here.", "empty"));
     return;
   }
-  for (const r of log.rows) {
-    const when = new Date(r.at * 1000);
-    const bad = r.status >= 400;
-    body.append(H("tr", { class: bad ? "failed" : "" },
-      H("td", { class: "num", text: TIME_FMT.format(when), title: when.toISOString() }),
-      H("td", { text: r.key }),
-      H("td", { text: r.provider }),
-      H("td", { text: r.model }),
-      H("td", null, H("span", { class: "status " + (bad ? "bad" : "good"), text: bad ? r.status + " error" : "ok" })),
-      H("td", { class: "num", text: Number(r.tokens).toLocaleString() }),
-      H("td", { class: "num", text: bad ? "-" : r.priced ? "$" + Number(r.usd).toFixed(6) : "unpriced" }),
-      H("td", { class: "detail", text: r.error, title: r.error })));
+  for (const r of log.rows) body.append(logRow(r));
+  if (log.next) body.append(logMoreRow(log.next));
+}
+
+/** Appends the page after the last one shown, under the same filter. */
+async function loadOlderLog(offset) {
+  const seq = USAGE_SEQ;
+  const q = logQuery();
+  q.set("offset", String(offset));
+  let log;
+  try {
+    log = await api("/ui/api/log?" + q);
+  } catch (err) {
+    if (seq !== USAGE_SEQ) return;
+    $("usage-error").textContent = err.message;
+    $("usage-error").hidden = false;
+    return;
   }
+  if (seq !== USAGE_SEQ || !$("usage-rows")) return;
+  if (log.error) {
+    $("usage-error").textContent = log.error;
+    $("usage-error").hidden = false;
+    return;
+  }
+  const body = $("usage-rows");
+  body.querySelector("tr.more")?.remove();
+  for (const r of log.rows) body.append(logRow(r));
+  if (log.next) body.append(logMoreRow(log.next));
+  LOG_SHOWN += log.rows.length;
+  LOG_FAILED += log.rows.filter((r) => r.status >= 400).length;
+  paintLogTotals();
 }
 
 /* Pure-div bars, max-normalized; heights carry the data, title carries detail. */

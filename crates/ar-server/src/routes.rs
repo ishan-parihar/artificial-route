@@ -5730,6 +5730,7 @@ mod tests {
             provider: None,
             errors_only: true,
             limit: 10,
+            offset: 0,
         };
         let rows = ledger
             .lock()

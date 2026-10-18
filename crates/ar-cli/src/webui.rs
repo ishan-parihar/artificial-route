@@ -467,6 +467,8 @@ struct LogQuery {
     provider: Option<String>,
     /// `error` shows failed requests only; anything else shows all.
     status: Option<String>,
+    /// Rows to skip from the newest end: the page after the last one shown.
+    offset: Option<usize>,
 }
 
 /// Most log rows one response carries; the page shows a window, not a dump.
@@ -481,12 +483,14 @@ async fn request_log(State(ctx): State<Arc<Ctx>>, Query(q): Query<LogQuery>) -> 
     // Empty strings are the filter bar's "any": treat them as absent.
     let pick = |v: &Option<String>| v.as_deref().filter(|s| !s.is_empty()).map(str::to_owned);
     let (model, provider) = (pick(&q.model), pick(&q.provider));
+    let offset = q.offset.unwrap_or(0);
     let filter = ar_tokens::LogFilter {
         days: q.days.unwrap_or(30).clamp(1, 365),
         model: model.as_deref(),
         provider: provider.as_deref(),
         errors_only: q.status.as_deref() == Some("error"),
         limit: LOG_LIMIT,
+        offset,
     };
     let guard = ledger
         .lock()
@@ -495,6 +499,8 @@ async fn request_log(State(ctx): State<Arc<Ctx>>, Query(q): Query<LogQuery>) -> 
         Ok(rows) => Json(json!({
             "open": true,
             "limit": LOG_LIMIT,
+            // A short page is the last one; a full page may have older rows behind it.
+            "next": (rows.len() == LOG_LIMIT).then_some(offset + LOG_LIMIT),
             "rows": rows.iter().map(|r| json!({
                 "at": r.created_at, "key": r.key_id, "provider": r.provider, "model": r.model,
                 "tokens": r.tokens, "usd": r.cost_usd.micros as f64 / 1_000_000.0,

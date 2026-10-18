@@ -389,7 +389,7 @@ WHERE created_at >= ?1
   AND (?2 IS NULL OR model = ?2)
   AND (?3 IS NULL OR provider = ?3)
   AND (?4 = 0 OR status >= 400)
-ORDER BY created_at DESC LIMIT ?5
+ORDER BY created_at DESC LIMIT ?5 OFFSET ?6
 ";
 
 /// What the /ui request log asks for.
@@ -405,6 +405,10 @@ pub struct LogFilter<'a> {
     pub errors_only: bool,
     /// Most rows returned, newest first.
     pub limit: usize,
+    /// Rows skipped from the newest end, for paging back through the window.
+    /// Ties on `created_at` may repeat or skip a row across pages: the union
+    /// has no shared key to order them by.
+    pub offset: usize,
 }
 
 /// One line of the request log: an answered request or a failed one.
@@ -769,6 +773,7 @@ impl Ledger {
             filter.provider,
             i64::from(filter.errors_only),
             i64::try_from(filter.limit).unwrap_or(i64::MAX),
+            i64::try_from(filter.offset).unwrap_or(i64::MAX),
         ])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
@@ -1003,6 +1008,7 @@ mod tests {
             provider: None,
             errors_only: false,
             limit: 50,
+            offset: 0,
         }
     }
 
@@ -1063,6 +1069,34 @@ mod tests {
             .record_failure("k1", "jev", 502, "down", 1_700_000_100)
             .expect("failure");
         assert_eq!(ledger.report(10).expect("report").rows.len(), 0);
+    }
+
+    #[test]
+    fn log_should_page_back_through_the_window_when_offset_is_set() {
+        let ledger = Ledger::open_in_memory().expect("open");
+        for t in 0..5 {
+            ledger
+                .record_failure("k1", "jev", 502, "down", 1_700_000_100 + t)
+                .expect("failure");
+        }
+        let page = |offset| {
+            ledger
+                .log(&LogFilter {
+                    days: 30,
+                    model: None,
+                    provider: None,
+                    errors_only: true,
+                    limit: 2,
+                    offset,
+                })
+                .expect("log")
+                .iter()
+                .map(|r| r.created_at)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(page(0), vec![1_700_000_104, 1_700_000_103]);
+        assert_eq!(page(4), vec![1_700_000_100]);
+        assert!(page(6).is_empty());
     }
 
     #[test]

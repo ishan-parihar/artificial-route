@@ -55,7 +55,7 @@ on-demand rows (D4–D8, E2–E8), which the outline says not to start on specul
 |---|---|---|---|---|
 | C1 | Failures are only logged for the four chat dialects | code | fixed | The JSON media routes (`embeddings`, `images/generations`, `ocr`) and the two audio routes now write their failures to the failure log through the same `note_failure` the chat path uses. Audio rows carry the `?model=` they asked for. Test: `a_failed_media_request_lands_in_the_failure_log_with_the_model_asked_for`. |
 | C2 | A stream that fails after it started is not a failure row | decide | open | Unchanged. The response is already `200`. |
-| C3 | The log shows the newest 200 rows with no paging | code | open (conditional) | `LOG_LIMIT = 200` (`webui.rs`), no `before` parameter. Conditional, as C1. |
+| C3 | The log shows the newest 200 rows with no paging | code | fixed | `/ui/api/log` takes `offset` and returns `next` when a full page came back. The page's "Load older" row appends the next page under the same filter. Ceiling: rows that share a `created_at` second may repeat or skip across pages, because the union has no shared key. Test: `log_should_page_back_through_the_window_when_offset_is_set`. Not checked in a browser. |
 | C4 | Failure rows carry no provider | decide | open | `ledger.rs` writes `'-'` for provider on failure rows. Unchanged. |
 | C5 | `Limit.model` scopes *when* a row applies, not *what it counts* | decide | open | Unchanged. docs/23 G3 records the choice. The `--model` help text now says so. |
 | C6 | Trust model of `/ui` | probe | fixed (other + this pass) | `aroute serve` passes `public: false` (`serve.rs`), so `/ui` is loopback-only. The open question moved to G2. |
@@ -91,10 +91,10 @@ on-demand rows (D4–D8, E2–E8), which the outline says not to start on specul
 | Seam | Where | State | Note |
 |---|---|---|---|
 | `#p1-admission` | `crates/ar-server/src/keys.rs:28` | open | Lane control is not wired. |
-| `#p1-cancel` | `crates/ar-server/src/exec.rs:855` | open | Per-request cancellation token. |
+| `#p1-cancel` | `crates/ar-server/src/exec.rs:855` | closed | The upstream wait is cancelled by dropping its future, which drops the `reqwest` request. `tests/disconnect.rs` pins that for the plain and streamed shapes. The per-attempt `CancellationToken` is not threaded from the router, because `ar_route::ArExec::post_chat` has no cancel channel; that is intended. |
 | `#p1-config-public` | `crates/ar-server/src/config.rs` | text corrected (`6a50d7f`) | The TODO no longer refers to `ar serve --public`. It now says it is blocked on the G2 ruling. |
 | `#p1-tools` | `crates/ar-translate/src/canonical.rs:218,232` | open | Canonical tool-call type. Overlaps D6. |
-| `#p0-align` | `crates/ar-exec/src/lib.rs:865`, `crates/ar-translate/src/translate.rs:351` | open | `auth_header` / `auth_prefix` on `ProviderDef`. |
+| `#p0-align` | `crates/ar-exec/src/lib.rs:889`, `crates/ar-translate/src/translate.rs:351` | latent | `ProviderDef` has no `auth_header` / `auth_prefix`. Gemini is covered by its wire (`x-goog-api-key`). `azure-ai` and `clarifai`, the two named cases, are not in this build's catalog (checked 2026-10-18), so no shipped provider needs it today. A custom provider spells its header out in its file. Add the fields when a catalog provider needs them. |
 | `#P0-translate`, `#P0-route` | `crates/ar-core/src/traits.rs` | closed | The unused `ar-core` seam traits (all `todo!()`) were deleted. The live seams are `ArExec` and `ArTranslate` in `crates/ar-route/src/contract.rs`. |
 | `#F-MED-2-device` | `crates/ar-keys/src/store.rs:423` | open | `poll_state` column is absent. |
 
