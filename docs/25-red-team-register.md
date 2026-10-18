@@ -95,7 +95,7 @@ Run against the working tree, not yet committed or deployed.
 
 - `cargo fmt --all -- --check`: clean, after one `cargo fmt --all` for this pass's edits.
 - `cargo clippy --all-targets --all-features --locked -- -D warnings`: exit 0.
-- `cargo test --workspace --locked --no-fail-fast`: **45 suites, 2057 passed, 0 failed**, exit 0. This is the final run, after the `expect` conversion, the seam removal, and the CSS changes. Before the `expect` conversion it was 2054.
+- `cargo test --workspace --locked --no-fail-fast`: **45 suites, 2059 passed, 0 failed**, exit 0. This is the final run, after the shutdown-drain fix. Before the drain fix it was 2057, and before the `expect` conversion 2054.
 - K4 and K5 mutation and discrimination checks: the K4 e2e test fails with `storable_reply` forced to `true` and passes with the real function. The K5 reload path has unit tests for both the refusal and the accept case.
 - `cargo audit`: exit 0, no advisories reported against the 360 locked dependencies.
 - `#![deny(missing_docs)]`: every library crate has it. `ar-limit` was the one missing.
@@ -109,6 +109,8 @@ Run against the working tree, not yet committed or deployed.
 - **R5, half-open.** The helper has unit tests. The attempt-loop call that uses it has none.
 - **R1 / R4.** The in-band dialects are tested end to end (a `stream_error` frame, no `[DONE]`). The raw path (Ollama) has only the `abort_on_cut` unit test.
 - **K5.** The startup refusal was checked by running `serve`. It has no test. `Config::empty_api_keys` has unit tests. The reload refusal has unit tests.
+- **Shutdown drain (found by a live restart).** `axum::serve` with graceful shutdown waits for every connection, with no upper bound, so the old 10 s window only delayed the drain. A live stream held the process open, and systemd escalated to SIGKILL after `TimeoutStopSec` (20 s). Fixed: `serve_until_drained` races the graceful future against a deadline that starts at the signal. Tests `serve_until_drained_should_return_within_the_window_when_a_request_hangs` and `serve_until_drained_should_return_at_once_when_idle`. Mutation: with the deadline arm removed, the hang test fails at its 5 s timeout.
+- **Audit directory on `/tmp` (open).** The live `aroute.service` sets `AR_OBS_DIR=/tmp/ar-obs`. The audit ledger does not survive a reboot. Point it at a persistent directory; that edit changes the live unit and needs the user's go-ahead.
 - **Silent fallback on a bad table.** `global()` on a malformed table serves an empty one and logs it. That is reachable only in a binary that skipped `serve`'s boot check, such as a library caller or a test. It is not a silent path in a shipped `aroute serve`.
 - **Dead seam traits.** `crates/ar-core/src/traits.rs` (`ArTranslate`, `ArExec`, `ArRoute`, all `todo!()`) had no users. The live seams are in `ar-route`, so the file was deleted. Its `#P0-translate` and `#P0-route` rows in `docs/24` are closed.
 - **K4.** The e2e test was checked for discrimination: with `storable_reply` forced to `true` it fails (`left: "hit"`), and with the real function it passes.

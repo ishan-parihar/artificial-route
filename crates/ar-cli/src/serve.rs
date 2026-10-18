@@ -227,8 +227,7 @@ pub async fn serve(cli: &Cli, args: &ServeArgs) -> anyhow::Result<()> {
     // a routable bind, so nothing outside this machine reaches `/ui`.
     let router = webui::mount(server.router, ui_ctx);
 
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
+    serve_until_drained(listener, router, shutdown_signal(), DRAIN_WINDOW)
         .await
         .map_err(|e| commands::fail(e, "the listener stopped unexpectedly"))?;
 
@@ -240,25 +239,56 @@ pub async fn serve(cli: &Cli, args: &ServeArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// How long a signal-initiated shutdown waits for in-flight responses before
-/// the listener is allowed to drop the connections they ride on.
+/// How long a signal-initiated shutdown gives in-flight responses to finish
+/// before the process drops the connections they ride on and exits.
 ///
-/// The proxy's own request timeout is the only other deadline in the stack, and
-/// it deliberately bounds the *request* rather than the response body
-/// (`ar-server`'s `TimeoutLayer`), so a streamed generation can hold a
-/// connection open for its whole run. A drain with no bound therefore never
-/// ends under load: the update flow stops this unit, finds the process still
-/// alive after `TimeoutStopSec`, and escalates to SIGKILL — a `stop-sigterm'
-/// timed out` line and an unclean exit every time.
+/// The window runs from the signal. It must stay under the unit's
+/// `TimeoutStopSec` (20 s in `aroute.service`), or systemd escalates to SIGKILL.
+/// The proxy's request timeout bounds the request, not the response body
+/// (`ar-server`'s `TimeoutLayer`), so a streamed generation can outlive any
+/// window: an unbounded drain would never end under load.
 const DRAIN_WINDOW: Duration = Duration::from_secs(10);
 
-/// Resolves on SIGINT/SIGTERM so a Ctrl-C drains rather than cutting a streamed
-/// answer in half.
+/// Serves `router` on `listener` until `stop` resolves, then waits at most
+/// `drain` for in-flight connections before returning.
 ///
-/// The signal only *starts* the drain; it does not wait for every connection to
-/// close, because a live stream can outlive any sane stop deadline. When the
-/// window expires this future resolves anyway and `axum::serve` returns, which
-/// is what lets the process exit cleanly instead of being killed.
+/// `axum::serve`'s own graceful shutdown waits for every connection to close,
+/// with no upper bound, so it cannot be the only exit. This races it against a
+/// deadline that starts when `stop` resolves. Past the deadline the listener and
+/// any connections still open are dropped, and the process can exit.
+async fn serve_until_drained(
+    listener: tokio::net::TcpListener,
+    router: axum::Router,
+    stop: impl std::future::Future<Output = ()> + Send + 'static,
+    drain: Duration,
+) -> std::io::Result<()> {
+    use std::future::IntoFuture;
+
+    let (stopping_tx, stopping_rx) = tokio::sync::oneshot::channel::<()>();
+    let graceful = axum::serve(listener, router).with_graceful_shutdown(async move {
+        stop.await;
+        // The receiver is only dropped once `serve_until_drained` has returned,
+        // so a failed send means nobody is waiting on the deadline any more.
+        let _ = stopping_tx.send(());
+    });
+    let deadline = async {
+        if stopping_rx.await.is_ok() {
+            tokio::time::sleep(drain).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::select! {
+        result = graceful.into_future() => result,
+        () = deadline => {
+            eprintln!("drain window of {}s elapsed with connections still open; dropping them", drain.as_secs());
+            Ok(())
+        }
+    }
+}
+
+/// Resolves on SIGINT/SIGTERM so a stop drains rather than cutting a streamed
+/// answer in half. The drain bound lives in [`serve_until_drained`].
 async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -275,13 +305,9 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 
-    // A signal arms the drain; the window bounds it. Racing them means a
-    // stop under load still completes: `axum::serve` returns once this future
-    // resolves, and whether the in-flight streams finished is the drain's
-    // business, not the process's.
     tokio::select! {
-        () = ctrl_c => { tokio::time::sleep(DRAIN_WINDOW).await }
-        () = terminate => { tokio::time::sleep(DRAIN_WINDOW).await }
+        () = ctrl_c => {}
+        () = terminate => {}
     }
 }
 
@@ -434,5 +460,85 @@ mod tests {
             vec!["gpt-5.4"],
             "a model with no catalog row stays unpriced: {candidates:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use std::time::{Duration, Instant};
+
+    use axum::Router;
+    use axum::routing::get;
+
+    use super::serve_until_drained;
+
+    /// A handler that never answers, so its request is in flight for the test.
+    async fn hang() -> &'static str {
+        std::future::pending::<&'static str>().await
+    }
+
+    #[tokio::test]
+    async fn serve_until_drained_should_return_within_the_window_when_a_request_hangs() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds");
+        let addr = listener.local_addr().expect("address");
+        let router = Router::new().route("/hang", get(hang));
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve_until_drained(
+            listener,
+            router,
+            async move {
+                let _ = stop_rx.await;
+            },
+            Duration::from_millis(200),
+        ));
+
+        // Keep one request in flight, then ask the server to stop.
+        let mut stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connects");
+        tokio::io::AsyncWriteExt::write_all(&mut stream, b"GET /hang HTTP/1.1\r\nHost: t\r\n\r\n")
+            .await
+            .expect("writes");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let started = Instant::now();
+        stop_tx.send(()).expect("server is listening");
+
+        let result = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("the drain must end; an unbounded drain would hang here")
+            .expect("server task joins");
+        assert!(result.is_ok(), "drain returned an error: {result:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "drain took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_until_drained_should_return_at_once_when_idle() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds");
+        let router = Router::new().route("/hang", get(hang));
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve_until_drained(
+            listener,
+            router,
+            async move {
+                let _ = stop_rx.await;
+            },
+            Duration::from_secs(10),
+        ));
+        stop_tx.send(()).expect("server is listening");
+        let started = Instant::now();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("an idle server stops without waiting for the window")
+            .expect("server task joins")
+            .expect("serves cleanly");
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 }
