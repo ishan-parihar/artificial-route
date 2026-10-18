@@ -38,6 +38,14 @@
 //! write in everything but the syscall. The scope stays as `docs/06` names it
 //! (`execute:completions`); the bit values are host-visible and unchanged.
 
+#![cfg_attr(
+    all(not(feature = "mcp"), not(test)),
+    expect(
+        dead_code,
+        reason = "the bodies are reached only through the `mcp` transport; the default build has no caller"
+    )
+)]
+
 use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 
