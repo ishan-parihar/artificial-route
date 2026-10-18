@@ -113,6 +113,10 @@ pub enum OutboundWire {
     Clova,
     /// Kiro's `conversationState` envelope.
     Kiro,
+    /// AWS Bedrock Converse (`/model/{id}/converse[-stream]`).
+    Bedrock,
+    /// GitLab Duo `code_suggestions` (monolith endpoint).
+    Gitlab,
 }
 
 impl OutboundWire {
@@ -127,6 +131,8 @@ impl OutboundWire {
         Self::Cursor,
         Self::Clova,
         Self::Kiro,
+        Self::Bedrock,
+        Self::Gitlab,
     ];
 
     /// The stable `canonical-to-*` name, as it appears in a report.
@@ -141,6 +147,8 @@ impl OutboundWire {
             Self::Cursor => "cursor",
             Self::Clova => "clova",
             Self::Kiro => "kiro",
+            Self::Bedrock => "bedrock",
+            Self::Gitlab => "gitlab",
         }
     }
 }
@@ -190,6 +198,8 @@ pub fn render_for_wire(chat: &CanonicalChat, wire: OutboundWire) -> Vec<u8> {
         OutboundWire::Cursor => render_cursor_body(chat),
         OutboundWire::Clova => render_clova_body(chat),
         OutboundWire::Kiro => render_kiro_body(chat),
+        OutboundWire::Bedrock => crate::bedrock::render_bedrock_body(chat),
+        OutboundWire::Gitlab => crate::gitlab::render_gitlab_body(chat),
     }
 }
 
@@ -1803,6 +1813,11 @@ mod tests {
             ..chat(vec![turn])
         };
         for wire in OutboundWire::ALL {
+            // `code_suggestions` is text-only. Its media is refused in `ar-exec`
+            // before any rendering, so there are no bytes here to carry.
+            if *wire == OutboundWire::Gitlab {
+                continue;
+            }
             let body = String::from_utf8(render_for_wire(&canonical, *wire)).expect("utf-8");
             assert!(
                 body.contains("QUJD"),

@@ -109,6 +109,8 @@ use crate::sse::{DEFAULT_FRAME_CAP, SseDecoder};
 
 pub use crate::media::{MediaBody, MediaEndpoint, MediaResponse};
 
+mod bedrock;
+mod gitlab;
 mod grok;
 pub mod media;
 /// The OAuth taxonomy, its single terminal-status list, and the
@@ -251,6 +253,16 @@ pub enum ExecError {
     /// The SSE stream could not be decoded.
     #[error(transparent)]
     Sse(#[from] SseError),
+    /// The request carries content this provider's dialect cannot express: tool
+    /// declarations or media parts. Refused rather than sent without them, so a
+    /// client that expects a tool call or an image is not answered as if none
+    /// were wanted.
+    #[error("provider wire format {0:?} cannot carry {1}")]
+    UnsupportedContent(WireFormat, &'static str),
+    /// A Bedrock event-stream frame was malformed: a bad length, a checksum that
+    /// does not match, or a header block that overruns its frame.
+    #[error("bedrock event stream: {0}")]
+    EventStream(String),
     /// The canonical request could not be encoded.
     #[error("cannot encode canonical request: {0}")]
     Encode(#[from] serde_json::Error),
@@ -414,14 +426,17 @@ impl ArExec {
         body: Bytes,
         abort: &CancellationToken,
     ) -> Result<ChatStream, ExecError> {
+        // Bedrock's path depends on whether the reply streams (`converse` vs
+        // `converse-stream`), which `dispatch_url` does not see, so it is chosen here.
+        let url = match (d.wire_format, d.endpoint) {
+            (WireFormat::Bedrock, None) => {
+                bedrock::converse_url(d.base_url, d.upstream_model, d.stream)
+            }
+            _ => crate::url::dispatch_url(d.wire_format, d.base_url, d.upstream_model, d.endpoint),
+        };
         let start = await_start(
             self.client
-                .post(crate::url::dispatch_url(
-                    d.wire_format,
-                    d.base_url,
-                    d.upstream_model,
-                    d.endpoint,
-                ))
+                .post(url)
                 .headers(build_headers(d.wire_format, d.api_key, d.stream, d.headers))
                 .body(body),
             abort,
@@ -473,6 +488,17 @@ impl ArExec {
             return Err(ExecError::NotAnObject);
         }
         let mut chat: CanonicalChat = serde_json::from_value(value)?;
+        if wire == OutboundWire::Gitlab {
+            if !chat.tools.is_empty() {
+                return Err(ExecError::UnsupportedContent(
+                    d.wire_format,
+                    "tool declarations",
+                ));
+            }
+            if chat.messages.iter().any(|m| !m.media.is_empty()) {
+                return Err(ExecError::UnsupportedContent(d.wire_format, "media parts"));
+            }
+        }
         if !d.upstream_model.is_empty() {
             chat.model = d.upstream_model.to_owned();
         }
@@ -553,6 +579,8 @@ pub const fn outbound_wire(format: WireFormat) -> Option<OutboundWire> {
         WireFormat::Cursor => Some(OutboundWire::Cursor),
         WireFormat::Clova => Some(OutboundWire::Clova),
         WireFormat::Kiro => Some(OutboundWire::Kiro),
+        WireFormat::Bedrock => Some(OutboundWire::Bedrock),
+        WireFormat::Gitlab => Some(OutboundWire::Gitlab),
         WireFormat::Custom => None,
     }
 }
@@ -809,6 +837,27 @@ impl ChatStream {
         }
     }
 
+    /// Relays a Bedrock event stream as OpenAI chat SSE, ending with `[DONE]`.
+    ///
+    /// The Bedrock counterpart of [`Self::into_bytes`]: its frames are binary, so
+    /// the raw relay cannot serve them. `model` is the name the client asked for,
+    /// echoed in every chunk.
+    pub fn into_bedrock_sse(
+        self,
+        model: &str,
+    ) -> impl Stream<Item = Result<Bytes, ExecError>> + Send + use<> {
+        bedrock::relay(self.into_bytes(), model.to_owned())
+    }
+
+    /// Synthesizes an OpenAI chat SSE stream from a whole GitLab `code_suggestions`
+    /// reply. The reply is read in full first; see the `gitlab` module.
+    pub fn into_gitlab_sse(
+        self,
+        model: &str,
+    ) -> impl Stream<Item = Result<Bytes, ExecError>> + Send + use<> {
+        gitlab::relay(self.into_bytes(), model.to_owned())
+    }
+
     /// Decodes the body as an SSE stream of payloads.
     ///
     /// Returns `impl Stream`, not a boxed one: the generator type is unnamed but
@@ -901,17 +950,20 @@ fn build_headers(
     stream: bool,
     extra: &BTreeMap<String, String>,
 ) -> reqwest::header::HeaderMap {
-    headers_for_class(
-        auth_class(wire),
-        api_key,
-        "application/json",
-        if stream {
-            "text/event-stream"
-        } else {
-            "application/json"
-        },
-        extra,
-    )
+    // Bedrock's stream is AWS's binary event stream, not SSE, and it is named as
+    // such in `Accept`; every other streamed wire asks for SSE.
+    let accept = match (wire, stream) {
+        (crate::WireFormat::Bedrock, true) => "application/vnd.amazon.eventstream",
+        (_, true) => "text/event-stream",
+        (_, false) => "application/json",
+    };
+    // The GitLab monolith answers whole JSON even when the client streams.
+    let accept = if wire == crate::WireFormat::Gitlab {
+        "application/json"
+    } else {
+        accept
+    };
+    headers_for_class(auth_class(wire), api_key, "application/json", accept, extra)
 }
 
 /// The credential header this wire accepts.
@@ -934,7 +986,9 @@ const fn auth_class(wire: crate::WireFormat) -> AuthClass {
         | crate::WireFormat::Cursor
         | crate::WireFormat::Clova
         | crate::WireFormat::Custom
-        | crate::WireFormat::Kiro => AuthClass::ApiKey,
+        | crate::WireFormat::Kiro
+        | crate::WireFormat::Bedrock
+        | crate::WireFormat::Gitlab => AuthClass::ApiKey,
     }
 }
 
@@ -1298,6 +1352,8 @@ mod tests {
             (WireFormat::Cursor, OutboundWire::Cursor),
             (WireFormat::Clova, OutboundWire::Clova),
             (WireFormat::Kiro, OutboundWire::Kiro),
+            (WireFormat::Bedrock, OutboundWire::Bedrock),
+            (WireFormat::Gitlab, OutboundWire::Gitlab),
         ];
         for (format, wire) in pairs {
             assert_eq!(

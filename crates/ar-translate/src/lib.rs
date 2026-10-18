@@ -128,8 +128,10 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 mod anthropic;
+mod bedrock;
 mod canonical;
 mod gemini;
+mod gitlab;
 mod media;
 mod ollama;
 mod openai;
@@ -141,6 +143,7 @@ mod translate;
 pub use anthropic::{
     AnthropicBlock, AnthropicBlockContent, AnthropicContent, AnthropicMessages, AnthropicSystem,
 };
+pub use bedrock::{BedrockStream, bedrock_response_to_openai, render_bedrock_body};
 pub use canonical::{
     CanonicalChat, CanonicalResponse, CanonicalTool, FinishReason, MediaPart, Msg, Role, ToolCall,
     ToolChoice, Usage, render_openai_body,
@@ -149,6 +152,7 @@ pub use gemini::{
     GeminiBlob, GeminiChat, GeminiContent, GeminiFunctionCall, GeminiFunctionResponse,
     GeminiGenerationConfig, GeminiPart,
 };
+pub use gitlab::{completion_chunks, gitlab_response_to_openai, render_gitlab_body};
 pub use media::{
     EMBEDDING_REGISTRY, EmbeddingFamily, EmbeddingInput, EmbeddingRequest, EmbeddingUpstream,
     EmbeddingUsage, EmbeddingVector, MediaError, Modality, create_embedding_response, family_guard,

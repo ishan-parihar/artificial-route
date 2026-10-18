@@ -97,6 +97,10 @@ pub enum Pair {
     CanonicalToClova,
     /// canonical chat -> Kiro `conversationState` request body.
     CanonicalToKiro,
+    /// canonical chat -> AWS Bedrock Converse request body.
+    CanonicalToBedrock,
+    /// canonical chat -> GitLab Duo `code_suggestions` request body.
+    CanonicalToGitlab,
     /// canonical response -> Anthropic Messages response object.
     CanonicalToClaudeResponse,
     /// canonical response -> OpenAI Responses response object.
@@ -120,6 +124,8 @@ impl Pair {
         Self::CanonicalToCursor,
         Self::CanonicalToClova,
         Self::CanonicalToKiro,
+        Self::CanonicalToBedrock,
+        Self::CanonicalToGitlab,
         Self::CanonicalToClaudeResponse,
         Self::CanonicalToResponsesResponse,
     ];
@@ -141,6 +147,8 @@ impl Pair {
             Self::CanonicalToCursor => "canonical-to-cursor",
             Self::CanonicalToClova => "canonical-to-clova",
             Self::CanonicalToKiro => "canonical-to-kiro",
+            Self::CanonicalToBedrock => "canonical-to-bedrock",
+            Self::CanonicalToGitlab => "canonical-to-gitlab",
             Self::CanonicalToClaudeResponse => "canonical-to-claude-response",
             Self::CanonicalToResponsesResponse => "canonical-to-responses-response",
         }

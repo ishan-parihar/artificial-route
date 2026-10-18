@@ -681,14 +681,21 @@ async fn unwrap_response(
         stream: Box::pin(futures::stream::once(async move { body })),
         cut: Default::default(),
     };
-    // A Gemini reply is Google's own envelope, which neither the router nor an
-    // OpenAI client can read as a completion (docs/22, D6). A text reply is
-    // rendered as the OpenAI completion it answers; anything else relays as it
-    // arrived. Streams never reach this helper.
-    if cfg.wire_format == WireFormat::Gemini {
+    // A Gemini, Bedrock or GitLab reply is the provider's own envelope, which
+    // neither the router nor an OpenAI client can read as a completion (docs/22,
+    // D6). A text reply is rendered as the OpenAI completion it answers; anything
+    // else relays as it arrived. Streams never reach this helper.
+    if matches!(
+        cfg.wire_format,
+        WireFormat::Gemini | WireFormat::Bedrock | WireFormat::Gitlab
+    ) {
         let rendered = serde_json::from_slice::<serde_json::Value>(&body)
             .ok()
-            .and_then(|value| ar_translate::gemini_response_to_openai(&value, model))
+            .and_then(|value| match cfg.wire_format {
+                WireFormat::Bedrock => ar_translate::bedrock_response_to_openai(&value, model),
+                WireFormat::Gitlab => ar_translate::gitlab_response_to_openai(&value, model),
+                _ => ar_translate::gemini_response_to_openai(&value, model),
+            })
             .and_then(|value| serde_json::to_vec(&value).ok());
         return match rendered {
             Some(bytes) => single(Bytes::from(bytes)),
@@ -970,7 +977,16 @@ impl ArRouteExec for HttpExec {
                 // finished reply, so it is recorded in `cut` for the relay.
                 let cut = ar_route::CutFlag::default();
                 let flag = cut.clone();
-                let chunks = stream.into_bytes().filter_map(move |chunk| {
+                // Bedrock's frames are binary and GitLab answers a whole document, so
+                // both are re-spelled as OpenAI SSE here; every other wire relays its
+                // bytes untouched.
+                let model = canonical.model.as_ref();
+                let source: futures::stream::BoxStream<'static, _> = match cfg.wire_format {
+                    WireFormat::Bedrock => stream.into_bedrock_sse(model).boxed(),
+                    WireFormat::Gitlab => stream.into_gitlab_sse(model).boxed(),
+                    _ => stream.into_bytes().boxed(),
+                };
+                let chunks = source.filter_map(move |chunk| {
                     futures::future::ready(match chunk {
                         Ok(bytes) => Some(bytes),
                         Err(e) => {

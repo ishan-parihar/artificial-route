@@ -42,7 +42,15 @@ use ar_core::Strng;
 use ar_registry::free::{FreeBudgetRow, FreeBudgets, FreeRegime};
 use ar_registry::lifecycle::ModelLifecycle;
 use ar_registry::meta::ProviderMeta;
-use ar_registry::{AuthClass, Price, ProviderDef, wire_format};
+use ar_registry::{AuthClass, Price, ProviderDef, WireFormat, wire_format};
+
+/// The runtime endpoint a `bedrock` entry dispatches to when the operator names no
+/// region. Matches the reference's `BEDROCK_DEFAULT_REGION`, `us-east-1`.
+const BEDROCK_RUNTIME_DEFAULT: &str = "https://bedrock-runtime.us-east-1.amazonaws.com";
+/// The instance a `gitlab` entry reaches when the operator names none.
+const GITLAB_DEFAULT: &str = "https://gitlab.com";
+/// GitLab's monolith completions path, relative to the instance.
+const GITLAB_MONOLITH_ENDPOINT: &str = "/api/v4/code_suggestions/completions";
 
 use crate::commands::fail;
 use crate::import::{Imported, render_yaml};
@@ -901,15 +909,41 @@ fn to_def(entry: &Entry, consts: &Consts, root: &Tree) -> Option<ProviderDef> {
         }
     }
 
+    let executor = executor.unwrap_or_else(|| "default".to_owned());
+    // Two executors speak a dialect their `format` does not name, and their URLs
+    // cannot be read from the catalog. `bedrock` is per region, so the default
+    // runtime endpoint stands in. `gitlab` is per instance, so gitlab.com stands
+    // in. Its OAuth flow is not ported, so it takes a pasted token: `apikey`.
+    let (wire, base_url, endpoint, auth) = match executor.as_str() {
+        "bedrock" => (
+            WireFormat::Bedrock,
+            base_url.or_else(|| Some(BEDROCK_RUNTIME_DEFAULT.to_owned())),
+            None,
+            auth,
+        ),
+        "gitlab" => (
+            WireFormat::Gitlab,
+            base_url.or_else(|| Some(GITLAB_DEFAULT.to_owned())),
+            Some(GITLAB_MONOLITH_ENDPOINT.to_owned()),
+            Some("apikey".to_owned()),
+        ),
+        _ => (
+            wire_format(&format.unwrap_or_else(|| "openai".to_owned())),
+            base_url,
+            None,
+            auth,
+        ),
+    };
+
     Some(ProviderDef {
         base_url: base_url.unwrap_or_default(),
-        endpoint: None,
-        wire_format: wire_format(&format.unwrap_or_else(|| "openai".to_owned())),
+        endpoint: endpoint.map(|e| Strng::from(e.as_str())),
+        wire_format: wire,
         auth: AuthClass::ApiKey,
         env_hint: env_hint(&entry.id),
         models,
         prices: BTreeMap::new(),
-        executor: Strng::from(executor.unwrap_or_else(|| "default".to_owned()).as_str()),
+        executor: Strng::from(executor.as_str()),
         auth_kind: Strng::from(auth.unwrap_or_else(|| "apikey".to_owned()).as_str()),
         flat_rate: false,
         // The gateway's own headers, which an imported node and a custom node
@@ -2076,6 +2110,50 @@ mod tests {
             headers.get("X-KILOCODE-EDITORNAME").map(String::as_str),
             Some("OmniRoute"),
         );
+    }
+
+    #[test]
+    fn bedrock_should_resolve_to_the_converse_wire_on_the_default_region() {
+        let src = r#"
+            export const bedrockProvider: RegistryEntry = buildOpenAiCompatibleRegistryEntry({
+              id: "bedrock",
+              executor: "bedrock",
+              models: [{ id: "anthropic.claude-haiku-4-5", name: "Haiku" }],
+            });
+        "#;
+        let consts = Consts::of(&strip_comments(src));
+        let e = &entries(&strip_comments(src))[0];
+        let def = to_def(e, &consts, &Tree::empty()).unwrap();
+
+        assert_eq!(def.wire_format, WireFormat::Bedrock);
+        assert_eq!(
+            def.base_url,
+            "https://bedrock-runtime.us-east-1.amazonaws.com"
+        );
+        assert_eq!(def.executor.as_ref(), "bedrock");
+    }
+
+    #[test]
+    fn gitlab_should_resolve_to_the_code_suggestions_endpoint_with_a_pasted_token() {
+        let src = r#"
+            export const gitlabDuoProvider: RegistryEntry = buildOpenAiCompatibleRegistryEntry({
+              id: "gitlab-duo",
+              executor: "gitlab",
+              authType: "oauth",
+              models: [{ id: "claude-haiku-4-5", name: "Haiku" }],
+            });
+        "#;
+        let consts = Consts::of(&strip_comments(src));
+        let e = &entries(&strip_comments(src))[0];
+        let def = to_def(e, &consts, &Tree::empty()).unwrap();
+
+        assert_eq!(def.wire_format, WireFormat::Gitlab);
+        assert_eq!(def.base_url, "https://gitlab.com");
+        assert_eq!(
+            def.endpoint.as_deref(),
+            Some("/api/v4/code_suggestions/completions")
+        );
+        assert_eq!(def.auth_kind.as_ref(), "apikey");
     }
 
     #[test]

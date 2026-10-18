@@ -71,11 +71,11 @@ under [Known gaps](#known-gaps).
 Stated plainly, because the alternative is a reader discovering them. The full
 explanation is [AUDIT-REPORT.md](AUDIT-REPORT.md).
 
-- **2 of 276 providers cannot route.** `bedrock` resolves its endpoint per AWS
-  region at request time behind SigV4, and `gitlab-duo` builds its URL at
-  runtime from environment variables through a function call. Both are named on
-  stderr by the importer rather than given an invented base URL. The other 274
-  carry a usable one.
+- **`bedrock` and `gitlab-duo` route, but are not verified live.** `bedrock` uses a
+  Bedrock API key and the runtime endpoint of `base_url` (default `us-east-1`; set
+  another region in `config.yaml`). `gitlab-duo` uses a pasted token against the
+  monolith `code_suggestions` endpoint. Neither has been called against its
+  provider. Their gaps are listed in docs/24 E2.
 - **The 12-hour soak is not claimed.** The harness (`scripts/soak.sh`) exists and
   has run four times — longest partial 51 samples, +996 KB, zero failures — but
   no 12-hour run has completed against a released binary. P6's accept line is

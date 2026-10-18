@@ -260,6 +260,10 @@ pub enum WireFormat {
     Custom,
     /// Kiro's dialect.
     Kiro,
+    /// AWS Bedrock's Converse dialect, reached with a Bedrock API key.
+    Bedrock,
+    /// GitLab Duo's `code_suggestions` dialect (the monolith endpoint).
+    Gitlab,
 }
 
 impl WireFormat {
@@ -275,6 +279,8 @@ impl WireFormat {
             Self::Clova => "clova",
             Self::Custom => "custom",
             Self::Kiro => "kiro",
+            Self::Bedrock => "bedrock",
+            Self::Gitlab => "gitlab",
         }
     }
 }
@@ -295,6 +301,8 @@ pub fn wire_format(name: &str) -> WireFormat {
         "cursor" => WireFormat::Cursor,
         "clova" => WireFormat::Clova,
         "kiro" => WireFormat::Kiro,
+        "bedrock" => WireFormat::Bedrock,
+        "gitlab" => WireFormat::Gitlab,
         _ => WireFormat::Custom,
     }
 }
