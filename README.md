@@ -414,7 +414,35 @@ For the initial one-time import, `aroute import --from omniroute --combos <stora
 
 ## Documentation
 
-`docs/` 00–07 are the standing sources of truth (budgets, subsystems, roadmap, AXI/MCP); 11–15 are the port plans with their closeouts — 15 is the policy/security layer; [16](docs/16-dashboard-unity-plan.md) the dashboard plan, [19](docs/19-ui-upgrade-plan.md) and [23](docs/23-ui-round-two-plan.md) the `/ui` plans, [20](docs/20-model-attribution-plan.md) per-model attribution, [21](docs/21-remaining-gaps.md) the open-gaps register and [22](docs/22-stream-and-failover-repair.md) the stream and failover repair. `AGENTS.md` holds the enforced Rust disciplines. Detail lives there; this file stays a funnel.
+Each crate under `crates/` has a README with its purpose, configuration, extension points, limitations, and the client-facing behaviour. The design documents are in `docs/`:
+
+| Page | What it covers |
+|---|---|
+| [00 overview](docs/00-overview.md) | Vision and the parity law |
+| [02 port from OmniRoute](docs/02-port-from-omniroute.md) | What is ported from the reference, and what is dropped |
+| [03 crates and deps](docs/03-crates-and-deps.md) | Crate layout and why each dependency is here |
+| [04 subsystems](docs/04-subsystems.md) | Hardened specs for each subsystem |
+| [05 roadmap](docs/05-roadmap.md) | The P0–P6 gates |
+| [06 AXI and MCP](docs/06-axi-mcp.md) | The CLI contract and the MCP tool catalog |
+| [07 blockers](docs/07-blockers.md) | Remaining blockers and their plan |
+| [07 parity closeout](docs/07-parity-closeout.md) | Parity closeout, waves A to O |
+| [11 web UI port plan](docs/11-web-ui-port-plan.md) | Porting the OmniRoute dashboard |
+| [12 import parity audit](docs/12-import-parity-audit.md) | What `aroute import` covers against OmniRoute |
+| [14 web UI port plan](docs/14-web-ui-port-plan.md) | Dashboard vendoring and rebrand |
+| [15 policy and security layer](docs/15-policy-security-layer.md) | The policy and security plan |
+| [16 dashboard unity plan](docs/16-dashboard-unity-plan.md) | The dashboard plan |
+| [19 UI upgrade plan](docs/19-ui-upgrade-plan.md) | The `/ui` plan |
+| [20 model attribution plan](docs/20-model-attribution-plan.md) | Per-model attribution |
+| [21 remaining gaps](docs/21-remaining-gaps.md) | The open-gaps register |
+| [22 stream and failover repair](docs/22-stream-and-failover-repair.md) | The stream and failover repair |
+| [23 UI round two plan](docs/23-ui-round-two-plan.md) | The second `/ui` plan |
+| [24 remaining gaps outline](docs/24-remaining-gaps-outline.md) | The execution record for the remaining gaps |
+| [25 red-team register](docs/25-red-team-register.md) | Defects found by red-teaming, and their status |
+| [audit notes](docs/audit-notes.md) | Audit notes |
+| [RECORDS](docs/RECORDS.md) | Decisions (AD) and regressions (RG) |
+| [RUNBOOK](docs/RUNBOOK.md) | Exact commands and environment traps |
+
+`AGENTS.md` holds the enforced Rust disciplines.
 
 ## Contributing
 
