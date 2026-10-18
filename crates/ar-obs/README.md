@@ -6,7 +6,7 @@ Observability: Prometheus metrics capped at `provider|family|decision`, a JSON `
 
 ## Configuration
 
-`AR_OBS_DIR` selects the directory for the trace files and the ledger. The live `aroute.service` unit currently sets it to `/tmp/ar-obs`, which is cleared on reboot, so its audit history does not survive one. Point it at a persistent directory before relying on the ledger.
+`AR_OBS_DIR` selects the directory for the trace files and the ledger. The live `aroute.service` unit sets it to `~/.local/state/ar/obs`, a persistent XDG state directory, so the audit history survives a reboot. Point it at a persistent directory before relying on the ledger.
 
 ## Extension points
 
