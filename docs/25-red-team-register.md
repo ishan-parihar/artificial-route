@@ -129,6 +129,7 @@ GitHub Actions cannot run here, so no workflow has run for the changes in this r
 - **C2, default verification.** Decided: opt-in. Releases published before attestations existed have none to check, so a default check would break installs of old tags. Make it the default once a release with an attestation is published.
 - **Invariant `expect`s (10). Closed.** AGENTS.md forbids `unwrap` and `expect` outside tests, and the previous pass had kept these. The four `ar-registry` `global()` parses no longer panic: each table has a fallible `parse()`, a malformed table is logged and served empty, and `ar_registry::check_embedded()` parses every table and checks the catalog's base URLs. `aroute serve` runs that check before it binds, so a shipped binary refuses to start on a bad table. The six `ar-cli` import serializers return `anyhow::Result`, and their callers in `commands` and `webui` propagate the error. A `webui` render failure returns 500 with nothing written. The `ar-cache` `rss` example returns `Result`. Tests: `check_embedded_should_pass_for_the_shipped_tables`, `embedded_or_empty_should_return_the_default_when_a_table_is_malformed`.
 - **Probe type-scale (2).** The 21 px first-viewport heading at 1440 px is judged, not changed. See U7.
+- **Root README length.** The README was 468 lines against the monorepo band of 70–340. The Benchmarks, Parity, Known gaps and OmniRoute comparison sections moved to `docs/26-benchmarks-parity-gaps.md`, and the README is now 332 lines. `docs-check` reports the README rubric clean.
 
 ### Not done
 
