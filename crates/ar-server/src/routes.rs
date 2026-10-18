@@ -58,8 +58,9 @@ use ar_cache::{Cache, CacheKey, CacheState};
 use ar_compress::Step;
 use ar_route::{
     AttemptOutcome, AutoCandidate, AutoSelector, Candidate, CanonicalRequest, ChainTarget,
-    JudgeOutcome, JudgePanel, JudgeTarget, ProviderId, Resilience, RouteError, Strategy, Strng,
-    attempt_loop, pick, settle_stream, simulate_route, synthesize, virtual_combo,
+    ChunkStream, CutFlag, JudgeOutcome, JudgePanel, JudgeTarget, ProviderId, Resilience,
+    RouteError, Strategy, Strng, attempt_loop, pick, settle_stream, simulate_route, synthesize,
+    virtual_combo,
 };
 use ar_tokens::ResponseMeta;
 use axum::body::Body;
@@ -816,6 +817,10 @@ async fn handle_chat_inner(
         dialect,
         plan.strategy,
         Stages {
+            failures: FailureSink {
+                ledger: state.ledger.clone(),
+                key_id: key_id.clone().unwrap_or_else(|| "anonymous".to_owned()),
+            },
             compression: compression_echo(&compression),
             cache_state,
             cache_key,
@@ -1488,6 +1493,8 @@ async fn fusion_response(
         dialect,
         plan.strategy,
         Stages {
+            // Fusion has no client key in scope, so its cut streams are not logged.
+            failures: FailureSink::none(),
             compression: String::new(),
             cache_state: CacheState::Bypass,
             cache_key: None,
@@ -1569,6 +1576,67 @@ fn fusion_empty_panel(outcome: &ar_route::FusionOutcome) -> Response {
 /// one place: the compression plan resolved, then the cache consulted, then
 /// whatever the cache said about this request. Threading them as four parameters
 /// is what let [`decorate`] reach eight arguments.
+/// Where a stream cut after its headers is written: the usage ledger, and the
+/// client key that asked. With no ledger, nothing is written.
+#[derive(Clone, Default)]
+struct FailureSink {
+    ledger: Option<Arc<std::sync::Mutex<ar_tokens::Ledger>>>,
+    key_id: String,
+}
+
+impl FailureSink {
+    /// A sink that writes nothing.
+    fn none() -> Self {
+        Self::default()
+    }
+}
+
+/// Logs a streamed reply that was cut after its headers, when the body is dropped.
+///
+/// Written on drop, so a clean finish and a client that goes away both write
+/// nothing: only a body the upstream broke is a failed request.
+struct CutRecord {
+    sink: FailureSink,
+    model: String,
+    cut: CutFlag,
+}
+
+impl Drop for CutRecord {
+    fn drop(&mut self) {
+        if !self.cut.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let Some(ledger) = self.sink.ledger.as_ref() else {
+            return;
+        };
+        if let Err(e) = ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record_failure(
+                &self.sink.key_id,
+                &self.model,
+                502,
+                "upstream stream cut after its headers",
+                epoch_now(),
+            )
+        {
+            // A log write must not turn a cut stream into a different failure.
+            tracing::warn!(error = %e, "failure log write failed");
+        }
+    }
+}
+
+/// Keeps `guard` alive for as long as `stream` is read, so it drops with the body.
+fn guarded<G: Send + 'static>(stream: ChunkStream, guard: G) -> ChunkStream {
+    Box::pin(async_stream::stream! {
+        let _guard = guard;
+        let mut stream = stream;
+        while let Some(chunk) = stream.next().await {
+            yield chunk;
+        }
+    })
+}
+
 struct Stages {
     /// The applied `x-ar-compression` value, echoed on the response.
     compression: String,
@@ -1598,6 +1666,9 @@ struct Stages {
     /// point has no clock and no body: the arithmetic happens once, where the
     /// measurement is taken.
     meta: ResponseMeta,
+    /// Where a stream cut after its headers is logged. Empty where no client key
+    /// is in scope, so nothing is written.
+    failures: FailureSink,
 }
 
 /// The cache key for a canonical request: `blake3(tenant | served | body)`.
@@ -2150,6 +2221,7 @@ fn decorate(
         model,
         cache_control,
         meta,
+        failures,
     } = stages;
 
     // Every accounting number the response reports, from one [`ResponseMeta`].
@@ -2225,7 +2297,20 @@ fn decorate(
                     // R5: the breaker verdict is settled when this body ends, cut
                     // or clean, so the stream is wrapped before either relay reads it.
                     let chunks = if stream {
-                        settle_stream(upstream.stream, resilience, provider.as_str(), cut.clone())
+                        let settled = settle_stream(
+                            upstream.stream,
+                            resilience,
+                            provider.as_str(),
+                            cut.clone(),
+                        );
+                        // C2: a cut after the headers is a failed request. The response is
+                        // already 200, so the failure log is the only record it leaves.
+                        let record = CutRecord {
+                            sink: failures,
+                            model: model.to_string(),
+                            cut: cut.clone(),
+                        };
+                        guarded(settled, record)
                     } else {
                         upstream.stream
                     };
@@ -3143,13 +3228,13 @@ mod tests {
 
     use super::DECISION_HEADER;
     use super::{
-        CACHE_HEADER, COMPRESSION_ECHO, CacheControl, DENY_HEADER, Dialect,
-        FALLBACK_ATTEMPTS_HEADER, Keepalive, LATENCY_MS_HEADER, MODEL_HEADER, PROVIDER_HEADER,
-        RESPONSE_COST_HEADER, SAVINGS_TOKENS_HEADER, Stages, TOKENS_IN_HEADER, TOKENS_OUT_HEADER,
-        TOKENS_PER_SECOND_HEADER, USAGE_FRAME_CAP, UsageTee, VERSION_HEADER, accept_forces_stream,
-        build_chain, card_json, completion_seen, declares_stream, decorate, error, error_because,
-        kind_for, model, models_head, not_found, outcome_label, require_json, unknown_model,
-        usage_from_frames,
+        CACHE_HEADER, COMPRESSION_ECHO, CacheControl, CutRecord, DENY_HEADER, Dialect,
+        FALLBACK_ATTEMPTS_HEADER, FailureSink, Keepalive, LATENCY_MS_HEADER, MODEL_HEADER,
+        PROVIDER_HEADER, RESPONSE_COST_HEADER, SAVINGS_TOKENS_HEADER, Stages, TOKENS_IN_HEADER,
+        TOKENS_OUT_HEADER, TOKENS_PER_SECOND_HEADER, USAGE_FRAME_CAP, UsageTee, VERSION_HEADER,
+        accept_forces_stream, build_chain, card_json, completion_seen, declares_stream, decorate,
+        error, error_because, kind_for, model, models_head, not_found, outcome_label, require_json,
+        unknown_model, usage_from_frames,
     };
     use crate::app::{AppState, Components};
     use crate::config::{ComboTarget, ServerConfig};
@@ -3496,6 +3581,7 @@ mod tests {
             Dialect::OpenAi,
             Strategy::Priority,
             Stages {
+                failures: FailureSink::none(),
                 compression: "default;engines=-".to_owned(),
                 cache_state: ar_cache::CacheState::Miss,
                 cache_key: None,
@@ -3597,6 +3683,7 @@ mod tests {
             Dialect::OpenAi,
             Strategy::Priority,
             Stages {
+                failures: FailureSink::none(),
                 compression: "default;engines=-".to_owned(),
                 cache_state: ar_cache::CacheState::Miss,
                 cache_key: None,
@@ -5707,6 +5794,45 @@ mod tests {
         let body = body_of(resp).await;
         assert_eq!(body["error"]["code"], "insufficient_quota");
         assert_eq!(body["error"]["type"], "server_error");
+    }
+
+    fn cut_rows(cut: bool) -> usize {
+        let ledger = Arc::new(Mutex::new(
+            ar_tokens::Ledger::open_in_memory().expect("in-memory ledger"),
+        ));
+        let record = CutRecord {
+            sink: FailureSink {
+                ledger: Some(Arc::clone(&ledger)),
+                key_id: "k1".to_owned(),
+            },
+            model: "jev".to_owned(),
+            cut: Arc::new(std::sync::atomic::AtomicBool::new(cut)),
+        };
+        drop(record);
+        let filter = ar_tokens::LogFilter {
+            days: 30,
+            model: None,
+            provider: None,
+            errors_only: true,
+            limit: 10,
+            offset: 0,
+        };
+        ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .log(&filter)
+            .expect("log")
+            .len()
+    }
+
+    #[test]
+    fn cut_record_should_log_one_failure_when_the_body_was_cut() {
+        assert_eq!(cut_rows(true), 1);
+    }
+
+    #[test]
+    fn cut_record_should_log_nothing_when_the_body_finished_clean() {
+        assert_eq!(cut_rows(false), 0);
     }
 
     #[tokio::test]
