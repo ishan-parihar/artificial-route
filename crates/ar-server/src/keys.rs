@@ -11,22 +11,18 @@
 //! can be set apart: a server with no gate refuses a routable bind, and a server
 //! on a routable bind has a gate or does not start.
 //!
-//! # Which `ar-keys` surface, and why not `Admission`
+//! # Which `ar-keys` surface, and why `Admission` is not here
 //!
 //! [`ar_keys::Tokens`] is the credential check, and it is synchronous and
 //! allocation-free after construction — a JWT signature plus an expiry, which is
 //! what a request-path decision needs.
 //!
-//! [`ar_keys::Admission`] is a *concurrency* gate: it hands out a lease that
-//! keeps a heavy request from starving an interactive one. Holding a lease for
-//! the life of a streaming body means holding it across the response body, which
-//! `AppState` cannot do — the lease would have to be owned by the body itself and
-//! released when the client disconnects mid-stream. That is real work and it is
-//! not an authorisation decision, so it is not smuggled in here as a second way
-//! to say "allowed".
-//!
-//! TODO(#p1-admission): move lane control to a body middleware that owns the
-//! lease, once a dropped connection is observable from the body future.
+//! [`ar_keys::Admission`] is a *concurrency* gate, and it is not an
+//! authorisation decision, so it is not a second way to say "allowed" here. Its
+//! lane permit is taken by the route after this gate has passed, and it is moved
+//! into the reply body, so it returns when the body is dropped (see
+//! `routes::hold_lease`). The permit is held across the whole reply, not only the
+//! upstream call.
 //!
 //! # What a rejected token says
 //!

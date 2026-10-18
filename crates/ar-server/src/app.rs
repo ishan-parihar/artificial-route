@@ -222,6 +222,11 @@ pub struct AppState {
     /// exists — a default block disables every arm — and shared by every
     /// request, so the buckets are the only mutable state in it.
     pub policy: Arc<crate::policy::Policy>,
+    /// Lane concurrency: `interactive`, `batch` and `heavy` each own a permit
+    /// pool, and a request holds a permit from admission until its reply body is
+    /// gone. `None` only if the controller refuses its own constants, which the
+    /// `NonZero` RPM bound never does; then requests are not lane-limited.
+    pub lanes: Option<Arc<ar_keys::Admission>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -457,6 +462,19 @@ impl Components {
                 }),
             auth_mode,
             policy,
+            // The policy layer owns the per-key requests-per-minute bucket, so this
+            // controller's own RPM bucket is set to `u32::MAX` and never sheds on
+            // rate. It owns only the lane permits.
+            lanes: ar_keys::Admission::new(
+                [
+                    ar_keys::LaneSpec::INTERACTIVE,
+                    ar_keys::LaneSpec::BATCH,
+                    ar_keys::LaneSpec::HEAVY,
+                ],
+                u32::MAX,
+            )
+            .ok()
+            .map(Arc::new),
             // `Secret` has no `Deref`, so the gate takes the bytes rather than the
             // wrapper; the wrapper stays in `master` so it is zeroized on drop.
             auth: master.as_ref().map(|m| m.as_bytes()).and_then(build_gate),

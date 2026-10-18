@@ -416,8 +416,74 @@ async fn handle_chat(
     // `Bytes` clones by refcount; the copy is only parsed on a failure.
     let asked = body.clone();
     let mut seen_key = None;
-    let resp = handle_chat_inner(state, headers, path, body, dialect, &mut seen_key).await;
+    let mut lease = None;
+    let resp = handle_chat_inner(
+        state,
+        headers,
+        path,
+        body,
+        dialect,
+        &mut seen_key,
+        &mut lease,
+    )
+    .await;
     note_failure(state, &resp, seen_key.as_deref(), || model_asked(&asked));
+    hold_lease(resp, lease)
+}
+
+/// Keeps a lane lease alive for as long as the reply body is.
+///
+/// The lease is moved into the body stream, so its permit returns when the body
+/// is dropped: after the last byte, or when a client disconnects mid-stream and
+/// the server drops the body. An error reply holds a lease too, which is harmless:
+/// it is short and it is dropped with the body.
+pub(crate) fn hold_lease(resp: Response, lease: Option<ar_keys::Lease>) -> Response {
+    let Some(lease) = lease else {
+        return resp;
+    };
+    let (parts, body) = resp.into_parts();
+    let held = body.into_data_stream().map(move |chunk| {
+        // Captured for its `Drop`: the closure owns the lease until the stream does.
+        let _lane = &lease;
+        chunk
+    });
+    Response::from_parts(parts, Body::from_stream(held))
+}
+
+/// Takes a permit on `lane` for `key`, or returns the reply to send instead.
+///
+/// `Ok(None)` when lane control is off, so a caller holds nothing and proceeds.
+pub(crate) async fn admit(
+    state: &AppState,
+    lane: ar_keys::Lane,
+    key: &str,
+) -> Result<Option<ar_keys::Lease>, Box<Response>> {
+    let Some(lanes) = state.lanes.as_ref() else {
+        return Ok(None);
+    };
+    lanes
+        .acquire(lane, key)
+        .await
+        .map(Some)
+        .map_err(|refused| Box::new(lane_refusal(&refused)))
+}
+
+/// The reply for a request the lane controller did not admit.
+///
+/// `busy` and `queue_full` both mean "come back later", so both are a 429 with
+/// the window the controller computed. `shutdown` is a 503: the gateway is going
+/// away, and a retry window would be a lie.
+pub(crate) fn lane_refusal(err: &ar_keys::AdmitError) -> Response {
+    let (status, code) = match err {
+        ar_keys::AdmitError::Shutdown | ar_keys::AdmitError::ZeroRpm => {
+            (StatusCode::SERVICE_UNAVAILABLE, "shutting_down")
+        }
+        _ => (StatusCode::TOO_MANY_REQUESTS, "lane_busy"),
+    };
+    let mut resp = error_because(status, code, err.detail(), &err.to_string());
+    if let Some(after) = err.retry_after() {
+        stamp(&mut resp, "retry-after", &after.to_string());
+    }
     resp
 }
 
@@ -506,6 +572,7 @@ async fn handle_chat_inner(
     body: Bytes,
     dialect: Dialect,
     seen_key: &mut Option<String>,
+    lease: &mut Option<ar_keys::Lease>,
 ) -> Response {
     let key_id = match authorize(state, headers, path) {
         Ok(key_id) => key_id,
@@ -547,6 +614,14 @@ async fn handle_chat_inner(
     // about the body's shape.
     if let Some(reason) = require_json(headers) {
         return reason;
+    }
+
+    // Lane admission comes after the gate and the format check, so a refused
+    // probe and a malformed body never take a permit. The lease is handed out
+    // through `lease` and rides with the reply body.
+    match admit(state, ar_keys::Lane::Interactive, policy_key).await {
+        Ok(granted) => *lease = granted,
+        Err(refusal) => return *refusal,
     }
 
     // A body that is not the dialect this route claims — including a body that
@@ -6855,5 +6930,72 @@ mod tests {
         cut.store(true, Ordering::SeqCst);
         let cut_items: Vec<_> = super::abort_on_cut(chunks(), cut).collect().await;
         assert!(matches!(cut_items.last(), Some(Err(_))));
+    }
+}
+
+#[cfg(test)]
+mod lane_tests {
+    use super::{hold_lease, lane_refusal};
+    use ar_keys::{Admission, AdmitError, Lane, LaneSpec};
+    use axum::body::Body;
+    use axum::http::StatusCode;
+    use axum::response::Response;
+
+    fn controller() -> Admission {
+        Admission::new(
+            [LaneSpec::INTERACTIVE, LaneSpec::BATCH, LaneSpec::HEAVY],
+            u32::MAX,
+        )
+        .expect("the standard lanes build")
+    }
+
+    #[tokio::test]
+    async fn hold_lease_should_hold_the_permit_while_the_body_lives() {
+        let lanes = controller();
+        let lease = lanes
+            .acquire(Lane::Interactive, "k")
+            .await
+            .expect("a free lane admits");
+        let resp = hold_lease(Response::new(Body::from("x")), Some(lease));
+        assert_eq!(lanes.in_flight(Lane::Interactive), 1);
+        drop(resp);
+    }
+
+    #[tokio::test]
+    async fn hold_lease_should_release_the_permit_when_the_body_is_dropped() {
+        let lanes = controller();
+        let lease = lanes
+            .acquire(Lane::Interactive, "k")
+            .await
+            .expect("a free lane admits");
+        let resp = hold_lease(Response::new(Body::from("x")), Some(lease));
+        drop(resp);
+        assert_eq!(lanes.in_flight(Lane::Interactive), 0);
+    }
+
+    #[test]
+    fn lane_refusal_should_answer_429_with_the_window_when_the_lane_is_busy() {
+        let refused = AdmitError::Busy {
+            lane: Lane::Interactive,
+            retry_after: 7,
+        };
+        let resp = lane_refusal(&refused);
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn lane_refusal_should_send_the_window_as_retry_after_when_the_lane_is_busy() {
+        let refused = AdmitError::Busy {
+            lane: Lane::Interactive,
+            retry_after: 7,
+        };
+        let resp = lane_refusal(&refused);
+        assert_eq!(resp.headers()["retry-after"], "7");
+    }
+
+    #[test]
+    fn lane_refusal_should_answer_503_when_the_gateway_is_shutting_down() {
+        let resp = lane_refusal(&AdmitError::Shutdown);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

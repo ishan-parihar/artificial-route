@@ -35,10 +35,12 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use std::collections::HashMap;
 
+use ar_keys::Lane;
+
 use crate::app::AppState;
 use crate::routes::{
-    DECISION_HEADER, RouteReject, SESSION_HEADER, authorize, error_because, model_asked,
-    note_failure, require_json, resolve,
+    DECISION_HEADER, RouteReject, SESSION_HEADER, admit, authorize, error_because, hold_lease,
+    model_asked, note_failure, require_json, resolve,
 };
 
 /// `POST /v1/embeddings` — text in, vectors out, response re-rendered.
@@ -129,6 +131,7 @@ async fn audio_route(
 ) -> Response {
     let asked = query.get("model").cloned().unwrap_or_default();
     let mut seen_key = None;
+    let mut lease = None;
     let resp = audio_route_inner(
         state,
         headers,
@@ -138,10 +141,11 @@ async fn audio_route(
         query,
         body,
         &mut seen_key,
+        &mut lease,
     )
     .await;
     note_failure(state, &resp, seen_key.as_deref(), || asked);
-    resp
+    hold_lease(resp, lease)
 }
 
 /// [`audio_route`]'s work: auth, `?model=` route input, verbatim forward.
@@ -158,12 +162,17 @@ async fn audio_route_inner(
     query: HashMap<String, String>,
     body: Bytes,
     seen_key: &mut Option<String>,
+    lease: &mut Option<ar_keys::Lease>,
 ) -> Response {
     let key_id = match authorize(state, headers, path) {
         Ok(key_id) => key_id,
         Err(reason) => return *reason,
     };
     seen_key.clone_from(&key_id);
+    match admit(state, Lane::Heavy, key_id.as_deref().unwrap_or("anonymous")).await {
+        Ok(granted) => *lease = granted,
+        Err(refusal) => return *refusal,
+    }
     // A malformed percent-encoding is no reason to refuse a request whose only
     // route input is this parameter; the missing-model case has its own refusal.
     let model = query.get("model").map(String::as_str).unwrap_or_default();
@@ -199,9 +208,19 @@ async fn json_route(
     // `Bytes` clones by refcount; the copy is only parsed on a failure.
     let asked = body.clone();
     let mut seen_key = None;
-    let resp = json_route_inner(state, headers, path, endpoint, body, &mut seen_key).await;
+    let mut lease = None;
+    let resp = json_route_inner(
+        state,
+        headers,
+        path,
+        endpoint,
+        body,
+        &mut seen_key,
+        &mut lease,
+    )
+    .await;
     note_failure(state, &resp, seen_key.as_deref(), || model_asked(&asked));
-    resp
+    hold_lease(resp, lease)
 }
 
 /// [`json_route`]'s work: auth, 415, model from the body.
@@ -212,6 +231,7 @@ async fn json_route_inner(
     endpoint: &'static str,
     body: Bytes,
     seen_key: &mut Option<String>,
+    lease: &mut Option<ar_keys::Lease>,
 ) -> Response {
     let key_id = match authorize(state, headers, path) {
         Ok(key_id) => key_id,
@@ -220,6 +240,16 @@ async fn json_route_inner(
     seen_key.clone_from(&key_id);
     if let Some(reason) = require_json(headers) {
         return reason;
+    }
+    // Embeddings are batch work that may wait; generation and OCR are heavy.
+    let lane = if endpoint == "/embeddings" {
+        Lane::Batch
+    } else {
+        Lane::Heavy
+    };
+    match admit(state, lane, key_id.as_deref().unwrap_or("anonymous")).await {
+        Ok(granted) => *lease = granted,
+        Err(refusal) => return *refusal,
     }
     let model = match serde_json::from_slice::<serde_json::Value>(&body) {
         Ok(value) => match value.get("model").and_then(serde_json::Value::as_str) {
