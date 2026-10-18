@@ -18,8 +18,8 @@ Row IDs are this doc's own. A reference such as "docs/22 D5" names a docs/22 dec
 
 ## Execution summary
 
-Done in this pass: B1, B2, B3, B4, B5, B7 (G3), G2's text fix, A3, the E1 correction in
-docs/05. Found closed by another session in the same window: G1 (`c3bf93a`), A4
+Done in this pass: B1, B2, B3, B4, B5, B7 (G3), B8, G2's text fix, A3, the E1
+correction in docs/05. Found closed by another session in the same window: G1 (`c3bf93a`), A4
 (`813dd94`) and the `too_many_arguments` lint on `read_and_record` (`c7a841a`).
 
 Not done, and why: A1 (release, tag and VPS deploy are outward-facing and need your
@@ -47,7 +47,7 @@ on-demand rows (D4–D8, E2–E8), which the outline says not to start on specul
 | B5 | README test badge and test line stale | code | done `150d27b` | Now 44 suites, 2021 passed (the figure from the full run above). Update again when the count moves. |
 | B6 | docs-check warnings | code | unverified | Located: `.git/hooks/pre-commit` runs `docs-check` in warn mode and does not gate. At this pass it reported 14 `D003` orphan pages (the earlier figure of 17 was wrong) and README-contract failures for 12 crates. Decide whether to gate it. |
 | B7 | No CI gate ran fmt, clippy or tests on push | code | done `7ae39ce` | `.github/workflows/ci.yml`: a `lint` job (fmt, clippy with `-D warnings`) and a `test` job, on push to `main` and on pull request, against the pinned toolchain. Verified on `HEAD` as above. Disclosure: I committed this file before its lint step was checked. My `\| tail` hid a clippy failure, which came from another session's uncommitted `routes.rs` and not from this commit. That was fixed in `c7a841a`. |
-| B8 | **new** — seven dead-code warnings in `ar-mcp` in the default build | code | done (this commit) | `crates/ar-mcp/src/tools.rs`: `list_combos`, `switch_combo`, `check_quota`, `route_request`, and three more `pub(crate)` helpers, unused outside the `mcp` feature. Clippy with all features is clean, and CI does not fail on them, so this is hygiene. Done: a module-level `expect(dead_code)` scoped to non-test builds without the `mcp` feature. A cfg gate would break the module's own tests in the default build. |
+| B8 | **new** — seven dead-code warnings in `ar-mcp` in the default build | code | done `486aa7a` | `crates/ar-mcp/src/tools.rs`: `list_combos`, `switch_combo`, `check_quota`, `route_request`, and three more `pub(crate)` helpers, unused outside the `mcp` feature. Clippy with all features is clean, and CI does not fail on them, so this is hygiene. Done: a module-level `expect(dead_code)` scoped to non-test builds without the `mcp` feature. A cfg gate would break the module's own tests in the default build. |
 
 ## C. Request log and scoping
 
