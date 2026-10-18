@@ -109,6 +109,7 @@ use crate::sse::{DEFAULT_FRAME_CAP, SseDecoder};
 
 pub use crate::media::{MediaBody, MediaEndpoint, MediaResponse};
 
+mod grok;
 pub mod media;
 /// The OAuth taxonomy, its single terminal-status list, and the
 /// grant-and-rotate executor. `Origin::Client` is the only origin a live

@@ -80,8 +80,10 @@ explanation is [AUDIT-REPORT.md](AUDIT-REPORT.md).
   has run four times — longest partial 51 samples, +996 KB, zero failures — but
   no 12-hour run has completed against a released binary. P6's accept line is
   therefore open.
-- **`grok-cli` authenticates but does not dispatch** — its Responses body and
-  `x-grok-*` headers are not transcribed.
+- **`grok-cli` dispatches with the core of its wire, not all of it** — the
+  Responses body repairs and `x-grok-*` identity are ported; foreign reasoning
+  stripping, tool-schema normalization, custom and namespace tools, and the
+  per-user headers are not (see docs/24 E3).
 - **`kilocode` has neither mechanism declared**, so its `oauth/` row is a `fail`
   whose fix names the YAML for either one. Its device flow and anonymous dispatch
   are both ported; the dispatch wire is not.

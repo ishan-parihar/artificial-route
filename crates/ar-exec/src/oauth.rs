@@ -1665,9 +1665,15 @@ impl Connection<Connected> {
             Err(fault) => return Err(self.record(fault).await),
         };
 
-        let stream = core
-            .post(&shape.with_api_key(first.token.expose()), canonical, abort)
-            .await?;
+        let stream = post_as(
+            self.kind(),
+            core,
+            shape,
+            canonical,
+            abort,
+            first.token.expose(),
+        )
+        .await?;
         if stream.status() != StatusCode::UNAUTHORIZED {
             return Ok(stream);
         }
@@ -1678,9 +1684,15 @@ impl Connection<Connected> {
             Err(fault) => return Err(self.record(fault).await),
         };
 
-        let retry = core
-            .post(&shape.with_api_key(second.token.expose()), canonical, abort)
-            .await?;
+        let retry = post_as(
+            self.kind(),
+            core,
+            shape,
+            canonical,
+            abort,
+            second.token.expose(),
+        )
+        .await?;
         if retry.status() != StatusCode::UNAUTHORIZED {
             return Ok(retry);
         }
@@ -1694,6 +1706,34 @@ impl Connection<Connected> {
             .record(classify_refresh(self.kind(), status.as_u16(), &text))
             .await)
     }
+}
+
+/// One POST under `token`, shaped for a session of `kind`'s upstream.
+///
+/// A Grok session renders once, repairs the body, and carries the CLI's identity
+/// headers, because the proxy refuses a body and a client it does not recognise.
+/// Every other family takes the plain path, which renders inside [`ArExec::post`]
+/// and is byte-identical to what it was before.
+async fn post_as(
+    kind: OAuthKind,
+    core: &ArExec,
+    shape: &Dispatch<'_>,
+    canonical: &[u8],
+    abort: &CancellationToken,
+    token: &str,
+) -> Result<ChatStream, ExecError> {
+    let shape = shape.with_api_key(token);
+    if kind != OAuthKind::GrokCli {
+        return core.post(&shape, canonical, abort).await;
+    }
+    let body = crate::grok::normalize_body(&core.render_request(&shape, canonical)?)?;
+    let mut headers = shape.headers.clone();
+    headers.extend(crate::grok::client_headers(shape.upstream_model));
+    let shape = Dispatch {
+        headers: &headers,
+        ..shape
+    };
+    core.post_rendered(&shape, body, abort).await
 }
 
 impl ExecError {
@@ -5821,6 +5861,77 @@ mod tests {
         // above it would 401 in production.
         let parsed = serde_json::json!({"access_token": "at"});
         assert_eq!(expiry_at(&parsed, 1_000), 1_000 + EXPIRES_IN_FALLBACK_SECS);
+    }
+
+    #[tokio::test]
+    async fn grok_post_should_send_the_cli_identity_and_the_repaired_body() {
+        // The proxy refuses a client it does not recognise and a body it has not
+        // repaired, so both are read off the wire rather than off the helpers.
+        let seen: Arc<Mutex<Option<(String, serde_json::Value)>>> = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&seen);
+        let app =
+            axum::Router::new().fallback(move |req: axum::http::Request<axum::body::Body>| {
+                let slot = Arc::clone(&slot);
+                async move {
+                    let auth = req
+                        .headers()
+                        .get("X-XAI-Token-Auth")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("")
+                        .to_owned();
+                    let raw = axum::body::to_bytes(req.into_body(), 64 * 1024)
+                        .await
+                        .unwrap_or_default();
+                    let body = serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null);
+                    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                        Some((auth, body));
+                    (StatusCode::OK, "{}")
+                }
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback binds");
+        let addr = listener.local_addr().expect("bound socket has an address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let core = crate::ArExec::new().expect("the client builds");
+        let base = format!("http://{addr}/v1/responses");
+        let no_headers = std::collections::BTreeMap::new();
+        let shape = crate::Dispatch {
+            base_url: &base,
+            endpoint: None,
+            wire_format: ar_registry::WireFormat::OpenaiResponses,
+            api_key: "",
+            upstream_model: "grok-4.6",
+            stream: false,
+            headers: &no_headers,
+        };
+        let canonical = br#"{"model":"auto","messages":[{"role":"user","content":"hi"}]}"#;
+        super::post_as(
+            OAuthKind::GrokCli,
+            &core,
+            &shape,
+            canonical,
+            &CancellationToken::new(),
+            "synthetic-token",
+        )
+        .await
+        .expect("the mock answers");
+
+        let (auth, body) = seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .expect("the mock saw a request");
+        assert_eq!(
+            (auth.as_str(), body["include"].clone()),
+            (
+                "xai-grok-cli",
+                serde_json::json!(["reasoning.encrypted_content"])
+            ),
+        );
     }
 
     /// One recorded `persist_rotation` call: provider, token exchanged, token
