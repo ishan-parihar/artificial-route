@@ -29,9 +29,11 @@
 //!
 //! Since P6 a turn carries its non-text parts in [`crate::Msg::media`],
 //! verbatim: `image_url` / `input_image` / `image` / `images` and
-//! `input_audio` / `audio` route to the vision and audio adapters, and an
-//! Anthropic `tool_use` block crosses as a carried part. The upstream shapes
-//! differ per dialect, so nothing is re-encoded — see [`crate::MediaPart`].
+//! `input_audio` / `audio` route to the vision and audio adapters. An Anthropic
+//! `tool_use` or Gemini `functionCall` is read as a canonical [`crate::ToolCall`],
+//! and the result that answers it carries the matching `tool_call_id`. The
+//! remaining parts cross as carried parts, and their upstream shapes differ per
+//! dialect, so nothing is re-encoded — see [`crate::MediaPart`].
 //!
 //! A part naming *no* modality still raises [`TranslateError::UnsupportedPart`]
 //! rather than being dropped. Unrecognised is not routable, and a silent drop
@@ -53,7 +55,7 @@ use crate::anthropic::{
     AnthropicBlock, AnthropicBlockContent, AnthropicContent, AnthropicMessages,
 };
 use crate::canonical::{
-    CanonicalChat, CanonicalResponse, FinishReason, MediaPart, Msg, Role, Usage,
+    CanonicalChat, CanonicalResponse, FinishReason, MediaPart, Msg, Role, ToolCall, Usage,
 };
 use crate::gemini::{GeminiChat, GeminiContent, GeminiPart};
 use crate::media::Modality;
@@ -443,6 +445,7 @@ impl ArTranslate<AnthropicMessages> for AnthropicInbound {
                     tool_msgs: Vec::new(),
                     text: text.clone(),
                     media: Vec::new(),
+                    tool_calls: Vec::new(),
                 },
                 AnthropicContent::Blocks(blocks) => anthropic_blocks(blocks)?,
             };
@@ -451,12 +454,12 @@ impl ArTranslate<AnthropicMessages> for AnthropicInbound {
             // text *and* no media after that is dropped rather than sent as an
             // empty turn.
             messages.extend(split.tool_msgs);
-            if !split.text.is_empty() || !split.media.is_empty() {
+            if !split.text.is_empty() || !split.media.is_empty() || !split.tool_calls.is_empty() {
                 messages.push(Msg {
                     role,
                     content: split.text,
                     media: split.media,
-                    tool_calls: Vec::new(),
+                    tool_calls: split.tool_calls,
                     tool_call_id: None,
                 });
             }
@@ -676,6 +679,7 @@ fn gemini_content(content: GeminiContent) -> Result<Vec<Msg>, TranslateError> {
     let mut text: Vec<String> = Vec::new();
     let mut media = Vec::new();
     let mut tool_msgs = Vec::new();
+    let mut tool_calls = Vec::new();
 
     for part in parts {
         // A thought part is the model's own reasoning from a prior turn. The
@@ -689,18 +693,19 @@ fn gemini_content(content: GeminiContent) -> Result<Vec<Msg>, TranslateError> {
         }
 
         if let Some(call) = part.function_call.as_ref() {
-            // A tool call names no modality, but the request that made it is the
-            // caller's own, so it crosses as a carried part — the same rule the
-            // Anthropic `tool_use` block follows.
-            media.push(MediaPart::new("functionCall", json!(call)));
+            // The call is canonical, so every dialect can answer it. A call with no
+            // name cannot be answered by name later, so it crosses as a carried part.
+            match gemini_tool_call(call) {
+                Some(canonical) => tool_calls.push(canonical),
+                None => media.push(MediaPart::new("functionCall", json!(call))),
+            }
             continue;
         }
 
         if let Some(response) = part.function_response.as_ref() {
-            tool_msgs.push(Msg::new(
-                Role::Tool,
-                gemini_function_response_text(response),
-            ));
+            let mut turn = Msg::new(Role::Tool, gemini_function_response_text(response));
+            turn.tool_call_id = response.id.clone().or_else(|| response.name.clone());
+            tool_msgs.push(turn);
             continue;
         }
 
@@ -721,16 +726,35 @@ fn gemini_content(content: GeminiContent) -> Result<Vec<Msg>, TranslateError> {
 
     // Tool results first, mirroring the reference, then the turn they shared.
     let mut out = tool_msgs;
-    if !text.is_empty() || !media.is_empty() {
+    if !text.is_empty() || !media.is_empty() || !tool_calls.is_empty() {
         out.push(Msg {
             role,
             content: text.join("\n"),
             media,
-            tool_calls: Vec::new(),
+            tool_calls,
             tool_call_id: None,
         });
     }
     Ok(out)
+}
+
+/// The canonical call a `functionCall` part makes, or `None` when it has no name.
+///
+/// Gemini numbers no calls, so the name is the correlation id unless the call
+/// carries its own `id`. A `functionResponse` that names the call answers it, and
+/// the outbound renderers pair by the same name.
+fn gemini_tool_call(call: &crate::gemini::GeminiFunctionCall) -> Option<ToolCall> {
+    let name = call.name.clone()?;
+    let id = call
+        .rest
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| name.clone(), str::to_owned);
+    Some(ToolCall {
+        id,
+        name,
+        arguments: call.args.clone().unwrap_or_else(|| json!({})),
+    })
 }
 
 /// Flattens a `functionResponse` payload to text.
@@ -932,31 +956,39 @@ fn anthropic_role(raw: &str) -> Result<Role, TranslateError> {
 
 /// Splits one Anthropic turn's blocks into (tool turns, text, media).
 ///
-/// `text` accumulates into the parent turn; `tool_result` becomes its own tool
-/// turn; `tool_use` and `image` cross as carried parts. `thinking` is still
-/// rejected — it is provider-internal bookkeeping with no place in the request
-/// this proxy makes, and forwarding it would leak a prior turn's reasoning.
+/// `text` accumulates into the parent turn; `tool_use` becomes a canonical call on
+/// that turn; `tool_result` becomes its own tool turn, correlated by id; `image`
+/// crosses as a carried part. `thinking` is still rejected — it is
+/// provider-internal bookkeeping with no place in the request this proxy makes,
+/// and forwarding it would leak a prior turn's reasoning.
 fn anthropic_blocks(blocks: &[AnthropicBlock]) -> Result<AnthropicSplit, TranslateError> {
     let mut tool_msgs = Vec::new();
     let mut text_parts: Vec<&str> = Vec::new();
     let mut media = Vec::new();
+    let mut tool_calls = Vec::new();
 
     for block in blocks {
         match block.kind.as_str() {
             "text" => text_parts.push(block.text.as_deref().unwrap_or_default()),
-            "tool_result" => tool_msgs.push(Msg::new(
-                Role::Tool,
-                block
-                    .content
-                    .as_ref()
-                    .map(tool_result_text)
-                    .transpose()?
-                    .unwrap_or_default(),
-            )),
-            // A tool call names no modality, but it is a request the caller made
-            // and dropping it would turn a tool-using turn into a bare one, so
-            // it crosses as a carried part rather than an error.
-            "tool_use" => media.push(MediaPart::new("tool_use", json!(block))),
+            "tool_result" => {
+                let mut turn = Msg::new(
+                    Role::Tool,
+                    block
+                        .content
+                        .as_ref()
+                        .map(tool_result_text)
+                        .transpose()?
+                        .unwrap_or_default(),
+                );
+                turn.tool_call_id = block.tool_use_id.clone();
+                tool_msgs.push(turn);
+            }
+            "tool_use" => match anthropic_tool_call(block) {
+                Some(call) => tool_calls.push(call),
+                // A block with no id or name cannot be answered later, so it
+                // crosses as a carried part rather than a call no result can find.
+                None => media.push(MediaPart::new("tool_use", json!(block))),
+            },
             other => {
                 require_routable(other)?;
                 media.push(MediaPart::new(other, json!(block)));
@@ -968,10 +1000,28 @@ fn anthropic_blocks(blocks: &[AnthropicBlock]) -> Result<AnthropicSplit, Transla
         tool_msgs,
         text: text_parts.join("\n"),
         media,
+        tool_calls,
     })
 }
 
-/// One Anthropic turn split into its three canonical projections.
+/// The canonical call a `tool_use` block makes, or `None` when the block lacks the
+/// `id` and `name` a later `tool_result` correlates by.
+fn anthropic_tool_call(block: &AnthropicBlock) -> Option<ToolCall> {
+    let id = block.rest.get("id")?.as_str()?;
+    let name = block.rest.get("name")?.as_str()?;
+    let arguments = block
+        .rest
+        .get("input")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    Some(ToolCall {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        arguments,
+    })
+}
+
+/// One Anthropic turn split into its canonical projections.
 struct AnthropicSplit {
     /// Turns lifted out of the parent by `tool_result` blocks.
     tool_msgs: Vec<Msg>,
@@ -979,6 +1029,8 @@ struct AnthropicSplit {
     text: String,
     /// Carried non-text blocks, in order.
     media: Vec<MediaPart>,
+    /// The calls the parent turn makes, in order.
+    tool_calls: Vec<ToolCall>,
 }
 
 /// Flattens a `tool_result` payload to text, mirroring the reference: a string
@@ -1097,7 +1149,10 @@ mod tests {
             vec![
                 Msg::new(Role::System, "be terse\nand kind"),
                 Msg::new(Role::User, "add 2 and 3"),
-                Msg::new(Role::Tool, "5"),
+                Msg {
+                    tool_call_id: Some("tu_1".to_owned()),
+                    ..Msg::new(Role::Tool, "5")
+                },
                 Msg::new(Role::Assistant, "calling"),
                 Msg::new(Role::User, "thanks"),
             ]
@@ -1229,15 +1284,15 @@ mod tests {
     }
 
     #[test]
-    fn carries_anthropic_tool_use_when_modality_none() {
+    fn reads_anthropic_tool_use_as_a_canonical_call() {
         let raw = r#"{"model":"m","messages":[{"role":"assistant","content":[
                       {"type":"tool_use","id":"tu_1","name":"add","input":{}}]}]}"#;
         let req: AnthropicMessages =
             serde_json::from_str(raw).expect("fixture is valid Anthropic Messages");
 
-        let canonical = anthropic_to_canonical(req).expect("tool_use is carried since P6");
+        let canonical = anthropic_to_canonical(req).expect("tool_use reads as a call");
 
-        assert_eq!(canonical.messages[0].media[0].kind, "tool_use");
+        assert_eq!(canonical.messages[0].tool_calls[0].name, "add");
     }
 
     #[test]
@@ -1349,10 +1404,10 @@ mod tests {
         assert_eq!(canonical.max_tokens, Some(512));
     }
 
-    /// A `functionResponse` carries no `tool_call_id` on this wire, so the
-    /// correlation id is dropped and only the payload crosses. The turn must still
-    /// come out as a tool turn, ahead of the text it was co-located with —
-    /// reading order, not wire order.
+    /// A `functionResponse` is correlated by its name, since Gemini numbers no
+    /// calls, so the name becomes the `tool_call_id`. The turn must still come out
+    /// as a tool turn, ahead of the text it was co-located with — reading order,
+    /// not wire order.
     #[test]
     fn hoists_gemini_function_response_ahead_of_its_turn() {
         let canonical = gemini(
@@ -1364,7 +1419,13 @@ mod tests {
 
         assert_eq!(
             canonical.messages,
-            vec![Msg::new(Role::Tool, "5"), Msg::new(Role::User, "and now")]
+            vec![
+                Msg {
+                    tool_call_id: Some("add".to_owned()),
+                    ..Msg::new(Role::Tool, "5")
+                },
+                Msg::new(Role::User, "and now"),
+            ]
         );
     }
 
@@ -1382,14 +1443,14 @@ mod tests {
     }
 
     #[test]
-    fn carries_gemini_function_call_when_modality_none() {
+    fn reads_gemini_function_call_as_a_canonical_call() {
         let canonical = gemini(
             r#"{"contents":[{"role":"model","parts":[
                   {"functionCall":{"name":"add","args":{"a":1}}}]}]}"#,
         )
-        .expect("functionCall is carried since P6");
+        .expect("functionCall reads as a call");
 
-        assert_eq!(canonical.messages[0].media[0].kind, "functionCall");
+        assert_eq!(canonical.messages[0].tool_calls[0].id, "add");
     }
 
     /// Thought parts are the model's own reasoning from a prior turn. Folding them

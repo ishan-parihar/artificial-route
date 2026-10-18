@@ -281,10 +281,11 @@ pub enum ToolChoice {
 /// inbound dialects parse these and canonical has nowhere to put them:
 ///
 /// * Tool declarations and tool calls are carried ([`CanonicalTool`],
-///   [`ToolCall`], `tool_choice`). An Anthropic `tool_use` or Gemini
-///   `functionCall` in history still crosses as a carried [`MediaPart`]: it
-///   reaches a same-dialect upstream intact, but a cross-dialect renderer does
-///   not yet turn it into a canonical [`ToolCall`]. `TODO(#p1-tools)` closes that.
+///   [`ToolCall`], `tool_choice`) on every dialect that declares them. An
+///   Anthropic `tool_use` or Gemini `functionCall` in history is read as a
+///   [`ToolCall`] and rendered back out on any wire that takes one. A call with
+///   no id or name crosses as a carried [`MediaPart`] instead, since no result
+///   can be correlated to it.
 /// * `top_p` — parsed by two inbound adapters (`OllamaOptions::top_p`,
 ///   `GeminiGenerationConfig::top_p`), no canonical field. Sampling becomes
 ///   temperature-only upstream.

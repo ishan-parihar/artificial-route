@@ -24,7 +24,9 @@ CanonicalChat {
             content: "5",
             media: [],
             tool_calls: [],
-            tool_call_id: None,
+            tool_call_id: Some(
+                "add",
+            ),
         },
         Msg {
             role: Assistant,

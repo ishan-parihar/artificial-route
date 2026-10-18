@@ -76,10 +76,12 @@
 //! `inlineData`, `functionCall` — alone, because those are already the target
 //! wire's own spelling and re-encoding them would only risk losing a field.
 
+use std::collections::HashMap;
+
 use serde_json::{Map, Value, json};
 
 use crate::canonical::{
-    CanonicalChat, CanonicalResponse, CanonicalTool, FinishReason, MediaPart, Msg, Role,
+    CanonicalChat, CanonicalResponse, CanonicalTool, FinishReason, MediaPart, Msg, Role, ToolCall,
     ToolChoice, render_openai_body,
 };
 
@@ -281,22 +283,28 @@ pub fn render_claude_body(chat: &CanonicalChat) -> Vec<u8> {
             continue;
         }
         // Anthropic has no `tool` role: a tool turn is a user turn carrying a
-        // `tool_result` block. Canonical keeps no `tool_use_id`, so the block
-        // carries the result text alone — documented above as the missing tool
-        // registry, which is the same gap.
+        // `tool_result` block, which names the `tool_use` it answers by id.
         let role = if msg.role == Role::Assistant {
             "assistant"
         } else {
             "user"
         };
-        let mut content: Vec<Value> = Vec::with_capacity(msg.media.len() + 1);
-        if !msg.content.is_empty() {
-            if msg.role == Role::Tool {
-                content.push(json!({ "type": "tool_result", "content": msg.content }));
-            } else {
-                content.push(json!({ "type": "text", "text": msg.content }));
+        let mut content: Vec<Value> =
+            Vec::with_capacity(msg.tool_calls.len() + msg.media.len() + 1);
+        if msg.role == Role::Tool {
+            // A result with no id has nothing to answer, so it goes out as the bare
+            // block the wire has always taken for one.
+            if msg.tool_call_id.is_some() || !msg.content.is_empty() {
+                let mut block = json!({ "type": "tool_result", "content": msg.content });
+                if let Some(id) = &msg.tool_call_id {
+                    block["tool_use_id"] = id.as_str().into();
+                }
+                content.push(block);
             }
+        } else if !msg.content.is_empty() {
+            content.push(json!({ "type": "text", "text": msg.content }));
         }
+        content.extend(msg.tool_calls.iter().map(claude_tool_use));
         content.extend(msg.media.iter().map(claude_block));
         if content.is_empty() {
             continue;
@@ -356,6 +364,20 @@ pub fn render_openai_responses_body(chat: &CanonicalChat) -> Vec<u8> {
             }
             continue;
         }
+        // A tool result is a `function_call_output` item correlated by `call_id`,
+        // not a message.
+        if let Some(call_id) = msg
+            .tool_call_id
+            .as_deref()
+            .filter(|_| msg.role == Role::Tool)
+        {
+            input.push(json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": msg.content,
+            }));
+            continue;
+        }
         let part_type = if msg.role == Role::Assistant {
             "output_text"
         } else {
@@ -370,16 +392,17 @@ pub fn render_openai_responses_body(chat: &CanonicalChat) -> Vec<u8> {
         // what keeps a `function_call` part intact, since Responses' own tool
         // spelling is the OpenAI one.
         parts.extend(msg.media.iter().map(MediaPart::to_wire));
-        // A turn with neither text nor media is dropped rather than emitted with
-        // an empty `content` array, which the wire has no spelling for.
-        if parts.is_empty() {
-            continue;
+        // A turn with neither text nor media emits no message, since the wire has
+        // no spelling for an empty `content` array.
+        if !parts.is_empty() {
+            input.push(json!({
+                "type": "message",
+                "role": msg.role.as_wire(),
+                "content": parts,
+            }));
         }
-        input.push(json!({
-            "type": "message",
-            "role": msg.role.as_wire(),
-            "content": parts,
-        }));
+        // A call follows the text it came with, as its own `function_call` item.
+        input.extend(msg.tool_calls.iter().map(responses_function_call));
     }
 
     let mut body = Map::with_capacity(5);
@@ -422,6 +445,14 @@ pub fn render_openai_responses_body(chat: &CanonicalChat) -> Vec<u8> {
 pub fn render_gemini_body(chat: &CanonicalChat) -> Vec<u8> {
     let mut system: Vec<Value> = Vec::new();
     let mut contents: Vec<Value> = Vec::with_capacity(chat.messages.len());
+    // Gemini pairs a result with its call by name, so each call id maps to the
+    // name it was made under.
+    let names: HashMap<&str, &str> = chat
+        .messages
+        .iter()
+        .flat_map(|msg| msg.tool_calls.iter())
+        .map(|call| (call.id.as_str(), call.name.as_str()))
+        .collect();
 
     for msg in &chat.messages {
         if msg.role == Role::System {
@@ -435,10 +466,15 @@ pub fn render_gemini_body(chat: &CanonicalChat) -> Vec<u8> {
         } else {
             "user"
         };
-        let mut parts: Vec<Value> = Vec::with_capacity(msg.media.len() + 1);
-        if !msg.content.is_empty() {
-            parts.push(json!({ "text": msg.content }));
+        let mut parts: Vec<Value> = Vec::with_capacity(msg.tool_calls.len() + msg.media.len() + 1);
+        match msg.tool_call_id.as_deref() {
+            Some(id) if msg.role == Role::Tool => {
+                parts.push(gemini_function_response(id, &names, &msg.content));
+            }
+            _ if !msg.content.is_empty() => parts.push(json!({ "text": msg.content })),
+            _ => {}
         }
+        parts.extend(msg.tool_calls.iter().map(gemini_function_call));
         parts.extend(msg.media.iter().map(gemini_part));
         if parts.is_empty() {
             continue;
@@ -490,6 +526,27 @@ pub fn render_gemini_body(chat: &CanonicalChat) -> Vec<u8> {
 /// identity. What it does add is the one shape Gemini has and OpenAI spells
 /// differently: an `image_url`. Gemini takes `fileData` for a URI or `inlineData`
 /// for bytes, and rejects the OpenAI wrapper around it.
+/// The Gemini `functionCall` part a canonical call renders to.
+fn gemini_function_call(call: &ToolCall) -> Value {
+    json!({ "functionCall": { "name": call.name, "args": call.arguments } })
+}
+
+/// The Gemini `functionResponse` part answering the call `id`.
+///
+/// Gemini pairs a result by name, so the name is the one the call that carried
+/// `id` was made under. A result whose call is not in the history keeps `id` as
+/// its name, the only spelling the wire can still pair by. The response is an
+/// object on this wire: a JSON-object result goes as it is, anything else as
+/// `content`.
+fn gemini_function_response(id: &str, names: &HashMap<&str, &str>, text: &str) -> Value {
+    let name = names.get(id).copied().unwrap_or(id);
+    let response = match serde_json::from_str::<Value>(text) {
+        Ok(object @ Value::Object(_)) => object,
+        _ => json!({ "content": text }),
+    };
+    json!({ "functionResponse": { "name": name, "response": response } })
+}
+
 fn gemini_part(part: &MediaPart) -> Value {
     if part.kind != "image_url" {
         return part.to_wire();
@@ -1005,6 +1062,11 @@ fn encode(value: Value) -> Vec<u8> {
 }
 
 /// One declared tool in Anthropic's spelling: `input_schema`, no wrapper.
+/// The Anthropic `tool_use` block a canonical call renders to.
+fn claude_tool_use(call: &ToolCall) -> Value {
+    json!({ "type": "tool_use", "id": call.id, "name": call.name, "input": call.arguments })
+}
+
 fn claude_tool(tool: &CanonicalTool) -> Value {
     let mut decl = Map::with_capacity(3);
     decl.insert("name".to_owned(), tool.name.as_str().into());
@@ -1027,6 +1089,17 @@ fn claude_tool_choice(choice: &ToolChoice) -> Value {
 
 /// One declared tool in Responses' flat spelling: `function` with the
 /// declaration fields beside `type`, no wrapper object.
+/// The Responses `function_call` item a canonical call renders to. Its
+/// `arguments` is a JSON string on this wire, as it is on the chat wire.
+fn responses_function_call(call: &ToolCall) -> Value {
+    json!({
+        "type": "function_call",
+        "call_id": call.id,
+        "name": call.name,
+        "arguments": call.arguments.to_string(),
+    })
+}
+
 fn responses_tool(tool: &CanonicalTool) -> Value {
     let mut decl = Map::with_capacity(4);
     decl.insert("type".to_owned(), "function".into());
@@ -1076,7 +1149,7 @@ fn gemini_tool_config(choice: &ToolChoice) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::Value;
+    use serde_json::{Value, json};
 
     use super::{
         OutboundWire, render_for_wire, render_openai_body, to_anthropic_response,
@@ -1109,6 +1182,115 @@ mod tests {
             tools: Vec::new(),
             tool_choice: None,
         }
+    }
+
+    /// A history where the assistant called `add` as `c1` and the tool answered.
+    fn call_history() -> Vec<Msg> {
+        let mut asked = Msg::new(Role::Assistant, "");
+        asked.tool_calls = vec![crate::canonical::ToolCall {
+            id: "c1".to_owned(),
+            name: "add".to_owned(),
+            arguments: json!({ "a": 1 }),
+        }];
+        let mut answer = Msg::new(Role::Tool, "5");
+        answer.tool_call_id = Some("c1".to_owned());
+        vec![user("hi"), asked, answer]
+    }
+
+    fn parsed(bytes: Vec<u8>) -> Value {
+        serde_json::from_slice(&bytes).expect("a rendered body is json")
+    }
+
+    #[test]
+    fn claude_body_should_render_a_call_as_a_tool_use_block() {
+        let body = parsed(super::render_claude_body(&chat(call_history())));
+
+        assert_eq!(
+            body["messages"][1]["content"][0],
+            json!({ "type": "tool_use", "id": "c1", "name": "add", "input": { "a": 1 } }),
+        );
+    }
+
+    #[test]
+    fn claude_body_should_answer_a_tool_use_by_id_in_its_tool_result() {
+        let body = parsed(super::render_claude_body(&chat(call_history())));
+
+        assert_eq!(
+            body["messages"][2]["content"][0]["tool_use_id"],
+            json!("c1")
+        );
+    }
+
+    #[test]
+    fn gemini_body_should_render_a_call_as_a_function_call_part() {
+        let body = parsed(super::render_gemini_body(&chat(call_history())));
+
+        assert_eq!(
+            body["contents"][1]["parts"][0],
+            json!({ "functionCall": { "name": "add", "args": { "a": 1 } } }),
+        );
+    }
+
+    #[test]
+    fn gemini_body_should_name_a_result_after_the_call_it_answers() {
+        let body = parsed(super::render_gemini_body(&chat(call_history())));
+
+        assert_eq!(
+            body["contents"][2]["parts"][0]["functionResponse"]["name"],
+            json!("add"),
+        );
+    }
+
+    #[test]
+    fn gemini_body_should_wrap_a_plain_text_result_as_content() {
+        let body = parsed(super::render_gemini_body(&chat(call_history())));
+
+        assert_eq!(
+            body["contents"][2]["parts"][0]["functionResponse"]["response"],
+            json!({ "content": "5" }),
+        );
+    }
+
+    #[test]
+    fn responses_body_should_render_a_call_as_a_function_call_item() {
+        let body = parsed(super::render_openai_responses_body(&chat(call_history())));
+
+        assert_eq!(
+            body["input"][1],
+            json!({ "type": "function_call", "call_id": "c1", "name": "add", "arguments": "{\"a\":1}" }),
+        );
+    }
+
+    #[test]
+    fn responses_body_should_render_a_result_as_a_function_call_output_item() {
+        let body = parsed(super::render_openai_responses_body(&chat(call_history())));
+
+        assert_eq!(
+            body["input"][2],
+            json!({ "type": "function_call_output", "call_id": "c1", "output": "5" }),
+        );
+    }
+
+    #[test]
+    fn anthropic_history_should_reach_an_anthropic_upstream_under_the_same_ids() {
+        // The cross-dialect case: a `tool_use` read from an Anthropic client must
+        // leave for an Anthropic upstream under the id its `tool_result` names.
+        let raw = r#"{"model":"m","messages":[
+            {"role":"assistant","content":[{"type":"tool_use","id":"tu_9","name":"add","input":{"a":1}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_9","content":"5"}]}]}"#;
+        let req: crate::anthropic::AnthropicMessages =
+            serde_json::from_str(raw).expect("fixture is valid Anthropic Messages");
+        let canonical = crate::translate::anthropic_to_canonical(req).expect("history reads");
+
+        let body = parsed(super::render_claude_body(&canonical));
+
+        assert_eq!(
+            (
+                body["messages"][0]["content"][0]["id"].clone(),
+                body["messages"][1]["content"][0]["tool_use_id"].clone(),
+            ),
+            (json!("tu_9"), json!("tu_9")),
+        );
     }
 
     /// The shape every mapper test starts from: a system turn, a user turn and an
