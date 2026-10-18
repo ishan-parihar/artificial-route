@@ -37,7 +37,8 @@ use std::collections::HashMap;
 
 use crate::app::AppState;
 use crate::routes::{
-    DECISION_HEADER, RouteReject, SESSION_HEADER, authorize, error_because, require_json, resolve,
+    DECISION_HEADER, RouteReject, SESSION_HEADER, authorize, error_because, model_asked,
+    note_failure, require_json, resolve,
 };
 
 /// `POST /v1/embeddings` — text in, vectors out, response re-rendered.
@@ -115,8 +116,8 @@ pub async fn translations(
     .await
 }
 
-/// The shared body of the two multipart audio routes: auth, `?model=` route
-/// input, verbatim forward.
+/// The shared body of the two multipart audio routes. Logs a failed request
+/// to the failure log under the `?model=` it asked for, as the chat routes do.
 async fn audio_route(
     state: &AppState,
     headers: &HeaderMap,
@@ -126,9 +127,43 @@ async fn audio_route(
     query: HashMap<String, String>,
     body: Bytes,
 ) -> Response {
-    if let Err(reason) = authorize(state, headers, path) {
-        return *reason;
-    }
+    let asked = query.get("model").cloned().unwrap_or_default();
+    let mut seen_key = None;
+    let resp = audio_route_inner(
+        state,
+        headers,
+        path,
+        route_name,
+        endpoint,
+        query,
+        body,
+        &mut seen_key,
+    )
+    .await;
+    note_failure(state, &resp, seen_key.as_deref(), || asked);
+    resp
+}
+
+/// [`audio_route`]'s work: auth, `?model=` route input, verbatim forward.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the inputs are audio_route's own; a struct would exist for one call"
+)]
+async fn audio_route_inner(
+    state: &AppState,
+    headers: &HeaderMap,
+    path: &str,
+    route_name: &str,
+    endpoint: &'static str,
+    query: HashMap<String, String>,
+    body: Bytes,
+    seen_key: &mut Option<String>,
+) -> Response {
+    let key_id = match authorize(state, headers, path) {
+        Ok(key_id) => key_id,
+        Err(reason) => return *reason,
+    };
+    seen_key.clone_from(&key_id);
     // A malformed percent-encoding is no reason to refuse a request whose only
     // route input is this parameter; the missing-model case has its own refusal.
     let model = query.get("model").map(String::as_str).unwrap_or_default();
@@ -152,7 +187,8 @@ async fn audio_route(
     respond_media(state, headers, model, endpoint, content_type, body).await
 }
 
-/// The shared body of the three JSON routes: auth, 415, model from the body.
+/// The shared body of the three JSON routes. Logs a failed request to the
+/// failure log under the `model` its body asked for, as the chat routes do.
 async fn json_route(
     state: &AppState,
     headers: &HeaderMap,
@@ -160,9 +196,28 @@ async fn json_route(
     endpoint: &'static str,
     body: Bytes,
 ) -> Response {
-    if let Err(reason) = authorize(state, headers, path) {
-        return *reason;
-    }
+    // `Bytes` clones by refcount; the copy is only parsed on a failure.
+    let asked = body.clone();
+    let mut seen_key = None;
+    let resp = json_route_inner(state, headers, path, endpoint, body, &mut seen_key).await;
+    note_failure(state, &resp, seen_key.as_deref(), || model_asked(&asked));
+    resp
+}
+
+/// [`json_route`]'s work: auth, 415, model from the body.
+async fn json_route_inner(
+    state: &AppState,
+    headers: &HeaderMap,
+    path: &str,
+    endpoint: &'static str,
+    body: Bytes,
+    seen_key: &mut Option<String>,
+) -> Response {
+    let key_id = match authorize(state, headers, path) {
+        Ok(key_id) => key_id,
+        Err(reason) => return *reason,
+    };
+    seen_key.clone_from(&key_id);
     if let Some(reason) = require_json(headers) {
         return reason;
     }
@@ -739,6 +794,38 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let body = body_of(resp).await;
         assert_eq!(body["error"]["code"], "payload_too_large");
+    }
+
+    #[tokio::test]
+    async fn a_failed_media_request_lands_in_the_failure_log_with_the_model_asked_for() {
+        let ledger = Arc::new(Mutex::new(
+            ar_tokens::Ledger::open_in_memory().expect("in-memory ledger"),
+        ));
+        let exec = Arc::new(MediaExec {
+            seen: Arc::new(Mutex::new(Vec::new())),
+            reply: r#"{"error":{"message":"bad document","code":"payload_too_large"}}"#,
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            error: false,
+            refuse: None,
+        });
+        let mut state = routed_under(exec);
+        state.ledger = Some(Arc::clone(&ledger));
+        let router = crate::app::app(state);
+        let _ = drive(&router, post("/v1/ocr", r#"{"model":"m","document":"x"}"#)).await;
+
+        let filter = ar_tokens::LogFilter {
+            days: 30,
+            model: Some("m"),
+            provider: None,
+            errors_only: true,
+            limit: 10,
+        };
+        let rows = ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .log(&filter)
+            .expect("log");
+        assert_eq!(rows.len(), 1);
     }
 
     #[tokio::test]

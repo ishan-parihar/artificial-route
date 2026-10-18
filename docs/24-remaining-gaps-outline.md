@@ -53,7 +53,7 @@ on-demand rows (D4–D8, E2–E8), which the outline says not to start on specul
 
 | # | Gap | Type | State | Detail |
 |---|---|---|---|---|
-| C1 | Failures are only logged for the four chat dialects | code | open (conditional) | `note_failure` is called only from the chat path (`routes.rs:419`). `media.rs` has no failure logging. The outline makes this conditional on the log being relied on. Not started. |
+| C1 | Failures are only logged for the four chat dialects | code | fixed | The JSON media routes (`embeddings`, `images/generations`, `ocr`) and the two audio routes now write their failures to the failure log through the same `note_failure` the chat path uses. Audio rows carry the `?model=` they asked for. Test: `a_failed_media_request_lands_in_the_failure_log_with_the_model_asked_for`. |
 | C2 | A stream that fails after it started is not a failure row | decide | open | Unchanged. The response is already `200`. |
 | C3 | The log shows the newest 200 rows with no paging | code | open (conditional) | `LOG_LIMIT = 200` (`webui.rs`), no `before` parameter. Conditional, as C1. |
 | C4 | Failure rows carry no provider | decide | open | `ledger.rs` writes `'-'` for provider on failure rows. Unchanged. |

@@ -416,8 +416,23 @@ async fn handle_chat(
     let asked = body.clone();
     let mut seen_key = None;
     let resp = handle_chat_inner(state, headers, path, body, dialect, &mut seen_key).await;
-    note_failure(state, &resp, seen_key.as_deref(), &asked);
+    note_failure(state, &resp, seen_key.as_deref(), || model_asked(&asked));
     resp
+}
+
+/// The `model` a JSON request body asked for, or empty when it names none.
+///
+/// The failure log reads it only after a failure, so the body is parsed once
+/// and only then.
+pub(crate) fn model_asked(asked: &[u8]) -> String {
+    #[derive(serde::Deserialize)]
+    struct Asked {
+        model: Option<String>,
+    }
+    serde_json::from_slice::<Asked>(asked)
+        .ok()
+        .and_then(|a| a.model)
+        .unwrap_or_default()
 }
 
 /// Why a failed response failed, in one line, for the /ui request log.
@@ -429,7 +444,12 @@ struct FailNote(String);
 /// Writes a failed request to the usage ledger's `failures` table, when a
 /// ledger is configured. Auth refusals (401/403) are skipped: they are probes,
 /// not routed requests, and would let anyone fill the log.
-fn note_failure(state: &AppState, resp: &Response, key_id: Option<&str>, asked: &[u8]) {
+pub(crate) fn note_failure(
+    state: &AppState,
+    resp: &Response,
+    key_id: Option<&str>,
+    model: impl FnOnce() -> String,
+) {
     let status = resp.status();
     if status.as_u16() < 400 || matches!(status.as_u16(), 401 | 403) {
         return;
@@ -437,14 +457,8 @@ fn note_failure(state: &AppState, resp: &Response, key_id: Option<&str>, asked: 
     let Some(ledger) = state.ledger.as_ref() else {
         return;
     };
-    #[derive(serde::Deserialize)]
-    struct Asked {
-        model: Option<String>,
-    }
-    let model = serde_json::from_slice::<Asked>(asked)
-        .ok()
-        .and_then(|a| a.model)
-        .unwrap_or_default();
+    // Read only here, on a failure: a successful request never pays for the parse.
+    let model = model();
     let why = resp.extensions().get::<FailNote>().map_or_else(
         || status.canonical_reason().unwrap_or("error"),
         |note| note.0.as_str(),
