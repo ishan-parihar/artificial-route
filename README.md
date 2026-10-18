@@ -14,6 +14,8 @@ curl -fsSL https://raw.githubusercontent.com/ishan-parihar/artificial-route/main
 
 That one command installs the newest release, writes a working `~/.config/ar/config.yaml`, writes a `600` credential env file, and installs and starts a **systemd unit** so the proxy comes up on boot.
 
+The command reads `install.sh` from `main`, so the installer is always the newest one. Every binary it downloads is checked against that release's `SHA256SUMS`, and the release carries a build-provenance attestation you can verify with `gh attestation verify aroute-x86_64-unknown-linux-musl --repo ishan-parihar/artificial-route`. Pass `--verify-attestation` to have the installer run that check and refuse to install if it fails. To pin the installer as well, use the tag URL printed in that release's notes instead of `main`.
+
 It does **not** add the weekly update timer when piped. The timer runs a saved copy of the installer, and a piped `curl | bash` has no file to copy — `$0` is `bash`. For unattended updates, save it first:
 
 ```sh
@@ -212,6 +214,7 @@ Static musl binary, checksum-verified, no runtime deps. Lands in `~/.local/bin/a
 | `--dashboard-src <path>` | the dist to install: the `dashboard/dist` directory or a tarball of it; defaults to `dashboard/dist` beside the script |
 | `--no-cta` | skip the closing star/donate note (`SKIP_CTA=1`) |
 | `--all-harnesses` / `--no-harness` | register the MCP server (`aroute mcp`) in every detected AI harness without asking / skip it (`ALL_HARNESS=1` / `SKIP_HARNESS=1`). Claude Code and Codex are registered and verified; OpenCode gets its JSON printed. Non-interactive runs skip it unless `--all-harnesses` is given |
+| `--verify-attestation` | also run `gh attestation verify` on the downloaded binary against this repo, and stop before installing if it fails. Opt-in: needs the [GitHub CLI](https://cli.github.com), and releases published before attestations existed have none to check |
 | `--force-root` | allow running as root (default: refuse) |
 | `--check` | installed vs newest, config and dashboard presence, service and dashsvc state — changes nothing |
 | `--uninstall` | remove binary, unit, timer and dashboard dist; **keeps** config, credentials and the dashboard's data DB |

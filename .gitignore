@@ -41,3 +41,8 @@ perf.data*
 # Local run artifacts, never part of a release
 /serve.pid
 /xd:/
+
+# genome runtime state (locks, temp files, recon tokens, read marks)
+*.genome-lock
+*.genome-tmp
+.genome/

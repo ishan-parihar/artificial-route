@@ -136,6 +136,7 @@ async fn call(app: &Router, req: Request<Body>) -> (StatusCode, HeaderMap, Strin
 /// A POST to `path` with JSON content.
 fn post(path: &str, body: &str, extra: &[(&str, &str)]) -> Request<Body> {
     let mut req = Request::builder()
+        .header(header::HOST, "127.0.0.1:20128")
         .method("POST")
         .uri(path)
         .header(header::CONTENT_TYPE, "application/json")

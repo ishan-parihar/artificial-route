@@ -62,6 +62,48 @@
 
   --anim: 120ms cubic-bezier(0.4, 0, 0.2, 1);
   --shadow: 0 1px 0 rgba(163, 173, 255, 0.04) inset, 0 10px 30px rgba(0, 0, 0, 0.35);
+
+  /* Text drawn on a solid accent. Each palette pairs its accent with ink that
+     clears 4.5:1, so a button never inherits the dark theme's ink on a light fill. */
+  --indigo-deep: #5a63e8;
+  --on-indigo: #0d1030;
+  --on-accent: #07080d;
+  --on-amber: #14100a;
+  /* Amber as text (`code` on a banner), not as a fill. */
+  --amber-ink: #ffab2e;
+  color-scheme: dark;
+}
+
+/* Follows the OS theme (U6). The palette above is the default. The light
+   scheme swaps only the colors that carry meaning, so the layout is shared. */
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f5f6fa;
+    --panel: #ffffff;
+    --panel-2: #f0f2f8;
+    --raised: #e8ecf6;
+    --hover: #e1e6f2;
+    --border: #d6dcea;
+    --border-2: #bcc5da;
+    --text: #161a2d;
+    --muted: #565d7a;
+    --faint: #646b88;
+    --indigo: #4a57d6;
+    --indigo-bright: #3b47bf;
+    --indigo-soft: rgba(74, 87, 214, 0.12);
+    --indigo-soft-2: rgba(74, 87, 214, 0.06);
+    --indigo-deep: #3d49c9;
+    --on-indigo: #ffffff;
+    --on-accent: #ffffff;
+    --amber: #e0900f;
+    --on-amber: #14100a;
+    --amber-ink: #8a5a00;
+    --ok: #17784a;
+    --err: #b42424;
+    --warn: #8a5d00;
+    --shadow: 0 1px 0 rgba(255, 255, 255, 0.7) inset, 0 8px 24px rgba(20, 26, 48, 0.08);
+    color-scheme: light;
+  }
 }
 
 /* ── L1 · base ─────────────────────────────────────────────────────────────── */
@@ -141,8 +183,8 @@ code, .mono, .num, .varname, td.num {
   font-weight: 700;
   font-size: 13px;
   letter-spacing: 0.02em;
-  background: linear-gradient(135deg, var(--indigo), #5a63e8);
-  color: #07080d;
+  background: linear-gradient(135deg, var(--indigo), var(--indigo-deep));
+  color: var(--on-accent);
   border-radius: 8px;
   padding: 5px 8px;
 }
@@ -208,7 +250,9 @@ code, .mono, .num, .varname, td.num {
 @media (max-width: 880px) {
   .shell { grid-template-columns: minmax(0, 1fr); }
   .side {
-    position: sticky;
+    /* Not sticky: a wrapped three-row bar pinned to the top takes ~116 px of
+       every phone and tablet screen. The nav scrolls away with the page. */
+    position: static;
     height: auto;
     flex-direction: row;
     flex-wrap: wrap;
@@ -222,7 +266,7 @@ code, .mono, .num, .varname, td.num {
   .side-brand { border-bottom: 0; margin: 0; padding: 0; }
   .nav { flex-direction: row; flex: 1 1 0; min-width: 0; overflow-x: auto; padding: 0; scrollbar-width: none; }
   .nav a { padding: 10px 10px; white-space: nowrap; min-height: 44px; align-self: center; }
-  .side-foot { border-top: 0; padding: 0; grid-auto-flow: row; align-items: center; gap: 10px; min-width: 0; flex: 1 1 100%; }
+  .side-foot { border-top: 0; padding: 0; grid-auto-flow: column; justify-content: start; align-items: center; gap: 10px; min-width: 0; flex: 1 1 100%; }
   .side-config { display: none; }
 }
 
@@ -241,7 +285,7 @@ code, .mono, .num, .varname, td.num {
   padding: 10px 14px;
 }
 .banner p { margin: 0 0 4px; color: var(--text); font-size: var(--fs-sm); }
-.banner code { font-size: var(--fs-xs); color: var(--amber); }
+.banner code { font-size: var(--fs-xs); color: var(--amber-ink); }
 
 /* ── L2 · view scaffolding ────────────────────────────────────────────────── */
 
@@ -261,6 +305,8 @@ code, .mono, .num, .varname, td.num {
 .view-head .hint { margin: 0; }
 
 .hint { font-size: var(--fs-sm); color: var(--faint); margin: 0; }
+/* WCAG 2.5.8: 24 px minimum target. Inline links were 19 px tall and passed only by spacing. The phone rule raises this to 44 px. */
+.hint[href] { display: inline-flex; align-items: center; min-height: 24px; }
 
 section.block {
   border: 1px solid var(--border);
@@ -273,6 +319,7 @@ section.block {
 }
 .block > .block-head {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 12px;
   padding: 13px 16px;
@@ -286,6 +333,7 @@ section.block {
   letter-spacing: -0.01em;
 }
 .block-head .hint { margin-left: auto; }
+.block-head input { flex: 0 1 180px; min-width: 0; max-width: 100%; }
 .block > .block-body { padding: 14px 16px; }
 
 /* ── L3 · stat band ───────────────────────────────────────────────────────── */
@@ -393,7 +441,7 @@ section.block {
   border-radius: 50%;
   background: var(--indigo-soft);
   color: var(--indigo-bright);
-  font-size: 10px;
+  font-size: var(--fs-xs);
   font-weight: 700;
 }
 .pill.pool { border-style: dashed; color: var(--muted); }
@@ -485,7 +533,7 @@ input[type="password"] { width: 180px; }
   gap: 6px;
   background: var(--amber);
   border: 0;
-  color: #14100a;
+  color: var(--on-amber);
   border-radius: var(--r-sm);
   padding: 6px 13px;
   font: inherit;
@@ -498,7 +546,7 @@ input[type="password"] { width: 180px; }
 .btn:active { transform: translateY(1px); }
 .btn.btn-primary {
   background: var(--indigo);
-  color: #0d1030;
+  color: var(--on-indigo);
   font-size: var(--fs-md);
   padding: 9px 18px;
 }
@@ -510,6 +558,15 @@ input[type="password"] { width: 180px; }
 .btn.ghost:hover { border-color: var(--indigo); color: var(--indigo-bright); background: transparent; }
 .btn.small { padding: 3px 9px; font-size: var(--fs-xs); }
 .icon-btn { width: 24px; height: 24px; padding: 0; justify-content: center; }
+
+/* collapsed layout (phones, tablets): 44px hit areas for the row actions; desktop keeps the dense rows */
+@media (max-width: 880px) {
+  .btn { min-height: 44px; }
+  .btn.small { padding: 10px 14px; }
+  .icon-btn { width: 44px; height: 44px; }
+  .hint[href], .fav > summary { min-height: 44px; }
+  .view-head .hint { font-size: 15px; }
+}
 
 .row-form { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .row-form label { color: var(--muted); font-size: var(--fs-sm); }
@@ -616,7 +673,7 @@ textarea { font-size: var(--fs-sm); }
   color: var(--faint); font-size: var(--fs); line-height: 1; border-radius: var(--r-sm); }
 .star.on { color: var(--amber); }
 .star:hover { color: var(--amber); background: var(--amber-soft); }
-.fav > summary { cursor: pointer; font-weight: 600; font-size: var(--fs-sm); }
+.fav > summary { cursor: pointer; font-weight: 600; font-size: var(--fs-sm); display: inline-flex; align-items: center; min-height: 24px; }
 #fav-body { display: flex; flex-wrap: wrap; gap: 4px 12px; padding-top: 8px; }
 
 @media (prefers-reduced-motion: reduce) {

@@ -12,6 +12,8 @@
 //! several proxies gets one independent limit per instance, exactly as the
 //! source does. A cluster-wide ceiling needs shared state and is out of scope.
 
+#![deny(missing_docs)]
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -83,7 +85,10 @@ impl Limiter {
     /// so this arm is reachable only by constructing the struct by hand.
     pub fn check(&self, key: &str) -> Result<(), u64> {
         let now = Instant::now();
-        let mut buckets = self.buckets.lock().expect("limit mutex poisoned");
+        let mut buckets = self
+            .buckets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let spec = self.spec;
         let is_new = !buckets.contains_key(key);
         let bucket = buckets.entry(key.to_owned()).or_insert(Bucket {

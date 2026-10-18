@@ -10,11 +10,14 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
 use futures::Stream;
 use http::StatusCode;
+
+use crate::resilience::{BreakerClass, Resilience};
 
 /// Interned provider/model/session name.
 ///
@@ -339,6 +342,70 @@ pub struct MediaReply {
     pub retry_after: Option<Duration>,
 }
 
+/// Set by the executor when the upstream body fails after its headers.
+///
+/// `ChunkStream` yields bare bytes, so a body error cannot travel in the stream
+/// itself. The relay reads this flag once the stream ends, to tell a finished
+/// reply from a cut one.
+pub type CutFlag = Arc<std::sync::atomic::AtomicBool>;
+
+/// Settles a streamed attempt's breaker verdict when its body is over.
+///
+/// The breaker is not credited at the first byte. `record_provider_success`
+/// takes one failure off the count, so a provider that cut every stream after
+/// its first byte would be credited and charged once per request and never
+/// reach its threshold. The verdict is taken here instead: a cut is one
+/// failure, and any other end (a clean finish, or the client going away) is a
+/// success. Dropping the stream is the settle point, so a disconnect settles too.
+pub fn settle_stream(
+    stream: ChunkStream,
+    resilience: Arc<Resilience>,
+    provider: &str,
+    cut: CutFlag,
+) -> ChunkStream {
+    Box::pin(Settled {
+        inner: stream,
+        _verdict: Verdict {
+            resilience,
+            provider: Strng::from(provider),
+            cut,
+        },
+    })
+}
+
+/// The breaker verdict for one streamed attempt, taken on drop.
+struct Verdict {
+    resilience: Arc<Resilience>,
+    provider: Strng,
+    cut: CutFlag,
+}
+
+impl Drop for Verdict {
+    fn drop(&mut self) {
+        if self.cut.load(std::sync::atomic::Ordering::SeqCst) {
+            self.resilience
+                .record_provider_failure(&self.provider, BreakerClass::default());
+        } else {
+            self.resilience.record_provider_success(&self.provider);
+        }
+    }
+}
+
+/// A chunk stream that carries its [`Verdict`] until it is dropped.
+struct Settled {
+    inner: ChunkStream,
+    // Read only by its `Drop`, which runs when this stream is dropped.
+    _verdict: Verdict,
+}
+
+impl Stream for Settled {
+    type Item = Bytes;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Bytes>> {
+        self.get_mut().inner.as_mut().poll_next(cx)
+    }
+}
+
 /// A completed upstream exchange, successful or not.
 pub struct Upstream {
     /// HTTP status the provider returned.
@@ -351,6 +418,8 @@ pub struct Upstream {
     pub error_body: Bytes,
     /// Success payload. Empty for non-2xx, which never has one.
     pub stream: ChunkStream,
+    /// Whether `stream` ended because the upstream body failed. See [`CutFlag`].
+    pub cut: CutFlag,
 }
 
 impl fmt::Debug for Upstream {
@@ -375,6 +444,7 @@ impl Upstream {
             retry_after: None,
             error_body: Bytes::new(),
             stream,
+            cut: CutFlag::default(),
         }
     }
 
@@ -386,6 +456,7 @@ impl Upstream {
             retry_after,
             error_body,
             stream: Box::pin(futures::stream::empty()),
+            cut: CutFlag::default(),
         }
     }
 }
@@ -558,5 +629,46 @@ mod tests {
     fn headroom_is_the_free_fraction_of_the_window() {
         let q = QuotaWindow::new(200, 50, 0);
         assert!((q.headroom() - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn settle_stream_should_open_the_breaker_when_every_body_is_cut() {
+        use super::{CutFlag, settle_stream};
+        use crate::resilience::{BreakerClass, BreakerState, Resilience};
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+        let resilience = Arc::new(Resilience::new());
+        for _ in 0..BreakerClass::default().threshold() {
+            let cut = CutFlag::default();
+            cut.store(true, Ordering::SeqCst);
+            let stream = settle_stream(
+                Box::pin(futures::stream::empty()),
+                Arc::clone(&resilience),
+                "p1",
+                cut,
+            );
+            drop(stream);
+        }
+        assert_eq!(resilience.breaker_state("p1"), BreakerState::Open);
+    }
+
+    #[test]
+    fn settle_stream_should_credit_nothing_until_the_body_is_dropped() {
+        use super::{CutFlag, settle_stream};
+        use crate::resilience::{BreakerClass, BreakerState, Resilience};
+        use std::sync::Arc;
+        let resilience = Arc::new(Resilience::new());
+        for _ in 0..BreakerClass::default().threshold() {
+            resilience.record_provider_failure("p1", BreakerClass::default());
+        }
+        assert_eq!(resilience.breaker_state("p1"), BreakerState::Open);
+        let open_stream = settle_stream(
+            Box::pin(futures::stream::empty()),
+            Arc::clone(&resilience),
+            "p1",
+            CutFlag::default(),
+        );
+        assert_eq!(resilience.breaker_state("p1"), BreakerState::Open);
+        drop(open_stream);
     }
 }

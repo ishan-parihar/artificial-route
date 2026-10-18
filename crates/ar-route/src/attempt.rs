@@ -835,7 +835,16 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
                         // closes the breaker, since a working call is proof the
                         // provider is back.
                         resilience.record_success(provider.as_str());
-                        resilience.record_provider_success(provider.as_str());
+                        // A non-stream body is whole here, so the breaker is credited
+                        // now. A stream's verdict waits for its body to end (R5):
+                        // `settle_stream` takes it in the server, where the body is read.
+                        // The one exception is a half-open probe, which closes at first
+                        // byte so a long stream cannot hold the breaker shut for its length.
+                        if canonical.stream {
+                            resilience.credit_first_byte(provider.as_str());
+                        } else {
+                            resilience.record_provider_success(provider.as_str());
+                        }
                         return Ok(AttemptOutcome::Succeeded {
                             provider: provider.clone(),
                             // One allocation, on the request path, at most

@@ -244,7 +244,7 @@ mod tests {
         let dir = scratch("roundtrip");
         let path = db(&dir);
         let out = read(&path);
-        let yaml = crate::import::render_yaml(&BTreeMap::new(), &[], &out);
+        let yaml = crate::import::render_yaml(&BTreeMap::new(), &[], &out).expect("renders");
         assert!(yaml.contains("custom_providers:"), "no node block:\n{yaml}");
         assert!(
             yaml.contains("key_ref: openai-compatible-chat-abc"),

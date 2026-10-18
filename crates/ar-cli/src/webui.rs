@@ -139,7 +139,11 @@ pub fn mount(proxy: Router, ctx: Ctx) -> Router {
         .route("/ui/api/keys/mint", post(mint_key))
         .route("/ui/api/limits", post(set_limits))
         .with_state(Arc::new(ctx));
-    ui.merge(proxy)
+    // `app()` guards the proxy routes; this guards `/ui`, which is merged in
+    // after `app()` ran. The mint, provider-key and limits routes are the ones a
+    // rebinding page would reach, so they are the reason this layer exists.
+    ui.layer(axum::middleware::from_fn(ar_server::app::loopback_only))
+        .merge(proxy)
 }
 
 // ── assets ──────────────────────────────────────────────────────────────────
@@ -223,6 +227,19 @@ fn conflict(error: String, help: &str) -> Response {
         .into_response()
 }
 
+/// A section the page could not serialize. Nothing has been written yet, so the
+/// config stays as it was and the refusal says so.
+fn render_failed(error: anyhow::Error) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "error": format!("cannot render the config section: {error:#}"),
+            "help": "nothing was written",
+        })),
+    )
+        .into_response()
+}
+
 /// A body that did not parse is a 400 with the rejection's own words; the
 /// page never sees a bare axum rejection.
 fn body_error(rejection: JsonRejection) -> Response {
@@ -246,10 +263,11 @@ fn raw_keys(doc: &str) -> BTreeMap<String, String> {
 }
 
 /// The raw `keys:` mapping, with one binding upserted.
-fn with_key_binding(doc: &str, name: &str, var: &str) -> String {
+fn with_key_binding(doc: &str, name: &str, var: &str) -> anyhow::Result<String> {
     let mut keys = raw_keys(doc);
     keys.insert(name.to_owned(), format!("${var}"));
-    commands::splice_section(doc, "keys", &crate::import::render_keys_section(&keys))
+    let section = crate::import::render_keys_section(&keys)?;
+    Ok(commands::splice_section(doc, "keys", &section))
 }
 
 /// The env resolver `Config::parse` wants: a present variable, or the parse
@@ -571,11 +589,11 @@ async fn save_combos(
     if let Err(msg) = check_combos(&combos, &cfg) {
         return bad_request(msg, "fix the fields the error names; nothing was written");
     }
-    let next = commands::splice_section(
-        &doc,
-        "combos",
-        &crate::import::render_combos_section(&combos),
-    );
+    let section = match crate::import::render_combos_section(&combos) {
+        Ok(section) => section,
+        Err(e) => return render_failed(e),
+    };
+    let next = commands::splice_section(&doc, "combos", &section);
     if next == doc {
         return Json(json!({ "ok": true, "pending_restart": false, "note": "identical" }))
             .into_response();
@@ -747,12 +765,15 @@ async fn provider_key(
                 key: id.clone(),
                 keys: None,
             });
-            let next = commands::splice_section(
-                &doc,
-                "providers",
-                &crate::import::render_providers_section(&rows),
-            );
-            (with_key_binding(&next, &id, var.as_str()), var)
+            let section = match crate::import::render_providers_section(&rows) {
+                Ok(section) => section,
+                Err(e) => return render_failed(e),
+            };
+            let next = commands::splice_section(&doc, "providers", &section);
+            match with_key_binding(&next, &id, var.as_str()) {
+                Ok(next) => (next, var),
+                Err(e) => return render_failed(e),
+            }
         }
     };
 
@@ -786,13 +807,7 @@ fn set_env_var(path: &std::path::Path, name: &str, value: &str) -> std::io::Resu
         Some(i) => lines[i] = entry,
         None => lines.push(entry),
     }
-    std::fs::write(path, lines.join("\n") + "\n")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+    commands::write_private(path, &(lines.join("\n") + "\n"))
 }
 
 /// Mints a client token through the same gate the proxy verifies against.
@@ -1110,11 +1125,11 @@ async fn provider_custom(
             headers: BTreeMap::new(),
         },
     );
-    let mut next = commands::splice_section(
-        &doc,
-        "custom_providers",
-        &crate::import::render_custom_section(&rows),
-    );
+    let section = match crate::import::render_custom_section(&rows) {
+        Ok(section) => section,
+        Err(e) => return render_failed(e),
+    };
+    let mut next = commands::splice_section(&doc, "custom_providers", &section);
     if !key.is_empty() {
         // Env first: the config write below is the one that publishes it.
         if let Err(e) = set_env_var(&ctx.env, var, &key) {
@@ -1123,7 +1138,10 @@ async fn provider_custom(
                 "check permissions on the env file",
             );
         }
-        next = with_key_binding(&next, &id, var);
+        next = match with_key_binding(&next, &id, var) {
+            Ok(next) => next,
+            Err(e) => return render_failed(e),
+        };
     }
     if next == doc {
         return Json(json!({ "ok": true, "pending_restart": false, "note": "identical" }))
@@ -1157,22 +1175,19 @@ fn upsert_custom_rows(
 ///
 /// The `ar.env` line is never touched: an unset `$AR_KEY_*` is harmless, and
 /// the same variable may still back a row that stays.
-fn splice_remove_provider(doc: &str, cfg: &Config, id: &str) -> Option<String> {
+fn splice_remove_provider(doc: &str, cfg: &Config, id: &str) -> anyhow::Result<Option<String>> {
     if !cfg.providers.iter().any(|p| p.id == id) && !cfg.custom_providers.iter().any(|c| c.id == id)
     {
-        return None;
+        return Ok(None);
     }
-    let next = commands::splice_section(
-        doc,
-        "providers",
-        &crate::import::render_providers_section(
-            &cfg.providers
-                .iter()
-                .filter(|p| p.id != id)
-                .cloned()
-                .collect::<Vec<_>>(),
-        ),
-    );
+    let providers = crate::import::render_providers_section(
+        &cfg.providers
+            .iter()
+            .filter(|p| p.id != id)
+            .cloned()
+            .collect::<Vec<_>>(),
+    )?;
+    let next = commands::splice_section(doc, "providers", &providers);
     let kept: BTreeSet<String> = cfg
         .providers
         .iter()
@@ -1185,17 +1200,14 @@ fn splice_remove_provider(doc: &str, cfg: &Config, id: &str) -> Option<String> {
                 .map(|c| c.key_ref.clone()),
         )
         .collect();
-    let next = commands::splice_section(
-        &next,
-        "custom_providers",
-        &crate::import::render_custom_section(
-            &cfg.custom_providers
-                .iter()
-                .filter(|c| c.id != id)
-                .cloned()
-                .collect::<Vec<_>>(),
-        ),
-    );
+    let customs = crate::import::render_custom_section(
+        &cfg.custom_providers
+            .iter()
+            .filter(|c| c.id != id)
+            .cloned()
+            .collect::<Vec<_>>(),
+    )?;
+    let next = commands::splice_section(&next, "custom_providers", &customs);
     // Keys entries the removed rows alone held: every entry the removed rows
     // name, minus the entries the surviving rows name. Shared entries survive
     // by construction, so this is exactly a “no dangling reference” edit.
@@ -1213,17 +1225,14 @@ fn splice_remove_provider(doc: &str, cfg: &Config, id: &str) -> Option<String> {
         .filter(|name| !kept.contains(name))
         .collect();
     if orphaned.is_empty() {
-        return Some(next);
+        return Ok(Some(next));
     }
     let keys = raw_keys(doc)
         .into_iter()
         .filter(|(name, _)| !orphaned.contains(name))
         .collect();
-    Some(commands::splice_section(
-        &next,
-        "keys",
-        &crate::import::render_keys_section(&keys),
-    ))
+    let section = crate::import::render_keys_section(&keys)?;
+    Ok(Some(commands::splice_section(&next, "keys", &section)))
 }
 
 /// Removes one provider: refuses while any combo still references it, refuses
@@ -1272,7 +1281,11 @@ async fn provider_remove(
             "delete or repoint those combos first; a dead provider fails loudly, a dangling one fails late",
         );
     }
-    let Some(next) = splice_remove_provider(&doc, &cfg, &id) else {
+    let next = match splice_remove_provider(&doc, &cfg, &id) {
+        Ok(next) => next,
+        Err(e) => return render_failed(e),
+    };
+    let Some(next) = next else {
         return conflict(
             format!("{id:?} is not configured in this file"),
             "the providers pane lists what is configured",
@@ -1359,12 +1372,16 @@ mod tests {
         );
         let cfg = Config::parse(doc, resolve_env).expect("fixture must parse");
         assert!(
-            splice_remove_provider(doc, &cfg, "zzz").is_none(),
+            splice_remove_provider(doc, &cfg, "zzz")
+                .expect("renders")
+                .is_none(),
             "an unknown id is a refusal, not an edit"
         );
 
         // pd alone holds `dkey`, so the row and its binding go together.
-        let next = splice_remove_provider(doc, &cfg, "pd").expect("pd is configured");
+        let next = splice_remove_provider(doc, &cfg, "pd")
+            .expect("renders")
+            .expect("pd is configured");
         let keys = raw_keys(&next);
         assert!(!keys.contains_key("dkey"), "{keys:?}");
         assert!(keys.contains_key("shared"), "{keys:?}");
@@ -1373,7 +1390,9 @@ mod tests {
 
         // pa shares `shared` with pc, so the binding — and therefore the
         // keys section — is untouched.
-        let next2 = splice_remove_provider(&next, &cfg2, "pa").expect("pa is configured");
+        let next2 = splice_remove_provider(&next, &cfg2, "pa")
+            .expect("renders")
+            .expect("pa is configured");
         assert_eq!(
             raw_keys(&next2),
             keys,
@@ -1444,6 +1463,7 @@ mod http_tests {
 
     async fn call(app: &Router, method: Method, uri: &str, body: &str) -> (StatusCode, Value) {
         let req = Request::builder()
+            .header("host", "127.0.0.1:20128")
             .method(method)
             .uri(uri)
             .header("content-type", "application/json")

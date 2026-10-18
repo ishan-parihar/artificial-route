@@ -296,6 +296,8 @@ dependencies = [
  "ar-keys",
  "crossbeam-channel",
  "redb 4.3.0",
+ "sha2",
+ "subtle",
  "thiserror",
  "tracing",
  "tracing-subscriber",
@@ -309,6 +311,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

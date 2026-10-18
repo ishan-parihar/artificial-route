@@ -50,10 +50,9 @@ fn vmrss_kb() -> u64 {
 const PER_ROUND: u64 = 200;
 const ROUNDS: u64 = 40;
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cache =
-        Cache::with_config(CacheConfig::memory_only().with_mem_bytes(ar_cache::DEFAULT_MEM_BYTES))
-            .expect("memory-only cache");
+        Cache::with_config(CacheConfig::memory_only().with_mem_bytes(ar_cache::DEFAULT_MEM_BYTES))?;
 
     println!(
         "baseline_vmRSS_kb={} mem_weight={}",
@@ -90,4 +89,5 @@ fn main() {
         cache.mem().capacity(),
     );
     println!("final weight={weight} vmRSS_kb={}", vmrss_kb());
+    Ok(())
 }

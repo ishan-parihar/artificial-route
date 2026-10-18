@@ -143,8 +143,26 @@ fn components(
 }
 
 /// Boots the listener and blocks until interrupted.
+/// K5: an API-key provider whose `$VAR` key is empty would send every request
+/// unauthenticated. Refuses by key name, never by value. `doctor` still reports
+/// the same finding, because it loads the config without this check.
+fn refuse_empty_api_keys(cfg: &Config) -> anyhow::Result<()> {
+    let empty = cfg.empty_api_keys();
+    anyhow::ensure!(
+        empty.is_empty(),
+        "key(s) {} resolved to an empty value, so their providers would go upstream with no credential. \
+         Set the variable(s) in the environment, or write \"\" in config.yaml if the provider is meant to be keyless",
+        empty.join(", ")
+    );
+    Ok(())
+}
+
 pub async fn serve(cli: &Cli, args: &ServeArgs) -> anyhow::Result<()> {
+    // Before anything binds: a malformed compiled-in table is a build defect, and
+    // refusing here keeps it from degrading a running proxy at first use.
+    ar_registry::check_embedded()?;
     let cfg = commands::load(cli)?;
+    refuse_empty_api_keys(&cfg)?;
     let built = components(cli, &cfg, args.port, None)?;
 
     // The control page (docs/16 Option B): the ledger Arc is cloned before the
@@ -274,6 +292,7 @@ async fn shutdown_signal() {
 /// would have to remember to print is how it gets lost.
 pub async fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<()> {
     let cfg = commands::load(cli)?;
+    refuse_empty_api_keys(&cfg)?;
     let model = match args.model.as_deref() {
         Some(id) => {
             anyhow::ensure!(

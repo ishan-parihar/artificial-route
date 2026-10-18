@@ -138,6 +138,12 @@ pub use crate::sse::{SseError, SseEvent};
 /// OmniRoute's `FETCH_TIMEOUT_MS` default.
 const BASE_START_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// The longest silence allowed on an upstream body between two chunks, once
+/// headers have landed. A ceiling for a stalled connection, not a bound on a
+/// healthy stream: a slow stream that keeps sending is never cut by it. Not
+/// measured against a provider; adjust here if a real stream pauses longer.
+const IDLE_BODY_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// OmniRoute's `DEFAULT_FETCH_START_TIMEOUT_CAP_MS`: a streaming request may not
 /// take longer than this to produce its first byte, even when the provider
 /// configures a longer budget. Providers that buffer whole generations behind a
@@ -773,7 +779,16 @@ impl ChatStream {
                 let read = tokio::select! {
                     biased;
                     () = abort.cancelled() => Err(ExecError::Aborted),
-                    next = tokio_stream::StreamExt::next(&mut body) => Ok(next),
+                    next = tokio::time::timeout(
+                        IDLE_BODY_TIMEOUT,
+                        tokio_stream::StreamExt::next(&mut body),
+                    ) => match next {
+                        Ok(item) => Ok(item),
+                        Err(_) => Err(ExecError::Transport(format!(
+                            "upstream body idle for {}s",
+                            IDLE_BODY_TIMEOUT.as_secs()
+                        ))),
+                    },
                 };
                 match read {
                     Err(e) => {
@@ -816,7 +831,16 @@ impl ChatStream {
                 let read = tokio::select! {
                     biased;
                     () = abort.cancelled() => Err(ExecError::Aborted),
-                    next = tokio_stream::StreamExt::next(&mut body) => Ok(next),
+                    next = tokio::time::timeout(
+                        IDLE_BODY_TIMEOUT,
+                        tokio_stream::StreamExt::next(&mut body),
+                    ) => match next {
+                        Ok(item) => Ok(item),
+                        Err(_) => Err(ExecError::Transport(format!(
+                            "upstream body idle for {}s",
+                            IDLE_BODY_TIMEOUT.as_secs()
+                        ))),
+                    },
                 };
 
                 let chunk = match read {

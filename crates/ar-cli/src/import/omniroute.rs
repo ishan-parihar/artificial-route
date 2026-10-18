@@ -148,7 +148,7 @@ pub fn scan(providers_dir: &Path, storage: Option<&Path>) -> anyhow::Result<Impo
     // combo names a provider it does not define refuses to start.
     let custom_providers = storage.map(crate::import::custom::read).unwrap_or_default();
 
-    let config_yaml = render_yaml(&defs, &combos, &custom_providers);
+    let config_yaml = render_yaml(&defs, &combos, &custom_providers)?;
     Ok(Imported {
         registry: defs,
         combos,

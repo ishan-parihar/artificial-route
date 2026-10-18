@@ -106,19 +106,18 @@ impl ModelLifecycle {
     }
 }
 
-/// The process-wide snapshot, parsed on first use.
-///
-/// # Panics
-///
-/// Panics if the embedded snapshot is malformed. It is a generated source file,
-/// not user input, so a panic at first use is the honest signal.
+/// The process-wide snapshot, parsed on first use. A malformed snapshot is
+/// logged and served empty; see [`crate::check_embedded`].
 #[must_use]
 pub fn global() -> &'static ModelLifecycle {
-    static TABLE: LazyLock<ModelLifecycle> = LazyLock::new(|| {
-        serde_json::from_str(MODEL_LIFECYCLE_JSON)
-            .expect("embedded modelLifecycle.json is malformed")
-    });
+    static TABLE: LazyLock<ModelLifecycle> =
+        LazyLock::new(|| crate::embedded_or_empty("modelLifecycle.json", parse()));
     &TABLE
+}
+
+/// Parses the compiled-in snapshot. [`crate::check_embedded`] runs it at boot.
+pub(crate) fn parse() -> Result<ModelLifecycle, serde_json::Error> {
+    serde_json::from_str(MODEL_LIFECYCLE_JSON)
 }
 
 #[cfg(test)]

@@ -1,17 +1,12 @@
 //! Shared vocabulary for every Artificial Route crate.
 //!
-//! P0 scope: the interned name type, the three cross-crate trait seams that
-//! `ar-translate` / `ar-exec` / `ar-route` will implement, and the placeholder
-//! error those seams return until each owning crate brings its own `thiserror`
-//! enums (docs/03 assigns those enums to the owning crates, not here).
+//! The interned name type and the helpers around it. The cross-crate seams live
+//! in the crates that implement them (`ar-route` owns `ArExec` and `ArTranslate`),
+//! not here: an unused seam declared in this crate drifted from the real one.
 
 #![deny(missing_docs)]
 
 use std::sync::Arc;
-
-mod traits;
-
-pub use traits::{ArError, ArExec, ArRoute, ArTranslate, RouteTarget};
 
 /// Cheaply-cloned, immutable string used for provider, model, combo and key
 /// names (docs/03: "`Strng` for names").

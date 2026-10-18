@@ -491,8 +491,14 @@ impl ProviderConfig {
     /// what refuses those before the socket is spent (MW4).
     #[must_use]
     pub fn pick_key(&self) -> usize {
-        let state = self.key_state.lock().expect("key state lock");
-        let mut cursor = self.key_cursor.lock().expect("key cursor lock");
+        let state = self
+            .key_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut cursor = self
+            .key_cursor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = std::time::Instant::now();
         let usable = |slot: &KeySlot| !slot.blocked_until.is_some_and(|t| t > now);
         let n = state.len();
@@ -528,7 +534,10 @@ impl ProviderConfig {
         status: StatusCode,
         retry_after: Option<std::time::Duration>,
     ) {
-        let mut state = self.key_state.lock().expect("key state lock");
+        let mut state = self
+            .key_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = std::time::Instant::now();
         let usable = |slot: &KeySlot| !slot.blocked_until.is_some_and(|t| t > now);
         let is_auth = matches!(status.as_u16(), 401 | 403);
@@ -583,7 +592,10 @@ impl ProviderConfig {
     /// rotation while any key answers is untouched.
     #[must_use]
     pub fn all_keys_auth_blocked(&self) -> bool {
-        let state = self.key_state.lock().expect("key state lock");
+        let state = self
+            .key_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = std::time::Instant::now();
         !state.is_empty()
             && state
@@ -643,12 +655,20 @@ async fn unwrap_response(
     // and dropping it unread would close a connection the relay below
     // still owes the client. Non-streaming replies cross the proxy in one
     // buffer whether or not an envelope was claimed.
-    let body = drain_chat(upstream).await;
+    let body = match drain_chat(upstream).await {
+        Ok(body) => body,
+        Err(reason) => {
+            // The router reads a 502 as a failed attempt, so it can fail over
+            // and the cache never sees the reply.
+            return Upstream::failure(StatusCode::BAD_GATEWAY, Bytes::from(reason), retry_after);
+        }
+    };
     let single = |body: Bytes| Upstream {
         status,
         retry_after,
         error_body: Bytes::new(),
         stream: Box::pin(futures::stream::once(async move { body })),
+        cut: Default::default(),
     };
     // A Gemini reply is Google's own envelope, which neither the router nor an
     // OpenAI client can read as a completion (docs/22, D6). A text reply is
@@ -850,11 +870,9 @@ impl ArRouteExec for HttpExec {
             // only thing between a client hang and a hung socket. It is not
             // threaded from the router because `ar_route::ArExec::post_chat`
             // carries no cancellation channel, and adding one is ar-route's
-            // signature to change.
-            //
-            // TODO(#p1-cancel): plumb a per-request token from the router so a
-            // client disconnect aborts the upstream read instead of waiting for
-            // the response-start budget.
+            // signature to change. A client that hangs up is not left waiting:
+            // axum drops the handler future, which drops this call and its
+            // `reqwest` request. `tests/disconnect.rs` pins that for both shapes.
             let abort = CancellationToken::new();
             // The model the router picked for *this* attempt, not the provider's
             // configured one: a chain entry names its own model, and every
@@ -937,11 +955,16 @@ impl ArRouteExec for HttpExec {
             // scan and the accounting buffer share the one chunk); streams
             // keep the raw relay.
             if canonical.stream {
-                let chunks = stream.into_bytes().filter_map(|chunk| {
+                // A body error ends the stream early. It must not look like a
+                // finished reply, so it is recorded in `cut` for the relay.
+                let cut = ar_route::CutFlag::default();
+                let flag = cut.clone();
+                let chunks = stream.into_bytes().filter_map(move |chunk| {
                     futures::future::ready(match chunk {
                         Ok(bytes) => Some(bytes),
                         Err(e) => {
                             tracing::warn!(error = ?e, "upstream stream ended early");
+                            flag.store(true, std::sync::atomic::Ordering::SeqCst);
                             None
                         }
                     })
@@ -954,6 +977,7 @@ impl ArRouteExec for HttpExec {
                     retry_after,
                     error_body: Bytes::new(),
                     stream: chunks.boxed(),
+                    cut,
                 });
             }
             return Ok(
@@ -1042,7 +1066,7 @@ impl ArRouteExec for HttpExec {
 /// body to strip a gateway envelope, and the attempt loop must read it again
 /// to scan for error-shaped 2xx replies — both work off buffers, never off
 /// the socket, so a read error here ends the relay rather than retrying it.
-async fn drain_chat(upstream: ar_exec::ChatStream) -> Bytes {
+async fn drain_chat(upstream: ar_exec::ChatStream) -> Result<Bytes, String> {
     use futures::StreamExt as _;
     let mut buffered = Vec::new();
     // `into_bytes` returns an unnamed generator stream: `Unpin` is not
@@ -1050,15 +1074,30 @@ async fn drain_chat(upstream: ar_exec::ChatStream) -> Bytes {
     let mut chunks = Box::pin(upstream.into_bytes());
     while let Some(chunk) = chunks.next().await {
         match chunk {
-            Ok(bytes) => buffered.extend_from_slice(&bytes),
+            Ok(bytes) => {
+                if buffered.len() + bytes.len() > NON_STREAM_BODY_BYTES {
+                    return Err(format!(
+                        "upstream reply exceeds {NON_STREAM_BODY_BYTES} bytes"
+                    ));
+                }
+                buffered.extend_from_slice(&bytes);
+            }
+            // A cut reply is a failure, not a shorter success. Returning the
+            // partial body here answered 200 with truncated JSON, and the
+            // cache stored it for its full TTL.
             Err(e) => {
-                tracing::warn!(error = ?e, "upstream stream ended early");
-                break;
+                tracing::warn!(error = ?e, "upstream reply cut before it completed");
+                return Err(format!("upstream reply cut before it completed: {e:?}"));
             }
         }
     }
-    Bytes::from(buffered)
+    Ok(Bytes::from(buffered))
 }
+
+/// Largest non-streaming reply the gateway will buffer. A chat completion is
+/// text; past this the reply is refused as a 502 rather than held in memory.
+/// The stream path is not capped here: it relays chunk by chunk.
+const NON_STREAM_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 /// Replaces the `model` field of a JSON body with `upstream_model`.
 ///
@@ -1718,7 +1757,10 @@ mod tests {
         p.note_key_result(1, StatusCode::UNAUTHORIZED, None);
         assert!(p.all_keys_auth_blocked());
         {
-            let mut state = p.key_state.lock().expect("key state lock");
+            let mut state = p
+                .key_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for slot in state.iter_mut() {
                 slot.blocked_until = Some(std::time::Instant::now());
             }

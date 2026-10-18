@@ -445,6 +445,7 @@ mod tests {
 
     fn post(path: &str, body: &str) -> axum::http::Request<axum::body::Body> {
         axum::http::Request::builder()
+            .header("host", "127.0.0.1:20128")
             .method("POST")
             .uri(path)
             .header(header::CONTENT_TYPE, "application/json")
@@ -581,6 +582,7 @@ mod tests {
         let resp = drive(
             &router,
             axum::http::Request::builder()
+                .header("host", "127.0.0.1:20128")
                 .method("POST")
                 .uri("/v1/audio/transcriptions")
                 .header(header::CONTENT_TYPE, "multipart/form-data; boundary=b")
@@ -609,6 +611,7 @@ mod tests {
         let resp = drive(
             &router,
             axum::http::Request::builder()
+                .header("host", "127.0.0.1:20128")
                 .method("POST")
                 .uri("/v1/audio/transcriptions?model=m")
                 .header(header::CONTENT_TYPE, "multipart/form-data; boundary=b")
@@ -644,6 +647,7 @@ mod tests {
         let resp = drive(
             &router,
             axum::http::Request::builder()
+                .header("host", "127.0.0.1:20128")
                 .method("POST")
                 .uri("/v1/audio/translations")
                 .header(header::CONTENT_TYPE, "multipart/form-data; boundary=b")
@@ -672,6 +676,7 @@ mod tests {
         let resp = drive(
             &router,
             axum::http::Request::builder()
+                .header("host", "127.0.0.1:20128")
                 .method("POST")
                 .uri("/v1/audio/translations?model=m")
                 .header(header::CONTENT_TYPE, "multipart/form-data; boundary=b")

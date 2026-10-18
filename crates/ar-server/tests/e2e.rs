@@ -128,6 +128,7 @@ async fn call(app: &Router, req: Request<Body>) -> (StatusCode, HeaderMap, Strin
 
 fn post_chat(body: &str, extra: &[(&str, &str)]) -> Request<Body> {
     let mut req = Request::builder()
+        .header(header::HOST, "127.0.0.1:20128")
         .method("POST")
         .uri("/v1/chat/completions")
         .header(header::CONTENT_TYPE, "application/json")
@@ -145,6 +146,7 @@ fn post_chat(body: &str, extra: &[(&str, &str)]) -> Request<Body> {
 
 fn get(path: &str) -> Request<Body> {
     Request::builder()
+        .header(header::HOST, "127.0.0.1:20128")
         .uri(path)
         .body(Body::empty())
         .expect("request builds")
@@ -260,6 +262,49 @@ async fn e2e_fails_over_when_first_provider_429s() {
         "decision was: {decision}"
     );
     assert!(decision.contains("provider=p1"), "decision was: {decision}");
+}
+
+#[tokio::test]
+async fn e2e_a_fallback_reply_is_not_replayed_under_the_winners_key() {
+    // K4, end to end. p1 is the planned winner and always 429s; p2 answers. The
+    // second identical request must go through the failover again rather than
+    // replay p2's reply from a key that belongs to p1.
+    let throttled = always_429().await;
+    let healthy = mock_upstream().await;
+    let providers = vec![
+        ProviderConfig::new(ProviderId::new("p1"), &throttled, "k").with_model("m1"),
+        ProviderConfig::new(ProviderId::new("p2"), &healthy, "k").with_model("m2"),
+    ];
+    let (router, _state) = boot_with(
+        ServerConfig::single(20128, Strategy::Priority, providers),
+        vec![],
+    );
+    let body = r#"{"model":"m1","messages":[{"role":"user","content":"hi"}]}"#;
+    // `post_chat` sends `Accept: text/event-stream`, which forces a stream and
+    // skips the cache entirely. This test needs the non-stream path to be the
+    // one that looks up and stores.
+    let json = [("accept", "application/json")];
+
+    let (first_status, first_headers, first_text) = call(&router, post_chat(body, &json)).await;
+    assert_eq!(first_status, 200, "fallback did not answer: {first_text}");
+    assert!(
+        header_of(&first_headers, "x-ar-decision").contains("provider=p2"),
+        "the fallback should have served the first request"
+    );
+
+    let (second_status, second_headers, _) = call(&router, post_chat(body, &json)).await;
+    assert_eq!(second_status, 200);
+    // `miss`, not merely "not a hit": a `bypass` here would mean the lookup never
+    // ran, and the test would pass without exercising K4 at all.
+    assert_eq!(
+        header_of(&second_headers, "x-ar-cache"),
+        "miss",
+        "the second request must consult the cache and miss it"
+    );
+    assert!(
+        header_of(&second_headers, "x-ar-decision").contains("provider=p2"),
+        "a fallback's reply was replayed under the winner's key"
+    );
 }
 
 #[tokio::test]
@@ -390,6 +435,101 @@ async fn error_shaped_200() -> String {
         let _ = axum::serve(listener, app).await;
     });
     format!("http://{addr}/v1")
+}
+
+/// A 200 that streams one frame and then fails the body. The chunked response
+/// is cut before its terminator, which is what a dropped upstream socket looks
+/// like to the proxy.
+async fn cut_mid_stream() -> String {
+    use futures::StreamExt as _;
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                // The pause lets the first frame reach the wire. Without it hyper
+                // drops the buffered frame with the connection, and the proxy sees a
+                // stream with no bytes, which is a failover and not a cut.
+                .body(Body::from_stream(
+                    futures::stream::once(async {
+                        Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                            b"data: {\"delta\":{\"content\":\"Hel\"}}\n\n",
+                        ))
+                    })
+                    .chain(futures::stream::once(async {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        Err(std::io::Error::other("connection reset by peer"))
+                    })),
+                ))
+                .unwrap_or_else(|_| fallback(StatusCode::INTERNAL_SERVER_ERROR))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr: SocketAddr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}/v1")
+}
+
+/// Sends one streaming chat request and reads its body to the end. Returns the
+/// status and the body text, or the body error when the stream failed mid-way.
+async fn stream_body(app: &Router) -> (StatusCode, Result<String, String>) {
+    let body = r#"{"model":"mockprov/mock-model","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let resp = app
+        .clone()
+        .oneshot(post_chat(body, &[]))
+        .await
+        .expect("router responds");
+    let status = resp.status();
+    let text = resp
+        .into_body()
+        .collect()
+        .await
+        .map(|b| String::from_utf8_lossy(&b.to_bytes()).into_owned())
+        .map_err(|e| e.to_string());
+    (status, text)
+}
+
+#[tokio::test]
+async fn e2e_a_stream_cut_mid_body_is_named_in_band() {
+    // R1: a cut stream must not look like a finished reply. OpenAI-shaped
+    // streams carry the cut as an error frame, and the `[DONE]` terminator never
+    // follows it.
+    let upstream = cut_mid_stream().await;
+    let (router, _state) = boot(&upstream);
+    let (status, text) = stream_body(&router).await;
+    assert_eq!(status, 200);
+    let text = text.expect("the relay ends with a named frame, not a body error");
+    assert!(text.contains("stream_error"), "no cut named: {text}");
+    assert!(
+        !text.contains("[DONE]"),
+        "a cut stream got a terminator: {text}"
+    );
+}
+
+#[tokio::test]
+async fn e2e_repeated_stream_cuts_open_the_provider_breaker() {
+    // R5: the breaker used to be credited at the first byte, so a provider that
+    // always cut after one frame never tripped. Each cut is now one failure.
+    let upstream = cut_mid_stream().await;
+    let (router, state) = boot(&upstream);
+    // The key class trips at 12 failures. The bound is slack, so the test does
+    // not restate the threshold: it stops as soon as the breaker is open.
+    for _ in 0..24 {
+        if !state.resilience.is_usable("mockprov") {
+            break;
+        }
+        let (status, _) = stream_body(&router).await;
+        assert_eq!(status, 200);
+    }
+    assert!(
+        !state.resilience.is_usable("mockprov"),
+        "the breaker should be open after repeated cuts"
+    );
 }
 
 /// A 200 whose stream carries only an error event: the non-streaming client's

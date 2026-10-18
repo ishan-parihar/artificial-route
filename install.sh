@@ -34,6 +34,10 @@
 #   --all-harnesses        register the MCP server in every detected harness
 #                          (claude and codex are registered; opencode gets its JSON printed)
 #   --no-harness           skip harness/MCP registration (set SKIP_HARNESS=1)
+#   --verify-attestation   also check the binary's GitHub build attestation with
+#                          `gh attestation verify`; fatal on failure. Opt-in: needs
+#                          the gh CLI, and releases published before attestations
+#                          existed have none to check.
 #   --help
 # Unknown flags fail loudly (exit 2).
 #
@@ -93,6 +97,7 @@ SKIP_CTA="${SKIP_CTA:-0}"
 FORCE_ROOT="${FORCE_ROOT:-0}"
 SKIP_HARNESS="${SKIP_HARNESS:-0}"
 ALL_HARNESS="${ALL_HARNESS:-0}"
+VERIFY_ATTESTATION=0
 
 # Absolute, resolved before anything cd's away from the caller's directory.
 # A relative $0 stops existing the moment the script does `cd "$TMP"`, which
@@ -134,6 +139,7 @@ while [ $# -gt 0 ]; do
     --no-cta) SKIP_CTA=1; shift ;;
     --all-harnesses) ALL_HARNESS=1; shift ;;
     --no-harness) SKIP_HARNESS=1; shift ;;
+    --verify-attestation) VERIFY_ATTESTATION=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "error: unknown flag '$1' (see --help)" >&2; exit 2 ;;
   esac
@@ -567,15 +573,12 @@ done
 ASSET="$ASSET_FILE"
 curl -fsSL -o SHA256SUMS "$BASE/SHA256SUMS"
 
-# Ensure a checksum tool is available before verifying.
-if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
-  echo "error: installing prerequisite: coreutils (for sha256sum/shasum)" >&2
-  pm_install coreutils 2>/dev/null || true
-fi
-
 # Verified before the binary is ever executable, so a corrupt or substituted
-# download cannot run. Missing tooling is a warning, not a skip: an install that
-# quietly gives up verification is the one that should not.
+# download cannot run. Missing tooling is a refusal, not a skip: an install that
+# quietly gives up verification is the one that should not. There is no silent
+# package install here: on Linux sha256sum is coreutils, and on macOS shasum
+# ships with the OS, so a missing tool means the system is unusual enough to
+# be fixed by the operator, not by a sudo run from a piped install.
 if command -v sha256sum >/dev/null 2>&1; then
   grep " $ASSET\$" SHA256SUMS | sha256sum -c - >/dev/null 2>&1 \
     || die "checksum mismatch for $ASSET — report at github.com/${REPO}/issues"
@@ -584,9 +587,21 @@ elif command -v shasum >/dev/null 2>&1; then
   ACTUAL="$(shasum -a 256 "$ASSET" | cut -d' ' -f1)"
   [ -n "$EXPECTED" ] && [ "$EXPECTED" = "$ACTUAL" ] || die "checksum mismatch for $ASSET — report at github.com/${REPO}/issues"
 else
-  echo "warning: no sha256sum/shasum found, skipping checksum verify" >&2
+  # Refused, not warned: an install that runs an unverified binary because a
+  # tool is missing is the case verification exists for.
+  die "no sha256sum or shasum found; install coreutils and re-run, the binary was not installed"
 fi
 echo "checksum verified"
+
+# Opt-in provenance check. A checksum only proves the file matches SHA256SUMS,
+# and that file is published beside it; the attestation is signed by the release
+# workflow's identity, so it also proves which workflow built the bytes.
+if [ "$VERIFY_ATTESTATION" = 1 ]; then
+  command -v gh >/dev/null 2>&1 || die "--verify-attestation needs the GitHub CLI (gh); install it, or re-run without the flag"
+  gh attestation verify "$ASSET" --repo "$REPO" >/dev/null 2>&1 \
+    || die "build attestation check failed for $ASSET (gh attestation verify --repo $REPO); the binary was not installed"
+  echo "build attestation verified"
+fi
 
 chmod +x "$ASSET"
 mkdir -p "$DIR"

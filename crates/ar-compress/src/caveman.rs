@@ -38,7 +38,7 @@
 //!
 //! | rung | level | what it may delete |
 //! |---|---|---|
-//! | 0 | [`Intensity::Lite`] | noise with no referent — a hedge, a bare adverb |
+//! | 0 | [`Intensity::Lite`] | noise with no referent — a bare adverb, a summary lead-in. Hedges are never deleted |
 //! | 1 | [`Intensity::Full`] | any filler phrase, including ones that restate a clause |
 //! | 2 | [`Intensity::Ultra`] | the filler, plus the noun abbreviations below |
 //!
@@ -77,7 +77,7 @@ const FILLER: u8 = 1;
 /// Ported from `caveman.ts::RULE_KEYWORDS`. These are the words a prompt
 /// carries without them meaning anything; the `tier` is this port's
 /// [`Intensity`] gate.
-const PHRASES: [Phrase; 46] = [
+const PHRASES: [Phrase; 42] = [
     // Purpose clauses that restate the next clause.
     Phrase {
         text: "in order to",
@@ -209,23 +209,9 @@ const PHRASES: [Phrase; 46] = [
         text: "when you get a chance",
         tier: FILLER,
     },
-    // Hedging. Referent-free: the sentence behind it says the same thing.
-    Phrase {
-        text: "it seems like",
-        tier: NOISE,
-    },
-    Phrase {
-        text: "it appears that",
-        tier: NOISE,
-    },
-    Phrase {
-        text: "i think that",
-        tier: NOISE,
-    },
-    Phrase {
-        text: "i believe that",
-        tier: NOISE,
-    },
+    // Hedges are not in this table. "it seems like" and "I think that" carry the
+    // model's confidence: deleting one turns an uncertain claim into a flat one
+    // the model never made (K9). They cost tokens, and that cost is kept.
     Phrase {
         text: "to summarize",
         tier: NOISE,
@@ -603,10 +589,11 @@ mod tests {
     }
 
     #[test]
-    fn deletes_a_referent_free_hedge_at_every_rung() {
+    fn keeps_a_hedge_at_every_rung() {
+        // K9: a hedge is the model's stated confidence, so no rung may drop it.
         let src = "It seems like the cache is basically re-validating every response header.";
         for level in [Intensity::Lite, Intensity::Full, Intensity::Ultra] {
-            assert!(caveman_at(src, level).len() < src.len(), "{level}");
+            assert!(caveman_at(src, level).contains("It seems like"), "{level}");
         }
     }
 

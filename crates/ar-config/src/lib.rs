@@ -61,6 +61,16 @@ pub enum ConfigError {
         /// Underlying parse failure, including line and column.
         source: serde_yaml::Error,
     },
+    /// A reload would swap in a provider whose key variable is empty. The
+    /// previous snapshot keeps serving, so no provider goes upstream without a
+    /// credential because the file changed.
+    #[error(
+        "key(s) {keys} resolved to an empty value; the reload was refused and the previous config keeps serving"
+    )]
+    EmptyApiKeys {
+        /// Names of the `keys:` entries whose variables are empty.
+        keys: String,
+    },
     /// A provider referenced a key name that is not declared under `keys:`.
     #[error("provider {provider:?} references undeclared key {key:?}")]
     UnknownKey {
@@ -1039,6 +1049,11 @@ pub struct Config {
     /// Listen address.
     #[serde(default)]
     pub server: Server,
+    /// `keys:` names written as `$VAR`, recorded by [`Config::parse`] before
+    /// expansion. An empty expansion is a different fact from a literal `""`, and
+    /// only the first one is a missing credential. Not part of the file.
+    #[serde(skip)]
+    env_declared: Vec<String>,
     /// Declared credentials, keyed by name and `$VAR`-expanded.
     #[serde(default)]
     pub keys: HashMap<String, Secret>,
@@ -1205,15 +1220,93 @@ impl Config {
     where
         F: FnMut(&str) -> Result<Option<String>, String>,
     {
-        let expanded = shellexpand::env_with_context(yaml, |name| lookup(name)).map_err(|e| {
-            ConfigError::Expand {
-                cause: e.to_string(),
-            }
-        })?;
-        let cfg: Self =
-            serde_yaml::from_str(&expanded).map_err(|source| ConfigError::Yaml { source })?;
+        // Parse first, expand each string after. Expanding the text before parsing
+        // let a secret containing ` #`, `:` or a newline change the document's
+        // structure without any error.
+        let mut doc: serde_yaml::Value =
+            serde_yaml::from_str(yaml).map_err(|source| ConfigError::Yaml { source })?;
+        // Keys written as `$VAR` (not literal text) are the ones an operator meant
+        // to fill from the environment. Recorded before expansion, while the
+        // reference is still visible.
+        let from_env = Self::env_declared_keys(&doc);
+        Self::expand_scalars(&mut doc, &mut lookup)?;
+        let mut cfg: Self =
+            serde_yaml::from_value(doc).map_err(|source| ConfigError::Yaml { source })?;
         cfg.validate()?;
+        // Loading stays permissive: `doctor` and the first-login flow must be able
+        // to read a config whose variable is set but empty. `serve` refuses to start
+        // on one (see [`Config::empty_api_keys`]).
+        for (name, secret) in &cfg.keys {
+            if secret.expose().is_empty() {
+                tracing::warn!(key = %name, "credential resolved to an empty value; requests using it go upstream without one");
+            }
+        }
+        cfg.env_declared = from_env;
         Ok(cfg)
+    }
+
+    /// API-key providers whose `$VAR` key resolved to nothing, by key name.
+    ///
+    /// Those providers would go upstream with no credential, and the gateway
+    /// would look healthy. An OAuth access row is not listed: an empty one is a
+    /// first login that has not happened yet. A literal `""` in the file is not
+    /// listed either, because the file says the key is empty on purpose.
+    #[must_use]
+    pub fn empty_api_keys(&self) -> Vec<&str> {
+        self.env_declared
+            .iter()
+            .filter(|name| {
+                self.keys
+                    .get(name.as_str())
+                    .is_some_and(|secret| secret.expose().is_empty())
+                    && self.providers.iter().any(|p| p.key == **name)
+            })
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// Names of the `keys:` entries whose value is a string with a `$` in it.
+    fn env_declared_keys(doc: &serde_yaml::Value) -> Vec<String> {
+        let Some(keys) = doc.get("keys").and_then(serde_yaml::Value::as_mapping) else {
+            return Vec::new();
+        };
+        keys.iter()
+            .filter_map(|(name, value)| match (name.as_str(), value.as_str()) {
+                (Some(name), Some(text)) if text.contains('$') => Some(name.to_owned()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Replaces `$VAR` in every string of `value`, leaving mapping keys and the
+    /// document's shape untouched.
+    fn expand_scalars<F>(value: &mut serde_yaml::Value, lookup: &mut F) -> Result<(), ConfigError>
+    where
+        F: FnMut(&str) -> Result<Option<String>, String>,
+    {
+        match value {
+            serde_yaml::Value::String(s) => {
+                let expanded =
+                    shellexpand::env_with_context(s, |name| lookup(name)).map_err(|e| {
+                        ConfigError::Expand {
+                            cause: e.to_string(),
+                        }
+                    })?;
+                *s = expanded.into_owned();
+            }
+            serde_yaml::Value::Sequence(items) => {
+                for item in items {
+                    Self::expand_scalars(item, lookup)?;
+                }
+            }
+            serde_yaml::Value::Mapping(map) => {
+                for (_, v) in map.iter_mut() {
+                    Self::expand_scalars(v, lookup)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// [`Config::parse`] with `$VAR` resolved from the process environment.
@@ -1540,9 +1633,13 @@ impl ConfigHandle {
     /// Re-reads and swaps in the file.
     ///
     /// On failure the previous snapshot stays in place and the error is
-    /// returned: a half-saved config must not take a running proxy down.
+    /// returned: a half-saved config must not take a running proxy down. A file
+    /// that would leave a provider with an empty key is refused for the same
+    /// reason. Startup refuses that file too, and this closes the gap a reload
+    /// would otherwise open.
     pub fn reload(&self) -> Result<(), ConfigError> {
         let cfg = read_and_parse(&self.path)?;
+        refuse_empty_api_keys(&cfg)?;
         self.current.store(Arc::new(cfg));
         Ok(())
     }
@@ -1609,6 +1706,18 @@ impl std::fmt::Debug for WatcherGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("WatcherGuard")
     }
+}
+
+/// Refuses a config whose referenced key variables are empty. Only the names
+/// are reported, never the values.
+fn refuse_empty_api_keys(cfg: &Config) -> Result<(), ConfigError> {
+    let empty = cfg.empty_api_keys();
+    if empty.is_empty() {
+        return Ok(());
+    }
+    Err(ConfigError::EmptyApiKeys {
+        keys: empty.join(", "),
+    })
 }
 
 fn read_and_parse(path: &Path) -> Result<Config, ConfigError> {
@@ -1751,6 +1860,67 @@ combos:
             cfg.key("openai").map(Secret::expose),
             Some("secret-for-AR_TEST_OPENAI_KEY")
         );
+    }
+
+    #[test]
+    fn keeps_a_secret_with_yaml_syntax_as_one_value() {
+        // Before the fix, ` #` in the value ended the scalar and dropped the rest.
+        let yaml =
+            "keys:\n  openai: $AR_TEST_OPENAI_KEY\nproviders:\n  - id: openai\n    key: openai\n";
+        let lookup = |name: &str| {
+            Ok(Some(if name == "AR_TEST_OPENAI_KEY" {
+                "abc # tail: x".to_owned()
+            } else {
+                String::new()
+            }))
+        };
+        let cfg = Config::parse(yaml, lookup).unwrap();
+        assert_eq!(cfg.key("openai").map(Secret::expose), Some("abc # tail: x"));
+    }
+
+    #[test]
+    fn lists_an_api_key_whose_variable_is_empty() {
+        // K5: the provider would go upstream with no credential. Loading still succeeds.
+        let yaml =
+            "keys:\n  openai: $AR_TEST_EMPTY_KEY\nproviders:\n  - id: openai\n    key: openai\n";
+        let cfg = Config::parse(yaml, |_| Ok(Some(String::new()))).unwrap();
+        assert_eq!(cfg.empty_api_keys(), ["openai"]);
+    }
+
+    #[test]
+    fn refuses_a_reload_whose_provider_key_is_empty() {
+        // K5 on reload: the previous snapshot must keep serving instead.
+        let yaml =
+            "keys:\n  openai: $AR_TEST_EMPTY_KEY\nproviders:\n  - id: openai\n    key: openai\n";
+        let cfg = Config::parse(yaml, |_| Ok(Some(String::new()))).unwrap();
+        assert!(matches!(
+            refuse_empty_api_keys(&cfg),
+            Err(ConfigError::EmptyApiKeys { ref keys }) if keys == "openai"
+        ));
+    }
+
+    #[test]
+    fn accepts_a_reload_with_every_provider_key_set() {
+        let yaml =
+            "keys:\n  openai: $AR_TEST_SET_KEY\nproviders:\n  - id: openai\n    key: openai\n";
+        let cfg = Config::parse(yaml, |_| Ok(Some("sk-live".to_owned()))).unwrap();
+        assert!(refuse_empty_api_keys(&cfg).is_ok());
+    }
+
+    #[test]
+    fn leaves_an_empty_key_no_provider_uses_out_of_the_list() {
+        // An empty OAuth access row is a first login, not a missing credential.
+        let yaml = "keys:\n  access: $AR_TEST_EMPTY_KEY\n";
+        let cfg = Config::parse(yaml, |_| Ok(Some(String::new()))).unwrap();
+        assert!(cfg.empty_api_keys().is_empty());
+    }
+
+    #[test]
+    fn keeps_a_literal_empty_key_as_a_keyless_provider() {
+        // The file says the key is empty on purpose, so it is not a missing variable.
+        let yaml = "keys:\n  free: \"\"\nproviders:\n  - id: free\n    key: free\n";
+        let cfg = Config::parse(yaml, stub_lookup).unwrap();
+        assert_eq!(cfg.key("free").map(Secret::expose), Some(""));
     }
 
     #[test]

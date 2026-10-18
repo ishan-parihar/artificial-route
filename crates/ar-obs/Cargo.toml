@@ -23,6 +23,10 @@ crossbeam-channel = "0.5.17"
 # Same disk tier and same lockfile entry as `ar-cache`: one file per ledger.
 redb = "4.3.0"
 thiserror = { workspace = true }
+# Constant-time admin-secret compare: both sides are hashed first, so the
+# comparison leaks neither the secret's bytes nor its length.
+sha2 = "0.10"
+subtle = "2.6"
 tracing = { workspace = true }
 # `env-filter` + `json` are already on in the workspace table.
 tracing-subscriber = { workspace = true }

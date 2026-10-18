@@ -246,7 +246,10 @@ impl Resilience {
     /// semantics untouched.
     pub fn mark_multi(&self, provider: &str) {
         let id = Strng::from(provider);
-        self.multi.lock().expect("multi set").insert(id);
+        self.multi
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id);
     }
 
     /// Whether `provider` dispatches under more than one credential.
@@ -254,7 +257,7 @@ impl Resilience {
     pub fn is_multi(&self, provider: &str) -> bool {
         self.multi
             .lock()
-            .expect("multi set")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(&Strng::from(provider))
     }
 
@@ -587,6 +590,29 @@ impl Resilience {
         if b.state == BreakerState::Closed {
             b.failures = b.failures.saturating_sub(1);
         } else {
+            b.state = BreakerState::Closed;
+            b.failures = 0;
+            b.open_cycles = 0;
+        }
+    }
+
+    /// Closes a `HalfOpen` breaker when a streamed probe shows its first byte.
+    ///
+    /// A stream's success is otherwise credited only when its body ends (R5),
+    /// and a half-open breaker admits one probe. A long stream would keep every
+    /// other caller refused for its whole length, so the first byte stands in
+    /// for the verdict: the provider has answered. A cut later still settles
+    /// through `settle_stream` and reopens the breaker. Any other state is left
+    /// alone, so an open breaker is not closed by a stream that started before
+    /// it tripped.
+    pub fn credit_first_byte(&self, provider: &str) {
+        let Ok(mut breakers) = self.breakers.lock() else {
+            return;
+        };
+        let Some(b) = breakers.get_mut(provider) else {
+            return;
+        };
+        if b.state == BreakerState::HalfOpen {
             b.state = BreakerState::Closed;
             b.failures = 0;
             b.open_cycles = 0;
@@ -977,6 +1003,30 @@ mod tests {
         r.record_provider_success("p");
         assert_eq!(r.breaker_state("p"), BreakerState::Closed);
         assert!(r.is_usable("p"));
+    }
+
+    #[test]
+    fn credit_first_byte_should_close_half_open_when_the_probe_streams() {
+        let r = Resilience::new().with_test_breaker_reset(Duration::from_millis(30));
+        for _ in 0..BreakerClass::Key.threshold() {
+            r.record_provider_failure("p", BreakerClass::Key);
+        }
+        std::thread::sleep(Duration::from_millis(45));
+        assert!(r.is_usable("p"), "the stream's probe is admitted");
+        r.credit_first_byte("p");
+        assert_eq!(r.breaker_state("p"), BreakerState::Closed);
+        assert!(r.is_usable("p"), "a closed breaker admits the next caller");
+        assert!(r.is_usable("p"), "and the one after it");
+    }
+
+    #[test]
+    fn credit_first_byte_should_leave_open_breaker_when_provider_is_down() {
+        let r = Resilience::new();
+        for _ in 0..BreakerClass::Key.threshold() {
+            r.record_provider_failure("p", BreakerClass::Key);
+        }
+        r.credit_first_byte("p");
+        assert_eq!(r.breaker_state("p"), BreakerState::Open);
     }
 
     #[test]

@@ -34,6 +34,9 @@ ar-core = { workspace = true }
 # cannot be lost by an unrelated workspace-manifest edit.
 serde = { workspace = true, features = ["rc"] }
 serde_json = { workspace = true }
+# Logs a malformed compiled-in table before the process falls back to serving
+# without it. Already in the workspace and in `Cargo.lock`.
+tracing = { workspace = true }
 # Typed errors on the public refresh path, per the workspace discipline. Declared
 # here rather than hoisted because this crate is the only new consumer.
 thiserror = { workspace = true }

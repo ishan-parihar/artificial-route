@@ -81,18 +81,17 @@ fn expired(raw: bool, written_at: u64, now: u64) -> bool {
     raw && written_at.saturating_add(RAW_TTL_SECS) <= now
 }
 
-/// Compares two secrets without an early exit.
+/// Compares two secrets in constant time, without leaking their length.
 ///
-/// Length is compared implicitly, the one leak this leaves: a caller learns the
-/// expected length. Acceptable for a shared admin secret, and one more reason to
-/// move this onto `ar-keys`' admin scope.
+/// Both sides are hashed to a fixed 32 bytes first, so the constant-time
+/// comparison runs over equal-length inputs and a caller learns neither the
+/// secret's length nor how many leading bytes matched. The hand-rolled loop it
+/// replaces compared lengths in the clear.
 fn ct_eq(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    let mut diff = (a.len() ^ b.len()) as u32;
-    for i in 0..a.len().max(b.len()) {
-        diff |= u32::from(a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0));
-    }
-    diff == 0
+    use sha2::{Digest as _, Sha256};
+    use subtle::ConstantTimeEq as _;
+    let (a, b) = (Sha256::digest(a.as_bytes()), Sha256::digest(b.as_bytes()));
+    a.as_slice().ct_eq(b.as_slice()).into()
 }
 
 /// An append-only audit ledger over one `redb` file.

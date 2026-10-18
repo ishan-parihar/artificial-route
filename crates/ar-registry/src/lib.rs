@@ -617,28 +617,100 @@ impl Registry {
 /// Lazy on purpose: `ar --version` must exit before this runs (docs/06
 /// `--version` fast path), so the JSON parse is not on that path at all.
 ///
-/// # Panics
-///
-/// Panics if the compiled-in catalog is malformed. That is a build-time defect
-/// (`registry.json` is a source file, not user input), so a panic at first use
-/// is the honest signal; it cannot be triggered by a request.
+/// A malformed catalog is logged and served empty rather than panicking, and an
+/// entry with an unresolved base URL is dropped. `aroute serve` refuses to start
+/// on either first (see [`check_embedded`]).
 pub fn global() -> &'static Registry {
     static REGISTRY: OnceLock<Registry> = OnceLock::new();
     REGISTRY.get_or_init(|| {
-        let defs: BTreeMap<Strng, ProviderDef> =
-            serde_json::from_str(CATALOG_JSON).expect("embedded registry.json is malformed");
+        let mut defs = embedded_or_empty("registry.json", parse_defs());
         // A generated base URL that is a bare SCREAMING_CASE identifier means the
-        // reader lost a `const` chain. Panic here rather than route to that
+        // reader lost a `const` chain. Drop the entry rather than route to that
         // literal string: an entry that cannot be reached is a build-time defect,
         // and the importer already reports those by name on stderr. An empty base
         // URL is allowed (a provider whose endpoint resolves at request time) and
         // a non-http one is allowed (a CLI or websocket transport).
-        assert!(
-            defs.values().all(|d| !looks_unresolved(&d.base_url)),
-            "registry.json holds an unresolved base URL; regenerate it with `ar import --from omniroute`"
-        );
+        defs.retain(|id, d| {
+            let resolved = !looks_unresolved(&d.base_url);
+            if !resolved {
+                tracing::error!(
+                    provider = ar_core::as_str(id),
+                    "registry.json holds an unresolved base URL; dropping the entry"
+                );
+            }
+            resolved
+        });
         Registry { defs }
     })
+}
+
+fn parse_defs() -> Result<BTreeMap<Strng, ProviderDef>, serde_json::Error> {
+    serde_json::from_str(CATALOG_JSON)
+}
+
+/// Parses one compiled-in table. On failure, logs the error and returns the
+/// empty table, so a defect degrades the catalog instead of ending the process.
+fn embedded_or_empty<T: Default>(table: &str, parsed: Result<T, serde_json::Error>) -> T {
+    parsed.unwrap_or_else(|e| {
+        tracing::error!(table, error = %e, "embedded table is malformed; serving without it");
+        T::default()
+    })
+}
+
+/// A compiled-in table that fails to parse, or a catalog entry whose base URL
+/// is an unresolved `const` name.
+#[derive(Debug, thiserror::Error)]
+pub enum EmbeddedError {
+    /// A table file does not parse as the type it is compiled into.
+    #[error("embedded table {table} is malformed: {source}")]
+    Malformed {
+        /// The source file's name, as it appears in the crate.
+        table: &'static str,
+        /// The parser's own message, with its line and column.
+        #[source]
+        source: serde_json::Error,
+    },
+    /// A provider's base URL is a bare identifier the generator failed to resolve.
+    #[error(
+        "registry.json holds an unresolved base URL for {provider}; regenerate it with `ar import --from omniroute`"
+    )]
+    UnresolvedBaseUrl {
+        /// The provider id whose base URL did not resolve.
+        provider: String,
+    },
+}
+
+/// Parses every compiled-in table and reports the first defect. `aroute serve`
+/// calls this before it binds, so a malformed table stops the process at boot
+/// rather than degrading it at first use.
+///
+/// # Errors
+///
+/// Returns [`EmbeddedError`] for the first table that does not parse, or the
+/// first catalog entry whose base URL is unresolved.
+pub fn check_embedded() -> Result<(), EmbeddedError> {
+    let defs = parse_defs().map_err(|source| EmbeddedError::Malformed {
+        table: "registry.json",
+        source,
+    })?;
+    if let Some((id, _)) = defs.iter().find(|(_, d)| looks_unresolved(&d.base_url)) {
+        return Err(EmbeddedError::UnresolvedBaseUrl {
+            provider: ar_core::as_str(id).to_owned(),
+        });
+    }
+    free::parse().map_err(|source| EmbeddedError::Malformed {
+        table: "freeBudgets.json",
+        source,
+    })?;
+    lifecycle::parse().map_err(|source| EmbeddedError::Malformed {
+        table: "modelLifecycle.json",
+        source,
+    })?;
+    meta::parse().map_err(|source| EmbeddedError::Malformed {
+        table: "providerMeta.json",
+        source,
+    })?;
+    Ok(())
 }
 
 /// Whether a base URL is a `const` name the reader failed to substitute.
@@ -905,5 +977,27 @@ mod tests {
         let mut n = node("bad");
         n.base_url = "https://api.example.invalid/v 1".to_owned();
         assert!(!n.base_url_ok());
+    }
+}
+
+#[cfg(test)]
+mod embedded_tests {
+    use super::*;
+
+    #[test]
+    fn check_embedded_should_pass_for_the_shipped_tables() {
+        check_embedded().expect("every compiled-in table parses and resolves");
+    }
+
+    #[test]
+    fn embedded_or_empty_should_return_the_default_when_a_table_is_malformed() {
+        let parsed = serde_json::from_str::<BTreeMap<String, String>>("{not json");
+        assert!(embedded_or_empty("fixture.json", parsed).is_empty());
+    }
+
+    #[test]
+    fn embedded_or_empty_should_return_the_table_when_it_parses() {
+        let parsed = serde_json::from_str::<BTreeMap<String, String>>(r#"{"a":"b"}"#);
+        assert_eq!(embedded_or_empty("fixture.json", parsed).len(), 1);
     }
 }

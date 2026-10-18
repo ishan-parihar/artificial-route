@@ -95,7 +95,7 @@ on-demand rows (D4–D8, E2–E8), which the outline says not to start on specul
 | `#p1-config-public` | `crates/ar-server/src/config.rs` | text corrected (`6a50d7f`) | The TODO no longer refers to `ar serve --public`. It now says it is blocked on the G2 ruling. |
 | `#p1-tools` | `crates/ar-translate/src/canonical.rs:218,232` | open | Canonical tool-call type. Overlaps D6. |
 | `#p0-align` | `crates/ar-exec/src/lib.rs:865`, `crates/ar-translate/src/translate.rs:351` | open | `auth_header` / `auth_prefix` on `ProviderDef`. |
-| `#P0-translate`, `#P0-route` | `crates/ar-core/src/traits.rs` | open | Trait seams. |
+| `#P0-translate`, `#P0-route` | `crates/ar-core/src/traits.rs` | closed | The unused `ar-core` seam traits (all `todo!()`) were deleted. The live seams are `ArExec` and `ArTranslate` in `crates/ar-route/src/contract.rs`. |
 | `#F-MED-2-device` | `crates/ar-keys/src/store.rs:423` | open | `poll_state` column is absent. |
 
 ## G. Found by the audit

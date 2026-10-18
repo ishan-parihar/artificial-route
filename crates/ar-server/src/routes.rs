@@ -58,8 +58,8 @@ use ar_cache::{Cache, CacheKey, CacheState};
 use ar_compress::Step;
 use ar_route::{
     AttemptOutcome, AutoCandidate, AutoSelector, Candidate, CanonicalRequest, ChainTarget,
-    JudgeOutcome, JudgePanel, JudgeTarget, ProviderId, RouteError, Strategy, Strng, attempt_loop,
-    pick, simulate_route, synthesize, virtual_combo,
+    JudgeOutcome, JudgePanel, JudgeTarget, ProviderId, Resilience, RouteError, Strategy, Strng,
+    attempt_loop, pick, settle_stream, simulate_route, synthesize, virtual_combo,
 };
 use ar_tokens::ResponseMeta;
 use axum::body::Body;
@@ -449,13 +449,17 @@ fn note_failure(state: &AppState, resp: &Response, key_id: Option<&str>, asked: 
         || status.canonical_reason().unwrap_or("error"),
         |note| note.0.as_str(),
     );
-    if let Err(e) = ledger.lock().expect("ledger lock").record_failure(
-        key_id.unwrap_or("anonymous"),
-        &model,
-        status.as_u16(),
-        why,
-        epoch_now(),
-    ) {
+    if let Err(e) = ledger
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .record_failure(
+            key_id.unwrap_or("anonymous"),
+            &model,
+            status.as_u16(),
+            why,
+            epoch_now(),
+        )
+    {
         // A log write must not turn a failed request into a different failure.
         tracing::warn!(error = %e, "failure log write failed");
     }
@@ -619,10 +623,25 @@ async fn handle_chat_inner(
     // looks, and its verdict is whatever the lookup said.
     let cache_control = CacheControl::read(headers);
     let cache = state.cache.clone();
+    // K4: the key names the target that will serve the request, not the
+    // client-facing alias. A combo retargeted in config keeps its alias, so an
+    // alias-keyed entry would replay the old target's reply for its whole TTL.
+    let planned_target = plan
+        .chain
+        .first()
+        .map(|target| format!("{}/{}", target.provider.as_str(), target.model));
     let cache_key = if canonical.stream || cache_control.no_cache {
         None
     } else {
-        request_key(&canonical, cache_control.key.as_deref())
+        let served = planned_target
+            .clone()
+            .unwrap_or_else(|| canonical.model.to_string());
+        request_key(
+            &canonical,
+            &served,
+            key_id.as_deref().unwrap_or("anonymous"),
+            cache_control.key.as_deref(),
+        )
     };
 
     if let (Some(key), Some(cache)) = (cache_key.as_ref(), cache.as_ref())
@@ -651,7 +670,9 @@ async fn handle_chat_inner(
         let verdict = {
             // Poisoned is the record path's convention too: a ledger that
             // panicked mid-write is a bug to surface, not a ceiling to guess.
-            let guard = ledger.lock().expect("ledger lock");
+            let guard = ledger
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.policy.spend_verdict(policy_key, &guard, &projection)
         };
         if let ar_tokens::Verdict::Deny(reason) = verdict {
@@ -776,6 +797,7 @@ async fn handle_chat_inner(
 
     decorate(
         outcome,
+        state.resilience.clone(),
         canonical.stream,
         dialect,
         plan.strategy,
@@ -783,6 +805,7 @@ async fn handle_chat_inner(
             compression: compression_echo(&compression),
             cache_state,
             cache_key,
+            planned_target,
             cache,
             model: canonical.model.clone(),
             cache_control,
@@ -950,14 +973,17 @@ fn read_and_record(
         queue_wait_us: 0,
     });
     if let Some(ledger) = state.ledger.as_ref()
-        && let Err(e) = ledger.lock().expect("ledger lock").record_response(
-            key_id.unwrap_or("anonymous"),
-            provider,
-            model,
-            usage,
-            epoch_now(),
-            pricing,
-        )
+        && let Err(e) = ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record_response(
+                key_id.unwrap_or("anonymous"),
+                provider,
+                model,
+                usage,
+                epoch_now(),
+                pricing,
+            )
     {
         // The response headers already carry the computed figure, and a
         // ledger write failure must not fail a request that succeeded — the
@@ -1177,14 +1203,18 @@ impl UsageTee {
         let Some(ledger) = self.state.ledger.as_ref() else {
             return;
         };
-        if let Err(e) = ledger.lock().expect("ledger lock").record_response(
-            &self.key_id,
-            &self.provider,
-            &self.model,
-            &usage,
-            epoch_now(),
-            &self.state.config.prices,
-        ) {
+        if let Err(e) = ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record_response(
+                &self.key_id,
+                &self.provider,
+                &self.model,
+                &usage,
+                epoch_now(),
+                &self.state.config.prices,
+            )
+        {
             // Same contract as the non-streaming arm: a ledger write failure is
             // an operator-visible gap, never the client's problem.
             tracing::warn!(error = %e, "usage ledger write failed for a streamed reply");
@@ -1439,6 +1469,7 @@ async fn fusion_response(
         .with_savings_tokens(savings_tokens);
     decorate(
         outcome,
+        state.resilience.clone(),
         canonical.stream,
         dialect,
         plan.strategy,
@@ -1446,6 +1477,7 @@ async fn fusion_response(
             compression: String::new(),
             cache_state: CacheState::Bypass,
             cache_key: None,
+            planned_target: None,
             cache: None,
             model: canonical.model.clone(),
             cache_control: CacheControl::default(),
@@ -1530,6 +1562,10 @@ struct Stages {
     cache_state: CacheState,
     /// The key a non-streaming request was looked up under, when it had one.
     cache_key: Option<CacheKey>,
+    /// The `provider/model` the plan named first. A reply is stored only when
+    /// that target served it, so a fallback's reply never sits under the winner's
+    /// key (K4). `None` when the request had no chain.
+    planned_target: Option<String>,
     /// The cache itself, when one is configured.
     cache: Option<Arc<Cache>>,
     /// The model the client named, for [`MODEL_HEADER`]. Carried rather than
@@ -1550,21 +1586,36 @@ struct Stages {
     meta: ResponseMeta,
 }
 
-/// The cache key for a canonical request: `blake3(tenant | model | body)`.
+/// The cache key for a canonical request: `blake3(tenant | served | body)`.
 ///
-/// `ar_cache::key::request_key` is the `docs/04` key. The tenant is the constant
-/// `"default"` because there is exactly one tenant — a single-operator install —
-/// and inventing a second one would only change the digest.
+/// `served` is the `provider/model` that will answer, not the client alias (K4).
+///
+/// `ar_cache::key::request_key` is the `docs/04` key. The tenant is the client
+/// key the gate authenticated, or `anonymous` on an ungated gateway. A single
+/// shared tenant let one client's cached reply answer another client's identical
+/// request, and the hit skipped the second client's spend record.
 /// `None` for a body that is not JSON, which the translator has already refused
 /// before this runs, so the arm is unreachable rather than a guess.
-fn request_key(canonical: &CanonicalRequest, caller_key: Option<&str>) -> Option<CacheKey> {
+fn request_key(
+    canonical: &CanonicalRequest,
+    served: &str,
+    tenant: &str,
+    caller_key: Option<&str>,
+) -> Option<CacheKey> {
     let body = serde_json::from_slice::<serde_json::Value>(&canonical.body).ok()?;
     Some(ar_cache::key::request_key_with(
-        "default",
-        &canonical.model,
-        &body,
-        caller_key,
+        tenant, served, &body, caller_key,
     ))
+}
+
+/// K4: whether a reply may be stored under the planned winner's key.
+///
+/// Only the planned winner's reply is kept. A fallback's reply stored under the
+/// winner's key would replay for the whole TTL after the winner recovered. A
+/// request with no planned target has no winner to be wrong about, so its reply
+/// is kept as it always was.
+fn storable_reply(planned: Option<&str>, served: &str) -> bool {
+    planned.is_none_or(|planned| planned == served)
 }
 
 /// The cache-control headers one request carried, as the dispatch needs them.
@@ -2062,6 +2113,7 @@ fn cache_hit(
 /// the half that explains the other.
 fn decorate(
     outcome: AttemptOutcome,
+    resilience: Arc<Resilience>,
     stream: bool,
     dialect: Dialect,
     strategy: Strategy,
@@ -2079,6 +2131,7 @@ fn decorate(
         compression,
         cache_state,
         cache_key,
+        planned_target,
         cache,
         model,
         cache_control,
@@ -2136,7 +2189,10 @@ fn decorate(
             // incrementally. A non-stream completion arrives as one JSON chunk,
             // and a comment line injected into it would corrupt the JSON.
             let keepalive = stream.then(|| Keepalive::new(dialect, KEEPALIVE_INTERVAL));
-            match (cache_key, cache) {
+            let served = format!("{}/{}", provider.as_str(), model);
+            let store_key =
+                cache_key.filter(|_| storable_reply(planned_target.as_deref(), &served));
+            match (store_key, cache) {
                 // Only a non-streaming completion reaches here with a key; the
                 // caller already turned a stream into `CacheState::Bypass`.
                 (Some(key), Some(cache)) => builder
@@ -2151,14 +2207,20 @@ fn decorate(
                         cache_control.ttl,
                     ))),
                 _ => {
-                    let stream = upstream.stream;
+                    let cut = upstream.cut;
+                    // R5: the breaker verdict is settled when this body ends, cut
+                    // or clean, so the stream is wrapped before either relay reads it.
+                    let chunks = if stream {
+                        settle_stream(upstream.stream, resilience, provider.as_str(), cut.clone())
+                    } else {
+                        upstream.stream
+                    };
                     let body = match keepalive.filter(|k| !k.is_noop()) {
-                        Some(k) => {
-                            Body::from_stream(k.relay(stream, provider.as_str(), model.as_ref()))
-                        }
-                        None => {
-                            Body::from_stream(stream.map(Ok::<Bytes, std::convert::Infallible>))
-                        }
+                        Some(k) => Body::from_stream(
+                            k.relay(chunks, provider.as_str(), model.as_ref())
+                                .map(|r| r.map_err(|never| -> std::io::Error { match never {} })),
+                        ),
+                        None => Body::from_stream(abort_on_cut(chunks, cut)),
                     };
                     builder
                         .header(header::CONTENT_TYPE, ct)
@@ -2244,6 +2306,54 @@ fn decorate(
 /// Only the non-streaming arm: a stream is never cached, so there is no key and
 /// no tee. The store happens on the generator's final poll, i.e. after the last
 /// byte has already reached the client, so a cache write never delays a relay.
+/// Relays a raw-dialect stream, and ends it with an error if the upstream was cut.
+///
+/// A raw dialect has no in-band frame that names a cut, so a partial reply
+/// would reach the client as a clean end of stream. An errored body makes the
+/// server drop the connection instead, which a client reads as a failed
+/// request. Nothing is added to the bytes already sent.
+fn abort_on_cut(
+    mut stream: ar_route::ChunkStream,
+    cut: ar_route::CutFlag,
+) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    async_stream::stream! {
+        while let Some(chunk) = stream.next().await {
+            yield Ok(chunk);
+        }
+        if cut.load(std::sync::atomic::Ordering::SeqCst) {
+            yield Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "upstream stream was cut before its end",
+            ));
+        }
+    }
+}
+
+/// Did this completion stop at the token ceiling?
+///
+/// Reads the stop marker of each dialect the reply can be in: OpenAI
+/// `finish_reason`, Anthropic `stop_reason`, and Gemini `finishReason`. A reply
+/// stopped at the ceiling is a partial answer, and storing it would replay a
+/// truncated answer as a complete one (`ar_cache` names this as
+/// `store_truncated`, which nothing called before).
+fn stopped_at_ceiling(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    let openai = value["choices"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|c| matches!(c["finish_reason"].as_str(), Some("length" | "max_tokens")));
+    let anthropic = value["stop_reason"].as_str() == Some("max_tokens");
+    let gemini = value["candidates"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|c| c["finishReason"].as_str() == Some("MAX_TOKENS"));
+    openai || anthropic || gemini
+}
+
 /// Past [`CACHE_MAX_BODY`] the buffer is dropped rather than grown: a partial
 /// answer replayed from cache looks like a complete one, and `ar_cache` has a
 /// named `store_truncated` for exactly that decision.
@@ -2273,7 +2383,7 @@ fn tee_and_store(
         // this tee's whole job was the write. A caller TTL, when present,
         // shortens the entry — the policy ceiling still wins on the store side
         // ([`ar_cache::Cache::store_with_ttl`]).
-        if keep && status < 300 && !no_store {
+        if keep && status < 300 && !no_store && !stopped_at_ceiling(&buf) {
             match ttl {
                 Some(ttl) => {
                     cache.store_with_ttl(
@@ -2399,7 +2509,10 @@ impl Keepalive {
                     // client is waiting on a frame that will never arrive, so name
                     // that in-band and say so in the log.
                     Ok(None) => {
-                        if keepalive.last_terminated == Some(false)
+                        // `!= Some(true)`, not `== Some(false)`: a stream that
+                        // ended before its first chunk is `None`, and a client
+                        // handed a silent 200 with no body is the same failure.
+                        if keepalive.last_terminated != Some(true)
                             && let Some(frame) = keepalive.truncated
                         {
                             tracing::warn!(
@@ -3264,6 +3377,7 @@ mod tests {
     /// A chat POST with a JSON body, plus any extra headers.
     fn chat(body: &str, extra: &[(&str, &str)]) -> axum::http::Request<axum::body::Body> {
         let mut req = axum::http::Request::builder()
+            .header("host", "127.0.0.1:20128")
             .method("POST")
             .uri("/v1/chat/completions")
             .header(header::CONTENT_TYPE, "application/json")
@@ -3363,6 +3477,7 @@ mod tests {
     fn headers_for(meta: ar_tokens::ResponseMeta, attempts: u16) -> HeaderMap {
         let resp = decorate(
             succeeded(attempts),
+            Arc::new(ar_route::Resilience::new()),
             false,
             Dialect::OpenAi,
             Strategy::Priority,
@@ -3370,6 +3485,7 @@ mod tests {
                 compression: "default;engines=-".to_owned(),
                 cache_state: ar_cache::CacheState::Miss,
                 cache_key: None,
+                planned_target: None,
                 cache: None,
                 model: ar_route::Strng::from("m"),
                 cache_control: CacheControl::default(),
@@ -3462,6 +3578,7 @@ mod tests {
                 provider: ProviderId::new("nvidia"),
                 tried: 3,
             },
+            Arc::new(ar_route::Resilience::new()),
             false,
             Dialect::OpenAi,
             Strategy::Priority,
@@ -3469,6 +3586,7 @@ mod tests {
                 compression: "default;engines=-".to_owned(),
                 cache_state: ar_cache::CacheState::Miss,
                 cache_key: None,
+                planned_target: None,
                 cache: None,
                 model: ar_route::Strng::from("free-stack"),
                 cache_control: CacheControl::default(),
@@ -3811,6 +3929,7 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_path_is_a_json_404_that_carries_the_path() {
         let req = axum::http::Request::builder()
+            .header("host", "127.0.0.1:20128")
             .uri("/v1/chat/completionz")
             .body(axum::body::Body::empty())
             .expect("request builds");
@@ -4304,6 +4423,7 @@ mod tests {
     /// the route swapped.
     fn post_to(path: &str, body: &str) -> axum::http::Request<axum::body::Body> {
         axum::http::Request::builder()
+            .header("host", "127.0.0.1:20128")
             .method("POST")
             .uri(path)
             .header(header::CONTENT_TYPE, "application/json")
@@ -4318,7 +4438,7 @@ mod tests {
     fn only_row(ledger: &Mutex<ar_tokens::Ledger>) -> Option<ar_tokens::LedgerRow> {
         let report = ledger
             .lock()
-            .expect("ledger lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .report(10)
             .expect("report");
         let mut rows = report.rows;
@@ -4389,7 +4509,7 @@ mod tests {
         drain_body(resp).await;
         let report = ledger
             .lock()
-            .expect("ledger lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .report(10)
             .expect("report");
         assert!(
@@ -5177,14 +5297,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_empty_stream_gets_no_truncation_frame() {
-        // `None` rather than `Some(false)`: the upstream produced nothing at all,
-        // so there is no half-finished answer to describe and a client that got
-        // zero bytes is not waiting on a frame.
+    async fn an_empty_stream_gets_the_truncation_frame() {
+        // An upstream that produced nothing and then closed is a failed answer,
+        // and a client that got zero bytes is waiting on a frame that will not
+        // come. Named in-band, the same as a cut mid-stream (R3). Before the fix
+        // the check was `== Some(false)`, which left this case silent.
         let frames = drain(Keepalive::new(Dialect::OpenAi, NOWAIT), vec![]).await;
-        assert!(
-            frames.is_empty(),
-            "an empty stream was described: {frames:?}"
+        assert_eq!(
+            frames.len(),
+            1,
+            "an empty stream was not named in-band: {frames:?}"
         );
     }
 
@@ -5470,7 +5592,7 @@ mod tests {
         );
         let report = ledger
             .lock()
-            .expect("ledger lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .report(10)
             .expect("report");
         assert_eq!(
@@ -5597,7 +5719,7 @@ mod tests {
         };
         let rows = ledger
             .lock()
-            .expect("ledger lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .log(&filter)
             .expect("log");
         assert_eq!(rows.len(), 1);
@@ -5865,6 +5987,33 @@ mod tests {
             Some("hit"),
             "the fixture cache never hits, so this test proves nothing"
         );
+    }
+
+    #[test]
+    fn request_key_should_change_when_the_served_target_changes() {
+        use super::request_key;
+        // K4: a combo retargeted in config keeps its alias. The key must follow
+        // the target that answers, or the old target's reply is replayed.
+        let canonical = ar_route::CanonicalRequest::new("combo", Bytes::from_static(b"{}"));
+        let before = request_key(&canonical, "openai/gpt-a", "anonymous", None);
+        let after = request_key(&canonical, "anthropic/claude-b", "anonymous", None);
+        assert_ne!(before, after);
+        assert_eq!(
+            before,
+            request_key(&canonical, "openai/gpt-a", "anonymous", None)
+        );
+    }
+
+    #[test]
+    fn storable_reply_should_refuse_a_fallback_under_the_winners_key() {
+        // K4: the winner is planned, a fallback answers. Its reply must not be
+        // stored under the winner's key, where it would outlive the winner's recovery.
+        assert!(!super::storable_reply(
+            Some("openai/gpt-a"),
+            "anthropic/claude-b"
+        ));
+        assert!(super::storable_reply(Some("openai/gpt-a"), "openai/gpt-a"));
+        assert!(super::storable_reply(None, "anthropic/claude-b"));
     }
 
     #[tokio::test]
@@ -6138,5 +6287,44 @@ mod tests {
             Some("miss"),
             "the body said JSON and Accept was only a fallback"
         );
+    }
+
+    #[test]
+    fn stopped_at_ceiling_should_flag_length_in_each_dialect() {
+        assert!(super::stopped_at_ceiling(
+            br#"{"choices":[{"finish_reason":"length"}]}"#
+        ));
+        assert!(super::stopped_at_ceiling(
+            br#"{"stop_reason":"max_tokens"}"#
+        ));
+        assert!(super::stopped_at_ceiling(
+            br#"{"candidates":[{"finishReason":"MAX_TOKENS"}]}"#
+        ));
+    }
+
+    #[test]
+    fn stopped_at_ceiling_should_pass_a_complete_reply() {
+        assert!(!super::stopped_at_ceiling(
+            br#"{"choices":[{"finish_reason":"stop"}]}"#
+        ));
+        assert!(!super::stopped_at_ceiling(b"not json"));
+    }
+
+    #[tokio::test]
+    async fn abort_on_cut_should_end_clean_only_when_not_cut() {
+        use futures::StreamExt as _;
+        use std::sync::atomic::Ordering;
+        let chunks = || -> ar_route::ChunkStream {
+            Box::pin(futures::stream::iter([Bytes::from_static(b"a")]))
+        };
+        let clean: Vec<_> = super::abort_on_cut(chunks(), Default::default())
+            .collect()
+            .await;
+        assert!(clean.iter().all(Result::is_ok));
+
+        let cut = ar_route::CutFlag::default();
+        cut.store(true, Ordering::SeqCst);
+        let cut_items: Vec<_> = super::abort_on_cut(chunks(), cut).collect().await;
+        assert!(matches!(cut_items.last(), Some(Err(_))));
     }
 }

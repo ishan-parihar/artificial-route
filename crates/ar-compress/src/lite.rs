@@ -71,12 +71,8 @@ fn needs_rewrite(text: &str) -> bool {
                 }
                 newline_run = 0;
             }
-            b'#' => {
-                if hash_is_comment(&text[i + 1..]) {
-                    return true;
-                }
-                newline_run = 0;
-            }
+            // `#` is never a comment here: see `comment_cut` for why prose hashtags
+            // must survive.
             _ => newline_run = 0,
         }
     }
@@ -168,34 +164,14 @@ fn comment_cut(line: &str) -> Option<usize> {
             b'/' if b.get(i + 1) == Some(&b'/') && (i == 0 || b[i - 1].is_ascii_whitespace()) => {
                 return Some(i);
             }
-            b'#' if (i == 0 || b[i - 1].is_ascii_whitespace())
-                && hash_is_comment(&line[i + 1..]) =>
-            {
-                return Some(i);
-            }
+            // `#` is not a comment marker here on purpose. `#ops, do not override`
+            // is prose, and stripping it drops the negation. ponytail: `#` code
+            // comments stay in the prompt; add them back only with a per-language
+            // rule, not a word heuristic.
             _ => i += 1,
         }
     }
     None
-}
-
-/// Is the `#` at the start of `rest` a comment rather than structure?
-///
-/// Rejects markdown headings (`# Title`), shebangs, and the preprocessor /
-/// shell / Julia words where `#` is syntax. `rest` is everything after the `#`.
-fn hash_is_comment(rest: &str) -> bool {
-    let mut chars = rest.chars();
-    let Some(first) = chars.next() else {
-        // A lone trailing `#` (an anchor link) is worth nothing.
-        return false;
-    };
-    if first.is_whitespace() {
-        return false;
-    }
-    const DIRECTIVE: [&str; 9] = [
-        "!", "include", "import", "set", "show", "let", "pragma", "define", "f",
-    ];
-    !DIRECTIVE.iter().any(|d| rest.starts_with(d))
 }
 
 #[cfg(test)]
@@ -227,6 +203,14 @@ mod tests {
     #[test]
     fn keeps_heading_when_hash_is_markdown() {
         assert_eq!(comment_cut("# Title"), None);
+    }
+
+    #[test]
+    fn keeps_prose_after_a_hash_word() {
+        assert_eq!(
+            comment_cut("Never deploy on Fridays #ops, do not override"),
+            None
+        );
     }
 
     #[test]

@@ -344,14 +344,6 @@ pub enum TranslateError {
 /// Inbound wire -> canonical.
 ///
 /// Generic over `In` so the impl is static: `OpenAiInbound::to_canonical(chat)`
-/// monomorphises and inlines. `ar-core::ArTranslate` is the cross-crate seam
-/// and carries the same method name, but its signature is a `serde_json::Value`
-/// placeholder pending this crate's concrete types.
-///
-/// # TODO(#p0-align)
-/// Reconcile with `ar_core::ArTranslate` once `ar-route`/`ar-cli` call the typed
-/// form; the placeholder cannot express streaming or the canonical struct, so
-/// both seams cannot coexist long.
 pub trait ArTranslate<In> {
     /// Normalises one inbound request into canonical shape.
     fn to_canonical(input: In) -> Result<CanonicalChat, TranslateError>;

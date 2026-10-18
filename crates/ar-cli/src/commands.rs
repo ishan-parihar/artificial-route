@@ -1831,12 +1831,12 @@ fn sync_config(cli: &Cli, args: &SyncArgs) -> anyhow::Result<()> {
             "sync splices into an existing config; run `aroute import` first",
         )
     })?;
-    let mut next = splice_section(&doc, "combos", &import::render_combos_section(&combos));
+    let mut next = splice_section(&doc, "combos", &import::render_combos_section(&combos)?);
     if !custom.is_empty() {
         next = splice_section(
             &next,
             "custom_providers",
-            &import::render_custom_section(&custom),
+            &import::render_custom_section(&custom)?,
         );
         next = add_missing_custom_key_refs(&next, &custom);
     }
@@ -2151,11 +2151,11 @@ fn sync_credentials(doc: &str, db: &Path) -> anyhow::Result<String> {
             row.keys = Some(names.clone());
         }
     }
-    let mut out = splice_section(doc, "keys", &import::render_keys_section(&key_rows));
+    let mut out = splice_section(doc, "keys", &import::render_keys_section(&key_rows)?);
     out = splice_section(
         &out,
         "providers",
-        &import::render_providers_section(&providers),
+        &import::render_providers_section(&providers)?,
     );
     Ok(out)
 }
@@ -2252,26 +2252,52 @@ fn sync_env_file(env_path: &Path, db: &Path, doc: &str) -> anyhow::Result<(usize
     }
     let changed = materialised + ensured > 0;
     if changed {
-        std::fs::write(env_path, lines.join("\n") + "\n").map_err(|e| {
+        write_private(env_path, &(lines.join("\n") + "\n")).map_err(|e| {
             fail(
                 format!("cannot write {}: {e}", env_path.display()),
                 "fix the file, or pass --env <FILE> at a path you can write",
             )
         })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(env_path, std::fs::Permissions::from_mode(0o600)).map_err(
-                |e| {
-                    fail(
-                        format!("cannot chmod {}: {e}", env_path.display()),
-                        "fix the file, or pass --env <FILE> at a path you can write",
-                    )
-                },
-            )?;
-        }
     }
     Ok((materialised, ensured, changed))
+}
+
+/// Writes a file that holds credentials: staged at `0600` from its first byte,
+/// then renamed over the target.
+///
+/// Writing the target in place and chmod-ing it afterwards leaves a window where
+/// a new file carries the umask mode (`0644` under `022`) and an existing one
+/// keeps its old mode while the secrets land. Staging the file at `0600` closes
+/// that window, and the rename means a reader sees the old file or the new one,
+/// never a partial write. A failed stage removes its temp file.
+pub fn write_private(path: &std::path::Path, body: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    let staged = stage_private(&tmp, body).and_then(|()| std::fs::rename(&tmp, path));
+    if staged.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    staged
+}
+
+fn stage_private(tmp: &std::path::Path, body: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(tmp)?;
+    // `mode` applies only when the file is created, so a stale temp file from
+    // an earlier crash would keep its old bits without this.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(body.as_bytes())?;
+    file.sync_all()
 }
 
 /// Every `AR_KEY_*` variable name the document references after a `$`.
@@ -2305,12 +2331,31 @@ const BACKUP_DEPTH: usize = 3;
 /// `ar-registry`, so a bad regeneration is a rebuild away from being live.
 pub(crate) fn write_file(path: &Path, body: &str) -> anyhow::Result<()> {
     rotate_backups(path)?;
-    std::fs::write(path, body).map_err(|e| {
+    write_atomic(path, body).map_err(|e| {
         fail(
             format!("cannot write {}: {e}", path.display()),
             "pass --out-dir <DIR> at a path you can write",
         )
     })
+}
+
+/// Replaces `path` through a synced temp file beside it, then renames over it.
+///
+/// A crash or a second writer mid-write leaves the old file whole, never a
+/// truncated config. The temp name carries the PID so two writers do not share it.
+fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    let staged = (|| {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(body.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if staged.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    staged
 }
 
 /// `<name>.1` for `name = /p/config.yaml`, and so on.
@@ -3689,5 +3734,65 @@ models\":[{\"kind\":\"model\",\"model\":\"nvidia/z-ai/glm-5.3\",\"providerId\":\
         drop(conn);
         assert!(import::limits::read_rpm(&db).is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod write_private_tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use super::{write_atomic, write_private};
+
+    fn dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("ar-private-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("scratch dir");
+        d
+    }
+
+    fn mode(path: &std::path::Path) -> u32 {
+        std::fs::metadata(path).expect("stat").permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn write_private_should_create_owner_only_when_target_is_new() {
+        let d = dir("new");
+        let target = d.join("ar.env");
+        write_private(&target, "AR_KEY_X=secret\n").expect("write");
+        assert_eq!(mode(&target), 0o600);
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read"),
+            "AR_KEY_X=secret\n"
+        );
+    }
+
+    #[test]
+    fn write_atomic_should_replace_contents_and_leave_no_temp_file() {
+        let d = dir("atomic");
+        let target = d.join("config.yaml");
+        std::fs::write(&target, "old: 1\n").expect("seed");
+        write_atomic(&target, "new: 2\n").expect("write");
+        assert_eq!(std::fs::read_to_string(&target).expect("read"), "new: 2\n");
+        assert_eq!(std::fs::read_dir(&d).expect("list").count(), 1);
+    }
+
+    #[test]
+    fn write_private_should_tighten_mode_when_target_was_world_readable() {
+        let d = dir("widen");
+        let target = d.join("ar.env");
+        std::fs::write(&target, "OLD=1\n").expect("seed");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        write_private(&target, "NEW=2\n").expect("write");
+        assert_eq!(mode(&target), 0o600);
+        assert_eq!(std::fs::read_to_string(&target).expect("read"), "NEW=2\n");
+    }
+
+    #[test]
+    fn write_private_should_leave_no_temp_file_behind() {
+        let d = dir("tmp");
+        let target = d.join("ar.env");
+        write_private(&target, "A=1\n").expect("write");
+        let leftovers = std::fs::read_dir(&d).expect("list").count();
+        assert_eq!(leftovers, 1, "only the target should remain");
     }
 }

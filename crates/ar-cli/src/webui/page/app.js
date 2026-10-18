@@ -95,8 +95,8 @@ async function route() {
 
 async function refresh() {
   renderChrome(await api("/ui/api/state"));
+  await fillUsage(); // before route(): the dashboard's totals are built from USAGE
   await route();
-  await fillUsage(); // stats on dashboard + rows on usage pane
 }
 
 /* ── usage fetch (dashboard band + usage pane) ────────────────────────────── */
@@ -110,18 +110,20 @@ async function fillUsage() {
 
 /* ── pane: dashboard ──────────────────────────────────────────────────────── */
 
-function stat(label, valueId) {
+function stat(label, value, valueId) {
   return H("div", { class: "stat" },
-    H("dt", { text: label }), H("dd", { id: valueId, text: "-" }));
+    H("dt", { text: label }), H("dd", { id: valueId, text: value }));
 }
 
 function paneDashboard(root, st) {
+  // Client keys are signed tokens and never stored, so the state carries no
+  // count for them. The card shows the gate they are verified against.
   root.append(
     H("section", { class: "stats", "aria-label": "Status" },
-      stat("Providers", "st-providers"),
-      stat("Combos", "st-combos"),
-      stat("Client keys", "st-keys"),
-      stat("Spend, all keys", "st-spend")),
+      stat("Providers", String(st.providers.length), "st-providers"),
+      stat("Combos", String(st.combos.length), "st-combos"),
+      stat("Client keys", st.gate_armed ? "armed" : "unarmed", "st-keys"),
+      stat("Spend, all keys", USAGE ? "$" + Number(USAGE.totals.usd).toFixed(4) : "-", "st-spend")),
     H("section", { class: "block" },
       H("div", { class: "block-head" },
         H("h2", { text: "Routing" }),
@@ -133,6 +135,7 @@ function paneDashboard(root, st) {
         H("h2", { text: "Recent usage" }),
         H("a", { class: "hint", href: "#/usage", text: "full log \u2192" })),
       H("div", { class: "block-body" }, H("p", { class: "totals" }, usageSummary()))));
+  renderCombos(st); // the Routing block lists the combos, same as the combos pane
 }
 
 function usageSummary() {
@@ -313,7 +316,12 @@ function freshCombo() {
 function paneProviders(root, st) {
   root.append(
     H("section", { class: "block" },
-      H("div", { class: "block-head" }, H("h2", { text: "Configured" })),
+      H("div", { class: "block-head" }, H("h2", { text: "Configured" }),
+        H("input", { id: "provider-filter", type: "search", placeholder: "filter providers",
+          "aria-label": "filter providers", value: PROVIDER_FILTER,
+          oninput: (e) => { PROVIDER_FILTER = e.target.value; PROVIDER_ALL = false; renderProviders(STATE); } }),
+        H("button", { id: "provider-more", type: "button", class: "btn ghost small", hidden: true,
+          onclick: () => { PROVIDER_ALL = true; renderProviders(STATE); } })),
       H("div", { class: "block-body", style: "padding:0" },
         H("div", { class: "table-wrap" }, H("table", null,
           H("thead", null, H("tr", null,
@@ -449,11 +457,26 @@ async function loadCatalog() {
   $("fav-body").addEventListener("click", onClick);
 }
 
+/* The providers table is capped: each row is a password field and two buttons, so a
+ * long config would otherwise put thousands of controls on one page. The filter and
+ * "show all" survive a refresh, since refresh() rebuilds this table from STATE. */
+const PROVIDER_CAP = 40;
+let PROVIDER_FILTER = "";
+let PROVIDER_ALL = false;
+
 function renderProviders(st) {
   const body = $("provider-rows");
   if (!body) return;
   body.textContent = "";
-  for (const p of st.providers) {
+  const q = PROVIDER_FILTER.trim().toLowerCase();
+  const matches = st.providers.filter((p) => !q || p.id.toLowerCase().includes(q));
+  const shown = PROVIDER_ALL || q ? matches : matches.slice(0, PROVIDER_CAP);
+  const more = $("provider-more");
+  if (more) {
+    more.hidden = shown.length === matches.length;
+    more.textContent = `Show all ${matches.length}`;
+  }
+  for (const p of shown) {
     const cred = H("td");
     for (const ref of p.key_refs) {
       cred.append(H("span", { class: "keycell" },
@@ -884,6 +907,15 @@ $("copy-restart").addEventListener("click", async () => {
 });
 
 window.addEventListener("hashchange", route);
+
+/* The dashboard's numbers move while it sits open. Only the spend and usage totals
+ * are refreshed, never the whole view, so a form the operator is typing into survives. */
+setInterval(async () => {
+  if (document.hidden || currentView() !== "dashboard") return;
+  await fillUsage().catch(() => {});
+  const totals = document.querySelector("#view .totals");
+  if (totals) totals.replaceChildren(usageSummary());
+}, 15000);
 refresh().catch(() => {
   const root = $("view");
   root.textContent = "";

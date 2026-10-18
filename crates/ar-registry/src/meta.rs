@@ -49,7 +49,7 @@ use crate::Registry;
 const PROVIDER_META_JSON: &str = include_str!("providerMeta.json");
 
 /// The credential header a provider gets when the catalog names none.
-/// /
+///
 /// `bearer` is the spelling upstream's entry builder defaults to
 /// (`buildOpenAiCompatibleRegistryEntry`), so it is the right answer for the
 /// ~200 entries that declare nothing.
@@ -129,7 +129,7 @@ pub struct ProviderMeta {
 }
 
 /// `skip_serializing_if` helper: keeps an unset name out of the JSON.
-/// /
+///
 /// A `&str` method rather than `Strng::is_empty`, which resolves against
 /// `ExactSizeIterator` on `Arc<str>` and does not compile.
 fn is_blank(v: &Strng) -> bool {
@@ -284,23 +284,22 @@ impl MetaCatalog {
 }
 
 /// The process-wide table, parsed on first call.
-/// /
+///
 /// Lazy on the same reasoning as `crate::global`: the parse is not on the
 /// `--version` fast path, and nothing on a dispatch path needs it.
-/// /
-/// # Panics
-/// /
-/// Panics if the embedded table is malformed. It is a generated source file, not
-/// user input, so a panic at first use is the honest signal; it cannot be
-/// triggered by a request.
+///
+/// A malformed table is logged and served empty rather than panicking; see
+/// [`crate::check_embedded`].
 #[must_use]
 pub fn global() -> &'static MetaCatalog {
     static TABLE: OnceLock<MetaCatalog> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        let by_id: BTreeMap<Strng, ProviderMeta> = serde_json::from_str(PROVIDER_META_JSON)
-            .expect("embedded providerMeta.json is malformed");
-        MetaCatalog { by_id }
-    })
+    TABLE.get_or_init(|| crate::embedded_or_empty("providerMeta.json", parse()))
+}
+
+/// Parses the compiled-in table. [`crate::check_embedded`] runs it at boot.
+pub(crate) fn parse() -> Result<MetaCatalog, serde_json::Error> {
+    let by_id: BTreeMap<Strng, ProviderMeta> = serde_json::from_str(PROVIDER_META_JSON)?;
+    Ok(MetaCatalog { by_id })
 }
 
 #[cfg(test)]

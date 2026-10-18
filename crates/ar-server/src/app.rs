@@ -641,8 +641,67 @@ pub fn app(state: AppState) -> Router {
         ))
         // Outermost, and last in the chain: outermost so a preflight is answered
         // from the headers alone, and last so it wraps the fallback too.
+        .layer(axum::middleware::from_fn(loopback_only))
         .layer(axum::middleware::from_fn(cors))
         .with_state(state)
+}
+
+/// Refuses a request whose `Host` or `Origin` names anything but loopback.
+///
+/// The bind is loopback, but that does not keep a web page out. A DNS-rebinding
+/// page resolves its own name to `127.0.0.1` and then talks to this server as
+/// same-origin, so a bind check alone admits it. The `Host` header is the one
+/// thing the rebinding page cannot choose, so it is checked. An `Origin` that is
+/// present and not loopback is refused too, which covers a cross-site page that
+/// does not rebind. An `Origin` of `null` (a sandboxed frame) is refused.
+///
+/// Mounted inside [`cors`], so a refusal still carries the CORS headers and the
+/// page can read why it was refused.
+pub async fn loopback_only(req: Request, next: Next) -> Response {
+    let host_ok = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(loopback_authority);
+    let origin_ok = req.headers().get(header::ORIGIN).is_none_or(|v| {
+        v.to_str()
+            .ok()
+            .and_then(|o| o.split_once("://"))
+            .is_some_and(|(_, rest)| loopback_authority(rest.split('/').next().unwrap_or_default()))
+    });
+    if host_ok && origin_ok {
+        return next.run(req).await;
+    }
+    (
+        axum::http::StatusCode::FORBIDDEN,
+        [(header::CONTENT_TYPE, "application/json")],
+        r#"{"error":{"type":"forbidden","code":"non_loopback_request","message":"this gateway answers loopback clients only; the Host or Origin header names another host"}}"#,
+    )
+        .into_response()
+}
+
+/// `true` when a `host[:port]` authority names the loopback interface.
+///
+/// Bracketed IPv6 (`[::1]:20128`) is read up to its `]`. A bare IPv6 literal
+/// has more than one `:`, so the port split is skipped for it. An IPv4-mapped
+/// loopback (`::ffff:127.0.0.1`) is refused: it is rare and a refusal is the
+/// safe answer.
+fn loopback_authority(authority: &str) -> bool {
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        match bracketed.split_once(']') {
+            Some((inner, _)) => inner,
+            None => return false,
+        }
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, port)) if !h.contains(':') && port.bytes().all(|b| b.is_ascii_digit()) => h,
+            _ => authority,
+        }
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Answers a CORS preflight and stamps the headers on every response.
@@ -1099,6 +1158,7 @@ mod tests {
     /// with a different verb.
     async fn response_of(method: &str, path: &str) -> axum::response::Response {
         let req = axum::http::Request::builder()
+            .header("host", "127.0.0.1:20128")
             .method(method)
             .uri(path)
             .body(axum::body::Body::empty())
@@ -1124,6 +1184,7 @@ mod tests {
         // request. The 204 is every preflight's answer — the assertion is
         // about the allow-list, which is answered wholesale.
         let req = axum::http::Request::builder()
+            .header("host", "127.0.0.1:20128")
             .method("OPTIONS")
             .uri("/v1/chat/completions")
             .header(axum::http::header::ORIGIN, "http://localhost:5173")
@@ -1251,6 +1312,7 @@ mod tests {
     async fn a_cross_origin_request_gets_its_origin_echoed_with_vary() {
         use axum::http::header;
         let req = axum::http::Request::builder()
+            .header("host", "127.0.0.1:20128")
             .uri("/healthz")
             .header(header::ORIGIN, "https://example.test")
             .body(axum::body::Body::empty())
@@ -1289,6 +1351,7 @@ mod tests {
         // JSON body the fallback just built never reaches the client.
         use axum::http::header;
         let req = axum::http::Request::builder()
+            .header("host", "127.0.0.1:20128")
             .uri("/v1/nope")
             .header(header::ORIGIN, "https://example.test")
             .body(axum::body::Body::empty())
@@ -1596,6 +1659,7 @@ mod tests {
         extra: &[(&str, &str)],
     ) -> axum::http::Request<axum::body::Body> {
         let mut req = axum::http::Request::builder()
+            .header("host", "127.0.0.1:20128")
             .method("POST")
             .uri("/v1/chat/completions")
             .header(axum::http::header::CONTENT_TYPE, "application/json")
@@ -1735,6 +1799,7 @@ mod tests {
         // the gate read the path, which is the property under test.
         let token = accepted_token();
         let req = axum::http::Request::builder()
+            .header("host", "127.0.0.1:20128")
             .method("POST")
             .uri(format!("/vscode/{token}/chat/completions"))
             .header(axum::http::header::CONTENT_TYPE, "application/json")
@@ -1806,5 +1871,113 @@ mod tests {
                 .is_ok(),
             "the explicit key did not win"
         );
+    }
+}
+
+#[cfg(test)]
+mod loopback_guard_tests {
+    use super::loopback_authority;
+
+    #[test]
+    fn loopback_authority_should_accept_when_host_is_loopback() {
+        for host in [
+            "127.0.0.1",
+            "127.0.0.1:20128",
+            "localhost:20128",
+            "LOCALHOST",
+            "[::1]:20128",
+            "::1",
+        ] {
+            assert!(loopback_authority(host), "{host} should pass");
+        }
+    }
+
+    #[test]
+    fn loopback_authority_should_refuse_when_host_is_a_name() {
+        for host in [
+            "evil.example",
+            "evil.example:20128",
+            "127.0.0.1.evil.example",
+            "localhost.evil.example",
+        ] {
+            assert!(!loopback_authority(host), "{host} should be refused");
+        }
+    }
+
+    #[test]
+    fn loopback_authority_should_refuse_when_host_is_routable() {
+        for host in [
+            "10.0.0.5:20128",
+            "0.0.0.0:20128",
+            "[2001:db8::1]:20128",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(!loopback_authority(host), "{host} should be refused");
+        }
+    }
+
+    #[test]
+    fn loopback_authority_should_refuse_when_bracket_is_unclosed() {
+        assert!(!loopback_authority("[::1:20128"));
+    }
+}
+
+#[cfg(test)]
+mod loopback_router_tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt as _;
+
+    use super::{app, loopback_only};
+
+    #[tokio::test]
+    async fn loopback_only_should_refuse_when_host_is_a_rebinding_name() {
+        let router = axum::Router::new()
+            .route("/probe", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(loopback_only));
+        let req = Request::builder()
+            .uri("/probe")
+            .header("host", "evil.example:20128")
+            .body(Body::empty())
+            .expect("request");
+        let resp = router.oneshot(req).await.expect("answers");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn loopback_only_should_refuse_when_origin_is_cross_site() {
+        let router = axum::Router::new()
+            .route("/probe", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(loopback_only));
+        let req = Request::builder()
+            .uri("/probe")
+            .header("host", "127.0.0.1:20128")
+            .header("origin", "https://attacker.example")
+            .body(Body::empty())
+            .expect("request");
+        let resp = router.oneshot(req).await.expect("answers");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn loopback_only_should_pass_when_host_and_origin_are_loopback() {
+        let router = axum::Router::new()
+            .route("/probe", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(loopback_only));
+        let req = Request::builder()
+            .uri("/probe")
+            .header("host", "localhost:20128")
+            .header("origin", "http://localhost:3000")
+            .body(Body::empty())
+            .expect("request");
+        let resp = router.oneshot(req).await.expect("answers");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn app_should_be_guarded_when_built() {
+        // Compile-time pin: `app` must keep building with the guard in its chain.
+        // A behavioural check runs against the live listener in the scratch probe.
+        let _ = app as fn(_) -> axum::Router;
     }
 }

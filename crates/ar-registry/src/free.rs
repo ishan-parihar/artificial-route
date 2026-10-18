@@ -503,17 +503,17 @@ fn pool_max_entry<'a>(pool_max: &mut BTreeMap<&'a str, u64>, pool: &'a str, valu
 /// `--version` fast path, and nothing on a dispatch path needs a free-tier
 /// figure.
 ///
-/// # Panics
-///
-/// Panics if the embedded table is malformed. It is a generated source file, not
-/// user input, so a panic at first use is the honest signal; it cannot be
-/// triggered by a request.
+/// A malformed table is logged and served empty rather than panicking. `aroute
+/// serve` refuses to start on one first (see [`crate::check_embedded`]).
 #[must_use]
 pub fn global() -> &'static FreeBudgets {
     static TABLE: OnceLock<FreeBudgets> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        serde_json::from_str(FREE_BUDGETS_JSON).expect("embedded freeBudgets.json is malformed")
-    })
+    TABLE.get_or_init(|| crate::embedded_or_empty("freeBudgets.json", parse()))
+}
+
+/// Parses the compiled-in table. [`crate::check_embedded`] runs it at boot.
+pub(crate) fn parse() -> Result<FreeBudgets, serde_json::Error> {
+    serde_json::from_str(FREE_BUDGETS_JSON)
 }
 
 #[cfg(test)]
