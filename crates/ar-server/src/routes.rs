@@ -3387,8 +3387,17 @@ pub async fn healthz() -> Response {
         .into_response()
 }
 
-/// `GET /metrics` — Prometheus text exposition.
-pub async fn metrics(State(state): State<AppState>) -> Response {
+/// `GET /metrics` — Prometheus text exposition. Behind the gate when one is armed:
+/// the series name providers, models and traffic, which a public listener must not
+/// hand to an anonymous reader. `/healthz` stays open as a liveness probe.
+pub async fn metrics(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(reason) = authorize(&state, &headers, uri.path()) {
+        return *reason;
+    }
     (
         StatusCode::OK,
         [(
@@ -3512,7 +3521,14 @@ fn cached_models(state: &AppState) -> crate::models::Cached {
 }
 
 /// `GET /v1/models` — OpenAI-compatible catalog, stale-while-revalidate 60s.
-pub async fn models(State(state): State<AppState>) -> Response {
+pub async fn models(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(reason) = authorize(&state, &headers, uri.path()) {
+        return *reason;
+    }
     let cached = cached_models(&state);
     let payload = serde_json::json!({
         "object": "list",
@@ -3540,7 +3556,14 @@ pub async fn models(State(state): State<AppState>) -> Response {
 /// [`models`] rather than sharing it so the probe never enumerates the catalog —
 /// a `HEAD` that built a card body to throw it away would be work per probe on
 /// the one route an SDK hits hardest.
-pub async fn models_head() -> Response {
+pub async fn models_head(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(reason) = authorize(&state, &headers, uri.path()) {
+        return *reason;
+    }
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
@@ -3559,7 +3582,15 @@ pub async fn models_head() -> Response {
 /// card rather than report a miss. It resolves against the *configured* catalog,
 /// so a miss here means this server does not serve that model — not that the
 /// registry lacks it.
-pub async fn model(State(state): State<AppState>, Path(model): Path<String>) -> Response {
+pub async fn model(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    Path(model): Path<String>,
+) -> Response {
+    if let Err(reason) = authorize(&state, &headers, uri.path()) {
+        return *reason;
+    }
     let cached = cached_models(&state);
     let found = cached.cards.iter().find(|c| c.id == model).or_else(|| {
         cached
@@ -4303,7 +4334,12 @@ mod tests {
 
     #[tokio::test]
     async fn head_models_is_200_with_no_body() {
-        let resp = models_head().await;
+        let resp = models_head(
+            State(state(vec![])),
+            axum::extract::OriginalUri("/v1/models".parse().expect("uri")),
+            HeaderMap::new(),
+        )
+        .await;
         assert_eq!(resp.status(), 200);
         assert_eq!(
             resp.headers()["content-type"],
@@ -4322,7 +4358,14 @@ mod tests {
     async fn serves_the_card_for_a_known_id() {
         let card = ModelCard::new("openai", "gpt-4o-mini");
         let state = state(vec![card.clone()]);
-        let resp = model(State(state), Path(card.id.clone())).await;
+        let uri = format!("/v1/models/{}", card.id);
+        let resp = model(
+            State(state),
+            axum::extract::OriginalUri(uri.parse().expect("uri")),
+            HeaderMap::new(),
+            Path(card.id.clone()),
+        )
+        .await;
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = serde_json::from_slice(
             &axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -4336,7 +4379,13 @@ mod tests {
     #[tokio::test]
     async fn answers_an_unknown_id_with_model_not_found() {
         let state = state(vec![ModelCard::new("openai", "gpt-4o-mini")]);
-        let resp = model(State(state), Path("gpt-4o".to_owned())).await;
+        let resp = model(
+            State(state),
+            axum::extract::OriginalUri("/v1/models/gpt-4o".parse().expect("uri")),
+            HeaderMap::new(),
+            Path("gpt-4o".to_owned()),
+        )
+        .await;
         assert_eq!(resp.status(), 404);
         let body = body_of(resp).await;
         assert_eq!(body["error"]["code"], "model_not_found");

@@ -1671,6 +1671,45 @@ mod tests {
         gated_with(master, crate::config::AuthMode::Required)
     }
 
+    /// The catalog and the traffic counters are the same data a chat call reveals,
+    /// so an armed gate covers them too. `/healthz` is the one open route.
+    #[tokio::test]
+    async fn an_armed_gate_refuses_the_catalog_and_metrics_without_a_token() {
+        for path in ["/v1/models", "/v1/models/free-stack", "/metrics"] {
+            let router = gated(MASTER);
+            let req = axum::http::Request::builder()
+                .uri(path)
+                .header("host", "127.0.0.1:20128")
+                .body(axum::body::Body::empty())
+                .expect("request builds");
+            let resp = send(router, req).await;
+            assert_eq!(resp.status(), 401, "{path} answered without a token");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_armed_gate_serves_the_catalog_to_a_valid_token() {
+        let req = axum::http::Request::builder()
+            .uri("/v1/models")
+            .header("host", "127.0.0.1:20128")
+            .header("authorization", format!("Bearer {}", accepted_token()))
+            .body(axum::body::Body::empty())
+            .expect("request builds");
+        let resp = send(gated(MASTER), req).await;
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn healthz_stays_open_when_the_gate_is_armed() {
+        let req = axum::http::Request::builder()
+            .uri("/healthz")
+            .header("host", "127.0.0.1:20128")
+            .body(axum::body::Body::empty())
+            .expect("request builds");
+        let resp = send(gated(MASTER), req).await;
+        assert_eq!(resp.status(), 200);
+    }
+
     /// A chat POST with a JSON body, plus any extra headers.
     async fn post_chat(
         body: &str,
