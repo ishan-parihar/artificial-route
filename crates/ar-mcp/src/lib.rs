@@ -35,7 +35,7 @@ mod tools;
 pub mod transport;
 
 #[cfg(feature = "mcp")]
-pub use transport::{Host, HostCombo, STDIO_WIRED, TOOL_SEARCH_NAME, serve_stdio};
+pub use transport::{Host, HostCombo, STDIO_WIRED, TOOL_SEARCH_NAME, serve_http, serve_stdio};
 
 pub use audit::{AUDIT_OUTPUT_LIMIT, Audit, AuditError, CallOutcome, input_hash};
 pub use login::{AuthTarget, LOGIN_TTL, PendingLogin, PendingLogins, PendingRow};

@@ -75,7 +75,19 @@ pub async fn run(cli: &Cli, args: &McpArgs) -> anyhow::Result<()> {
             "run `aroute doctor`; a target whose provider is not in the compiled-in registry cannot be served",
         )
     })?;
-    ar_mcp::serve_stdio(built).await.map_err(|e| {
+    let served = match args.http {
+        Some(addr) => {
+            let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+                commands::fail(
+                    e,
+                    "the HTTP address could not be bound; pick a free loopback port",
+                )
+            })?;
+            ar_mcp::serve_http(built, listener).await
+        }
+        None => ar_mcp::serve_stdio(built).await,
+    };
+    served.map_err(|e| {
         commands::fail(
             e,
             "the MCP host closed the connection; nothing to retry from here",

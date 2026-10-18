@@ -867,6 +867,59 @@ pub async fn serve_stdio(host: Host) -> Result<(), Error> {
         .map_err(|e| Error::Transport(e.to_string()))
 }
 
+/// Serves the catalog over StreamableHTTP at `/mcp` on `listener`, until the
+/// process is interrupted.
+///
+/// Loopback only, and refused otherwise. The control plane can switch combos and
+/// start logins, and its scope guard is the only authorisation it has, so it is
+/// not offered to a routable address. rmcp's default `Host` allow-list is also
+/// loopback, which rejects a DNS-rebinding request whose `Host` names some other
+/// host.
+///
+/// # Errors
+/// [`Error::Transport`] when the listener is not loopback, or when serving fails.
+pub async fn serve_http(host: Host, listener: tokio::net::TcpListener) -> Result<(), Error> {
+    let addr = listener
+        .local_addr()
+        .map_err(|e| Error::Transport(e.to_string()))?;
+    if !addr.ip().is_loopback() {
+        return Err(Error::Transport(format!(
+            "refusing to serve the control plane on {addr}: the HTTP transport is loopback only"
+        )));
+    }
+    let app = axum::Router::new().nest_service("/mcp", http_service(host));
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            // A failed signal read means no shutdown trigger; the server then runs
+            // until the process is killed, which is the same outcome as no handler.
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await
+        .map_err(|e| Error::Transport(e.to_string()))
+}
+
+/// The StreamableHTTP service over the catalog, with a fresh session per client.
+fn http_service(
+    host: Host,
+) -> rmcp::transport::streamable_http_server::StreamableHttpService<
+    Server,
+    rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
+> {
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    };
+    let host = Arc::new(host);
+    StreamableHttpService::new(
+        move || {
+            Ok(Server {
+                host: Arc::clone(&host),
+            })
+        },
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    )
+}
+
 /// Whether the stdio server is wired.
 ///
 /// A `const`, not a runtime probe: the answer is a property of the *build*, so it
@@ -1294,5 +1347,52 @@ mod tests {
     #[test]
     fn the_login_budget_the_tools_report_is_the_clis_default() {
         assert_eq!(LOGIN_TTL, std::time::Duration::from_secs(300));
+    }
+
+    #[tokio::test]
+    async fn serve_http_should_refuse_a_routable_listener_when_bound() {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0")
+            .await
+            .expect("bind an ephemeral port");
+        let err = super::serve_http(host("http-routable"), listener)
+            .await
+            .expect_err("the control plane is loopback only");
+        assert!(err.to_string().contains("loopback only"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn serve_http_should_answer_initialize_when_posted_to_mcp() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral loopback port");
+        let addr = listener.local_addr().expect("bound address");
+        let server = tokio::spawn(super::serve_http(host("http-init"), listener));
+
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#;
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect to the server");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("send the request");
+        let mut reply = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stream.read_to_end(&mut reply),
+        )
+        .await
+        .expect("the server answers within 10s")
+        .expect("read the reply");
+        server.abort();
+
+        let reply = String::from_utf8_lossy(&reply);
+        assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
     }
 }

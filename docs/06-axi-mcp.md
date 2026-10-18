@@ -19,7 +19,7 @@ Source: `~/.agents/skills/axi` (TOON spec). Applies from P0. CI must enforce.
 
 Thin wrappers over same `ar-route|ar-tokens|ar-obs|ar-exec` fns. Transports stdio + StreamableHTTP via `rmcp`. `schemars+serde_json` schemas.
 
-**Status:** stdio is wired (`aroute mcp`, `--features mcp`); StreamableHTTP is deferred, and the
+**Status:** stdio is wired (`aroute mcp`, `--features mcp`); StreamableHTTP is wired loopback-only (`aroute mcp --http <ADDR>`, serving `/mcp`), and the
 `Scope` column below is each tool's *need* — a *grant* is a subset of the ten scope bits
 (`read:*`, `write:*`, `execute:*`, `*:health`, `*:combos`, `*:quota`, `*:usage`, `*:models`,
 `*:completions`, `*`), set per process in `AR_MCP_SCOPE`. Those spellings are compositions of

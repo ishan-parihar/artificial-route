@@ -83,7 +83,7 @@ on-demand rows (D4–D8, E2–E8), which the outline says not to start on specul
 | E4 | `kilocode` dispatch wire not ported | code | open | README "Known gaps". On request only. |
 | E5 | Anthropic-wire custom providers refuse at dispatch | code | open | README "Known gaps", including `zenmux-free`. On request only. |
 | E6 | Multi-provider `auto/*` pools fall back to config order | code | open | README: bare `auto` maps to `least-used` since 0.1.12. Scoring engages for literal `auto/*` names only. |
-| E7 | MCP control plane is stdio-only | decide | open | No HTTP transport owner or request. |
+| E7 | MCP control plane is stdio-only | build | built | `aroute mcp --http <ADDR>` serves StreamableHTTP at `/mcp` through rmcp's `transport-streamable-http-server`, behind the same `mcp` feature. Loopback only: `ar_mcp::serve_http` refuses a non-loopback listener, and rmcp's default `Host` allow-list is loopback. The stdio transport is unchanged and remains the default. Tests: `serve_http_should_refuse_a_routable_listener_when_bound`, `serve_http_should_answer_initialize_when_posted_to_mcp`. Not covered: a bearer gate on the HTTP route; the loopback bind and the scope guard are the only controls. |
 | E8 | Registry snapshot lags OmniRoute | ops | open | `aroute doctor` warns past 7 days. docs/21 T8 records a second scheduled sweep as rejected, so refresh cadence is an operations choice. |
 
 ## F. In-code seams (`TODO(#…)`)

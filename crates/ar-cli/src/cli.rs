@@ -274,6 +274,10 @@ pub struct McpArgs {
     /// Print the tool catalog and exit, without serving or reading the config.
     #[arg(long)]
     pub list: bool,
+    /// Serve StreamableHTTP at `/mcp` on this loopback address instead of stdio.
+    /// Any non-loopback address is refused.
+    #[arg(long, value_name = "ADDR")]
+    pub http: Option<std::net::SocketAddr>,
 }
 
 /// Options for `aroute keys`.

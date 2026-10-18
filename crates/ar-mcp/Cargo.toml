@@ -15,7 +15,7 @@ workspace = true
 # which is also what makes them callable and testable in-process.
 [features]
 default = []
-mcp = ["dep:rmcp"]
+mcp = ["dep:rmcp", "dep:axum", "dep:tokio"]
 
 [dependencies]
 # `ar-config` only for its `Secret`, which is the type `ar_exec`'s token carries
@@ -63,7 +63,11 @@ blake3 = "1.8.7"
 # `default-features = false` keeps the SDK's own `client`, `auth` and reqwest
 # halves out of the graph: this crate is a server. `server` is the only feature
 # that matters until the transports land -- see `src/transport.rs`.
-rmcp = { version = "3.5.0", optional = true, default-features = false, features = ["server", "transport-io"] }
+rmcp = { version = "3.5.0", optional = true, default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
+# The StreamableHTTP listener is an axum router, so `aroute mcp --http` mounts the
+# same service the stdio transport serves. Optional with the SDK.
+axum = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 # `rt`/`macros` so a test can hold a real `Admission` lease and assert the
