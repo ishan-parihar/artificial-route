@@ -75,6 +75,7 @@ use std::task::{Context, Poll};
 
 use crate::app::AppState;
 use crate::config::{DefaultChain, RouteCombo};
+use crate::reframe;
 use crate::text::{
     COMPRESSION_ECHO, COMPRESSION_HEADER, COMPRESSION_HEADER_ALIAS, GUARD_HEADER, GuardVerdict,
     compress_body, compression_echo, compression_plan_with_alias, guard_body,
@@ -291,7 +292,7 @@ const OPENAI_KEEPALIVE: &str = concat!(
 /// reachable as a match arm: the frames are not interchangeable and a `&str`
 /// route parameter would let a call site pass a path that has no frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Dialect {
+pub(crate) enum Dialect {
     /// `POST /v1/chat/completions`.
     OpenAi,
     /// `POST /v1/messages`. Its keepalive is a real `ping` *event*, not a
@@ -741,6 +742,7 @@ async fn handle_chat_inner(
             &served,
             key_id.as_deref().unwrap_or("anonymous"),
             cache_control.key.as_deref(),
+            dialect,
         )
     };
 
@@ -878,7 +880,11 @@ async fn handle_chat_inner(
     // longer lost: `account_stream` wraps the relay so the ledger records
     // whatever the dialect's final frames carried. See `docs/07` (wave D) for
     // the split this half closes.
+    let source = reframe_source(state, outcome.provider(), dialect, canonical.stream);
     let meta = if canonical.stream {
+        if let Some(source) = source {
+            reframe_stream(&mut outcome, dialect, &canonical.model, source);
+        }
         account_stream(&mut outcome, state, dialect, key_id.as_deref(), dispatched);
         ResponseMeta::default()
             .with_latency(dispatched.elapsed())
@@ -891,6 +897,7 @@ async fn handle_chat_inner(
             key_id.as_deref(),
             dispatched.elapsed(),
             savings_tokens,
+            source,
         )
         .await
     };
@@ -951,6 +958,7 @@ async fn buffer_for_accounting(
     key_id: Option<&str>,
     elapsed: Duration,
     savings_tokens: u32,
+    source: Option<ar_registry::WireFormat>,
 ) -> ResponseMeta {
     let defaults = || {
         ResponseMeta::default()
@@ -980,22 +988,30 @@ async fn buffer_for_accounting(
         buffered.extend_from_slice(&chunk);
     }
     let body = Bytes::from(buffered);
-    upstream.stream = Box::pin(futures::stream::once({
-        // `Bytes::clone` is a refcount bump, not a copy (zero-copy bodies, ch.2).
-        let body = body.clone();
-        async move { body }
-    }));
-
-    let Some(meta) = read_and_record(
+    // A reply the client reads in its own dialect is counted off the OpenAI body
+    // it was rendered from: the usage keys are the same, and that is the shape
+    // `read_and_record` is told to read.
+    let client = source.and_then(|source| reframed_body(dialect, source, &body));
+    let counted = if client.is_some() {
+        Dialect::OpenAi
+    } else {
+        dialect
+    };
+    let meta = read_and_record(
         state,
         key_id,
         provider.as_str(),
         &model,
-        dialect,
+        counted,
         &body,
         attempts,
         elapsed,
-    ) else {
+    );
+    // `Bytes::clone` is a refcount bump, not a copy (zero-copy bodies, ch.2).
+    let relayed = client.unwrap_or_else(|| body.clone());
+    upstream.stream = Box::pin(futures::stream::once(async move { relayed }));
+
+    let Some(meta) = meta else {
         // Unparseable replies (relay of a provider's HTML error page, say)
         // have no usage to count; the headers keep their zeros on purpose.
         return defaults();
@@ -1432,8 +1448,14 @@ fn usage_from_frames(
                 })
                 .and_then(|frame| frame.get("usage").cloned());
             match (input, output) {
+                // The delta names the input count too when a re-framed stream
+                // has it: its `message_start` cannot know it yet.
                 (Some(input), Some(output)) => Some(serde_json::json!({
-                    "input_tokens": input.get("input_tokens").cloned().unwrap_or(serde_json::Value::Null),
+                    "input_tokens": output
+                        .get("input_tokens")
+                        .or_else(|| input.get("input_tokens"))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
                     "cache_read_input_tokens": input.get("cache_read_input_tokens").cloned().unwrap_or(serde_json::Value::Null),
                     "cache_creation_input_tokens": input.get("cache_creation_input_tokens").cloned().unwrap_or(serde_json::Value::Null),
                     "output_tokens": output.get("output_tokens").cloned().unwrap_or(serde_json::Value::Null),
@@ -1799,6 +1821,72 @@ fn resumed(stream: ChunkStream, cut: CutFlag, plan: Continuation) -> (ChunkStrea
     (relayed, ends_cut)
 }
 
+/// The wire shape the served provider's answer arrives in, when it has to be
+/// re-spelled for `dialect`. `None` when it already is that shape, or when the
+/// wire has no lift (Kiro, Clova, Custom and the rest relay their own framing).
+///
+/// A stream arrives as OpenAI SSE from the OpenAI wire, and from Bedrock and
+/// GitLab, whose streams `ar_server::exec` re-spells on the way in. Anthropic,
+/// Responses and Gemini streams are lifted by `reframe`. A whole Gemini reply is
+/// rendered as OpenAI by `unwrap_response` before it gets here.
+fn reframe_source(
+    state: &AppState,
+    served: Option<&ProviderId>,
+    dialect: Dialect,
+    stream: bool,
+) -> Option<ar_registry::WireFormat> {
+    use ar_registry::WireFormat;
+    let served = served?;
+    let wire = state
+        .config
+        .providers
+        .iter()
+        .find(|p| &p.id == served)?
+        .wire_format;
+    let source = match wire {
+        WireFormat::Anthropic => WireFormat::Anthropic,
+        WireFormat::OpenaiResponses => WireFormat::OpenaiResponses,
+        WireFormat::Openai | WireFormat::Bedrock | WireFormat::Gitlab => WireFormat::Openai,
+        // A streamed Gemini call is SSE of `GenerateContentResponse`s; a whole
+        // reply is already rendered as OpenAI before it gets here.
+        WireFormat::Gemini if stream => WireFormat::Gemini,
+        WireFormat::Gemini => WireFormat::Openai,
+        _ => return None,
+    };
+    let already = matches!(
+        (source, dialect),
+        (WireFormat::Openai, Dialect::OpenAi)
+            | (WireFormat::Anthropic, Dialect::Anthropic)
+            | (WireFormat::OpenaiResponses, Dialect::Responses)
+    );
+    (!already).then_some(source)
+}
+
+/// Swaps a streamed success's relay for its re-framed form. Runs before
+/// [`account_stream`], so the usage tee reads the frames the client receives.
+fn reframe_stream(
+    outcome: &mut AttemptOutcome,
+    dialect: Dialect,
+    model: &str,
+    source: ar_registry::WireFormat,
+) {
+    let AttemptOutcome::Succeeded { upstream, .. } = outcome else {
+        return;
+    };
+    let inner = std::mem::replace(&mut upstream.stream, Box::pin(futures::stream::empty()));
+    upstream.stream = reframe::stream(inner, dialect, model, source);
+}
+
+/// The buffered reply re-spelled in `dialect`, or `None` when the body is not a
+/// completion in its source shape: an error object relays as it arrived.
+fn reframed_body(dialect: Dialect, source: ar_registry::WireFormat, body: &[u8]) -> Option<Bytes> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let completion = reframe::completion(source, value)?;
+    serde_json::to_vec(&reframe::reply(dialect, completion))
+        .ok()
+        .map(Bytes::from)
+}
+
 /// The continuation a streamed reply may take, when one is allowed. The first
 /// later target on the chain that is marked `continue_on_cut` and speaks OpenAI
 /// takes over. See [`Continuation`] for the conditions.
@@ -1958,10 +2046,14 @@ fn request_key(
     served: &str,
     tenant: &str,
     caller_key: Option<&str>,
+    dialect: Dialect,
 ) -> Option<CacheKey> {
     let body = serde_json::from_slice::<serde_json::Value>(&canonical.body).ok()?;
+    // A stored reply is in the client's dialect once re-framed, so each dialect
+    // keeps its own namespace: an OpenAI client never replays an Anthropic body.
+    let tenant = format!("{tenant}/{}", dialect.route());
     Some(ar_cache::key::request_key_with(
-        tenant, served, &body, caller_key,
+        &tenant, served, &body, caller_key,
     ))
 }
 
@@ -2927,9 +3019,14 @@ const TERMINATOR_WINDOW: usize = 128;
 fn completion_seen(dialect: Dialect, window: &[u8]) -> bool {
     match dialect {
         Dialect::OpenAi => openai_done_seen(window) || finish_reason_seen(window),
-        Dialect::Anthropic | Dialect::Responses => dialect
+        Dialect::Anthropic => dialect
             .terminator()
             .is_some_and(|t| window.windows(t.len()).any(|w| w == t)),
+        // `response.incomplete` is what a Responses stream ends with when its
+        // token budget runs out, which closes it as surely as `response.completed`.
+        Dialect::Responses => [&b"response.completed"[..], b"response.incomplete"]
+            .iter()
+            .any(|t| window.windows(t.len()).any(|w| w == *t)),
         Dialect::Ollama => false,
     }
 }
@@ -4903,17 +5000,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_anthropic_stream_composes_usage_from_its_first_and_last_frames() {
-        // Anthropic splits its counts: input in `message_start`, output in the
-        // final `message_delta` — the tee keeps exactly those two frames.
+    async fn an_anthropic_stream_records_the_usage_its_openai_upstream_reports() {
+        // The OpenAI upstream reports its counts on the chunk after the finish
+        // reason. The re-frame carries them in `message_delta`, and the tee
+        // composes that with the input count, which `message_start` cannot know.
         let ledger = Arc::new(Mutex::new(
             ar_tokens::Ledger::open_in_memory().expect("in-memory ledger"),
         ));
         let exec = Arc::new(CannedExec(vec![
-            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":21}}}\n\n",
-            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
-            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":5}}\n\n",
-            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":21,\"completion_tokens\":5}}\n\n",
+            "data: [DONE]\n\n",
         ]));
         let router = crate::app::app(routed_with_ledger(exec, Arc::clone(&ledger)));
         let resp = drive(
@@ -4931,15 +5029,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_responses_stream_records_the_completed_events_usage() {
-        // The Responses dialect carries the whole response object — usage
-        // included — in the `response.completed` frame, which is the tail the
-        // tee keeps.
+        // The re-framed `response.completed` carries the usage the OpenAI upstream
+        // reported on its last chunk, and that frame is the tail the tee keeps.
         let ledger = Arc::new(Mutex::new(
             ar_tokens::Ledger::open_in_memory().expect("in-memory ledger"),
         ));
         let exec = Arc::new(CannedExec(vec![
-            "data: {\"type\":\"response.in_progress\",\"sequence_number\":1}\n\n",
-            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
+            "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n",
+            "data: [DONE]\n\n",
         ]));
         let router = crate::app::app(routed_with_ledger(exec, Arc::clone(&ledger)));
         let resp = drive(
@@ -4957,15 +5055,16 @@ mod tests {
 
     #[tokio::test]
     async fn an_ollama_stream_records_the_final_counts() {
-        // Ollama's NDJSON stream ends with one `done:true` line that carries
-        // both counts at its root — the normalizer reads that spelling since
-        // this same wave fixed it.
+        // The OpenAI upstream's usage chunk becomes the one `done:true` line,
+        // which carries both counts at its root; the tee reads that spelling.
         let ledger = Arc::new(Mutex::new(
             ar_tokens::Ledger::open_in_memory().expect("in-memory ledger"),
         ));
         let exec = Arc::new(CannedExec(vec![
-            "{\"model\":\"m\",\"response\":\"hi\",\"done\":false}\n",
-            "{\"model\":\"m\",\"done\":true,\"prompt_eval_count\":9,\"eval_count\":4}\n",
+            "data: {\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":4}}\n\n",
+            "data: [DONE]\n\n",
         ]));
         let router = crate::app::app(routed_with_ledger(exec, Arc::clone(&ledger)));
         let resp = drive(
@@ -4979,6 +5078,275 @@ mod tests {
         drain_body(resp).await;
         let row = only_row(&ledger).expect("the final counts were recorded");
         assert_eq!(row.total_tokens, 13);
+    }
+
+    /// [`routed_under`] with the one provider speaking `wire`, as `zenmux-free`
+    /// (Anthropic) and `grok-cli` (Responses) do.
+    fn routed_on_wire(exec: Arc<dyn ArExec>, wire: ar_registry::WireFormat) -> AppState {
+        let mut config = one_provider_config();
+        config.providers = config
+            .providers
+            .into_iter()
+            .map(|p| p.with_wire_format(wire))
+            .collect();
+        Components {
+            exec,
+            ..Components::unconfigured(config)
+        }
+        .into_state()
+    }
+
+    #[tokio::test]
+    async fn openai_chat_should_answer_in_the_openai_shape_for_an_anthropic_upstream() {
+        let exec = Arc::new(CannedExec(vec![
+            r#"{"id":"msg_1","type":"message","model":"claude","role":"assistant","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":1}}"#,
+        ]));
+        let router = crate::app::app(routed_on_wire(exec, ar_registry::WireFormat::Anthropic));
+        let resp = drive(
+            &router,
+            post_to(
+                "/v1/chat/completions",
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+            ),
+        )
+        .await;
+
+        let body = body_of(resp).await;
+        assert_eq!(body["object"], "chat.completion", "{body}");
+        assert_eq!(body["choices"][0]["message"]["content"], "hi", "{body}");
+    }
+
+    #[tokio::test]
+    async fn openai_stream_should_carry_chat_chunks_for_an_anthropic_upstream() {
+        let exec = Arc::new(CannedExec(vec![
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"c\",\"usage\":{\"input_tokens\":2}}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ]));
+        let router = crate::app::app(routed_on_wire(exec, ar_registry::WireFormat::Anthropic));
+        let resp = drive(
+            &router,
+            post_to(
+                "/v1/chat/completions",
+                r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+            ),
+        )
+        .await;
+
+        let text = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("body reads")
+                .to_vec(),
+        )
+        .expect("the stream is UTF-8");
+        assert!(text.contains("\"content\":\"hi\""), "{text}");
+        assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+        assert!(!text.contains("message_start"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn openai_chat_should_answer_in_the_openai_shape_for_a_responses_upstream() {
+        let exec = Arc::new(CannedExec(vec![
+            r#"{"id":"resp_1","object":"response","model":"grok","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hi"}]}],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}"#,
+        ]));
+        let router = crate::app::app(routed_on_wire(
+            exec,
+            ar_registry::WireFormat::OpenaiResponses,
+        ));
+        let resp = drive(
+            &router,
+            post_to(
+                "/v1/chat/completions",
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+            ),
+        )
+        .await;
+
+        let body = body_of(resp).await;
+        assert_eq!(body["object"], "chat.completion", "{body}");
+        assert_eq!(body["choices"][0]["message"]["content"], "hi", "{body}");
+    }
+
+    #[tokio::test]
+    async fn openai_stream_should_carry_chat_chunks_for_a_responses_upstream() {
+        let exec = Arc::new(CannedExec(vec![
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"grok\"}}\n\n",
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}\n\n",
+        ]));
+        let router = crate::app::app(routed_on_wire(
+            exec,
+            ar_registry::WireFormat::OpenaiResponses,
+        ));
+        let resp = drive(
+            &router,
+            post_to(
+                "/v1/chat/completions",
+                r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+            ),
+        )
+        .await;
+
+        let text = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("body reads")
+                .to_vec(),
+        )
+        .expect("the stream is UTF-8");
+        assert!(text.contains("\"content\":\"hi\""), "{text}");
+        assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+        assert!(!text.contains("response.created"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn openai_stream_should_carry_chat_chunks_for_a_gemini_upstream() {
+        let exec = Arc::new(CannedExec(vec![
+            "data: {\"responseId\":\"g1\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}\r\n\r\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"!\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":2,\"candidatesTokenCount\":2,\"totalTokenCount\":4}}\r\n\r\n",
+        ]));
+        let router = crate::app::app(routed_on_wire(exec, ar_registry::WireFormat::Gemini));
+        let resp = drive(
+            &router,
+            post_to(
+                "/v1/chat/completions",
+                r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+            ),
+        )
+        .await;
+
+        let text = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("body reads")
+                .to_vec(),
+        )
+        .expect("the stream is UTF-8");
+        assert!(text.contains("\"content\":\"hi\""), "{text}");
+        assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+        assert!(!text.contains("candidates"), "{text}");
+    }
+
+    /// One OpenAI completion, as a non-stream upstream answers it.
+    const OPENAI_COMPLETION: &str = r#"{"id":"c1","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1}}"#;
+
+    #[tokio::test]
+    async fn anthropic_messages_should_answer_in_the_messages_shape_for_an_openai_upstream() {
+        // A system turn inside `messages` is the shape Claude Code sends, and it
+        // is the request that used to be refused as an unknown role.
+        let exec = Arc::new(CannedExec(vec![OPENAI_COMPLETION]));
+        let router = crate::app::app(routed_under(exec));
+        let resp = drive(
+            &router,
+            post_to(
+                "/v1/messages",
+                r#"{"model":"m","messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"}]}"#,
+            ),
+        )
+        .await;
+
+        let status = resp.status();
+        let body = body_of(resp).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert_eq!(body["type"], "message", "{body}");
+        assert_eq!(body["content"][0]["text"], "hi", "{body}");
+    }
+
+    /// A Responses client on a Responses upstream is the native pair: the reply is
+    /// relayed as the upstream wrote it, not re-synthesised, so no field is lost.
+    #[tokio::test]
+    async fn responses_stream_should_relay_a_responses_upstream_unchanged() {
+        let frames = [
+            "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_1\",\"model\":\"grok\"}}\n\n",
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"delta\":\"hi\"}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":2,\"response\":{\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}\n\n",
+        ];
+        let exec = Arc::new(CannedExec(frames.to_vec()));
+        let router = crate::app::app(routed_on_wire(
+            exec,
+            ar_registry::WireFormat::OpenaiResponses,
+        ));
+        let resp = drive(
+            &router,
+            post_to(
+                "/v1/responses",
+                r#"{"model":"m","stream":true,"input":"hi"}"#,
+            ),
+        )
+        .await;
+
+        let text = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("body reads")
+                .to_vec(),
+        )
+        .expect("the stream is UTF-8");
+        assert_eq!(text, frames.concat(), "{text}");
+    }
+
+    #[tokio::test]
+    async fn responses_should_answer_in_the_responses_shape_for_an_openai_upstream() {
+        let exec = Arc::new(CannedExec(vec![OPENAI_COMPLETION]));
+        let router = crate::app::app(routed_under(exec));
+        let resp = drive(
+            &router,
+            post_to("/v1/responses", r#"{"model":"m","input":"hi"}"#),
+        )
+        .await;
+
+        let body = body_of(resp).await;
+        assert_eq!(body["object"], "response", "{body}");
+        assert_eq!(body["output"][0]["content"][0]["text"], "hi", "{body}");
+    }
+
+    #[tokio::test]
+    async fn ollama_chat_should_answer_in_the_ollama_shape_for_an_openai_upstream() {
+        let exec = Arc::new(CannedExec(vec![OPENAI_COMPLETION]));
+        let router = crate::app::app(routed_under(exec));
+        let resp = drive(
+            &router,
+            post_to(
+                "/api/chat",
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+            ),
+        )
+        .await;
+
+        let body = body_of(resp).await;
+        assert_eq!(body["message"]["content"], "hi", "{body}");
+        assert_eq!(body["done"], true, "{body}");
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_should_end_with_message_stop_and_no_openai_frames() {
+        let exec = Arc::new(CannedExec(vec![
+            "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ]));
+        let router = crate::app::app(routed_under(exec));
+        let resp = drive(
+            &router,
+            post_to(
+                "/v1/messages",
+                r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+            ),
+        )
+        .await;
+
+        let text = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("body reads")
+                .to_vec(),
+        )
+        .expect("the stream is UTF-8");
+        assert!(text.contains("event: message_start"), "{text}");
+        assert!(text.contains("event: message_stop"), "{text}");
+        assert!(!text.contains("chat.completion.chunk"), "{text}");
     }
 
     #[tokio::test]
@@ -6599,13 +6967,54 @@ mod tests {
         // K4: a combo retargeted in config keeps its alias. The key must follow
         // the target that answers, or the old target's reply is replayed.
         let canonical = ar_route::CanonicalRequest::new("combo", Bytes::from_static(b"{}"));
-        let before = request_key(&canonical, "openai/gpt-a", "anonymous", None);
-        let after = request_key(&canonical, "anthropic/claude-b", "anonymous", None);
+        let before = request_key(
+            &canonical,
+            "openai/gpt-a",
+            "anonymous",
+            None,
+            Dialect::OpenAi,
+        );
+        let after = request_key(
+            &canonical,
+            "anthropic/claude-b",
+            "anonymous",
+            None,
+            Dialect::OpenAi,
+        );
         assert_ne!(before, after);
         assert_eq!(
             before,
-            request_key(&canonical, "openai/gpt-a", "anonymous", None)
+            request_key(
+                &canonical,
+                "openai/gpt-a",
+                "anonymous",
+                None,
+                Dialect::OpenAi
+            )
         );
+    }
+
+    #[test]
+    fn request_key_should_differ_by_dialect_when_the_same_reply_is_served() {
+        use super::request_key;
+        // A re-framed reply is stored in its client's dialect, so an OpenAI
+        // client and an Anthropic client sending one request must not share a key.
+        let canonical = ar_route::CanonicalRequest::new("combo", Bytes::from_static(b"{}"));
+        let openai = request_key(
+            &canonical,
+            "openai/gpt-a",
+            "anonymous",
+            None,
+            Dialect::OpenAi,
+        );
+        let anthropic = request_key(
+            &canonical,
+            "openai/gpt-a",
+            "anonymous",
+            None,
+            Dialect::Anthropic,
+        );
+        assert_ne!(openai, anthropic);
     }
 
     #[test]

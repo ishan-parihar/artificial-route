@@ -68,6 +68,7 @@ pub mod media;
 pub mod metrics;
 pub mod models;
 pub mod policy;
+mod reframe;
 pub mod routes;
 pub mod text;
 pub mod toon;

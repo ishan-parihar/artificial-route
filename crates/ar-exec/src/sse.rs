@@ -58,7 +58,7 @@ pub enum SseEvent {
 
 /// Incremental SSE framer. Feed bytes, pull events.
 #[derive(Debug)]
-pub(crate) struct SseDecoder {
+pub struct SseDecoder {
     /// Bytes received but not yet framed.
     buf: BytesMut,
     /// Frames decoded from `buf` but not yet handed out.
@@ -72,21 +72,31 @@ pub(crate) struct SseDecoder {
     scanned: usize,
     /// Longest frame this decoder will accept.
     cap: usize,
+    /// Whether a `data: [DONE]` sentinel has been framed. Set as the sentinel is
+    /// swallowed, so a caller can tell a stream that ended cleanly from one cut
+    /// short.
+    done: bool,
 }
 
 impl SseDecoder {
     /// A decoder accepting frames up to `cap` bytes.
-    pub(crate) fn new(cap: usize) -> Self {
+    pub fn new(cap: usize) -> Self {
         Self {
             buf: BytesMut::new(),
             ready: VecDeque::new(),
             scanned: 0,
             cap,
+            done: false,
         }
     }
 
+    /// Whether the `[DONE]` sentinel has been framed.
+    pub fn done(&self) -> bool {
+        self.done
+    }
+
     /// Appends `chunk` and decodes every complete frame it completes.
-    pub(crate) fn feed(&mut self, chunk: &[u8]) -> Result<(), SseError> {
+    pub fn feed(&mut self, chunk: &[u8]) -> Result<(), SseError> {
         self.buf.extend_from_slice(chunk);
         while let Some((frame_len, sep_len)) = self.find_frame() {
             let frame = self.buf.split_to(frame_len + sep_len).freeze();
@@ -113,15 +123,19 @@ impl SseDecoder {
     }
 
     /// Pops the next decoded payload, if any.
-    pub(crate) fn next_event(&mut self) -> Option<SseEvent> {
+    pub fn next_event(&mut self) -> Option<SseEvent> {
         let payload = self.ready.pop_front()?;
         // `[DONE]` ends the stream; the caller sees `None` instead of a
         // sentinel value it would have to special-case.
-        (payload.as_ref() != DONE).then_some(SseEvent::Data(payload))
+        if payload.as_ref() == DONE {
+            self.done = true;
+            return None;
+        }
+        Some(SseEvent::Data(payload))
     }
 
     /// Decodes a trailing frame that arrived without a terminating blank line.
-    pub(crate) fn finish(&mut self) -> Option<SseEvent> {
+    pub fn finish(&mut self) -> Option<SseEvent> {
         self.next_event().or_else(|| self.flush_trailing())
     }
 
@@ -132,7 +146,11 @@ impl SseDecoder {
         }
         let frame = self.buf.split().freeze();
         let payload = frame_payload(&frame)?;
-        (payload.as_ref() != DONE).then_some(SseEvent::Data(payload))
+        if payload.as_ref() == DONE {
+            self.done = true;
+            return None;
+        }
+        Some(SseEvent::Data(payload))
     }
 
     /// Finds the next frame, returning `(frame_len, separator_len)`.

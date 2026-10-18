@@ -78,7 +78,10 @@ impl AnthropicSystem {
 /// One inbound conversation turn.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AnthropicMessage {
-    /// Wire role name: `user` or `assistant`.
+    /// Wire role name: `user`, `assistant`, or `system` — an in-array system
+    /// message is what Claude Code sends for hook output, and the live API
+    /// takes it, so the parse does too. See [`crate::translate`] for the
+    /// role fold.
     pub role: String,
     /// Turn content, in either accepted spelling.
     pub content: AnthropicContent,

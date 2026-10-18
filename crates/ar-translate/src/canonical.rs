@@ -381,7 +381,7 @@ fn render_openai_message(msg: &Msg) -> serde_json::Value {
 
 /// One assistant tool call in OpenAI's spelling, where `arguments` is a JSON
 /// string rather than an object.
-fn openai_tool_call(call: &ToolCall) -> serde_json::Value {
+pub(crate) fn openai_tool_call(call: &ToolCall) -> serde_json::Value {
     serde_json::json!({
         "id": call.id,
         "type": "function",

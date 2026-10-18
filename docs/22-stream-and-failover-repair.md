@@ -28,6 +28,7 @@ this date; the mock harness lives outside the repo.
 | B9 | Found while verifying T5: a Gemini stream relayed raw ends in `finishReason`, which the OpenAI completion check did not recognise, so a complete answer got a false `stream_error`. | Completion also accepts a `finishReason` string (D2). | D2 |
 | B10 | Two stalls in one request exceed the router's 120s stream deadline, so the second is cut by `TimeoutLayer` and the client gets an empty 504. The same happens on multi-provider chains today. | **Ordering fixed.** The router layer and the model deadline both started at 120s, and the layer's timer started first, so the model-aware JSON 504 (`upstream_timeout`, `model_deadline`) never reached the client. The layer now outwaits the model deadline by `LAYER_GRACE` (5s). The budget itself is unchanged. | D10, D12 |
 | B11 | Streamed requests wrote `latency_ms: 0` to the trace and audit rows. `UsageTee::record_obs` built its meta without a latency. | `with_latency(dispatched.elapsed())`, matching the work metric. | D12 |
+| B13 | A streamed Gemini call dispatched `:generateContent`, which answers one JSON object rather than SSE, so a stream client got no frames. A Responses (`grok-cli`) reply was relayed raw to an OpenAI client. | Streamed Gemini calls take `:streamGenerateContent?alt=sse` (`ar-exec/src/url.rs`), and the Gemini, Responses and Anthropic stream events are lifted to chat chunks in `ar-translate` (`gemini_upstream.rs`, `responses_upstream.rs`, `anthropic_upstream.rs`) and re-framed in `ar-server/src/reframe.rs`. | D2 |
 | B12 | A mid-stream upstream failure was logged as `error decoding response body` with no cause. | The warn lines log the error with `?`, which carries the reqwest source chain. | D12 |
 | T2 | Cline stream envelope. | **Not reproduced.** The API-key cline row streams plain OpenAI SSE (44 frames, usage, `[DONE]`). The unwrap stays unimplemented until an OAuth cline session streams the envelope. | D7 |
 
@@ -116,7 +117,9 @@ short of its 19–29s, so `free-stack` cannot recover from a first-target stall
 under the 120s deadline. Two live probes on 2026-10-18 both returned 504 after
 120s; the journal shows one glm stall at 110s.
 
-The fix shipped for the ordering (B10). The budget is still open. The cheapest
+The fix shipped for the ordering (B10). The budget is still open. **Ruling (Q4,
+2026-10-18): keep the per-combo 150s for `free-stack`, and do not raise the global
+120s.** The cheapest
 fix with the current code is a per-combo entry in `timeouts:` for `free-stack`
 (110 + 29 = 139s, so 150s covers it). The per-combo entry changes only that
 combo's deadline. A lower start cap would change every provider and could cut

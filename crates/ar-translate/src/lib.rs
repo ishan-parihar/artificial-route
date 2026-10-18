@@ -128,21 +128,25 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 mod anthropic;
+mod anthropic_upstream;
 mod bedrock;
 mod canonical;
 mod gemini;
+mod gemini_upstream;
 mod gitlab;
 mod media;
 mod ollama;
 mod openai;
 mod outbound;
 mod responses;
+mod responses_upstream;
 mod tools;
 mod translate;
 
 pub use anthropic::{
     AnthropicBlock, AnthropicBlockContent, AnthropicContent, AnthropicMessages, AnthropicSystem,
 };
+pub use anthropic_upstream::{AnthropicStream, anthropic_response_to_openai};
 pub use bedrock::{BedrockStream, bedrock_response_to_openai, render_bedrock_body};
 pub use canonical::{
     CanonicalChat, CanonicalResponse, CanonicalTool, FinishReason, MediaPart, Msg, Role, ToolCall,
@@ -152,6 +156,7 @@ pub use gemini::{
     GeminiBlob, GeminiChat, GeminiContent, GeminiFunctionCall, GeminiFunctionResponse,
     GeminiGenerationConfig, GeminiPart,
 };
+pub use gemini_upstream::GeminiStream;
 pub use gitlab::{completion_chunks, gitlab_response_to_openai, render_gitlab_body};
 pub use media::{
     EMBEDDING_REGISTRY, EmbeddingFamily, EmbeddingInput, EmbeddingRequest, EmbeddingUpstream,
@@ -163,13 +168,15 @@ pub use openai::{
     OpenAIMessage,
 };
 pub use outbound::{
-    OutboundWire, render_claude_body, render_clova_body, render_cursor_body, render_for_wire,
-    render_gemini_body, render_kiro_body, render_openai_responses_body, to_anthropic_response,
-    to_responses_response,
+    OutboundWire, claude_stop_reason, openai_reply_to_anthropic, openai_reply_to_ollama,
+    openai_reply_to_responses, render_claude_body, render_clova_body, render_cursor_body,
+    render_for_wire, render_gemini_body, render_kiro_body, render_openai_responses_body,
+    to_anthropic_response, to_responses_response,
 };
 pub use responses::{
     ResponsesApi, ResponsesContentPart, ResponsesInput, ResponsesItem, ResponsesItemContent,
 };
+pub use responses_upstream::{ResponsesStream, responses_response_to_openai};
 pub use translate::{
     AnthropicInbound, ArTranslate, GeminiInbound, MissingPair, OllamaInbound, OpenAiInbound, Pair,
     ResponsesInbound, TranslateError, anthropic_to_canonical, chat_modality,

@@ -90,10 +90,20 @@ explanation is [AUDIT-REPORT.md](AUDIT-REPORT.md).
   (docs/24 E4). The reference has no kilocode-specific executor, so there is no
   further wire to port.
 - **Multi-provider `auto/*` pools fall back to config order.** Single-provider pools score identically; bare `auto` maps to `least-used` since 0.1.12, and the auto scoring engages for literal `auto/*` names.
-- **Custom providers dispatch the OpenAI wire only.** An `anthropic-compatible`
-  node is accepted and named by `aroute doctor`, then refused at dispatch.
-  Registry providers on the Anthropic wire dispatch. `zenmux-free` was switched
-  to it (docs/24 E5), but its auth has not been verified against a live key.
+- **Client dialects are re-framed for every wire that has a lift.** `ar-server/src/reframe.rs`
+  re-spells the OpenAI, Anthropic, Responses (`grok-cli`), Gemini, Bedrock and GitLab
+  answers into the dialect the client spoke. The Anthropic, Responses and Gemini streams are
+  lifted to chat-completion chunks first (`ar-translate/src/anthropic_upstream.rs`,
+  `responses_upstream.rs`, `gemini_upstream.rs`); a streamed Gemini call dispatches
+  `:streamGenerateContent?alt=sse`. Kiro and Clova streams still relay their own framing:
+  no reference for either is on disk, so no lift is written for them. Custom
+  `anthropic-compatible` nodes are accepted and named by `aroute doctor`, then refused at
+  dispatch. `zenmux-free` is on the Anthropic wire (docs/24 E5), but its auth has not been
+  verified against a live key. The Responses and Gemini lifts are covered by unit and
+  endpoint tests against canned upstream frames; no live `grok-cli` or Gemini key has been
+  run through them. A Responses client on a Responses upstream is relayed raw by design:
+  that pair is native, and re-synthesising its events would drop fields (pinned by
+  `responses_stream_should_relay_a_responses_upstream_unchanged`).
 - **The MCP control plane is stdio-only** and ships behind `--features mcp`.
 - **The registry snapshot lags OmniRoute's model rotation.** `aroute doctor` reports
   its age and warns past 7 days; `aroute import --from omniroute` regenerates it.

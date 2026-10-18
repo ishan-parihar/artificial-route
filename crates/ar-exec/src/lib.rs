@@ -105,7 +105,6 @@ use reqwest::StatusCode;
 use tokio_util::sync::CancellationToken;
 
 use crate::oauth::TerminalReport;
-use crate::sse::{DEFAULT_FRAME_CAP, SseDecoder};
 
 pub use crate::media::{MediaBody, MediaEndpoint, MediaResponse};
 
@@ -138,7 +137,7 @@ pub use crate::oauth::{
 
 // `into_sse` yields `SseEvent`, and `ExecError::Sse` wraps `SseError`, so both
 // belong on the crate root too — not only under `ar_exec::sse`.
-pub use crate::sse::{SseError, SseEvent};
+pub use crate::sse::{DEFAULT_FRAME_CAP, SseDecoder, SseError, SseEvent};
 
 /// OmniRoute's `FETCH_TIMEOUT_MS` default.
 const BASE_START_TIMEOUT: Duration = Duration::from_secs(600);
@@ -432,7 +431,13 @@ impl ArExec {
             (WireFormat::Bedrock, None) => {
                 bedrock::converse_url(d.base_url, d.upstream_model, d.stream)
             }
-            _ => crate::url::dispatch_url(d.wire_format, d.base_url, d.upstream_model, d.endpoint),
+            _ => crate::url::dispatch_url(
+                d.wire_format,
+                d.base_url,
+                d.upstream_model,
+                d.endpoint,
+                d.stream,
+            ),
         };
         let start = await_start(
             self.client

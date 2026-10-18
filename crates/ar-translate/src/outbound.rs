@@ -1,4 +1,4 @@
-//! Canonical -> provider wire: the outbound request mappers, and the two
+//! Canonical -> provider wire: the outbound request mappers, and the
 //! non-streaming response mappers that close the loop for the inbound
 //! dialects.
 //!
@@ -1053,6 +1053,218 @@ pub fn to_responses_response(response: &CanonicalResponse) -> Value {
             "input_tokens": response.usage.prompt_tokens,
             "output_tokens": response.usage.completion_tokens,
             "total_tokens": response.usage.total_tokens,
+        },
+    })
+}
+
+/// Re-frames a completed OpenAI chat-completion reply as an Anthropic
+/// Messages response object.
+///
+/// The serving path normalises every upstream reply to OpenAI JSON before the
+/// client sees it (`ar_server::exec` unwraps Bedrock, GitLab and Gemini to
+/// this shape), so the client-facing envelope for a `/v1/messages` client is
+/// built from that JSON here — the one place the `type:"message"` spelling
+/// exists for a whole reply. Text and `tool_use` blocks both render, because
+/// a Claude-family client cannot act on a reply whose tool calls were
+/// dropped.
+///
+/// `reasoning_content` (GLM, DeepSeek and friends) is deliberately not
+/// rendered as `thinking` blocks: a thinking block this build emitted would
+/// come back inside the client's next request and the inbound parse rejects
+/// it, so the honest shape is the answer text and nothing else.
+#[must_use]
+pub fn openai_reply_to_anthropic(reply: &Value) -> Value {
+    let choice = reply.pointer("/choices/0");
+    let message = choice
+        .and_then(|c| c.get("message"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let text = message.get("content").and_then(Value::as_str).unwrap_or("");
+
+    let mut content = Vec::new();
+    if !text.is_empty() {
+        content.push(json!({ "type": "text", "text": text }));
+    }
+    let calls = message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    for call in calls {
+        content.push(json!({
+            "type": "tool_use",
+            "id": call.get("id").and_then(Value::as_str).unwrap_or(""),
+            "name": call
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "input": call
+                .pointer("/function/arguments")
+                .and_then(Value::as_str)
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                .unwrap_or_else(|| json!({})),
+        }));
+    }
+
+    let finish = choice
+        .and_then(|c| c.get("finish_reason"))
+        .and_then(Value::as_str);
+    json!({
+        "id": reply.get("id").and_then(Value::as_str).unwrap_or("msg_0"),
+        "type": "message",
+        "role": "assistant",
+        "model": reply.get("model").and_then(Value::as_str).unwrap_or(""),
+        "content": content,
+        "stop_reason": claude_stop_reason(finish),
+        "stop_sequence": Value::Null,
+        "usage": {
+            "input_tokens": reply
+                .pointer("/usage/prompt_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            "output_tokens": reply
+                .pointer("/usage/completion_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        },
+    })
+}
+
+/// OpenAI's `finish_reason` onto Anthropic's `stop_reason`.
+pub fn claude_stop_reason(finish: Option<&str>) -> &'static str {
+    match finish {
+        Some("length") | Some("max_tokens") => "max_tokens",
+        Some("tool_calls") | Some("function_call") => "tool_use",
+        Some("content_filter") => "refusal",
+        _ => "end_turn",
+    }
+}
+
+/// Re-frames a completed OpenAI chat-completion reply as an Ollama `/api/chat`
+/// final message.
+///
+/// `created_at` is omitted rather than synthesized: ollama's own clients read
+/// `message` and `done`, and a wrong-format timestamp is worse than an absent
+/// one. Ollama's `tool_calls` take `arguments` as an object, which is the
+/// spelling this renders from OpenAI's JSON-string form.
+#[must_use]
+pub fn openai_reply_to_ollama(reply: &Value) -> Value {
+    let choice = reply.pointer("/choices/0");
+    let message = choice
+        .and_then(|c| c.get("message"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let text = message.get("content").and_then(Value::as_str).unwrap_or("");
+
+    let mut msg = json!({ "role": "assistant", "content": text });
+    let calls = message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let mapped: Vec<Value> = calls
+        .iter()
+        .map(|call| {
+            json!({
+                "function": {
+                    "name": call
+                        .pointer("/function/name")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                    "arguments": call
+                        .pointer("/function/arguments")
+                        .and_then(Value::as_str)
+                        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                        .unwrap_or_else(|| json!({})),
+                }
+            })
+        })
+        .collect();
+    if !mapped.is_empty() {
+        msg["tool_calls"] = Value::Array(mapped);
+    }
+
+    let mut out = json!({
+        "model": reply.get("model").and_then(Value::as_str).unwrap_or(""),
+        "message": msg,
+        "done": true,
+    });
+    if let Some(usage) = reply.get("usage") {
+        out["prompt_eval_count"] = usage.get("prompt_tokens").cloned().unwrap_or(json!(0));
+        out["eval_count"] = usage.get("completion_tokens").cloned().unwrap_or(json!(0));
+    }
+    out
+}
+
+/// Re-frames a completed OpenAI chat-completion reply as an OpenAI Responses
+/// response object.
+///
+/// The `output` item array is Responses' spelling of `choices`, and one
+/// `function_call` item is emitted per tool call so a Responses client can
+/// act on tools — the cell the reference's `responsesToolItem.ts` filled.
+#[must_use]
+pub fn openai_reply_to_responses(reply: &Value) -> Value {
+    let choice = reply.pointer("/choices/0");
+    let message = choice
+        .and_then(|c| c.get("message"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let text = message.get("content").and_then(Value::as_str).unwrap_or("");
+    let id = reply.get("id").and_then(Value::as_str).unwrap_or("resp_0");
+
+    let mut output = Vec::new();
+    if !text.is_empty() {
+        output.push(json!({
+            "type": "message",
+            "id": format!("msg_{id}"),
+            "status": "completed",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": text, "annotations": [] }],
+        }));
+    }
+    let calls = message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    for call in calls {
+        let call_id = call.get("id").and_then(Value::as_str).unwrap_or("");
+        output.push(json!({
+            "type": "function_call",
+            "id": format!("fc_{call_id}"),
+            "call_id": call_id,
+            "name": call
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "arguments": call
+                .pointer("/function/arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("{}"),
+            "status": "completed",
+        }));
+    }
+
+    json!({
+        "id": id,
+        "object": "response",
+        "created_at": reply.get("created").and_then(Value::as_u64).unwrap_or(0),
+        "model": reply.get("model").and_then(Value::as_str).unwrap_or(""),
+        "status": "completed",
+        "output": output,
+        "usage": {
+            "input_tokens": reply
+                .pointer("/usage/prompt_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            "output_tokens": reply
+                .pointer("/usage/completion_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            "total_tokens": reply
+                .pointer("/usage/total_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
         },
     })
 }

@@ -247,12 +247,13 @@ pub struct MissingPair {
 ///   canonical carries no tool registry to emit a `function_call` item from.
 /// * **Every remaining `*-to-openai` response cell.** These are the *response*
 ///   direction: a provider's SSE body has to be re-framed into the INBOUND
-///   dialect, and that path is a byte-relay today (see
+///   dialect. `ar-server/src/reframe.rs` does that for the streams that arrive
+///   OpenAI-shaped; every other wire still relays its own framing (see
 ///   `ar-server/src/exec.rs`). Six of them — `cursor-response-to-openai` in
 ///   particular — are a no-op in the reference itself, because the executor
 ///   already emits OpenAI frames; the other five are the chunk-level state
-///   machines above. Until the relay path carries a re-framing stage they stay
-///   named rather than half-ported: a partial re-framer drops tool calls.
+///   machines above. They stay named here rather than half-ported: a partial
+///   re-framer drops tool calls.
 /// * `claude-to-gemini` — a cross-dialect hop with no hub. Canonical *is* the hub
 ///   here, so this cell is claude-to-canonical then canonical-to-gemini, both of
 ///   which are implemented, and it needs nothing of its own.
@@ -260,10 +261,9 @@ pub struct MissingPair {
 pub fn missing_pairs() -> &'static [MissingPair] {
     &[
         // ── Response direction: a provider's wire -> the inbound dialect ──
-        // Each is a re-framer over the response stream. The relay in
-        // `ar-server/src/exec.rs` hands the client's bytes straight through
-        // today, so a non-OpenAI provider answers an Anthropic or Responses
-        // client in the provider's own framing.
+        // Each is a re-framer over the response stream. `ar-server/src/reframe.rs`
+        // re-frames the streams that arrive OpenAI-shaped (the OpenAI wire, Bedrock,
+        // GitLab); any other provider's stream still relays in its own framing.
         MissingPair {
             name: "claude-response-to-openai",
             reference: "OmniRoute/open-sse/translator/response/claude-to-openai.ts",
@@ -292,7 +292,8 @@ pub fn missing_pairs() -> &'static [MissingPair] {
         // Both reference mappers are chunk-level state machines: block-index
         // allocation, incremental tool-call argument accumulation, deferred
         // terminal emission until a trailing usage-only chunk arrives. The
-        // non-streaming envelopes are ported; the streaming re-framers are not.
+        // non-streaming envelopes are ported here. The streaming re-framers live in
+        // `ar-server/src/reframe.rs` for OpenAI-shaped upstreams, outside this matrix.
         MissingPair {
             name: "canonical-to-claude-response-stream",
             reference: "OmniRoute/open-sse/translator/response/openai-to-claude.ts",
@@ -751,7 +752,7 @@ fn gemini_content(content: GeminiContent) -> Result<Vec<Msg>, TranslateError> {
 /// Gemini numbers no calls, so the name is the correlation id unless the call
 /// carries its own `id`. A `functionResponse` that names the call answers it, and
 /// the outbound renderers pair by the same name.
-fn gemini_tool_call(call: &crate::gemini::GeminiFunctionCall) -> Option<ToolCall> {
+pub(crate) fn gemini_tool_call(call: &crate::gemini::GeminiFunctionCall) -> Option<ToolCall> {
     let name = call.name.clone()?;
     let id = call
         .rest
@@ -806,6 +807,18 @@ fn gemini_text(parts: &Option<Vec<GeminiPart>>) -> String {
 /// forwards it verbatim to the client: there is no second consumer to keep a
 /// struct in sync with. `serde_json::Value` is the wire, not a shortcut.
 pub fn to_openai(response: &CanonicalResponse) -> serde_json::Value {
+    let mut message = json!({
+        "role": response.message.role.as_wire(),
+        "content": response.message.content,
+    });
+    if !response.message.tool_calls.is_empty() {
+        message["tool_calls"] = response
+            .message
+            .tool_calls
+            .iter()
+            .map(crate::canonical::openai_tool_call)
+            .collect();
+    }
     json!({
         "id": response.id,
         "object": "chat.completion",
@@ -813,10 +826,7 @@ pub fn to_openai(response: &CanonicalResponse) -> serde_json::Value {
         "model": response.model,
         "choices": [{
             "index": 0,
-            "message": {
-                "role": response.message.role.as_wire(),
-                "content": response.message.content,
-            },
+            "message": message,
             "finish_reason": response.finish_reason.as_wire(),
         }],
         "usage": {
@@ -830,20 +840,25 @@ pub fn to_openai(response: &CanonicalResponse) -> serde_json::Value {
 /// Renders a non-streamed Gemini `generateContent` reply as the OpenAI chat
 /// completion it answers (docs/22, D6).
 ///
-/// `None` when the body has no text candidate to render: a function call, a
-/// blocked prompt, or an error object. Those relay unchanged. Thought parts are
-/// the model's reasoning rather than its answer, so they stay out of the content.
-/// An empty text reply is still rendered, so the caller's empty-completion check
-/// can judge it.
+/// `None` when the body has no text candidate to render: a blocked prompt, or an
+/// error object. Those relay unchanged. Thought parts are the model's reasoning
+/// rather than its answer, so they stay out of the content. A function call is
+/// carried as a tool call, and an empty text reply is still rendered, so the
+/// caller's empty-completion check can judge it.
 pub fn gemini_response_to_openai(
     body: &serde_json::Value,
     model: &str,
 ) -> Option<serde_json::Value> {
     let candidate = body.pointer("/candidates/0")?;
     let parts = candidate.pointer("/content/parts")?.as_array()?;
-    if parts.iter().any(|part| part.get("functionCall").is_some()) {
-        return None;
-    }
+    let calls: Vec<ToolCall> = parts
+        .iter()
+        .filter_map(|part| part.get("functionCall"))
+        .filter_map(|call| {
+            serde_json::from_value::<crate::gemini::GeminiFunctionCall>(call.clone()).ok()
+        })
+        .filter_map(|call| gemini_tool_call(&call))
+        .collect();
     let content: String = parts
         .iter()
         .filter(|part| {
@@ -858,6 +873,7 @@ pub fn gemini_response_to_openai(
         .get("finishReason")
         .and_then(serde_json::Value::as_str)
     {
+        _ if !calls.is_empty() => FinishReason::ToolCalls,
         Some("MAX_TOKENS") => FinishReason::Length,
         Some(
             "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" | "LANGUAGE",
@@ -869,6 +885,8 @@ pub fn gemini_response_to_openai(
             .and_then(serde_json::Value::as_u64)
             .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX))
     };
+    let mut message = Msg::new(Role::Assistant, content);
+    message.tool_calls = calls;
     let response = CanonicalResponse {
         id: body
             .get("responseId")
@@ -883,7 +901,7 @@ pub fn gemini_response_to_openai(
         created: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs()),
-        message: Msg::new(Role::Assistant, content),
+        message,
         finish_reason,
         usage: Usage {
             prompt_tokens: count("promptTokenCount"),
@@ -950,12 +968,15 @@ fn require_routable(kind: &str) -> Result<(), TranslateError> {
     }
 }
 
-/// Maps an Anthropic wire role onto canonical. Only `user` and `assistant` are
-/// wire roles here; `system` exists in this dialect only as the `system` field.
+/// Maps an Anthropic wire role onto canonical. `system` is accepted in-array as
+/// well as in the `system` field: Claude Code posts its SessionStart hook output
+/// as a `role:"system"` message, and the live API takes it, so refusing it would
+/// refuse the whole request.
 fn anthropic_role(raw: &str) -> Result<Role, TranslateError> {
     match raw {
         "user" => Ok(Role::User),
         "assistant" => Ok(Role::Assistant),
+        "system" => Ok(Role::System),
         other => Err(TranslateError::UnknownRole {
             role: other.to_owned(),
         }),
@@ -1163,6 +1184,33 @@ mod tests {
                 },
                 Msg::new(Role::Assistant, "calling"),
                 Msg::new(Role::User, "thanks"),
+            ]
+        );
+    }
+
+    #[test]
+    fn accepts_an_in_array_system_message_from_anthropic() {
+        // Claude Code 2.1.301 posts its SessionStart hook output as a trailing
+        // `role:"system"` message inside `messages`, and the live API accepts
+        // it, so the parse folds it as a canonical system turn at its position
+        // rather than refusing the whole request with `UnknownRole`.
+        let raw = r#"{"model":"claude-sonnet-4-5","max_tokens":64,
+            "system":"be terse",
+            "messages":[
+                {"role":"user","content":"hi"},
+                {"role":"system","content":"SessionStart:startup hook success"}],
+            "stream":true}"#;
+        let req: AnthropicMessages =
+            serde_json::from_str(raw).expect("fixture is valid Anthropic Messages");
+
+        let canonical = anthropic_to_canonical(req).expect("in-array system is accepted");
+
+        assert_eq!(
+            canonical.messages,
+            vec![
+                Msg::new(Role::System, "be terse"),
+                Msg::new(Role::User, "hi"),
+                Msg::new(Role::System, "SessionStart:startup hook success"),
             ]
         );
     }
@@ -1694,12 +1742,18 @@ mod tests {
     }
 
     #[test]
-    fn leaves_a_function_call_or_a_blocked_prompt_untranslated() {
-        let call = gemini_reply(r#"[{"functionCall":{"name":"f","args":{}}}]"#, "STOP");
-        assert!(
-            gemini_response_to_openai(&call, "m").is_none(),
-            "tool calls are not rendered yet"
-        );
+    fn renders_a_function_call_as_a_tool_call() {
+        let call = gemini_reply(r#"[{"functionCall":{"name":"f","args":{"a":1}}}]"#, "STOP");
+        let out = gemini_response_to_openai(&call, "m").expect("a call renders");
+        let message = &out["choices"][0]["message"];
+
+        assert_eq!(message["tool_calls"][0]["function"]["name"], "f", "{out}");
+        assert_eq!(message["tool_calls"][0]["id"], "f", "{out}");
+        assert_eq!(out["choices"][0]["finish_reason"], "tool_calls", "{out}");
+    }
+
+    #[test]
+    fn leaves_a_blocked_prompt_untranslated() {
         let blocked = serde_json::json!({"promptFeedback": {"blockReason": "SAFETY"}});
         assert!(gemini_response_to_openai(&blocked, "m").is_none());
         let error = serde_json::json!({"error": {"code": 400, "message": "bad"}});

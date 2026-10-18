@@ -71,6 +71,9 @@ pub fn chat_url(base: &str) -> String {
 /// that stem asks for a path the API does not have, which it answers `404` — a
 /// model that is present and reachable, reported as missing.
 ///
+/// A `stream` call takes `:streamGenerateContent?alt=sse` instead, so the answer
+/// arrives as SSE frames rather than one JSON object.
+///
 /// An empty `model` falls back to [`chat_url`] rather than producing a URL ending
 /// in a bare `:generateContent`: dispatch's own `upstream_model` doc allows an
 /// empty value to mean "send the caller's spelling", and a nameless member path
@@ -81,6 +84,7 @@ pub fn dispatch_url(
     base: &str,
     model: &str,
     endpoint: Option<&str>,
+    stream: bool,
 ) -> String {
     let stem = strip_trailing_slashes(base.trim());
     if let Some(endpoint) = endpoint {
@@ -94,11 +98,18 @@ pub fn dispatch_url(
     }
     match wire {
         crate::WireFormat::Gemini if !model.is_empty() => {
-            let mut url = String::with_capacity(stem.len() + model.len() + 18);
+            // A streamed call takes Gemini's SSE method, whose frames the lift in
+            // `ar-translate` reads; the whole-body method answers one JSON object.
+            let method = if stream {
+                ":streamGenerateContent?alt=sse"
+            } else {
+                ":generateContent"
+            };
+            let mut url = String::with_capacity(stem.len() + model.len() + method.len() + 1);
             url.push_str(stem);
             url.push('/');
             url.push_str(model);
-            url.push_str(":generateContent");
+            url.push_str(method);
             url
         }
         _ => chat_url(base),
@@ -238,6 +249,7 @@ mod tests {
                 "https://generativelanguage.googleapis.com/v1beta/models",
                 "gemini-3.8-flash",
                 None,
+                false,
             ),
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
         );
@@ -248,8 +260,24 @@ mod tests {
                 "https://generativelanguage.googleapis.com/v1beta/models///",
                 "gemini-3.8-flash",
                 None,
+                false,
             ),
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
+        );
+    }
+
+    #[test]
+    fn gemini_stream_should_address_the_sse_method() {
+        use crate::WireFormat;
+        assert_eq!(
+            dispatch_url(
+                WireFormat::Gemini,
+                "https://generativelanguage.googleapis.com/v1beta/models",
+                "gemini-3.8-flash",
+                None,
+                true,
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse"
         );
     }
 
@@ -264,7 +292,7 @@ mod tests {
             WireFormat::Cursor,
         ] {
             assert_eq!(
-                dispatch_url(wire, "https://api.x.com/v1", "m-1", None),
+                dispatch_url(wire, "https://api.x.com/v1", "m-1", None, false),
                 "https://api.x.com/v1/chat/completions",
                 "{wire:?} must not take the Gemini member path"
             );
@@ -282,7 +310,8 @@ mod tests {
                 WireFormat::Openai,
                 "https://openrouter.ai",
                 "respan/span-01-lite:free",
-                Some("/api/alpha/decisions")
+                Some("/api/alpha/decisions"),
+                false
             ),
             "https://openrouter.ai/api/alpha/decisions"
         );
@@ -296,7 +325,8 @@ mod tests {
                 WireFormat::Openai,
                 "https://ignored.example/v1",
                 "m",
-                Some("https://api.experientiallabs.ai/v1/systemone")
+                Some("https://api.experientiallabs.ai/v1/systemone"),
+                false
             ),
             "https://api.experientiallabs.ai/v1/systemone"
         );
@@ -312,7 +342,8 @@ mod tests {
                 WireFormat::Openai,
                 "https://openrouter.ai/api/alpha/decisions",
                 "m",
-                Some("/api/alpha/decisions")
+                Some("/api/alpha/decisions"),
+                false
             ),
             "https://openrouter.ai/api/alpha/decisions"
         );
@@ -329,7 +360,8 @@ mod tests {
                 WireFormat::Gemini,
                 "https://api.x.com",
                 "gemini-3.8-flash",
-                Some("/v1/systemone")
+                Some("/v1/systemone"),
+                false
             ),
             "https://api.x.com/v1/systemone"
         );
@@ -343,7 +375,8 @@ mod tests {
                 WireFormat::Gemini,
                 "https://generativelanguage.googleapis.com/v1beta/models",
                 "",
-                None
+                None,
+                false
             ),
             "https://generativelanguage.googleapis.com/v1beta/models/chat/completions"
         );
