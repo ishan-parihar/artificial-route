@@ -261,6 +261,9 @@ pub struct ProviderConfig {
     /// [`Self::headers`] already carries its editor header, both written by the
     /// config reader from the session's `anonymous:` block.
     pub anonymous: bool,
+    /// Whether this provider may take over a cut streamed reply. See `config.yaml`'s
+    /// `continue_on_cut`; off unless the operator names the provider.
+    pub continue_on_cut: bool,
 }
 
 impl ProviderConfig {
@@ -293,7 +296,15 @@ impl ProviderConfig {
             oauth: None,
             needs_oauth_executor: false,
             anonymous: false,
+            continue_on_cut: false,
         }
+    }
+
+    /// Marks this provider as a valid continuation target for a cut stream.
+    #[must_use]
+    pub const fn with_continue_on_cut(mut self, on: bool) -> Self {
+        self.continue_on_cut = on;
+        self
     }
 
     /// Sets the provider-local model name.

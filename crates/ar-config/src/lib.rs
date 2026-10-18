@@ -1075,6 +1075,10 @@ pub struct Config {
     /// [`OAuthSession`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub oauth: Vec<OAuthSession>,
+    /// Provider ids that may take over a cut streamed reply, by honouring a trailing
+    /// assistant message as prefill. Empty means no continuation anywhere.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub continue_on_cut: Vec<String>,
     /// Operator's catalog-visibility choices.
     ///
     /// Every field defaults to the *unfiltered* catalog, which is the same

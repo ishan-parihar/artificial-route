@@ -1517,6 +1517,7 @@ fn resolve_target(
         };
         // The flat table's model is a display default only; a combo target always
         // carries its own spelling.
+        entry.continue_on_cut = cfg.continue_on_cut.iter().any(|id| id == provider);
         entry.upstream_model = model.to_owned();
         entry.rank = rank;
         providers.push(entry);

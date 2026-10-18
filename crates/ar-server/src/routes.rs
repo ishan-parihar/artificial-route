@@ -57,7 +57,7 @@ use std::time::{Duration, Instant};
 use ar_cache::{Cache, CacheKey, CacheState};
 use ar_compress::Step;
 use ar_route::{
-    AttemptOutcome, AutoCandidate, AutoSelector, Candidate, CanonicalRequest, ChainTarget,
+    ArExec, AttemptOutcome, AutoCandidate, AutoSelector, Candidate, CanonicalRequest, ChainTarget,
     ChunkStream, CutFlag, JudgeOutcome, JudgePanel, JudgeTarget, ProviderId, Resilience,
     RouteError, Strategy, Strng, attempt_loop, pick, settle_stream, simulate_route, synthesize,
     virtual_combo,
@@ -810,6 +810,14 @@ async fn handle_chat_inner(
         .await
     };
 
+    let continuation = continuation_for(
+        state,
+        &plan.chain,
+        outcome.provider(),
+        dialect,
+        canonical.stream,
+        &canonical.body,
+    );
     decorate(
         outcome,
         state.resilience.clone(),
@@ -817,6 +825,7 @@ async fn handle_chat_inner(
         dialect,
         plan.strategy,
         Stages {
+            continuation,
             failures: FailureSink {
                 ledger: state.ledger.clone(),
                 key_id: key_id.clone().unwrap_or_else(|| "anonymous".to_owned()),
@@ -1495,6 +1504,7 @@ async fn fusion_response(
         Stages {
             // Fusion has no client key in scope, so its cut streams are not logged.
             failures: FailureSink::none(),
+            continuation: None,
             compression: String::new(),
             cache_state: CacheState::Bypass,
             cache_key: None,
@@ -1576,6 +1586,178 @@ fn fusion_empty_panel(outcome: &ar_route::FusionOutcome) -> Response {
 /// one place: the compression plan resolved, then the cache consulted, then
 /// whatever the cache said about this request. Threading them as four parameters
 /// is what let [`decorate`] reach eight arguments.
+/// What a cut stream needs to resume on another target: the executor, the
+/// canonical body the client sent, and the one target that takes over. Built only
+/// for a streamed OpenAI chat request, served by an OpenAI-wire provider, when a
+/// later target on the chain is marked `continue_on_cut` and also speaks OpenAI.
+#[derive(Clone)]
+struct Continuation {
+    exec: Arc<dyn ArExec>,
+    body: Bytes,
+    target: (ProviderId, Strng),
+}
+
+/// The assistant text a streamed OpenAI chat reply had already sent, read from its
+/// SSE frames as they pass the relay.
+///
+/// A reply that called a tool is not resumable: a half-sent call's arguments cannot
+/// be continued as prose. A reply that already finished is not resumable either,
+/// because nothing is missing.
+#[derive(Default)]
+struct SentText {
+    /// A frame split across chunks, kept until its newline arrives.
+    pending: Vec<u8>,
+    text: String,
+    tools: bool,
+    finished: bool,
+}
+
+impl SentText {
+    fn feed(&mut self, chunk: &[u8]) {
+        self.pending.extend_from_slice(chunk);
+        while let Some(end) = self.pending.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = self.pending.drain(..=end).collect();
+            let line = String::from_utf8_lossy(&line);
+            let Some(data) = line.trim().strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data == "[DONE]" {
+                self.finished = true;
+                continue;
+            }
+            let Ok(frame) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+            let Some(choice) = frame.pointer("/choices/0") else {
+                continue;
+            };
+            if let Some(piece) = choice
+                .pointer("/delta/content")
+                .and_then(serde_json::Value::as_str)
+            {
+                self.text.push_str(piece);
+            }
+            if choice.pointer("/delta/tool_calls").is_some() {
+                self.tools = true;
+            }
+            if choice.get("finish_reason").is_some_and(|f| !f.is_null()) {
+                self.finished = true;
+            }
+        }
+    }
+
+    /// The prefill to resume with, or `None` when the reply cannot honestly be continued.
+    fn resumable(&self) -> Option<&str> {
+        (!self.tools && !self.finished && !self.text.is_empty()).then_some(self.text.as_str())
+    }
+}
+
+/// The canonical body for a resumed request: the client's own messages, then the
+/// text already sent as a trailing assistant message marked `prefix`, aimed at
+/// `model`. `None` when the body has no `messages` array to extend.
+fn resume_body(body: &[u8], prefill: &str, model: &str) -> Option<Bytes> {
+    let mut request: serde_json::Value = serde_json::from_slice(body).ok()?;
+    request
+        .get_mut("messages")?
+        .as_array_mut()?
+        .push(serde_json::json!({ "role": "assistant", "content": prefill, "prefix": true }));
+    request["model"] = serde_json::json!(model);
+    request["stream"] = serde_json::json!(true);
+    serde_json::to_vec(&request).ok().map(Bytes::from)
+}
+
+/// Splices a second target onto a cut OpenAI chat stream, so the client reads one
+/// reply. Returns the stream to relay and the cut flag that decides how it ends.
+///
+/// One continuation per request: if the second target is cut too, the reply ends
+/// cut. If the continuation cannot be dispatched, the reply ends cut, and the
+/// relay's truncation frame says so, as it does without this wrapper.
+fn resumed(stream: ChunkStream, cut: CutFlag, plan: Continuation) -> (ChunkStream, CutFlag) {
+    let ends_cut: CutFlag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let out = Arc::clone(&ends_cut);
+    let relayed: ChunkStream = Box::pin(async_stream::stream! {
+        let mut sent = SentText::default();
+        let mut first = stream;
+        while let Some(chunk) = first.next().await {
+            sent.feed(&chunk);
+            yield chunk;
+        }
+        if !cut.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let (provider, model) = plan.target.clone();
+        let Some(prefill) = sent.resumable().map(str::to_owned) else {
+            out.store(true, std::sync::atomic::Ordering::SeqCst);
+            return;
+        };
+        let Some(body) = resume_body(&plan.body, &prefill, &model) else {
+            out.store(true, std::sync::atomic::Ordering::SeqCst);
+            return;
+        };
+        let canonical = CanonicalRequest::new(&model, body).with_stream(true);
+        let upstream = match plan.exec.post_chat(&provider, &canonical).await {
+            Ok(upstream) if upstream.status.is_success() => upstream,
+            _ => {
+                out.store(true, std::sync::atomic::Ordering::SeqCst);
+                return;
+            }
+        };
+        let mut second = upstream.stream;
+        while let Some(chunk) = second.next().await {
+            yield chunk;
+        }
+        if upstream.cut.load(std::sync::atomic::Ordering::SeqCst) {
+            out.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+    (relayed, ends_cut)
+}
+
+/// The continuation a streamed reply may take, when one is allowed. The first
+/// later target on the chain that is marked `continue_on_cut` and speaks OpenAI
+/// takes over. See [`Continuation`] for the conditions.
+fn continuation_for(
+    state: &AppState,
+    chain: &[ChainTarget],
+    served: Option<&ProviderId>,
+    dialect: Dialect,
+    stream: bool,
+    body: &Bytes,
+) -> Option<Continuation> {
+    if !stream || !matches!(dialect, Dialect::OpenAi) {
+        return None;
+    }
+    let served = served?;
+    let openai = |id: &ProviderId| {
+        state
+            .config
+            .providers
+            .iter()
+            .any(|p| &p.id == id && matches!(p.wire_format, ar_registry::WireFormat::Openai))
+    };
+    if !openai(served) {
+        return None;
+    }
+    let target = chain
+        .iter()
+        .skip_while(|t| &t.provider != served)
+        .skip(1)
+        .find(|t| {
+            state
+                .config
+                .providers
+                .iter()
+                .any(|p| p.id == t.provider && p.continue_on_cut)
+                && openai(&t.provider)
+        })?;
+    Some(Continuation {
+        exec: Arc::clone(&state.exec),
+        body: body.clone(),
+        target: (target.provider.clone(), target.model.clone()),
+    })
+}
+
 /// Where a stream cut after its headers is written: the usage ledger, and the
 /// client key that asked. With no ledger, nothing is written.
 #[derive(Clone, Default)]
@@ -1669,6 +1851,8 @@ struct Stages {
     /// Where a stream cut after its headers is logged. Empty where no client key
     /// is in scope, so nothing is written.
     failures: FailureSink,
+    /// The second target a cut OpenAI chat reply may resume on, when one is allowed.
+    continuation: Option<Continuation>,
 }
 
 /// The cache key for a canonical request: `blake3(tenant | served | body)`.
@@ -2222,6 +2406,7 @@ fn decorate(
         cache_control,
         meta,
         failures,
+        continuation,
     } = stages;
 
     // Every accounting number the response reports, from one [`ResponseMeta`].
@@ -2296,7 +2481,7 @@ fn decorate(
                     let cut = upstream.cut;
                     // R5: the breaker verdict is settled when this body ends, cut
                     // or clean, so the stream is wrapped before either relay reads it.
-                    let chunks = if stream {
+                    let (chunks, end_cut) = if stream {
                         let settled = settle_stream(
                             upstream.stream,
                             resilience,
@@ -2310,16 +2495,20 @@ fn decorate(
                             model: model.to_string(),
                             cut: cut.clone(),
                         };
-                        guarded(settled, record)
+                        let kept = guarded(settled, record);
+                        match continuation {
+                            Some(plan) => resumed(kept, cut, plan),
+                            None => (kept, cut),
+                        }
                     } else {
-                        upstream.stream
+                        (upstream.stream, cut)
                     };
                     let body = match keepalive.filter(|k| !k.is_noop()) {
                         Some(k) => Body::from_stream(
                             k.relay(chunks, provider.as_str(), model.as_ref())
                                 .map(|r| r.map_err(|never| -> std::io::Error { match never {} })),
                         ),
-                        None => Body::from_stream(abort_on_cut(chunks, cut)),
+                        None => Body::from_stream(abort_on_cut(chunks, end_cut)),
                     };
                     builder
                         .header(header::CONTENT_TYPE, ct)
@@ -3236,6 +3425,7 @@ mod tests {
         error, error_because, kind_for, model, models_head, not_found, outcome_label, require_json,
         unknown_model, usage_from_frames,
     };
+    use super::{Continuation, SentText, resume_body, resumed};
     use crate::app::{AppState, Components};
     use crate::config::{ComboTarget, ServerConfig};
     use crate::models::ModelCard;
@@ -3243,6 +3433,7 @@ mod tests {
         AbortReport, ArExec, AttemptOutcome, CanonicalRequest, ExecError, MediaReply, ProviderId,
         Strategy, Strng, Upstream,
     };
+    use ar_route::{ChunkStream, CutFlag};
     use axum::extract::{Path, State};
     use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
     use axum::response::Response;
@@ -3582,6 +3773,7 @@ mod tests {
             Strategy::Priority,
             Stages {
                 failures: FailureSink::none(),
+                continuation: None,
                 compression: "default;engines=-".to_owned(),
                 cache_state: ar_cache::CacheState::Miss,
                 cache_key: None,
@@ -3684,6 +3876,7 @@ mod tests {
             Strategy::Priority,
             Stages {
                 failures: FailureSink::none(),
+                continuation: None,
                 compression: "default;engines=-".to_owned(),
                 cache_state: ar_cache::CacheState::Miss,
                 cache_key: None,
@@ -5794,6 +5987,154 @@ mod tests {
         let body = body_of(resp).await;
         assert_eq!(body["error"]["code"], "insufficient_quota");
         assert_eq!(body["error"]["type"], "server_error");
+    }
+
+    /// One OpenAI chat SSE frame carrying `text` as its content delta.
+    fn openai_frame(text: &str) -> Bytes {
+        Bytes::from(format!(
+            "data: {}\n\n",
+            serde_json::json!({ "choices": [{ "delta": { "content": text } }] })
+        ))
+    }
+
+    /// Answers the one continuation dispatch with a canned stream, and records what
+    /// it was asked to send.
+    struct ResumeExec {
+        second: Mutex<Option<Upstream>>,
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl ArExec for ResumeExec {
+        fn post_chat<'a>(
+            &'a self,
+            provider: &'a ProviderId,
+            canonical: &'a CanonicalRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<Upstream, ExecError>> + Send + 'a>> {
+            self.seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(format!(
+                    "{}|{}|{}",
+                    provider.as_str(),
+                    canonical.model,
+                    String::from_utf8_lossy(&canonical.body)
+                ));
+            let next = self
+                .second
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            Box::pin(async move { next.ok_or_else(|| ExecError("no second target".to_owned())) })
+        }
+
+        fn post_media<'a>(
+            &'a self,
+            _provider: &'a ProviderId,
+            _model: Option<&'a str>,
+            _endpoint: &'a str,
+            _content_type: &'a str,
+            _body: &'a [u8],
+        ) -> Pin<Box<dyn Future<Output = Result<MediaReply, ExecError>> + Send + 'a>> {
+            Box::pin(async move { Err(ExecError("no media dispatch in this fixture".to_owned())) })
+        }
+    }
+
+    /// A first stream that sends `frames`, then is cut, and the continuation plan
+    /// that would take over from it.
+    fn cut_after(
+        frames: Vec<Bytes>,
+        second: Option<Upstream>,
+    ) -> (ChunkStream, CutFlag, Continuation, Arc<ResumeExec>) {
+        let exec = Arc::new(ResumeExec {
+            second: Mutex::new(second),
+            seen: Mutex::new(Vec::new()),
+        });
+        let plan = Continuation {
+            exec: Arc::clone(&exec) as Arc<dyn ArExec>,
+            body: Bytes::from(
+                r#"{"model":"combo","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+            ),
+            target: (ProviderId::new("p2"), Strng::from("m2")),
+        };
+        let cut: CutFlag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        (Box::pin(futures::stream::iter(frames)), cut, plan, exec)
+    }
+
+    #[test]
+    fn sent_text_should_read_a_frame_split_across_chunks() {
+        let mut sent = SentText::default();
+        let frame = openai_frame("Hi");
+        let (head, tail) = frame.split_at(frame.len() / 2);
+        sent.feed(head);
+        sent.feed(tail);
+        assert_eq!(sent.resumable(), Some("Hi"));
+    }
+
+    #[test]
+    fn sent_text_should_refuse_to_resume_when_a_tool_call_was_sent() {
+        let mut sent = SentText::default();
+        sent.feed(b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0}]}}]}\n\n");
+        assert_eq!(sent.resumable(), None);
+    }
+
+    #[test]
+    fn resume_body_should_append_the_prefill_and_retarget_the_model() {
+        let body = resume_body(
+            br#"{"model":"combo","messages":[{"role":"user","content":"hi"}]}"#,
+            "Hel",
+            "m2",
+        )
+        .expect("an OpenAI body resumes");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            v["messages"][1],
+            serde_json::json!({"role":"assistant","content":"Hel","prefix":true})
+        );
+    }
+
+    #[tokio::test]
+    async fn resumed_should_splice_the_second_target_when_the_first_is_cut() {
+        use futures::StreamExt;
+        let second = Upstream::success(Box::pin(futures::stream::iter(vec![
+            openai_frame("lo"),
+            Bytes::from("data: [DONE]\n\n"),
+        ])));
+        let (first, cut, plan, _) = cut_after(vec![openai_frame("Hel")], Some(second));
+        let (out, _) = resumed(first, cut, plan);
+        let joined: String = out
+            .map(|c: Bytes| String::from_utf8_lossy(&c).into_owned())
+            .collect::<Vec<_>>()
+            .await
+            .concat();
+        assert!(joined.contains("Hel") && joined.contains("lo") && joined.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn resumed_should_send_the_partial_text_as_prefill_to_the_second_target() {
+        use futures::StreamExt;
+        let second = Upstream::success(Box::pin(futures::stream::iter(Vec::<Bytes>::new())));
+        let (first, cut, plan, exec) = cut_after(vec![openai_frame("Hel")], Some(second));
+        let (out, _) = resumed(first, cut, plan);
+        let _ = out.collect::<Vec<_>>().await;
+        let seen = exec
+            .seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(
+            seen.len() == 1
+                && seen[0].starts_with("p2|m2|")
+                && seen[0].contains(r#""content":"Hel""#)
+        );
+    }
+
+    #[tokio::test]
+    async fn resumed_should_end_cut_when_no_second_target_answers() {
+        use futures::StreamExt;
+        let (first, cut, plan, _) = cut_after(vec![openai_frame("Hel")], None);
+        let (out, ends_cut) = resumed(first, cut, plan);
+        let _ = out.collect::<Vec<_>>().await;
+        assert!(ends_cut.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     fn cut_rows(cut: bool) -> usize {
