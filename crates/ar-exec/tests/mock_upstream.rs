@@ -102,6 +102,8 @@ fn chat() -> CanonicalChat {
         temperature: None,
         max_tokens: None,
         stream: true,
+        tools: Vec::new(),
+        tool_choice: None,
     }
 }
 

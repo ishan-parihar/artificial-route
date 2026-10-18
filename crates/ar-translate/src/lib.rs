@@ -135,13 +135,15 @@ mod ollama;
 mod openai;
 mod outbound;
 mod responses;
+mod tools;
 mod translate;
 
 pub use anthropic::{
     AnthropicBlock, AnthropicBlockContent, AnthropicContent, AnthropicMessages, AnthropicSystem,
 };
 pub use canonical::{
-    CanonicalChat, CanonicalResponse, FinishReason, MediaPart, Msg, Role, Usage, render_openai_body,
+    CanonicalChat, CanonicalResponse, CanonicalTool, FinishReason, MediaPart, Msg, Role, ToolCall,
+    ToolChoice, Usage, render_openai_body,
 };
 pub use gemini::{
     GeminiBlob, GeminiChat, GeminiContent, GeminiFunctionCall, GeminiFunctionResponse,

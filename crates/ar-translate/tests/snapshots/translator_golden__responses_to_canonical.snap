@@ -9,21 +9,29 @@ CanonicalChat {
             role: System,
             content: "be terse",
             media: [],
+            tool_calls: [],
+            tool_call_id: None,
         },
         Msg {
             role: User,
             content: "hello",
             media: [],
+            tool_calls: [],
+            tool_call_id: None,
         },
         Msg {
             role: Assistant,
             content: "hi",
             media: [],
+            tool_calls: [],
+            tool_call_id: None,
         },
         Msg {
             role: User,
             content: "again",
             media: [],
+            tool_calls: [],
+            tool_call_id: None,
         },
     ],
     temperature: Some(
@@ -33,4 +41,6 @@ CanonicalChat {
         256,
     ),
     stream: true,
+    tools: [],
+    tool_choice: None,
 }

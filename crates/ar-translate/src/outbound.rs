@@ -79,7 +79,8 @@
 use serde_json::{Map, Value, json};
 
 use crate::canonical::{
-    CanonicalChat, CanonicalResponse, FinishReason, MediaPart, Msg, Role, render_openai_body,
+    CanonicalChat, CanonicalResponse, CanonicalTool, FinishReason, MediaPart, Msg, Role,
+    ToolChoice, render_openai_body,
 };
 
 /// Which provider wire a dispatch must render into.
@@ -166,6 +167,8 @@ impl std::fmt::Display for OutboundWire {
 ///     temperature: None,
 ///     max_tokens: None,
 ///     stream: true,
+///     tools: vec![],
+///     tool_choice: None,
 /// };
 /// let body: serde_json::Value =
 ///     serde_json::from_slice(&render_for_wire(&chat, OutboundWire::Claude)).unwrap();
@@ -322,6 +325,13 @@ pub fn render_claude_body(chat: &CanonicalChat) -> Vec<u8> {
     if let Some(temperature) = chat.temperature {
         body.insert("temperature".to_owned(), temperature.into());
     }
+    if !chat.tools.is_empty() {
+        let tools = chat.tools.iter().map(claude_tool).collect();
+        body.insert("tools".to_owned(), Value::Array(tools));
+    }
+    if let Some(choice) = &chat.tool_choice {
+        body.insert("tool_choice".to_owned(), claude_tool_choice(choice));
+    }
     encode(Value::Object(body))
 }
 
@@ -384,6 +394,13 @@ pub fn render_openai_responses_body(chat: &CanonicalChat) -> Vec<u8> {
     body.insert("stream".to_owned(), chat.stream.into());
     if let Some(temperature) = chat.temperature {
         body.insert("temperature".to_owned(), temperature.into());
+    }
+    if !chat.tools.is_empty() {
+        let tools = chat.tools.iter().map(responses_tool).collect();
+        body.insert("tools".to_owned(), Value::Array(tools));
+    }
+    if let Some(choice) = &chat.tool_choice {
+        body.insert("tool_choice".to_owned(), responses_tool_choice(choice));
     }
     encode(Value::Object(body))
 }
@@ -450,6 +467,17 @@ pub fn render_gemini_body(chat: &CanonicalChat) -> Vec<u8> {
             "systemInstruction".to_owned(),
             json!({ "role": "system", "parts": system }),
         );
+    }
+    if !chat.tools.is_empty() {
+        // Gemini groups declarations: one `tools` entry carries them all.
+        let declarations: Vec<Value> = chat.tools.iter().map(gemini_declaration).collect();
+        body.insert(
+            "tools".to_owned(),
+            json!([{ "functionDeclarations": declarations }]),
+        );
+    }
+    if let Some(choice) = &chat.tool_choice {
+        body.insert("toolConfig".to_owned(), gemini_tool_config(choice));
     }
     encode(Value::Object(body))
 }
@@ -976,6 +1004,76 @@ fn encode(value: Value) -> Vec<u8> {
     })
 }
 
+/// One declared tool in Anthropic's spelling: `input_schema`, no wrapper.
+fn claude_tool(tool: &CanonicalTool) -> Value {
+    let mut decl = Map::with_capacity(3);
+    decl.insert("name".to_owned(), tool.name.as_str().into());
+    if let Some(description) = &tool.description {
+        decl.insert("description".to_owned(), description.as_str().into());
+    }
+    decl.insert("input_schema".to_owned(), tool.parameters.clone());
+    Value::Object(decl)
+}
+
+/// Anthropic's `tool_choice`. `Required` is `any`: "must call some tool".
+fn claude_tool_choice(choice: &ToolChoice) -> Value {
+    match choice {
+        ToolChoice::Auto => json!({ "type": "auto" }),
+        ToolChoice::None => json!({ "type": "none" }),
+        ToolChoice::Required => json!({ "type": "any" }),
+        ToolChoice::Named(name) => json!({ "type": "tool", "name": name }),
+    }
+}
+
+/// One declared tool in Responses' flat spelling: `function` with the
+/// declaration fields beside `type`, no wrapper object.
+fn responses_tool(tool: &CanonicalTool) -> Value {
+    let mut decl = Map::with_capacity(4);
+    decl.insert("type".to_owned(), "function".into());
+    decl.insert("name".to_owned(), tool.name.as_str().into());
+    if let Some(description) = &tool.description {
+        decl.insert("description".to_owned(), description.as_str().into());
+    }
+    decl.insert("parameters".to_owned(), tool.parameters.clone());
+    Value::Object(decl)
+}
+
+/// Responses' `tool_choice`: a keyword, or `{"type":"function","name"}`.
+fn responses_tool_choice(choice: &ToolChoice) -> Value {
+    match choice {
+        ToolChoice::Auto => "auto".into(),
+        ToolChoice::None => "none".into(),
+        ToolChoice::Required => "required".into(),
+        ToolChoice::Named(name) => json!({ "type": "function", "name": name }),
+    }
+}
+
+/// One declaration inside Gemini's `functionDeclarations` group.
+fn gemini_declaration(tool: &CanonicalTool) -> Value {
+    let mut decl = Map::with_capacity(3);
+    decl.insert("name".to_owned(), tool.name.as_str().into());
+    if let Some(description) = &tool.description {
+        decl.insert("description".to_owned(), description.as_str().into());
+    }
+    decl.insert("parameters".to_owned(), tool.parameters.clone());
+    Value::Object(decl)
+}
+
+/// Gemini's `toolConfig`. `Required` is `ANY` over every declared name, and
+/// `Named` is `ANY` over just that one, which is how the wire spells "this
+/// function and no other".
+fn gemini_tool_config(choice: &ToolChoice) -> Value {
+    let config = match choice {
+        ToolChoice::Auto => json!({ "mode": "AUTO" }),
+        ToolChoice::None => json!({ "mode": "NONE" }),
+        ToolChoice::Required => json!({ "mode": "ANY" }),
+        ToolChoice::Named(name) => {
+            json!({ "mode": "ANY", "allowedFunctionNames": [name] })
+        }
+    };
+    json!({ "functionCallingConfig": config })
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::Value;
@@ -1008,6 +1106,8 @@ mod tests {
             temperature: Some(0.5),
             max_tokens: Some(128),
             stream: true,
+            tools: Vec::new(),
+            tool_choice: None,
         }
     }
 

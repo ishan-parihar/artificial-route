@@ -182,3 +182,21 @@ what a model-not-found on the last target should look like to a client.
 - Repo hygiene: the rustfmt drift in `ar-cli` and in the pre-existing hunks of
   `attempt.rs`, `routes.rs` and `exec.rs` was left alone, so the diff carries
   only this work.
+
+## D4 corpus (2026-10-18, live)
+
+Four requests through the running gateway to `free-stack`: two streamed, two
+not, `max_tokens` 16, the prompt "Reply with the word OK and nothing else."
+
+| # | stream | status | elapsed | frames | chars | decision |
+|---|---|---|---|---|---|---|
+| 1 | yes | 504 | 150.1 s | 0 | 0 | `strategy=none` |
+| 2 | yes | 504 | 150.0 s | 0 | 0 | `strategy=none` |
+| 3 | no | 504 | 150.0 s | — | 0 | `strategy=none` |
+| 4 | no | 504 | 150.0 s | — | 0 | `strategy=none` |
+
+Every reply was `upstream_timeout` with reason `model_deadline`. The journal
+shows the first target, `nvidia z-ai/glm-5.3`, failing over with `upstream
+produced no headers within 110s`. The corpus has no empty 200, so no D5
+threshold is set. The failure is a stall past the model deadline, which the D1
+and D2 rows already cover.

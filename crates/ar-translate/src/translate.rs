@@ -339,6 +339,19 @@ pub enum TranslateError {
         /// The requested cell name, verbatim.
         pair: String,
     },
+    /// A tool declaration, tool choice or tool call is malformed.
+    #[error("invalid tool: {reason}")]
+    InvalidTool {
+        /// What is wrong with it. Never the arguments themselves.
+        reason: String,
+    },
+    /// A tool this build does not run (a built-in such as web search). Refused,
+    /// because a declaration that is dropped is a tool the model never sees.
+    #[error("unsupported tool type {kind:?}: this build does not run it")]
+    UnsupportedTool {
+        /// The tool's type or built-in key, verbatim.
+        kind: String,
+    },
 }
 
 /// Inbound wire -> canonical.
@@ -399,6 +412,8 @@ impl ArTranslate<OpenAIChat> for OpenAiInbound {
             temperature: input.temperature,
             max_tokens: input.max_tokens.or(input.max_completion_tokens),
             stream: input.stream.unwrap_or(false),
+            tools: crate::tools::openai_tools(&input.rest)?,
+            tool_choice: crate::tools::openai_tool_choice(&input.rest)?,
         })
     }
 }
@@ -441,6 +456,8 @@ impl ArTranslate<AnthropicMessages> for AnthropicInbound {
                     role,
                     content: split.text,
                     media: split.media,
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
                 });
             }
         }
@@ -455,6 +472,8 @@ impl ArTranslate<AnthropicMessages> for AnthropicInbound {
             temperature: input.temperature,
             max_tokens: input.max_tokens,
             stream: input.stream.unwrap_or(false),
+            tools: crate::tools::anthropic_tools(&input.rest)?,
+            tool_choice: crate::tools::anthropic_tool_choice(&input.rest)?,
         })
     }
 }
@@ -496,6 +515,8 @@ impl ArTranslate<ResponsesApi> for ResponsesInbound {
             temperature: input.temperature,
             max_tokens: input.max_output_tokens,
             stream: input.stream.unwrap_or(false),
+            tools: crate::tools::responses_tools(&input.rest)?,
+            tool_choice: crate::tools::responses_tool_choice(&input.rest)?,
         })
     }
 }
@@ -531,6 +552,8 @@ impl ArTranslate<OllamaChat> for OllamaInbound {
                 role,
                 content: msg.content,
                 media,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
             });
         }
 
@@ -540,6 +563,8 @@ impl ArTranslate<OllamaChat> for OllamaInbound {
             temperature: input.options.as_ref().and_then(|o| o.temperature),
             max_tokens: input.options.as_ref().and_then(|o| o.num_predict),
             stream: input.stream.unwrap_or(false),
+            tools: crate::tools::openai_tools(&input.rest)?,
+            tool_choice: crate::tools::openai_tool_choice(&input.rest)?,
         })
     }
 }
@@ -605,6 +630,8 @@ impl ArTranslate<GeminiChat> for GeminiInbound {
             // canonical flag mirrors the OpenAI one and the server decides. Kept
             // `false` because a body alone cannot distinguish them.
             stream: false,
+            tools: crate::tools::gemini_tools(&input.rest)?,
+            tool_choice: crate::tools::gemini_tool_choice(&input.rest)?,
         })
     }
 }
@@ -699,6 +726,8 @@ fn gemini_content(content: GeminiContent) -> Result<Vec<Msg>, TranslateError> {
             role,
             content: text.join("\n"),
             media,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         });
     }
     Ok(out)
@@ -873,6 +902,8 @@ fn msg_to_canonical(msg: crate::openai::OpenAIMessage) -> Result<Msg, TranslateE
         role,
         content,
         media,
+        tool_calls: crate::tools::openai_tool_calls(&msg.rest)?,
+        tool_call_id: msg.tool_call_id,
     })
 }
 
@@ -1007,6 +1038,8 @@ fn responses_item(item: ResponsesItem) -> Result<Msg, TranslateError> {
         role,
         content,
         media,
+        tool_calls: Vec::new(),
+        tool_call_id: None,
     })
 }
 
@@ -1190,7 +1223,9 @@ mod tests {
         let chat: OpenAIChat = serde_json::from_str(raw).expect("fixture is valid OpenAI chat");
 
         let canonical = to_canonical(chat).expect("fixture is translatable");
-        assert_eq!(canonical.messages, vec![Msg::new(Role::Tool, "")]);
+        let mut expected = Msg::new(Role::Tool, "");
+        expected.tool_call_id = Some("c1".to_owned());
+        assert_eq!(canonical.messages, vec![expected]);
     }
 
     #[test]

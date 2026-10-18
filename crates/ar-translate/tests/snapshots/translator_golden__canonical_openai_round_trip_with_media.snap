@@ -18,9 +18,13 @@ CanonicalChat {
                     },
                 },
             ],
+            tool_calls: [],
+            tool_call_id: None,
         },
     ],
     temperature: None,
     max_tokens: None,
     stream: false,
+    tools: [],
+    tool_choice: None,
 }

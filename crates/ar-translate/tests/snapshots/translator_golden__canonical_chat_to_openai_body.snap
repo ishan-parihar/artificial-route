@@ -26,7 +26,8 @@ expression: "body.parse::<serde_json::Value>().expect(\"the body is JSON\")"
     },
     {
       "content": "42",
-      "role": "tool"
+      "role": "tool",
+      "tool_call_id": "call_1"
     }
   ],
   "model": "gpt-5.4",

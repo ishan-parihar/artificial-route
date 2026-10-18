@@ -83,6 +83,14 @@ pub struct Msg {
     /// Non-text parts, in wire order. Empty for a text-only turn.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<MediaPart>,
+    /// Tool calls the model made in this turn. Empty for every turn but an
+    /// assistant turn that called a tool.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    /// On a `tool` turn, the id of the call whose result this is. Without it
+    /// an upstream cannot pair the result with the call it answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl Msg {
@@ -92,8 +100,25 @@ impl Msg {
             role,
             content: content.into(),
             media: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }
     }
+}
+
+/// One tool call the model made, carried so a later turn can refer to it.
+///
+/// `arguments` is parsed JSON, not the string OpenAI sends: Anthropic and Gemini
+/// take an object, and a string-typed canonical field would make every renderer
+/// re-parse it. The OpenAI renderer serializes it back to a string.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolCall {
+    /// Correlation id; the `tool` turn that answers this call repeats it.
+    pub id: String,
+    /// The tool the model called.
+    pub name: String,
+    /// The arguments the model produced, as a JSON value.
+    pub arguments: serde_json::Value,
 }
 
 /// One non-text content part, carried across the canonical boundary unchanged.
@@ -163,6 +188,48 @@ pub struct CanonicalChat {
     /// non-OpenAI renderers must decode that the same way.
     #[serde(default)]
     pub stream: bool,
+    /// Tools the model may call, declared by the caller. Empty when none were.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<CanonicalTool>,
+    /// Which tool the model must or may call. `None` leaves the choice to each
+    /// upstream's own default, which is what an absent `tool_choice` means.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
+}
+
+/// One callable tool, in the one shape every dialect reduces to: a name, an
+/// optional description, and a JSON Schema for the arguments.
+///
+/// `parameters` is carried as the schema the caller wrote. Each renderer picks
+/// its own key for it (`parameters`, `input_schema`), and none rewrites the
+/// schema, so a constraint the caller set reaches the upstream unchanged.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CanonicalTool {
+    /// The name the model calls the tool by.
+    pub name: String,
+    /// What the tool does, for the model's benefit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// JSON Schema for the arguments, exactly as declared.
+    pub parameters: serde_json::Value,
+}
+
+/// Which tool the model is steered toward.
+///
+/// `Required` is "must call some tool" and `Named` is "must call this one".
+/// Dialects spell these differently (`required` vs `any` vs `ANY`), and each
+/// renderer maps the variant to its own spelling; none invents a fifth state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolChoice {
+    /// The model decides whether to call a tool.
+    Auto,
+    /// The model must not call a tool.
+    None,
+    /// The model must call some tool.
+    Required,
+    /// The model must call the tool with this name.
+    Named(String),
 }
 
 /// Renders `chat` as an OpenAI chat-completions request body.
@@ -198,6 +265,8 @@ pub struct CanonicalChat {
 ///     temperature: None,
 ///     max_tokens: None,
 ///     stream: true,
+///     tools: vec![],
+///     tool_choice: None,
 /// };
 /// let body = String::from_utf8(render_openai_body(&chat)).unwrap();
 ///
@@ -211,11 +280,11 @@ pub struct CanonicalChat {
 /// field no adapter routes would be a claim without an implementation. So the
 /// inbound dialects parse these and canonical has nowhere to put them:
 ///
-/// * `tools` / `tool_choice` — no canonical tool registry. An Anthropic
-///   `tool_use` crosses as a carried [`MediaPart`], which is enough to *observe*
-///   that a turn used tools and not enough to declare them, so a tool-using
-///   request reaches the upstream without its tool declarations. Every outbound
-///   renderer inherits this gap; `TODO(#p1-tools)` is where it closes.
+/// * Tool declarations and tool calls are carried ([`CanonicalTool`],
+///   [`ToolCall`], `tool_choice`). An Anthropic `tool_use` or Gemini
+///   `functionCall` in history still crosses as a carried [`MediaPart`]: it
+///   reaches a same-dialect upstream intact, but a cross-dialect renderer does
+///   not yet turn it into a canonical [`ToolCall`]. `TODO(#p1-tools)` closes that.
 /// * `top_p` — parsed by two inbound adapters (`OllamaOptions::top_p`,
 ///   `GeminiGenerationConfig::top_p`), no canonical field. Sampling becomes
 ///   temperature-only upstream.
@@ -229,10 +298,9 @@ pub struct CanonicalChat {
 ///   ask the upstream to reason harder.
 ///
 /// Each is a request capability this build does not have, and each is visible
-/// rather than silently substituted. `TODO(#p1-tools)`: give canonical a tool
-/// registry, then the four samplers, `stop`, `n` and `reasoning_effort` follow
-/// from it; re-add them here and in the per-wire renderers alongside the
-/// canonical fields they read.
+/// rather than silently substituted. The samplers, `stop`, `n` and
+/// `reasoning_effort` each need their own canonical field before a renderer can
+/// read them; re-add them here and in the per-wire renderers alongside it.
 #[must_use]
 pub fn render_openai_body(chat: &CanonicalChat) -> Vec<u8> {
     let messages: Vec<serde_json::Value> =
@@ -241,7 +309,7 @@ pub fn render_openai_body(chat: &CanonicalChat) -> Vec<u8> {
     // Built as a map rather than a `json!` literal on purpose: `json!` writes
     // `Option::None` as an explicit `null`, which is the defect this function
     // exists to remove. Insertion is the omission.
-    let mut body = serde_json::Map::with_capacity(5);
+    let mut body = serde_json::Map::with_capacity(7);
     body.insert("model".to_owned(), chat.model.as_str().into());
     body.insert("messages".to_owned(), serde_json::Value::Array(messages));
     body.insert("stream".to_owned(), chat.stream.into());
@@ -250,6 +318,13 @@ pub fn render_openai_body(chat: &CanonicalChat) -> Vec<u8> {
     }
     if let Some(max_tokens) = chat.max_tokens {
         body.insert("max_tokens".to_owned(), max_tokens.into());
+    }
+    if !chat.tools.is_empty() {
+        let tools = chat.tools.iter().map(openai_tool).collect();
+        body.insert("tools".to_owned(), serde_json::Value::Array(tools));
+    }
+    if let Some(choice) = &chat.tool_choice {
+        body.insert("tool_choice".to_owned(), openai_tool_choice(choice));
     }
 
     // `to_vec` on strings, integers, bools and already-valid `Value`s cannot
@@ -271,25 +346,70 @@ pub fn render_openai_body(chat: &CanonicalChat) -> Vec<u8> {
 /// media-only turn still emits a content array, because a bare string would drop
 /// the part.
 fn render_openai_message(msg: &Msg) -> serde_json::Value {
-    let mut map = serde_json::Map::with_capacity(3);
+    let mut map = serde_json::Map::with_capacity(4);
     map.insert("role".to_owned(), msg.role.as_wire().into());
+    if let Some(id) = msg.tool_call_id.as_deref() {
+        map.insert("tool_call_id".to_owned(), id.into());
+    }
 
     if msg.media.is_empty() {
-        map.insert("content".to_owned(), msg.content.clone().into());
-        return serde_json::Value::Object(map);
+        // A turn that only called tools has no content. Omitting the key is the
+        // honest spelling; `""` would claim the model said nothing at all.
+        if !msg.content.is_empty() || msg.tool_calls.is_empty() {
+            map.insert("content".to_owned(), msg.content.clone().into());
+        }
+    } else {
+        let mut parts: Vec<serde_json::Value> = Vec::with_capacity(msg.media.len() + 1);
+        if !msg.content.is_empty() {
+            parts.push(serde_json::json!({ "type": "text", "text": msg.content }));
+        }
+        // The single media renderer, unchanged. A part this build cannot route never
+        // reaches here — inbound adapters reject it — so every `to_wire` result is
+        // the dialect's own spelling, and the upstream sees exactly what the client
+        // sent.
+        parts.extend(msg.media.iter().map(MediaPart::to_wire));
+        map.insert("content".to_owned(), serde_json::Value::Array(parts));
     }
 
-    let mut parts: Vec<serde_json::Value> = Vec::with_capacity(msg.media.len() + 1);
-    if !msg.content.is_empty() {
-        parts.push(serde_json::json!({ "type": "text", "text": msg.content }));
+    if !msg.tool_calls.is_empty() {
+        let calls = msg.tool_calls.iter().map(openai_tool_call).collect();
+        map.insert("tool_calls".to_owned(), serde_json::Value::Array(calls));
     }
-    // The single media renderer, unchanged. A part this build cannot route never
-    // reaches here — inbound adapters reject it — so every `to_wire` result is
-    // the dialect's own spelling, and the upstream sees exactly what the client
-    // sent.
-    parts.extend(msg.media.iter().map(MediaPart::to_wire));
-    map.insert("content".to_owned(), serde_json::Value::Array(parts));
     serde_json::Value::Object(map)
+}
+
+/// One assistant tool call in OpenAI's spelling, where `arguments` is a JSON
+/// string rather than an object.
+fn openai_tool_call(call: &ToolCall) -> serde_json::Value {
+    serde_json::json!({
+        "id": call.id,
+        "type": "function",
+        "function": { "name": call.name, "arguments": call.arguments.to_string() },
+    })
+}
+
+/// One declared tool in OpenAI's `tools` spelling: a `function` wrapper around
+/// the same name, description and schema.
+pub(crate) fn openai_tool(tool: &CanonicalTool) -> serde_json::Value {
+    let mut function = serde_json::Map::with_capacity(3);
+    function.insert("name".to_owned(), tool.name.as_str().into());
+    if let Some(description) = &tool.description {
+        function.insert("description".to_owned(), description.as_str().into());
+    }
+    function.insert("parameters".to_owned(), tool.parameters.clone());
+    serde_json::json!({ "type": "function", "function": function })
+}
+
+/// OpenAI's `tool_choice`: a keyword, or a named function.
+pub(crate) fn openai_tool_choice(choice: &ToolChoice) -> serde_json::Value {
+    match choice {
+        ToolChoice::Auto => "auto".into(),
+        ToolChoice::None => "none".into(),
+        ToolChoice::Required => "required".into(),
+        ToolChoice::Named(name) => {
+            serde_json::json!({ "type": "function", "function": { "name": name } })
+        }
+    }
 }
 
 /// Why generation stopped.

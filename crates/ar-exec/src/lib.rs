@@ -82,6 +82,8 @@
 //!     temperature: None,
 //!     max_tokens: None,
 //!     stream: true,
+//!     tools: vec![],
+//!     tool_choice: None,
 //! };
 //! let abort = CancellationToken::new();
 //! // Not awaited: a doctest must not perform network I/O.
@@ -1647,6 +1649,8 @@ mod tests {
             temperature: None,
             max_tokens: None,
             stream: true,
+            tools: Vec::new(),
+            tool_choice: None,
         };
 
         let err = exec

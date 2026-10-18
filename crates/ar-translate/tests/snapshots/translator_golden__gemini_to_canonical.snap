@@ -9,26 +9,36 @@ CanonicalChat {
             role: System,
             content: "be terse",
             media: [],
+            tool_calls: [],
+            tool_call_id: None,
         },
         Msg {
             role: User,
             content: "add 2 and 3",
             media: [],
+            tool_calls: [],
+            tool_call_id: None,
         },
         Msg {
             role: Tool,
             content: "5",
             media: [],
+            tool_calls: [],
+            tool_call_id: None,
         },
         Msg {
             role: Assistant,
             content: "calling",
             media: [],
+            tool_calls: [],
+            tool_call_id: None,
         },
         Msg {
             role: User,
             content: "thanks",
             media: [],
+            tool_calls: [],
+            tool_call_id: None,
         },
     ],
     temperature: Some(
@@ -38,4 +48,6 @@ CanonicalChat {
         512,
     ),
     stream: false,
+    tools: [],
+    tool_choice: None,
 }
