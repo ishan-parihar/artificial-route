@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS key_caps (
 CREATE TABLE IF NOT EXISTS failures (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     key_id     TEXT    NOT NULL,
+    provider   TEXT    NOT NULL DEFAULT '-',
     model      TEXT    NOT NULL,
     status     INTEGER NOT NULL,
     error      TEXT    NOT NULL,
@@ -81,6 +82,11 @@ INSERT INTO key_caps_migrated (key_id, usd_micros, token_cap, refuse_unpriced)
 DROP TABLE key_caps;
 ALTER TABLE key_caps_migrated RENAME TO key_caps;
 ";
+
+/// `failures.provider`, added after the table first shipped. An existing ledger
+/// keeps the old shape, so its old rows read as `-`, the value they always had.
+const MIGRATE_FAILURE_PROVIDER: &str =
+    "ALTER TABLE failures ADD COLUMN provider TEXT NOT NULL DEFAULT '-';";
 
 const INSERT_USAGE: &str = "
 INSERT INTO usage
@@ -376,14 +382,14 @@ SELECT MAX(m) FROM (SELECT MAX(created_at) AS m FROM usage
                     UNION ALL SELECT MAX(created_at) FROM failures)
 ";
 
-// Answered rows and failures as one stream. A failure has no provider (the
-// chain never settled on one), so it is `-`, and `200` marks an answered row.
+// Answered rows and failures as one stream. A failure names the last provider
+// the chain tried, or `-` when it tried none, and `200` marks an answered row.
 const LOG: &str = "
 SELECT * FROM (
     SELECT created_at, key_id, provider, model, total_tokens, cost_micros, priced,
            200 AS status, '' AS error FROM usage
     UNION ALL
-    SELECT created_at, key_id, '-', model, 0, 0, 1, status, error FROM failures
+    SELECT created_at, key_id, provider, model, 0, 0, 1, status, error FROM failures
 )
 WHERE created_at >= ?1
   AND (?2 IS NULL OR model = ?2)
@@ -468,7 +474,10 @@ impl Ledger {
         // request completion and read by `ar cost-report`.
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
         conn.execute_batch(SCHEMA)?;
-        if !has_column(&conn, "refuse_unpriced")? {
+        if !has_column(&conn, "failures", "provider")? {
+            conn.execute_batch(MIGRATE_FAILURE_PROVIDER)?;
+        }
+        if !has_column(&conn, "key_caps", "refuse_unpriced")? {
             conn.execute_batch(MIGRATE_REFUSE_UNPRICED)?;
         }
         Ok(Self { conn })
@@ -736,6 +745,7 @@ impl Ledger {
     pub fn record_failure(
         &self,
         key_id: &str,
+        provider: &str,
         model: &str,
         status: u16,
         error: &str,
@@ -743,8 +753,8 @@ impl Ledger {
     ) -> Result<(), TokenError> {
         let error: String = error.chars().take(FAILURE_TEXT_MAX).collect();
         self.conn.execute(
-            "INSERT INTO failures (key_id, model, status, error, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![key_id, model, i64::from(status), error, created_at],
+            "INSERT INTO failures (key_id, provider, model, status, error, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![key_id, provider, model, i64::from(status), error, created_at],
         )?;
         self.conn.execute(
             "DELETE FROM failures WHERE id <= (SELECT MAX(id) FROM failures) - ?1",
@@ -882,8 +892,8 @@ fn read_opt(n: Option<i64>) -> Option<u64> {
 
 /// Whether `key_caps` already carries `column`. See
 /// [`MIGRATE_REFUSE_UNPRICED`] for why the migration needs to ask.
-fn has_column(conn: &Connection, column: &str) -> Result<bool, TokenError> {
-    let mut stmt = conn.prepare("PRAGMA table_info(key_caps)")?;
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, TokenError> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         if row.get::<_, String>(1)? == column {
@@ -1019,7 +1029,7 @@ mod tests {
             .record(&entry("k1", "openai", "gpt-4o", 100))
             .expect("record");
         ledger
-            .record_failure("k1", "jev", 502, "all providers failed", 1_700_000_100)
+            .record_failure("k1", "-", "jev", 502, "all providers failed", 1_700_000_100)
             .expect("failure");
         let statuses: Vec<u16> = ledger
             .log(&all_rows())
@@ -1037,7 +1047,7 @@ mod tests {
             .record(&entry("k1", "openai", "gpt-4o", 100))
             .expect("record");
         ledger
-            .record_failure("k1", "jev", 429, "throttled", 1_700_000_100)
+            .record_failure("k1", "-", "jev", 429, "throttled", 1_700_000_100)
             .expect("failure");
         let filter = LogFilter {
             errors_only: true,
@@ -1066,9 +1076,54 @@ mod tests {
     fn record_failure_should_leave_the_spend_report_untouched_when_it_writes() {
         let ledger = Ledger::open_in_memory().expect("open");
         ledger
-            .record_failure("k1", "jev", 502, "down", 1_700_000_100)
+            .record_failure("k1", "-", "jev", 502, "down", 1_700_000_100)
             .expect("failure");
         assert_eq!(ledger.report(10).expect("report").rows.len(), 0);
+    }
+
+    #[test]
+    fn log_should_name_the_provider_on_a_failed_row() {
+        let ledger = Ledger::open_in_memory().expect("open");
+        ledger
+            .record_failure("k1", "p1", "jev", 502, "down", 1_700_000_100)
+            .expect("failure");
+        let rows = ledger
+            .log(&LogFilter {
+                days: 30,
+                model: None,
+                provider: None,
+                errors_only: true,
+                limit: 10,
+                offset: 0,
+            })
+            .expect("log");
+        assert_eq!(rows[0].provider, "p1");
+    }
+
+    #[test]
+    fn from_connection_should_add_the_provider_column_to_an_old_failures_table() {
+        let conn = Connection::open_in_memory().expect("open");
+        conn.execute_batch(
+            "CREATE TABLE failures (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, key_id TEXT NOT NULL,
+                model TEXT NOT NULL, status INTEGER NOT NULL,
+                error TEXT NOT NULL, created_at INTEGER NOT NULL);
+             INSERT INTO failures (key_id, model, status, error, created_at)
+                VALUES ('k1', 'jev', 502, 'old', 1700000100);",
+        )
+        .expect("old shape");
+        let ledger = Ledger::from_connection(conn).expect("migrates");
+        let rows = ledger
+            .log(&LogFilter {
+                days: 30,
+                model: None,
+                provider: None,
+                errors_only: true,
+                limit: 10,
+                offset: 0,
+            })
+            .expect("log");
+        assert_eq!(rows[0].provider, "-");
     }
 
     #[test]
@@ -1076,7 +1131,7 @@ mod tests {
         let ledger = Ledger::open_in_memory().expect("open");
         for t in 0..5 {
             ledger
-                .record_failure("k1", "jev", 502, "down", 1_700_000_100 + t)
+                .record_failure("k1", "-", "jev", 502, "down", 1_700_000_100 + t)
                 .expect("failure");
         }
         let page = |offset| {

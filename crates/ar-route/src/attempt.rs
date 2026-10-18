@@ -123,7 +123,7 @@ impl AttemptOutcome {
             Self::Succeeded { provider, .. }
             | Self::Retry { provider, .. }
             | Self::Failover { provider, .. } => Some(provider),
-            Self::Abort(_) => None,
+            Self::Abort(report) => report.last_provider.as_ref(),
         }
     }
 
@@ -165,6 +165,10 @@ pub struct AbortReport {
     pub reason: String,
     /// How many providers were tried before stopping.
     pub tried: u16,
+    /// The last provider the loop dispatched to, `None` when nothing was
+    /// dispatched. Names the provider behind a failure row even when the
+    /// abort is a refusal, not a relayed upstream answer.
+    pub last_provider: Option<ProviderId>,
 }
 
 /// One attempt's classification. Internal to the loop.
@@ -679,6 +683,7 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
             status: StatusCode::SERVICE_UNAVAILABLE,
             reason: "empty fallback chain".to_owned(),
             tried: 0,
+            last_provider: None,
         }));
     }
 
@@ -863,6 +868,7 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
                             status,
                             reason: abort_reason(status),
                             tried,
+                            last_provider: Some(provider.clone()),
                         }));
                     }
                     Step::Failover { status } => {
@@ -956,6 +962,7 @@ fn terminate(
             status: StatusCode::SERVICE_UNAVAILABLE,
             reason: "every provider in the chain is cooling down".to_owned(),
             tried,
+            last_provider: None,
         });
     };
     if let Some(throttled) = throttled_by {

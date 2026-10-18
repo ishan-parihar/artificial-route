@@ -460,6 +460,15 @@ pub(crate) fn note_failure(
     };
     // Read only here, on a failure: a successful request never pays for the parse.
     let model = model();
+    // The provider the chain last tried, from the decision header every routed
+    // reply carries. `-` when no provider was tried (a refusal before dispatch).
+    let provider = resp
+        .headers()
+        .get(DECISION_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|d| d.split(';').find_map(|kv| kv.strip_prefix("provider=")))
+        .filter(|p| !p.is_empty())
+        .unwrap_or("-");
     let why = resp.extensions().get::<FailNote>().map_or_else(
         || status.canonical_reason().unwrap_or("error"),
         |note| note.0.as_str(),
@@ -469,6 +478,7 @@ pub(crate) fn note_failure(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .record_failure(
             key_id.unwrap_or("anonymous"),
+            provider,
             &model,
             status.as_u16(),
             why,
@@ -1779,6 +1789,8 @@ impl FailureSink {
 /// nothing: only a body the upstream broke is a failed request.
 struct CutRecord {
     sink: FailureSink,
+    /// The provider whose body was cut.
+    provider: String,
     model: String,
     cut: CutFlag,
 }
@@ -1796,6 +1808,7 @@ impl Drop for CutRecord {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .record_failure(
                 &self.sink.key_id,
+                &self.provider,
                 &self.model,
                 502,
                 "upstream stream cut after its headers",
@@ -2492,6 +2505,7 @@ fn decorate(
                         // already 200, so the failure log is the only record it leaves.
                         let record = CutRecord {
                             sink: failures,
+                            provider: provider.as_str().to_owned(),
                             model: model.to_string(),
                             cut: cut.clone(),
                         };
@@ -3749,6 +3763,7 @@ mod tests {
             status: axum::http::StatusCode::BAD_REQUEST,
             reason: "bad".to_owned(),
             tried: 1,
+            last_provider: None,
         };
         assert_eq!(outcome_label(&AttemptOutcome::Abort(report)), "abort");
     }
@@ -6146,6 +6161,7 @@ mod tests {
                 ledger: Some(Arc::clone(&ledger)),
                 key_id: "k1".to_owned(),
             },
+            provider: "p".to_owned(),
             model: "jev".to_owned(),
             cut: Arc::new(std::sync::atomic::AtomicBool::new(cut)),
         };
@@ -6174,6 +6190,37 @@ mod tests {
     #[test]
     fn cut_record_should_log_nothing_when_the_body_finished_clean() {
         assert_eq!(cut_rows(false), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_request_names_the_provider_the_chain_tried() {
+        let ledger = Arc::new(Mutex::new(
+            ar_tokens::Ledger::open_in_memory().expect("in-memory ledger"),
+        ));
+        let exec = Arc::new(FailingExec(502, r#"{"error":{"message":"down"}}"#));
+        let router = crate::app::app(routed_with_ledger(exec, Arc::clone(&ledger)));
+        let _ = drive(
+            &router,
+            chat(
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ),
+        )
+        .await;
+        let filter = ar_tokens::LogFilter {
+            days: 30,
+            model: Some("m"),
+            provider: None,
+            errors_only: true,
+            limit: 10,
+            offset: 0,
+        };
+        let rows = ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .log(&filter)
+            .expect("log");
+        assert_eq!(rows[0].provider, "p");
     }
 
     #[tokio::test]

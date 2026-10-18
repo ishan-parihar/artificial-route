@@ -1488,7 +1488,7 @@ mod http_tests {
     async fn the_log_should_answer_failures_inside_the_date_range() {
         let ledger = ar_tokens::Ledger::open_in_memory().expect("ledger");
         ledger
-            .record_failure("ci", "c", 502, "every provider is down", 1_000_000)
+            .record_failure("ci", "-", "c", 502, "every provider is down", 1_000_000)
             .expect("row");
         let (app, _) = ui("log", Some(ledger));
         let (status, body) = call(&app, Method::GET, "/ui/api/log?days=30", "").await;
