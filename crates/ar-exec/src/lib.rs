@@ -963,7 +963,18 @@ fn build_headers(
     } else {
         accept
     };
-    headers_for_class(auth_class(wire), api_key, "application/json", accept, extra)
+    let mut headers =
+        headers_for_class(auth_class(wire), api_key, "application/json", accept, extra);
+    // The Messages API rejects a request without its version header. `x-api-key`
+    // is deliberately not added: the Claude OAuth path shares this wire and sends
+    // its bearer token, which a key header would misread.
+    if wire == crate::WireFormat::Anthropic {
+        headers.insert(
+            reqwest::header::HeaderName::from_static("anthropic-version"),
+            reqwest::header::HeaderValue::from_static("2023-06-01"),
+        );
+    }
+    headers
 }
 
 /// The credential header this wire accepts.
@@ -1181,6 +1192,15 @@ mod tests {
     fn skips_bearer_when_secret_has_illegal_header_byte() {
         let headers = build_headers(WireFormat::Openai, "sk\ninjected", false, &BTreeMap::new());
         assert!(!headers.contains_key(reqwest::header::AUTHORIZATION));
+    }
+
+    #[test]
+    fn sends_the_messages_version_header_on_the_anthropic_wire_only() {
+        let anthropic = build_headers(WireFormat::Anthropic, "k", false, &extra(&[]));
+        let openai = build_headers(WireFormat::Openai, "k", false, &extra(&[]));
+
+        assert_eq!(anthropic["anthropic-version"], "2023-06-01");
+        assert!(openai.get("anthropic-version").is_none());
     }
 
     #[test]

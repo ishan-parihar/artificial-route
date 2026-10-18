@@ -92,11 +92,8 @@ explanation is [AUDIT-REPORT.md](AUDIT-REPORT.md).
 - **Multi-provider `auto/*` pools fall back to config order.** Single-provider pools score identically; bare `auto` maps to `least-used` since 0.1.12, and the auto scoring engages for literal `auto/*` names.
 - **Custom providers dispatch the OpenAI wire only.** An `anthropic-compatible`
   node is accepted and named by `aroute doctor`, then refused at dispatch.
-  The same limit reaches registry providers whose OmniRoute entry points at an
-  Anthropic endpoint — `zenmux-free` (base URL `…/api/anthropic/v1/messages`)
-  serves the catalog but returns `upstream_unavailable` at dispatch, so any
-  combo whose targets are all Anthropic-wire cannot route until the
-  anthropic-messages executor lands.
+  Registry providers on the Anthropic wire dispatch. `zenmux-free` was switched
+  to it (docs/24 E5), but its auth has not been verified against a live key.
 - **The MCP control plane is stdio-only** and ships behind `--features mcp`.
 - **The registry snapshot lags OmniRoute's model rotation.** `aroute doctor` reports
   its age and warns past 7 days; `aroute import --from omniroute` regenerates it.
