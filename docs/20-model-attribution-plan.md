@@ -40,8 +40,8 @@ Every persisted/emitted surface names the *combo*, not the *target that won*:
 Operational consequence observed 2026-10-17: a multi-hour `provider=nvidia
 status=429` storm was unattributable; the only way to name the dead member was
 to replay the combo's targets directly against `integrate.api.nvidia.com`
-(glm-5.3: 429 on every call, ~0.9s; glm-5.3-flash: TTFT 99–124s vs
-`STREAM_START_TIMEOUT_CAP` 110s; step-5-preview: 1–11s TTFT).
+(glm-5.3: 429 on every call, ~0.9s; glm-5.3-flash: TTFT 99–124s vs `STREAM_START_TIMEOUT_CAP` 110s; step-5-preview: 1–11s TTFT)
+(Superseded 2026-10-19: glm-5.3-flash's TTFT reading was confirmed a probe artifact — malformed JSON body and too-short timeouts against build.nvidia.com — not the model. Re-probed live: correct answers at 7–12s on simple prompts, 51s on a design prompt; public-endpoint stream-start 59–66s, under the cap.)
 
 The serving model *is* present in the upstream echo (response body `model`,
 per-chunk SSE `model`), so attribution is possible in principle — aroute just
