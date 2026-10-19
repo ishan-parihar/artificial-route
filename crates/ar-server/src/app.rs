@@ -33,8 +33,8 @@ use axum::response::{IntoResponse, Response};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 
-use ar_route::{ArExec, LkgpPins, Resilience};
 use ar_registry::WireFormat;
+use ar_route::{ArExec, LkgpPins, Resilience};
 
 use crate::config::ServerConfig;
 use crate::keys::AuthGate;

@@ -607,7 +607,11 @@ mod tests {
             {"id":"bare-openai-row","object":"model"}
         ]}"#;
         let entry = parse_native_catalog("kilocode", body).unwrap();
-        let models: Vec<_> = entry.models.iter().map(|(id, m)| (id.to_string(), m.context_length)).collect();
+        let models: Vec<_> = entry
+            .models
+            .iter()
+            .map(|(id, m)| (id.to_string(), m.context_length))
+            .collect();
         assert_eq!(
             models,
             vec![
@@ -623,14 +627,20 @@ mod tests {
     /// spelling is what left every kilocode combo at the 128K floor.
     #[test]
     fn window_lookup_resolves_through_alias() {
-        let view: Catalog = [(Strng::from("kilo"), Discovered {
-            base_url: None,
-            env_hint: None,
-            models: vec![(Strng::from("poolside/laguna-s-2.1:free"), DiscoveredModel {
-                context_length: 262_144,
-                ..DiscoveredModel::default()
-            })],
-        })]
+        let view: Catalog = [(
+            Strng::from("kilo"),
+            Discovered {
+                base_url: None,
+                env_hint: None,
+                models: vec![(
+                    Strng::from("poolside/laguna-s-2.1:free"),
+                    DiscoveredModel {
+                        context_length: 262_144,
+                        ..DiscoveredModel::default()
+                    },
+                )],
+            },
+        )]
         .into_iter()
         .collect();
         assert_eq!(
