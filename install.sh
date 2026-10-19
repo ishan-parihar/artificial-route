@@ -660,12 +660,15 @@ server:
 keys:
   openai: $OPENAI_API_KEY
   anthropic: $ANTHROPIC_API_KEY
+  nvidia: $NVIDIA_API_KEY
 
 providers:
   - id: openai
     key: openai
   - id: anthropic
     key: anthropic
+  - id: nvidia
+    key: nvidia
 
 # A combo is a routable model name: providers alone are never addressable, so an
 # install without one leaves `aroute doctor` reporting "no model is routable" and
@@ -709,6 +712,7 @@ if [ ! -f "${ENV_FILE:-$HOME/.config/ar/ar.env}" ]; then
 # Uncomment and fill one line per key the config references.
 #OPENAI_API_KEY=sk-...
 #ANTHROPIC_API_KEY=sk-ant-...
+#NVIDIA_API_KEY=nvapi-...
 ENVEOF
   chmod 600 "$ENV_FILE"
   echo "env file:  wrote $ENV_FILE"
