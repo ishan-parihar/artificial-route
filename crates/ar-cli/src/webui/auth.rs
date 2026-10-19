@@ -71,7 +71,7 @@
 //! consulting it on every request. It is worth doing for `/v1` and the panel
 //! **together** — a panel-only fix would leave `/v1` with the same hole and
 //! would make the two surfaces disagree, which is worse than either being
-//! consistently incomplete. Recorded in `docs/28-gap-ledger.md` as **A8**.
+//! consistently incomplete. Recorded in `docs/28-gap-ledger.md` as **A7**.
 //!
 //! ## The refusal
 //!

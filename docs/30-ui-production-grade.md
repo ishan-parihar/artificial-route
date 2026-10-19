@@ -257,28 +257,49 @@ The three tests:
 | `probe.mjs` at 1440 / 1024 / 390, dark | **0 FAIL, 0 warn** on all ten views |
 | `contrast.py --css app.css` | **0 failing pairs** (light band) |
 | the dark band, hand-computed | **0 failing pairs** across 22 token pairs, including `--amber-ink` on both grounds |
-| the browser behaviour check, **unarmed** | **20/20 checks passed** |
-| the browser behaviour check, **armed** | **10/10 checks passed** |
+| the browser behaviour check, **unarmed** | **19/19 checks passed** (`scripts/ui/panel-check.mjs`) |
+| the browser behaviour check, **armed** | **10/10 checks passed** (`scripts/ui/panel-armed-check.mjs`) |
+| the pre-existing behaviour check | **13/13 checks passed** (`scripts/ui/behave.mjs`) |
 | `detect.sh` (anti-slop) | **24 passed, 0 failed** |
 
 That is **20 probe runs** (ten views x two bands x three widths), every one
 **0 FAIL and 0 warn**. The earlier runs carried a `type-scale` warn on every
 view and a `tap-target` warn on three; both are gone.
 
-The two behaviour checks drive a real Chromium against a scratch instance:
+The two behaviour checks drive a real Chromium against a scratch instance,
+and both are **in the repo** so the numbers above are reproducible:
 
-- **unarmed** (20 checks) — the panel renders, the ten panes load **their own
+```sh
+# an unarmed instance (a default install: no gate row)
+aroute --config <scratch>/config.yaml serve --port 20128
+node scripts/ui/panel-check.mjs http://127.0.0.1:20128
+
+# an armed instance
+aroute --config <scratch>/config.yaml keys arm-gate --key-id probe
+aroute --config <scratch>/config.yaml serve --port 20128
+TOKEN=$(aroute --config <scratch>/config.yaml keys mint --key-id probe \
+         | sed -n 's/^token: //p')
+node scripts/ui/panel-armed-check.mjs http://127.0.0.1:20128 "$TOKEN"
+```
+
+- **unarmed** (19 checks) — the panel renders, the ten panes load **their own
   data**, the settings view names the env-backed variables and marks them
-  "read at boot", the per-combo block is there, the budgets view does not
-  claim every key is unrestricted, a refused write leaves a **persistent**
-  message, clicking **Save server** actually posts (a dead button is
+  "read at boot", clicking **Save server** actually posts (a dead button is
   invisible to a probe — it renders, it is the right size, and clicking it
-  does nothing), a `?token=` is stripped from the URL and kept in
-  `sessionStorage` at **both** `/ui` and `/ui/`, an unarmed panel asks for no
-  credential, and there are **no console errors**.
+  does nothing), the per-combo block is there, the budgets view does not
+  claim every key is unrestricted, a refused write leaves a **persistent**
+  message, a `?token=` is stripped from the URL and kept in `sessionStorage`
+  at **both** `/ui` and `/ui/`, an unarmed panel asks for no credential, and
+  there are **no console errors**.
 - **armed** (10 checks) — the credential prompt appears, a wrong token is
   refused, the right one opens the panel, the `?token=` first paint works,
   the mint succeeds, and the state endpoint reports the gate armed.
+- **`scripts/ui/behave.mjs`** (13 checks, the pre-existing one) still passes:
+  the playground's multi-turn history, the failed send, mint-to-playground,
+  the favorites, and the request-log filters. Its log-filter check needs a
+  ledger with at least one **failed** row — an empty ledger shows the empty
+  state and there is nothing to filter, which is correct and is not a
+  failure of the panel.
 
 ### 5.1 The standing warns
 
@@ -311,7 +332,22 @@ From `docs/27` §5.3, restated because the pass re-litigated them:
 - **No per-key budget engine.** The `limits:` block is cumulative, and a
   rolling daily window is a different shape. `docs/15`'s non-goals name it.
 
-## 7. The traps that already exist (do not rediscover)
+## 7. What is still open, and where it is recorded
+
+Two gaps the pass found and deliberately did **not** close, both in
+`docs/28-gap-ledger.md`:
+
+- **A7 — a revoked token still authenticates.** `introspect` checks the
+  signature and the expiry and never consults the revoke list, and `/v1`'s
+  own `AuthGate::verify` does exactly the same. The panel matched the
+  server's existing behaviour rather than being stricter than it, and
+  fixing one surface alone would make the two disagree.
+- **A8 — the gate resolves at boot.** Arming the gate while the proxy is
+  running does not turn the panel's gate on. A gate that turns itself *off*
+  would be the dangerous direction, so this is a usability gap rather than
+  a security one.
+
+## 8. The traps that already exist (do not rediscover)
 
 From `docs/23` §0.1, plus this pass adds three:
 

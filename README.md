@@ -32,7 +32,7 @@ aroute serve      # loopback :20128
 curl -s localhost:20128/healthz && curl -s localhost:20128/v1/models
 ```
 
-Open **http://127.0.0.1:20128/ui/** for the control page: combos, providers, client keys and limits, a usage and failure log, and a playground. The installer prints this address (from your configured host and port) when it finishes.
+Open **http://127.0.0.1:20128/ui/** for the control page: routing combos, providers and client keys, the live resilience and provider-health state, per-key budgets, usage and a failure log, settings, and a playground. The installer prints this address (from your configured host and port) when it finishes.
 
 Full flag table, service details and `--uninstall` are further down under [Installation](#installation).
 
@@ -190,22 +190,28 @@ limits:
 
 ### Control page (/ui)
 
-`aroute serve` mounts a control page at `/ui/` on its own listener — same loopback bind as the proxy, nothing extra to run. It is a thin editor over `config.yaml`, `ar.env` and the usage ledger, so what it saves is what the proxy loads at its next start (a banner says when a restart is pending).
+`aroute serve` mounts a control page at `/ui` **on the proxy's own listener** — the same port and the same loopback bind as `/v1`, nothing extra to run. It is a thin editor over `config.yaml`, `ar.env` and the usage ledger, so what it saves is what the proxy loads at its next start (a banner says when a restart is pending).
 
 | pane | what it does |
 | --- | --- |
 | Dashboard | providers, combos and keys at a glance, total spend |
 | Combos | add, reorder, edit and delete routing chains |
 | Providers | paste a key (goes to `ar.env`, never shown again), add a registry or custom provider, browse the 276-provider catalog and star favorites (kept in the browser) |
+| Resilience | what is out of rotation right now and for how long: the per-provider breaker, the key cooldowns and the `provider:model` lockouts, read from the router's own table |
+| Health | whether each credential is present, readable and bound to a live session. A credential that will not decrypt reads as **broken**, which is a different fact from a missing one |
+| Budgets | what each key has spent against its `limits:` ceiling, and what each provider's own allowance says |
 | Client keys | mint a token (shown once; "Use in playground" hands it over in memory only) and set per-key `rpm`, dollar, token and `model` ceilings |
-| Usage | spend by day plus top models and providers over a 7/30/90-day range, and a request log filterable by model, provider and failed-only |
+| Usage | spend by day plus top models, providers and **combos** over a 7/30/90-day range, and a request log filterable by model, provider and failed-only |
+| Settings | the `server:` and `limits.default:` blocks of the YAML. The environment-backed values (model deadlines, discovery, auth mode) are shown with the variable that carries them, and are not editable there |
 | Playground | multi-turn chat with an optional system prompt through the real `/v1/chat/completions`, streaming |
 
 The request log shows answered requests from the usage ledger and failed ones from a separate `failures` table in the same SQLite file (last 10 000 kept). Failures are recorded from the build that added the table onward, authentication refusals (401/403) are not logged, and a stream that fails after it has already begun is not counted as a failure. The ledger's append-only usage rows are never touched, so spend sums and caps are unaffected.
 
-The page's behavior has a browser check, `scripts/ui/behave.mjs` (Playwright, 13 checks, run by hand against a demo `serve`; not in CI).
+The panel carries **its own gate**, separate from the one `/v1` uses, because it can mint the tokens that authorize `/v1` and rewrite the config that decides where `/v1` sends traffic. On a box whose gate is armed, every `/ui/api/*` call needs a bearer token; the page asks for one and keeps it in `sessionStorage` for the tab. A `?token=` on the first URL is accepted once and then stripped from the address bar. On a box with **no** gate, the panel is open on its loopback bind — that is the supported default — and refuses a cross-site request, so a page in another tab cannot spend through it. If the credential store's gate row cannot be decrypted, the panel still reads but **refuses every write**, because it cannot prove which credentials it is managing.
 
-Endpoints behind it, if you want to script them: `GET /ui/api/state|usage|log|models`, `POST /ui/api/combos|provider-key|provider-custom|provider-remove|keys/mint|limits`. Plans and outcomes: [docs/19](docs/19-ui-upgrade-plan.md), [docs/23](docs/23-ui-round-two-plan.md).
+The page's behavior has browser checks, `scripts/ui/behave.mjs` (the playground, mint, favorites and log filters) and `scripts/ui/panel-check.mjs` (every pane, the gate, and the settings save). Playwright, run by hand against a demo `serve`; not in CI.
+
+Endpoints behind it, if you want to script them: `GET /ui/api/state|usage|log|models|resilience|health|budgets`, `GET`+`POST /ui/api/settings`, `POST /ui/api/combos|provider-key|provider-custom|provider-remove|keys/mint|limits`. Plans and outcomes: [docs/19](docs/19-ui-upgrade-plan.md), [docs/23](docs/23-ui-round-two-plan.md), [docs/30](docs/30-ui-production-grade.md).
 
 ### Dashboard
 

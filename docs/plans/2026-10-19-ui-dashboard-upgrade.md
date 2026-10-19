@@ -109,7 +109,9 @@ also the operator's ruling.
 **The gates, as measured:** clippy clean; **2251** workspace tests green;
 **20** probe runs (ten views x two bands x three widths) at **0 FAIL, 0
 warn**; `contrast.py` 0 failing pairs; the anti-slop detector **24/24**; the
-browser behaviour checks **20/20** unarmed and **10/10** armed; CRAFT
+browser behaviour checks **19/19** unarmed and **10/10** armed (both scripts are
+in the repo, under `scripts/ui/`); the pre-existing `scripts/ui/behave.mjs`
+still passes **13/13**; CRAFT
 **18/20** with no item at 0.
 
 **U6 is not started** and stays out of scope until U0's ingress block is the
