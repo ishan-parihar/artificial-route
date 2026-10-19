@@ -157,12 +157,12 @@ several of them had gone stale (A1 said "v0.1.16 is the newest tag" when `v0.1.1
 tagged; B6 said "14 orphan pages" when the count is now 0). The old documents keep the
 **history** of their pass and point at the ledger; the ledger owns the **state**.
 
-<!-- genome:zone status sha=70415ace5f46 -->
+<!-- genome:zone status sha=ab8f1a44ed47 -->
 | status | items |
 |---|---|
 | open | 31 |
 | in-progress | 1 |
-| done | 8 |
+| done | 11 |
 
 - `UI-00` [open] **U0 — close the unauthenticated `/ui` write path** (AR-2 ingress 404 + AR-3 write handlers refuse o
 - `UI-01` [open] **U1 — gate `/ui` on the HTTP master** so the panel can be published deliberately (AR-1: bearer gate
