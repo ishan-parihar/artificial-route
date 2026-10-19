@@ -35,9 +35,13 @@ it gates the dashboard's future auth, but it is not a dashboard defect.
   `/ui`. Evidence: from the public internet, `POST /ui/api/provider-remove` → 409
   (validation ran), `POST /ui/api/limits` → 400 (validation ran), `POST /ui/api/combos`
   → `{"ok":true,"pending_restart":true}` and **the prod config file was rewritten**.
-  Impact: with the gate row readable, an unauthenticated caller can mint a client token
-  (the operator's provider keys, spendable), repoint every combo, and remove the spend
-  ceilings. Fix: `AR-1` (gate `/ui`) + `AR-2` (do not publish `/ui`).
+  **At 20:2x the exposure is complete, not potential:** `POST /ui/api/keys/mint` from the
+  internet returns **200 with a signed `execute:completions` token**, and that token
+  against `GET /v1/models` → 200, `GET /metrics` → 200, and
+  `POST /v1/chat/completions` → **200 with a real completion served by the operator's
+  provider keys**. Impact: an anonymous caller on the internet can mint a token that
+  spends the operator's provider keys, repoint every combo, and remove the spend
+  ceilings. Fix: `AR-1` (gate `/ui`) + `AR-2` (do not publish `/ui` — **staged**, see F12).
 
 - **[verified] F2 — `loopback_only` refuses exactly the requests a browser makes from the
   public URL.** The rule refuses a request whose `Host` **or** `Origin` names a non-loopback
@@ -120,6 +124,32 @@ it gates the dashboard's future auth, but it is not a dashboard defect.
   service was verified healthy: `healthz` 200, unit `active`, 20 combos, 266 providers,
   `pending_restart: false`). The probe row added later was removed and the file returned
   to its pre-probe 26 888 bytes. **Prod carries no residue from this audit.**
+
+- **[verified] F12 — the `mint` refusal was an accident that ended at 20:07:58.** Between
+  19:50 and 20:07 `POST /ui/api/keys/mint` answered `409 "the gate is not armed"` — because
+  the gate row in `~/.config/ar/credentials.db` could not be decrypted with the current
+  `$AR_MASTER_KEY` (F3), **not** because of any access control. At 20:07:58 a parallel
+  session re-armed the gate (the store file's mtime is that minute; the row is now a
+  readable `enc:v2` envelope and `keys mint` succeeds against **both** stores), and the
+  endpoint went to **200**. The exposure window therefore opened at 20:07:58, not at the
+  tunnel's publication. **Consequence for the operator: every token minted since
+  20:07:58 is valid, and the master must be rotated** — including the audit's own probe
+  tokens (`audit-probe`, `audit-verify`, `audit-verify-2`, `blast-radius-test`,
+  `timing-probe-1..3`, `verify-home-store`, `verify-cfg-store`, `verify-cfg-store-2`),
+  all of which carry `execute:completions`.
+
+- **[verified] F13 — the `AR-2` mitigation is staged and awaits one privileged command.**
+  The cloudflared ingress on the VPS now carries a path rule that 404s `/ui` before it
+  reaches the proxy (`path: ^/ui(/.*)?$`), validated with `cloudflared tunnel ingress
+  validate` (OK) and matched with `ingress rule` (`/ui/api/state` → rule #3 = 404;
+  `/v1/chat/completions` and `/healthz` → rule #4 = the proxy). The file is user-owned so
+  the edit needed no privilege; the running cloudflared is a **root** system unit, so the
+  new rules are not live until `sudo systemctl restart cloudflared`. Three reload routes
+  were tried and failed: `kill -HUP` → `Operation not permitted`; `PUT` on the tunnel's
+  own config API (`127.0.0.1:20241/config`) → **200 and a no-op** (the runtime rules were
+  re-read and were unchanged, and the tunnel's health was re-verified after: `/ready` →
+  200 with 4 ready connections, all four hostnames still answering); a second connector or
+  a user-level unit → both need root. **Until the restart, the public `/ui` is open.**
 
 - **[asserted] F11 — the OmniRoute contrast, by capability.** OmniRoute is a superset
   (124 routes, 750 API handlers); `/ui` is one router, three embedded assets, 3 499 lines.

@@ -109,7 +109,7 @@ Every one of these was executed against the live VPS and returned success:
 
 | Endpoint | Unauthenticated call | Result |
 |---|---|---|
-| `POST /ui/api/keys/mint` | `{"key_id":"audit-probe-20261019"}` | `409 "the gate is not armed"` — **refused, but only because the store row is unreadable (see §3), not because of any auth** |
+| `POST /ui/api/keys/mint` | `{"key_id":"audit-probe-20261019"}` | **409 at 20:0x → 200 at 20:2x.** The refusal was an *accident* (§2.4a), and it stopped. The endpoint now **mints working tokens**. |
 | `POST /ui/api/provider-remove` | `{"id":"no-such-provider"}` | `409` (validation) — **the handler ran** |
 | `POST /ui/api/limits` | `{"key":"x","rpm":999999}` | `400` (validation) — **the handler ran** |
 | `POST /ui/api/combos` | the config's own combo list, read back from `GET /ui/api/state` | **`{"ok":true,"pending_restart":true}` — the prod config file was rewritten** |
@@ -154,16 +154,87 @@ from any host on the internet, with no credential.
 
 ### 2.4 The reason it is not already catastrophic
 
-Two things currently stand between the internet and the write handlers, and neither is a
-control:
+One thing stood between the internet and the write handlers, and it was not a control:
 
-1. **`loopback_only` refuses a browser's cross-origin `fetch()`.** A drive-by page on another
-   origin cannot call `/ui` — but only because its request carries an `Origin`. A direct
-   `curl`/script sends no `Origin` and is admitted (§2.2). The check is a rebinding
-   defence, and it is being used as an access control it never was.
-2. **The gate master row is currently unreadable** (§3), so `mint` refuses. This is an
-   accident, not a design: the moment the operator re-arms the gate correctly, mint becomes
-   reachable and the door is open.
+**`loopback_only` refuses a browser's cross-origin `fetch()`.** A drive-by page on another
+origin cannot call `/ui` — but only because its request carries an `Origin`. A direct
+`curl`/script sends no `Origin` and is admitted (§2.2). The check is a rebinding
+defence, and it is being used as an access control it never was.
+
+### 2.4a The accident that ended, and what it exposed (2026-10-19, 20:07:58)
+
+Between 19:50 and 20:07 the `mint` endpoint was *incidentally* closed: the gate row in
+`~/.config/ar/credentials.db` could not be decrypted with the current `$AR_MASTER_KEY`
+(§3), so `gate_master` returned `None` and the handler answered `409 "the gate is not
+armed"`. That was luck, not a control — and it ended at **20:07:58**, when a parallel
+session re-armed the gate (the store file's mtime is that minute; the row is now a
+readable `enc:v2` envelope, and `keys mint` succeeds against both stores).
+
+The window that had been closed is now open, and it is open *completely*:
+
+| check | result at 20:2x |
+|---|---|
+| `POST /ui/api/keys/mint` from the internet, no credential | **200** — a signed token with `execute:completions` |
+| that token against `GET /v1/models` | **200** |
+| that token against `GET /metrics` | **200** |
+| that token against `POST /v1/chat/completions` (`small-stack`) | **200** — a real completion, served by the operator's provider keys |
+
+So the exposure is now the full one, not a hypothetical: **an anonymous caller on the
+internet can mint a token that spends the operator's provider keys, repoint every combo,
+and remove the spend ceilings.**
+
+**Mitigation staged at 20:23** (no deploy, no root needed for the edit): the cloudflared
+ingress config on the VPS now blocks the panel's path before it reaches the proxy —
+
+```yaml
+  - hostname: aroute.ishanparihar.com
+    path: ^/ui(/.*)?$
+    service: http_status:404
+  - hostname: aroute.ishanparihar.com
+    service: http://127.0.0.1:20128
+```
+
+`cloudflared tunnel ingress validate` → OK; `ingress rule` confirms `/ui/api/state` →
+rule #3 (404) and `/v1/chat/completions` and `/healthz` → rule #4 (the proxy). The file is
+user-owned, so the edit needed no privilege; the **running** cloudflared process is a
+root system unit, so it still serves the old rules until it is restarted. **That restart is
+the operator's one command:**
+
+```
+sudo systemctl restart cloudflared
+```
+
+Backup of the previous config: `~/.cloudflared/hermes-config.yml.bak-pre-ui-block-20261019`.
+**Until that restart runs, the public `/ui` is still open.**
+
+**What was tried and did not work** (so nobody repeats it):
+
+- `kill -HUP <cloudflared>` → `Operation not permitted` (the process is root's).
+- `PUT http://127.0.0.1:20241/config` (the tunnel's own config API) → **200, and a
+  no-op**: the runtime rules were re-read and were unchanged. The endpoint accepts the
+  request and does not apply it. The tunnel's health was re-verified afterwards
+  (`/ready` → 200, 4 ready connections; all four hostnames still answering).
+- A second connector on the same tunnel, a user-level cloudflared unit, a systemd
+  drop-in → all need root, and a second connector on the same tunnel would fight the
+  running one.
+
+So the tunnel reload is the one privileged step, and it is the operator's.
+
+**After the restart, rotate the gate master.** Any token minted during the exposure
+window (the audit's own `audit-probe`, `audit-verify-2`, `blast-radius-test`,
+`timing-probe-1..3`, `verify-home-store`, `verify-cfg-store`, `verify-cfg-store-2`, and
+`audit-verify` — all `execute:completions`, all minted from the live master) is valid
+until the master changes. `aroute keys arm-gate --key-id <id> --key "$AR_HTTP_MASTER_KEY"`
+does not rotate the master; a **new** master must be written, and every consumer
+(`scripts/gate-token.sh push`) re-pointed.
+
+**After the restart, rotate the gate master.** Any token minted during the exposure
+window (the audit's own `audit-probe`, `audit-verify-2`, `blast-radius-test`,
+`timing-probe-1..3`, `verify-home-store`, `verify-cfg-store`, `verify-cfg-store-2`, and
+`audit-verify` — all `execute:completions`, all minted from the live master) is valid
+until the master changes. `aroute keys arm-gate --key-id <id> --key "$AR_HTTP_MASTER_KEY"`
+does not rotate the master; a **new** master must be written, and every consumer
+(`scripts/gate-token.sh push`) re-pointed.
 
 ### 2.5 The fix
 
@@ -201,6 +272,9 @@ The `/ui` group must carry a credential check of its own, and the check must be 
 **Recommended order: `AR-2` now (config only, no deploy), `AR-1` next (a release), `AR-3`
 with it.** `AR-2` alone closes the internet-facing hole; `AR-1` makes the panel safe to
 publish deliberately.
+
+**Status: `AR-2`'s config change is applied on the VPS (2026-10-19 20:23) and awaits the
+operator's `sudo systemctl restart cloudflared`. `AR-1` and `AR-3` are not implemented.**
 
 ---
 
