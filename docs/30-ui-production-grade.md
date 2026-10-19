@@ -303,7 +303,7 @@ node scripts/ui/panel-armed-check.mjs http://127.0.0.1:20128 "$TOKEN"
 
 ### 5.1 The standing warns
 
-**There are none.** Every probe run reports `0 FAIL, 0 warn`. The three that
+**There are none.** Every probe run reports `0 FAIL, 0 warn`. The four that
 used to stand are closed:
 
 | the warn that used to stand | how it was closed |
