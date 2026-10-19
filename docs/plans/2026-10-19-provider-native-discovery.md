@@ -1,10 +1,6 @@
 # Provider-native model discovery (priority over models.dev)
 
-Operator ruling (2026-10-19): /v1/models context windows must come from the
-providers themselves first, models.dev second, the 128K floor last. Today the
-discovery overlay fetches models.dev only, so kilocode-routed models (laguna,
-beam-free, nemotron-3.5-super-vl) sit at the floor although kilocode's own
-catalog publishes real windows.
+Status: **implemented + deployed 2026-10-19** (commit `cc264ae`). Operator ruling: /v1/models windows must come from the providers themselves first, models.dev second, the 128K floor last.
 
 ## Evidence (probed live 2026-10-19)
 
@@ -46,10 +42,8 @@ models.dev fills gaps, config/floor unchanged):
 - Anthropic/Gemini-shaped native catalogs (no routed provider uses them).
 - Caching native responses to disk (in-memory SWR only, same as models.dev).
 
-## Acceptance
+## Acceptance — verified live on the VPS (2026-10-19)
 
-- `beam-free`, `nemotron-3.5-super-vl`, `laguna-s-2-1` cards report their
-  kilocode-published windows instead of 128000.
-- `glm-5.3-flash` / `step-5-preview` / `deepseek-v4-1-flash` unchanged
-  (1M / 1048576 / 1M) — models.dev leg still works.
-- models.dev outage does not clear windows previously published.
+- `beam-free` 128000 → **1048576**, `nemotron-3.5-super-vl` 128000 → **1000000**, `laguna-s-2-1` 128000 → **262144** — all from kilocode's native catalog.
+- `glm-5.3-flash` / `step-5-preview` / `deepseek-v4-1-flash` unchanged (1M / 1048576 / 1M via models.dev — nvidia's native `/v1/models` is a bare list, so models.dev remains the correct source there).
+- Implementation notes beyond the design: the alias fix became a catalog-scoped model-match fallback in `published_window` (models.dev's `kilo` key is found by asking which view entry names the model, not by alias tables — providerMeta aliases were the wrong source); native fetches ride the provider row's first credential and are skipped for OAuth/custom-wire rows; failures log at debug and never clear published windows.
