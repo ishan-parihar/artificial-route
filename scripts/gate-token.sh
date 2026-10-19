@@ -15,17 +15,24 @@
 #   opencode  ~/.config/opencode/opencode.json   {file:<canonical>}  — read at request time
 #   omp       ~/.omp/agent/models.yml             apiKey: <jwt>      — inline, regenerated here
 #   jcode     ~/.jcode/provider-omniroute.env     OMNIROUTE_API_KEY=<jwt> — inline, regenerated here
+#   claude    ~/.claude/settings.json             env.ANTHROPIC_AUTH_TOKEN=<jwt> — inline
 #
-# Why some are inline: opencode interpolates a file into its config, but omp
-# and jcode take a literal value. Rather than teach two harnesses a new
-# syntax, this script owns the two derived copies. A consumer that supports
+# Why some are inline: opencode interpolates a file into its config, but omp,
+# jcode and claude take a literal value. Rather than teach three harnesses a
+# new syntax, this script owns the derived copies. A consumer that supports
 # `{file:…}` should use the canonical path instead of a generated copy.
+#
+# Claude Code reads ANTHROPIC_AUTH_TOKEN from settings.json `env`, but it has
+# no `{file:…}` form — the value is taken literally. A stale copy there makes
+# every session 401 with "this token is not valid", which reads as a gateway
+# fault rather than a credential drift, so it is managed here too.
 set -euo pipefail
 
 CANONICAL="${AR_GATE_TOKEN_FILE:-$HOME/.config/ar/racknerd-gate-token.jwt}"
 OPENCODE_JSON="${AR_OPENCODE_JSON:-$HOME/.config/opencode/opencode.json}"
 OMP_MODELS="${AR_OMP_MODELS:-$HOME/.omp/agent/models.yml}"
 JCODE_ENV="${AR_JCODE_ENV:-$HOME/.jcode/provider-omniroute.env}"
+CLAUDE_SETTINGS="${AR_CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
 AROUTE_BIN="${AROUTE_BIN:-$HOME/.local/bin/aroute}"
 KEY_ID="${AR_GATE_KEY_ID:-racknerd-harness}"
 
@@ -75,13 +82,43 @@ PY
     printf 'OMNIROUTE_API_KEY=%s\n' "$token" > "$JCODE_ENV"
     chmod 600 "$JCODE_ENV"
   fi
+
+  if [ -f "$CLAUDE_SETTINGS" ]; then
+    python3 - "$CLAUDE_SETTINGS" "$token" <<'PY'
+import json, sys
+path, token = sys.argv[1], sys.argv[2]
+with open(path) as fh:
+    cfg = json.load(fh)
+env = cfg.setdefault("env", {})
+# Only touch a settings file that is actually pointed at this gateway: a
+# Claude Code install talking to first-party Anthropic has no auth token here
+# and must not be given one.
+if env.get("ANTHROPIC_BASE_URL"):
+    env["ANTHROPIC_AUTH_TOKEN"] = token
+    with open(path, "w") as fh:
+        json.dump(cfg, fh, indent=2)
+        fh.write("\n")
+    os_mode = 0o600
+    import os
+    os.chmod(path, os_mode)
+PY
+  fi
 }
 
 case "${1:-}" in
   mint)
-    [ -x "$AROUTE_BIN" ] || die "no aroute binary at $AROUTE_BIN (set AROUTE_BIN)"
-    token="$("$AROUTE_BIN" keys mint --key-id "$KEY_ID" --ttl-days 0 | awk '/^token: /{print $2}')"
-    [ -n "$token" ] || die "mint produced no token"
+    # The workstation holds no gate master (its ar.env has none), so a local
+    # `aroute keys mint` cannot sign and dies with "mint produced no token".
+    # The VPS holds the master and the credential store, so mint THERE and
+    # bring the token home. Set AR_GATE_MINT_SSH to override the host.
+    mint_ssh="${AR_GATE_MINT_SSH:-racknerd}"
+    if [ -x "$AROUTE_BIN" ] && "$AROUTE_BIN" keys mint --key-id "$KEY_ID" --ttl-days 0 2>/dev/null | grep -q '^token: '; then
+      token="$("$AROUTE_BIN" keys mint --key-id "$KEY_ID" --ttl-days 0 | awk '/^token: /{print $2}')"
+      [ -n "$token" ] || die "mint produced no token"
+    else
+      token="$(ssh "$mint_ssh" 'export AR_MASTER_KEY=$(grep -E "^AR_MASTER_KEY=" ~/.config/ar/ar.env | cut -d= -f2); export AR_HTTP_MASTER_KEY=$(grep -E "^AR_HTTP_MASTER_KEY=" ~/.config/ar/ar.env | cut -d= -f2); ~/.local/bin/aroute --config ~/.config/ar/config.yaml keys mint --key-id '"$KEY_ID"' --ttl-days 0' 2>/dev/null | awk '/^token: /{print $2}')"
+      [ -n "$token" ] || die "mint produced no token (local mint failed and the VPS mint over $mint_ssh failed too)"
+    fi
     push "$token"
     printf 'gate-token: minted %s (%s) and pushed to every consumer\n' "$KEY_ID" "$CANONICAL"
     ;;
@@ -94,7 +131,7 @@ case "${1:-}" in
     [ -f "$CANONICAL" ] || die "no canonical token file at $CANONICAL"
     token="$(cat "$CANONICAL")"
     printf 'canonical : %s (%s bytes)\n' "$CANONICAL" "${#token}"
-    for f in "$OPENCODE_JSON" "$OMP_MODELS" "$JCODE_ENV"; do
+    for f in "$OPENCODE_JSON" "$OMP_MODELS" "$JCODE_ENV" "$CLAUDE_SETTINGS"; do
       if [ ! -f "$f" ]; then printf '  %-44s (absent)\n' "$f"; continue; fi
       if grep -qF "$token" "$f"; then
         printf '  %-44s ok\n' "$f"
@@ -117,6 +154,7 @@ case "${1:-}" in
     printf 'opencode  : %s\n' "$OPENCODE_JSON"
     printf 'omp       : %s\n' "$OMP_MODELS"
     printf 'jcode     : %s\n' "$JCODE_ENV"
+  printf 'claude    : %s\n' "$CLAUDE_SETTINGS"
     printf 'key id    : %s\n' "$KEY_ID"
     ;;
   *)
