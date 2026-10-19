@@ -17,7 +17,8 @@ The command reads `install.sh` from `main`, so the installer is always the newes
 It does **not** add the weekly update timer when piped. The timer runs a saved copy of the installer, and a piped `curl | bash` has no file to copy — `$0` is `bash`. For unattended updates, save it first:
 
 ```sh
-curl -fsSL -o install.sh https://raw.githubusercontent.com/ishan-parihar/artificial-route/main/install.sh bash install.sh
+curl -fsSL -o install.sh https://raw.githubusercontent.com/ishan-parihar/artificial-route/main/install.sh
+bash install.sh
 ```
 
 The default install is **lite**: the rust binary only. The web dashboard — ~2 GiB of compiled Next.js built locally by `dashboard/rebrand-dist.sh`, too large to ship as a release asset — installs from that local tree with `--with-dashboard`; every flag is in the table under [Installation](#installation).
@@ -26,7 +27,9 @@ Then:
 
 ```sh
 export OPENAI_API_KEY=sk-... ANTHROPIC_API_KEY=sk-ant-...
-aroute doctor     # per-check report, never prints secret values aroute serve      # loopback :20128 curl -s localhost:20128/healthz && curl -s localhost:20128/v1/models
+aroute doctor     # per-check report, never prints secret values
+aroute serve      # loopback :20128
+curl -s localhost:20128/healthz && curl -s localhost:20128/v1/models
 ```
 
 Open **http://127.0.0.1:20128/ui/** for the control page: combos, providers, client keys and limits, a usage and failure log, and a playground. The installer prints this address (from your configured host and port) when it finishes.
@@ -94,7 +97,10 @@ Keys can also live encrypted at rest in a gitignored `credentials.db` beside the
 ## Configuration
 
 ```yaml
-server: { host: 127.0.0.1, port: 20128 } keys: { openai: $OPENAI_API_KEY }          # env refs, never values providers: [{ id: openai, key: openai }]   # id must be in the registry combos:                                    # clients request the combo id as `model`
+server: { host: 127.0.0.1, port: 20128 }
+keys: { openai: $OPENAI_API_KEY }          # env refs, never values
+providers: [{ id: openai, key: openai }]   # id must be in the registry
+combos:                                    # clients request the combo id as `model`
   - { id: cheap, strategy: cost-optimized, targets: [openai/gpt-5.4-nano] }
 ```
 
@@ -116,8 +122,13 @@ To adopt an OmniRoute provider tree wholesale, `aroute import --from omniroute -
 in this repo is a hand-written template and is **stale** — it describes an OmniRoute state that no longer exists on disk.) An OAuth session adds one block. The **access** token is the provider's existing `keys:` entry, the **refresh** token is a second credential row, and the block carries no secret, so a committed `config.yaml` cannot leak one through it.
 
 ```yaml
-providers: [{ id: codex, key: codex }] keys:      { codex: $CODEX_ACCESS, codex_refresh: $CODEX_REFRESH } oauth:
-  - provider: codex refresh_key: codex_refresh token_url: https://auth.openai.com/oauth/token   # required; never guessed client_id: <your public OAuth client id>
+providers: [{ id: codex, key: codex }]
+keys:      { codex: $CODEX_ACCESS, codex_refresh: $CODEX_REFRESH }
+oauth:
+  - provider: codex
+    refresh_key: codex_refresh
+    token_url: https://auth.openai.com/oauth/token   # required; never guessed
+    client_id: <your public OAuth client id>
 ```
 
 `token_url` is mandatory and deliberately not hardcoded: an auth endpoint inferred from a provider id would be an invented wire format. Without it the session still dispatches, and `aroute doctor` says its first 401 will be terminal.
@@ -126,7 +137,8 @@ An endpoint the registry lacks is declared in the same file, no rebuild, and `id
 
 ```yaml
 custom_providers:
-  - { id: my-gateway, protocol: openai-compatible, base_url: https://gateway.internal.example/v1, key_ref: my_gateway }
+  - { id: my-gateway, protocol: openai-compatible,
+      base_url: https://gateway.internal.example/v1, key_ref: my_gateway }
 ```
 
 `protocol` is `openai-compatible` or `anthropic-compatible`; only the OpenAI wire dispatches today, and `headers:` adds outbound headers for a gateway that wants something other than a bearer token. `aroute doctor` checks the base URL shape, the credential binding, and refuses an `id` that collides with a compiled-in one.
@@ -135,9 +147,16 @@ An optional `endpoint:` overrides where dispatches POST — an absolute path joi
 
 ```yaml
 custom_providers:
-  - { id: or-decisions, protocol: openai-compatible, base_url: https://openrouter.ai, endpoint: /api/alpha/decisions, key_ref: openrouter, headers: { HTTP-Referer: https://your.site, X-Title: aroute } } - { id: exp-systemone, protocol: openai-compatible,
-      base_url: https://api.experientiallabs.ai, endpoint: /v1/systemone, key_ref: experiential } combos:
-  - { id: decide, strategy: priority, targets: [or-decisions/respan/span-01-lite:free, or-decisions/inception/mercury-decide:free] }
+  - { id: or-decisions, protocol: openai-compatible,
+      base_url: https://openrouter.ai, endpoint: /api/alpha/decisions,
+      key_ref: openrouter, headers: { HTTP-Referer: https://your.site, X-Title: aroute } }
+  - { id: exp-systemone, protocol: openai-compatible,
+      base_url: https://api.experientiallabs.ai, endpoint: /v1/systemone,
+      key_ref: experiential }
+
+combos:
+  - { id: decide, strategy: priority,
+      targets: [or-decisions/respan/span-01-lite:free, or-decisions/inception/mercury-decide:free] }
 ```
 
 > [!WARNING] > `aroute doctor` and `aroute serve` share one target grammar: a config one accepts, the other accepts. If `serve` refuses a file, `doctor` says why.
@@ -152,7 +171,8 @@ The `limits:` block is the policy layer, and it is opt-in: a config that never m
 
 ```yaml
 limits:
-  default: { rpm: 60 } keys:
+  default: { rpm: 60 }
+  keys:
     prod-deploy: { rpm: 600, usd_micros: 5_000_000, tokens: 20_000_000 }
 ```
 
@@ -198,7 +218,10 @@ The dist ships **without the ONNX model-inference stack**: `onnxruntime-node` (2
 When the dashboard *is* installed it comes up as its own unit, **stopped by default** — `--with-dashboard` writes the unit, starts nothing:
 
 ```sh
-systemctl --user start aroute-dashboard   # UI up; the Node child holds ~700 MB RSS systemctl --user stop  aroute-dashboard   # RSS reclaimed, port 20149 freed systemctl --user enable aroute-dashboard  # optional: bring it up at boot instead bash install.sh --check                    # reports dashboard + dashsvc state
+systemctl --user start aroute-dashboard   # UI up; the Node child holds ~700 MB RSS
+systemctl --user stop  aroute-dashboard   # RSS reclaimed, port 20149 freed
+systemctl --user enable aroute-dashboard  # optional: bring it up at boot instead
+bash install.sh --check                    # reports dashboard + dashsvc state
 ```
 
 The proxy has never needed the dashboard: `serve` reads config and env only, so on a memory-tight box the UI is a deliberate, reversible choice. An update while the unit is running stops it for the binary swap and restarts it on the new build (`dashsvc: restarted on aroute <version>`), so unattended updates never leave a stale dashboard or a half-swapped binary.
@@ -219,7 +242,8 @@ Each crate under `crates/` has a README with its purpose, configuration, extensi
 Read `AGENTS.md`, then:
 
 ```sh
-cargo test --release cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --release
+cargo clippy --all-targets --all-features --locked -- -D warnings
 ```
 
 Both green, minimal diffs, no `unwrap` outside tests. See [CONTRIBUTING.md](CONTRIBUTING.md).
