@@ -1,10 +1,8 @@
 # Artificial Route
 
-**One OpenAI-compatible endpoint over 276 providers — a static binary that idles at ~28 MiB serving the full catalog.**
+**One OpenAI-compatible endpoint over 276 providers — a static binary that idles at ~28 MiB serving the full catalog.** [![release](https://img.shields.io/github/v/release/ishan-parihar/artificial-route)](https://github.com/ishan-parihar/artificial-route/releases) [![license](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE) [![musl](https://img.shields.io/badge/binary-static--musl-lightgrey)](https://github.com/ishan-parihar/artificial-route/releases) ![tests](https://img.shields.io/badge/tests-2021_passing-brightgreen) A minimal-RAM Rust port of the [OmniRoute](https://github.com/ishan-parihar/OmniRoute) gateway core: same combos, strategies and dialects, none of the desktop. File YAML in, SSE out — no runtime dependencies. A small built-in control page at [`/ui`](#control-page-ui) edits the same YAML; the full OmniRoute dashboard is an optional extra.
 
-[![release](https://img.shields.io/github/v/release/ishan-parihar/artificial-route)](https://github.com/ishan-parihar/artificial-route/releases) [![license](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE) [![musl](https://img.shields.io/badge/binary-static--musl-lightgrey)](https://github.com/ishan-parihar/artificial-route/releases) ![tests](https://img.shields.io/badge/tests-2021_passing-brightgreen)
-
-A minimal-RAM Rust port of the [OmniRoute](https://github.com/ishan-parihar/OmniRoute) gateway core: same combos, strategies and dialects, none of the desktop. File YAML in, SSE out — no runtime dependencies. A small built-in control page at [`/ui`](#control-page-ui) edits the same YAML; the full OmniRoute dashboard is an optional extra.
+Every document in `docs/` is listed with the question it answers in [docs/PAGE-INDEX.md](docs/PAGE-INDEX.md).
 
 ## Install
 
@@ -19,8 +17,7 @@ The command reads `install.sh` from `main`, so the installer is always the newes
 It does **not** add the weekly update timer when piped. The timer runs a saved copy of the installer, and a piped `curl | bash` has no file to copy — `$0` is `bash`. For unattended updates, save it first:
 
 ```sh
-curl -fsSL -o install.sh https://raw.githubusercontent.com/ishan-parihar/artificial-route/main/install.sh
-bash install.sh
+curl -fsSL -o install.sh https://raw.githubusercontent.com/ishan-parihar/artificial-route/main/install.sh bash install.sh
 ```
 
 The default install is **lite**: the rust binary only. The web dashboard — ~2 GiB of compiled Next.js built locally by `dashboard/rebrand-dist.sh`, too large to ship as a release asset — installs from that local tree with `--with-dashboard`; every flag is in the table under [Installation](#installation).
@@ -29,33 +26,21 @@ Then:
 
 ```sh
 export OPENAI_API_KEY=sk-... ANTHROPIC_API_KEY=sk-ant-...
-aroute doctor     # per-check report, never prints secret values
-aroute serve      # loopback :20128
-curl -s localhost:20128/healthz && curl -s localhost:20128/v1/models
+aroute doctor     # per-check report, never prints secret values aroute serve      # loopback :20128 curl -s localhost:20128/healthz && curl -s localhost:20128/v1/models
 ```
 
 Open **http://127.0.0.1:20128/ui/** for the control page: combos, providers, client keys and limits, a usage and failure log, and a playground. The installer prints this address (from your configured host and port) when it finishes.
 
-Full flag table, service details and `--uninstall` are further down under
-[Installation](#installation).
+Full flag table, service details and `--uninstall` are further down under [Installation](#installation).
 
 ## Features
 
-- **21 routing strategies + `auto/*`** — priority, least-used, quota-weighted/fair, cost-optimized, expiry-first, reset-aware, fusion, pipeline… with `simulate`/`explain` in the library. A combo's `strategy:` reaches the pick since 0.1.12 — it was silently shadowed by the global default before. Bare `auto` maps to `least-used`; the 8-variant auto factory engages for literal `auto/*` names
-- **276 providers, 1559 models** compiled in — the same provider set as OmniRoute's registry, regenerated from it by `aroute import --from omniroute`
-- **6 wire dialects** — OpenAI, Anthropic, OpenAI-Responses, Gemini, Ollama inbound, OpenAI render; 18 further pairs named loudly instead of half-ported
-- **3 compression engines** (lite, rtk, caveman) with honor-and-echo semantics, per-combo in `config.yaml` and per-request via header, on an intensity dial (`rtk` minimal/standard/aggressive, `caveman` lite/full/ultra) rather than a dozen half-wired engine ids
-- **OAuth dispatch** — codex, cline, claude, gemini-cli, cursor and grok-cli: token injection, refresh on expiry, one rotation retry on 401, per-connection single-flight so a concurrent burst cannot trip `refresh_token_reused`. Two login mechanisms, both with every endpoint operator-supplied: PKCE browser redirect, and RFC 8628 **device flow** for providers that publish no redirect endpoint
-- **One terminal-status list** — 6 `(status, reason)` rows plus 1 carve-out-only row, generated into the store's CHECK clause; Cursor's `expired` and Claude's transient `invalid_grant` are carve-outs toward retry, grok-cli's `invalid_client` is a carve-out toward terminal, and a transient can never retire an account — the one remaining intentional divergence from OmniRoute's taxonomy is first-sighting timing on `(401, token_revoked)`: we retire it on the first sighting, OmniRoute on the third attempt
-- **Quota-aware failover** — per-key backoff, `Retry-After` wins, throttle anywhere outranks later transport failure. When every target in the chain is cooling before dispatch, the answer is a `429` with the soonest recovery window in `Retry-After` — never a bare 503 a client would read as "gateway broken" and retry into the same cooling chain. Since 0.1.13 the verdict also reads the body: a non-streaming 2xx that carries an `error` object fails over with its code instead of reaching the client as a 200, a fully auth-locked key set is refused without paying the round trip, and the Cline gateway's `{"success":…,"data":…}` reply skin is stripped (its usage is counted) rather than relayed
-- **Policy & gate** — a `limits:` block (per-key rpm + cumulative dollar/token ceilings + `refuse_unpriced`) enforced at the edge: `429` with `Retry-After` before any body work, `402` with the denying arm in `x-ar-deny-reason` before dispatch, spend checked against the same usage ledger the response path records into; a bearer gate armed by `aroute keys arm-gate` (master in the encrypted store, 30-day signed client tokens, `keys mint` for more, `aroute doctor` reports armed/unarmed); `aroute limits` views and edits the block, and `aroute sync` carries the dashboard's per-key rpm into it
-- **Built-in control page** — `/ui` on the proxy's own port: edit combos, providers and per-key limits, mint client keys, read the usage and failure log by date range, and try a combo in a playground. Vanilla JS embedded in the binary, no build step, no extra process ([details](#control-page-ui))
-- **Agent-native CLI** — TOON output, `--fields` narrowing, stdout data / stderr diagnostics, exit 0/1/2, fail-loud flags
-- **Hot-reload config** — `config.yaml` watched live; secrets stay in `$VAR`, never in the file
+- **21 routing strategies + `auto/*`** — priority, least-used, quota-weighted/fair, cost-optimized, expiry-first, reset-aware, fusion, pipeline… with `simulate`/`explain` in the library. A combo's `strategy:` reaches the pick since 0.1.12 — it was silently shadowed by the global default before. Bare `auto` maps to `least-used`; the 8-variant auto factory engages for literal `auto/*` names - **276 providers, 1559 models** compiled in — the same provider set as OmniRoute's registry, regenerated from it by `aroute import --from omniroute` - **6 wire dialects** — OpenAI, Anthropic, OpenAI-Responses, Gemini, Ollama inbound, OpenAI render; 18 further pairs named loudly instead of half-ported - **3 compression engines** (lite, rtk, caveman) with honor-and-echo semantics, per-combo in `config.yaml` and per-request via header, on an intensity dial (`rtk` minimal/standard/aggressive, `caveman` lite/full/ultra) rather than a dozen half-wired engine ids
+- **OAuth dispatch** — codex, cline, claude, gemini-cli, cursor and grok-cli: token injection, refresh on expiry, one rotation retry on 401, per-connection single-flight so a concurrent burst cannot trip `refresh_token_reused`. Two login mechanisms, both with every endpoint operator-supplied: PKCE browser redirect, and RFC 8628 **device flow** for providers that publish no redirect endpoint - **One terminal-status list** — 6 `(status, reason)` rows plus 1 carve-out-only row, generated into the store's CHECK clause; Cursor's `expired` and Claude's transient `invalid_grant` are carve-outs toward retry, grok-cli's `invalid_client` is a carve-out toward terminal, and a transient can never retire an account — the one remaining intentional divergence from OmniRoute's taxonomy is first-sighting timing on `(401, token_revoked)`: we retire it on the first sighting, OmniRoute on the third attempt - **Quota-aware failover** — per-key backoff, `Retry-After` wins, throttle anywhere outranks later transport failure. When every target in the chain is cooling before dispatch, the answer is a `429` with the soonest recovery window in `Retry-After` — never a bare 503 a client would read as "gateway broken" and retry into the same cooling chain. Since 0.1.13 the verdict also reads the body: a non-streaming 2xx that carries an `error` object fails over with its code instead of reaching the client as a 200, a fully auth-locked key set is refused without paying the round trip, and the Cline gateway's `{"success":…,"data":…}` reply skin is stripped (its usage is counted) rather than relayed - **Policy & gate** — a `limits:` block (per-key rpm + cumulative dollar/token ceilings + `refuse_unpriced`) enforced at the edge: `429` with `Retry-After` before any body work, `402` with the denying arm in `x-ar-deny-reason` before dispatch, spend checked against the same usage ledger the response path records into; a bearer gate armed by `aroute keys arm-gate` (master in the encrypted store, 30-day signed client tokens, `keys mint` for more, `aroute doctor` reports armed/unarmed); `aroute limits` views and edits the block, and `aroute sync` carries the dashboard's per-key rpm into it
+- **Built-in control page** — `/ui` on the proxy's own port: edit combos, providers and per-key limits, mint client keys, read the usage and failure log by date range, and try a combo in a playground. Vanilla JS embedded in the binary, no build step, no extra process ([details](#control-page-ui)) - **Agent-native CLI** — TOON output, `--fields` narrowing, stdout data / stderr diagnostics, exit 0/1/2, fail-loud flags - **Hot-reload config** — `config.yaml` watched live; secrets stay in `$VAR`, never in the file
 
 ## Benchmarks, parity and open gaps
 
-Memory figures, the streaming battery, the OmniRoute and agentgateway comparison, and the open gaps are in [26 benchmarks, parity and known gaps](docs/26-benchmarks-parity-gaps.md). The dashboard front end, contrasted against the OmniRoute UI and audited against this one, is in [27 dashboard contrast and upgrade plan](docs/27-dashboard-contrast-and-upgrade-plan.md).
 
 ## Installation
 
@@ -85,56 +70,35 @@ The written config carries two routable combos out of the box: `default` (an `op
 
 The installer prints the portable `.mcp.json` entry for aroute's MCP server instead of writing it anywhere; paste it into a project root to use the tools there.
 
-Re-running it *is* the update path: it replaces the binary, leaves your config
-and credentials untouched, and refreshes the unit. `--check` tells you honestly
-whether an update exists.
+Re-running it *is* the update path: it replaces the binary, leaves your config and credentials untouched, and refreshes the unit. `--check` tells you honestly whether an update exists.
 
-Unattended updates are a systemd timer (`aroute.update.timer`, weekly, with a first
-re-check 15 minutes after boot). It runs a **saved copy of the installer**
-rather than a URL, so the audited script is what runs, and an updated binary
-restarts the service so the live proxy changes too. The timer never passes a
+Unattended updates are a systemd timer (`aroute.update.timer`, weekly, with a first re-check 15 minutes after boot). It runs a **saved copy of the installer** rather than a URL, so the audited script is what runs, and an updated binary restarts the service so the live proxy changes too. The timer never passes a
 dashboard flag, so an installed dist is left alone by weekly updates.
 
-The unit is `aroute.service`, `Restart=on-failure`, reading credentials from an
-`EnvironmentFile` so secrets stay out of the process table. It does **not**
-override the bind address: loopback comes from `server.host` in the config, so
-the sample config binds `127.0.0.1` and an operator who edits that line changes
-where it listens. A user unit enables `loginctl enable-linger`, without which
-"starts on boot" is false for any session that logs out first.
+The unit is `aroute.service`, `Restart=on-failure`, reading credentials from an `EnvironmentFile` so secrets stay out of the process table. It does **not** override the bind address: loopback comes from `server.host` in the config, so the sample config binds `127.0.0.1` and an operator who edits that line changes
+where it listens. A user unit enables `loginctl enable-linger`, without which "starts on boot" is false for any session that logs out first.
 
-Nothing is claimed that is not checked: a failed start is reported as such, and
-the usual cause on a first run is empty credentials in the env file, not a
-broken unit.
+Nothing is claimed that is not checked: a failed start is reported as such, and the usual cause on a first run is empty credentials in the env file, not a broken unit.
 
 ## Running it
 
 The dashboard is a vendored, rebranded build of the OmniRoute front end: `aroute dashboard` starts the compiled UI as a supervised Node child, resolving the dist from `--path`, `$AR_DASHBOARD_DIR`, beside the binary, or the `--with-dashboard` install location (`~/.config/ar/dashboard`) — no flags needed after an install. `dashboard/rebrand-dist.sh` is the one-step rebuild path (pull upstream → `npm ci` → build → rebrand); refresh an installed dist by re-running the installer with `--with-dashboard`. Detail lives in [docs/14-web-ui-port-plan.md](docs/14-web-ui-port-plan.md).
 
-The install already puts `aroute` on a systemd unit, so on a box with systemd the
-proxy is already running — `curl -s localhost:20128/healthz` answers before you
-type anything. The commands above are for the no-systemd case, or for running a
-second instance in the foreground. One-shot without a server at all:
+The install already puts `aroute` on a systemd unit, so on a box with systemd the proxy is already running — `curl -s localhost:20128/healthz` answers before you type anything. The commands above are for the no-systemd case, or for running a second instance in the foreground. One-shot without a server at all:
 `aroute run -m cheap -p 'hello'`.
 
-Smoke-tested locally on 2026-10-08: `aroute serve` + `aroute dashboard` serve
-`GET /healthz`, `GET /v1/models`, `GET /api/health`, `GET /` and `GET /login` and
-return valid OpenAI JSON for `free-stack` and `small-stack` chat completions.
+Smoke-tested locally on 2026-10-08: `aroute serve` + `aroute dashboard` serve `GET /healthz`, `GET /v1/models`, `GET /api/health`, `GET /` and `GET /login` and return valid OpenAI JSON for `free-stack` and `small-stack` chat completions.
 
 Keys can also live encrypted at rest in a gitignored `credentials.db` beside the config (`$AR_CRED_STORE` moves it; `$AR_MASTER_KEY` holds the 32-byte master). Resolution order is store → `$VAR`, so an install with no store behaves as before, and `aroute doctor` reports the `store` row and which source each key resolved from.
 
 ## Configuration
 
 ```yaml
-server: { host: 127.0.0.1, port: 20128 }
-keys: { openai: $OPENAI_API_KEY }          # env refs, never values
-providers: [{ id: openai, key: openai }]   # id must be in the registry
-combos:                                    # clients request the combo id as `model`
+server: { host: 127.0.0.1, port: 20128 } keys: { openai: $OPENAI_API_KEY }          # env refs, never values providers: [{ id: openai, key: openai }]   # id must be in the registry combos:                                    # clients request the combo id as `model`
   - { id: cheap, strategy: cost-optimized, targets: [openai/gpt-5.4-nano] }
 ```
 
-Three keys, and every one is load-bearing: without `combos` no model is
-routable and `aroute doctor` says so, because providers are addresses and only a
-combo is something a client can ask for.
+Three keys, and every one is load-bearing: without `combos` no model is routable and `aroute doctor` says so, because providers are addresses and only a combo is something a client can ask for.
 
 A provider may name more than one credential, and the extras **rotate**: `key` serves first, `keys:` lists the rest, and a rotating cursor walks them one per dispatch so load spreads across every account instead of burning the first until it throttles — the dynamic round robin OmniRoute promises. A throttle (429) or an auth refusal (401/403) on one skips it and the rotation continues with the next; when every credential is cooling, the soonest to recover serves without advancing the cursor. A 5xx is the endpoint's fault, not the credential's, and charges the key nothing. `Retry-After` on a throttle is honored per key, and an auth refusal doubles the lockout per strike, so a dead key is probed geometrically less often rather than forgotten.
 
@@ -142,40 +106,18 @@ A provider may name more than one credential, and the extras **rotate**: `key` s
 providers: [{ id: nvidia, key: nvidia, keys: [nvidia-2, nvidia-3] }]
 ```
 
-`aroute sync` builds that list itself: the dashboard's connections beyond each
-provider's first become numbered credentials (`nvidia-2` holding
-`$AR_KEY_NVIDIA_2`), in the dashboard's own priority order — a provider with
-seven keys there is never stuck on the first one here.
+`aroute sync` builds that list itself: the dashboard's connections beyond each provider's first become numbered credentials (`nvidia-2` holding `$AR_KEY_NVIDIA_2`), in the dashboard's own priority order — a provider with seven keys there is never stuck on the first one here.
 
-The router's cooldowns follow the same scope. A provider with more than one
-key is marked multi-credential at boot, and its credential-scoped faults — a
-throttle, an auth refusal, quota spent on one key, one banned account — charge
-the executor's per-key state and nothing at the provider scope, so a fresh
-key's very next request routes as if nothing happened. Endpoint-scoped faults
-(5xx, transport) keep every charge: a dead socket is not one credential's
-opinion. A single-credential provider keeps the strict P0 semantics unchanged
-— with one key there is nothing to fall to, so its 429 *is* the provider's —
-and the fallback chain no longer collapses same-provider targets: a combo
-pairing two models on one multi-key provider keeps both, so a 429 on the first
-fails over to the second inside the same request.
+The router's cooldowns follow the same scope. A provider with more than one key is marked multi-credential at boot, and its credential-scoped faults — a throttle, an auth refusal, quota spent on one key, one banned account — charge the executor's per-key state and nothing at the provider scope, so a fresh
+key's very next request routes as if nothing happened. Endpoint-scoped faults (5xx, transport) keep every charge: a dead socket is not one credential's opinion. A single-credential provider keeps the strict P0 semantics unchanged — with one key there is nothing to fall to, so its 429 *is* the provider's —
+and the fallback chain no longer collapses same-provider targets: a combo pairing two models on one multi-key provider keeps both, so a 429 on the first fails over to the second inside the same request.
 
-To adopt an OmniRoute provider tree wholesale, `aroute import --from omniroute
---path <OmniRoute/open-sse/config/providers> --out-dir <dir>` regenerates the
-config and the registry from OmniRoute's own source. It reports every provider
-it could not give a base URL rather than inventing one. (`config.omni-mirror.yaml`
-in this repo is a hand-written template and is **stale** — it describes an
-OmniRoute state that no longer exists on disk.)
-
-An OAuth session adds one block. The **access** token is the provider's existing `keys:` entry, the **refresh** token is a second credential row, and the block carries no secret, so a committed `config.yaml` cannot leak one through it.
+To adopt an OmniRoute provider tree wholesale, `aroute import --from omniroute --path <OmniRoute/open-sse/config/providers> --out-dir <dir>` regenerates the config and the registry from OmniRoute's own source. It reports every provider it could not give a base URL rather than inventing one. (`config.omni-mirror.yaml`
+in this repo is a hand-written template and is **stale** — it describes an OmniRoute state that no longer exists on disk.) An OAuth session adds one block. The **access** token is the provider's existing `keys:` entry, the **refresh** token is a second credential row, and the block carries no secret, so a committed `config.yaml` cannot leak one through it.
 
 ```yaml
-providers: [{ id: codex, key: codex }]
-keys:      { codex: $CODEX_ACCESS, codex_refresh: $CODEX_REFRESH }
-oauth:
-  - provider: codex
-    refresh_key: codex_refresh
-    token_url: https://auth.openai.com/oauth/token   # required; never guessed
-    client_id: <your public OAuth client id>
+providers: [{ id: codex, key: codex }] keys:      { codex: $CODEX_ACCESS, codex_refresh: $CODEX_REFRESH } oauth:
+  - provider: codex refresh_key: codex_refresh token_url: https://auth.openai.com/oauth/token   # required; never guessed client_id: <your public OAuth client id>
 ```
 
 `token_url` is mandatory and deliberately not hardcoded: an auth endpoint inferred from a provider id would be an invented wire format. Without it the session still dispatches, and `aroute doctor` says its first 401 will be terminal.
@@ -184,8 +126,7 @@ An endpoint the registry lacks is declared in the same file, no rebuild, and `id
 
 ```yaml
 custom_providers:
-  - { id: my-gateway, protocol: openai-compatible,
-      base_url: https://gateway.internal.example/v1, key_ref: my_gateway }
+  - { id: my-gateway, protocol: openai-compatible, base_url: https://gateway.internal.example/v1, key_ref: my_gateway }
 ```
 
 `protocol` is `openai-compatible` or `anthropic-compatible`; only the OpenAI wire dispatches today, and `headers:` adds outbound headers for a gateway that wants something other than a bearer token. `aroute doctor` checks the base URL shape, the credential binding, and refuses an `id` that collides with a compiled-in one.
@@ -194,20 +135,12 @@ An optional `endpoint:` overrides where dispatches POST — an absolute path joi
 
 ```yaml
 custom_providers:
-  - { id: or-decisions, protocol: openai-compatible,
-      base_url: https://openrouter.ai, endpoint: /api/alpha/decisions,
-      key_ref: openrouter, headers: { HTTP-Referer: https://your.site, X-Title: aroute } }
-  - { id: exp-systemone, protocol: openai-compatible,
-      base_url: https://api.experientiallabs.ai, endpoint: /v1/systemone,
-      key_ref: experiential }
-
-combos:
-  - { id: decide, strategy: priority,
-      targets: [or-decisions/respan/span-01-lite:free, or-decisions/inception/mercury-decide:free] }
+  - { id: or-decisions, protocol: openai-compatible, base_url: https://openrouter.ai, endpoint: /api/alpha/decisions, key_ref: openrouter, headers: { HTTP-Referer: https://your.site, X-Title: aroute } } - { id: exp-systemone, protocol: openai-compatible,
+      base_url: https://api.experientiallabs.ai, endpoint: /v1/systemone, key_ref: experiential } combos:
+  - { id: decide, strategy: priority, targets: [or-decisions/respan/span-01-lite:free, or-decisions/inception/mercury-decide:free] }
 ```
 
-> [!WARNING]
-> `aroute doctor` and `aroute serve` share one target grammar: a config one accepts, the other accepts. If `serve` refuses a file, `doctor` says why.
+> [!WARNING] > `aroute doctor` and `aroute serve` share one target grammar: a config one accepts, the other accepts. If `serve` refuses a file, `doctor` says why.
 
 ### Guardrails
 
@@ -219,8 +152,7 @@ The `limits:` block is the policy layer, and it is opt-in: a config that never m
 
 ```yaml
 limits:
-  default: { rpm: 60 }
-  keys:
+  default: { rpm: 60 } keys:
     prod-deploy: { rpm: 600, usd_micros: 5_000_000, tokens: 20_000_000 }
 ```
 
@@ -266,10 +198,7 @@ The dist ships **without the ONNX model-inference stack**: `onnxruntime-node` (2
 When the dashboard *is* installed it comes up as its own unit, **stopped by default** — `--with-dashboard` writes the unit, starts nothing:
 
 ```sh
-systemctl --user start aroute-dashboard   # UI up; the Node child holds ~700 MB RSS
-systemctl --user stop  aroute-dashboard   # RSS reclaimed, port 20149 freed
-systemctl --user enable aroute-dashboard  # optional: bring it up at boot instead
-bash install.sh --check                    # reports dashboard + dashsvc state
+systemctl --user start aroute-dashboard   # UI up; the Node child holds ~700 MB RSS systemctl --user stop  aroute-dashboard   # RSS reclaimed, port 20149 freed systemctl --user enable aroute-dashboard  # optional: bring it up at boot instead bash install.sh --check                    # reports dashboard + dashsvc state
 ```
 
 The proxy has never needed the dashboard: `serve` reads config and env only, so on a memory-tight box the UI is a deliberate, reversible choice. An update while the unit is running stops it for the binary swap and restarts it on the new build (`dashsvc: restarted on aroute <version>`), so unattended updates never leave a stale dashboard or a half-swapped binary.
@@ -290,8 +219,7 @@ Each crate under `crates/` has a README with its purpose, configuration, extensi
 Read `AGENTS.md`, then:
 
 ```sh
-cargo test --release
-cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --release cargo clippy --all-targets --all-features --locked -- -D warnings
 ```
 
 Both green, minimal diffs, no `unwrap` outside tests. See [CONTRIBUTING.md](CONTRIBUTING.md).
