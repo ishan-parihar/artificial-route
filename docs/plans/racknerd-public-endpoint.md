@@ -67,6 +67,43 @@ Status: **complete** (2026-10-19). Local-only proxy removed; all harnesses use `
 - Removed: `nvidia/z-ai/glm-5.3` (429 dead on all keys). `nvidia/z-ai/glm-5.3-flash`: removed 2026-10-18 on the 99–124s TTFT reading, **re-admitted 2026-10-19 as `large-stack` primary** — that reading was a probe artifact (malformed JSON body / too-short timeouts), not the model; public-endpoint stream-start is 59–66s, under the 110s cap.
 - `browser-stack-2` still targets dead `nvidia/z-ai/glm-5.3` — left as-is (out of scope; harness lanes don't use it as default).
 
+## Critical-infra hardening (2026-10-19)
+
+The proxy is the only LLM path every harness has, so "it is down" stops all of
+them at once. Closed these gaps on the VPS:
+
+- **Watchdog** — `~/.local/bin/aroute-watchdog.sh` + `aroute-watchdog.timer`
+  (every 2 min, enabled). It checks three things a crash does not cover: the
+  unit is `active` (a crash-loop looks active between restarts), the loopback
+  `healthz` answers, and the **public** path answers through the tunnel with a
+  valid token. It restarts the unit when the process is alive but not serving,
+  remints the token when the public path returns 401, and logs a state
+  transition to `~/.local/share/aroute-watchdog.log`. Verified by killing the
+  proxy: `activating` → watchdog → `active` → loopback 200.
+- **Memory ceiling** — `aroute.service.d/limits.conf`: `MemoryMax=512M`,
+  `MemoryHigh=384M`, plus `StartLimitBurst=12` so a crash loop cannot burn the
+  box. A runaway request body or a leak must not take the tunnel with it.
+- **Boot persistence** — `aroute` and the watchdog timer are `enabled`,
+  `loginctl show-user nerd -p Linger` is `yes` (user services start without a
+  login), and cloudflared is a **system** unit (`enabled`, running since
+  2026-10-18) rather than a user unit. The boot sequence was rehearsed:
+  stop+start of both units brings loopback and public back to 200.
+- **Gate master** — `AR_MASTER_KEY` and `AR_HTTP_MASTER_KEY` are the same
+  value on the VPS, and the `http-gate` row in the credential store is
+  encrypted under it. Bare `aroute keys arm-gate` generates a *different*
+  random master, which desynchronises server, store and mint and makes every
+  token 401 with "this token is not valid". Arm with
+  `--key "$AR_HTTP_MASTER_KEY"`.
+- **Gate token is now non-expiring** — `aroute keys mint --ttl-days 0` issues
+  a token that does not expire; the harnesses read it from one file
+  (`~/.config/ar/racknerd-gate-token.jwt`, see the `harness-management`
+  skill), so rotation is one command instead of four hand-copies.
+
+**Not covered**: there is one instance on one host. A second region or a
+warm standby is the remaining single point of failure, and no alert channel
+(notification on a failed public check) is wired — the watchdog logs, it does
+not page anyone.
+
 ## Known caveats
 
 - `free-stack` returned 504 "produced no response within 150s" on the local swap check. The VPS has the same combo, so a public smoke test may time out for the same reason. Use a combo that answers if that happens. **Resolved 2026-10-19**: `free-stack` was renamed `large-stack` and repointed at live targets (see above); the broken nvidia GLM targets are gone.
