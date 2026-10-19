@@ -336,6 +336,14 @@ pub struct MintArgs {
     /// `limits.keys:` block key this credential by.
     #[arg(long, default_value = "default")]
     pub key_id: String,
+    /// Lifetime of the token in days.
+    ///
+    /// The default is 30 days, which is a credential an operator has to
+    /// remember to replace. A harness that reads its key from a file wants the
+    /// opposite: one token, written once, read until the operator decides
+    /// otherwise. `0` mints a token that never expires.
+    #[arg(long, default_value_t = 30)]
+    pub ttl_days: u32,
 }
 
 /// Options for `aroute limits`. No subcommand is the view.

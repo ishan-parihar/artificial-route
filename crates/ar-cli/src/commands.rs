@@ -356,15 +356,15 @@ pub const GATE_ROW: &str = "http-gate";
 /// point: the row says which command wrote it.
 const GATE_PROVIDER: &str = "aroute";
 
-/// How long a client token `aroute keys` mints lives: thirty days.
+/// How long a client token `aroute keys` mints lives by default: thirty days.
 ///
 /// The library default is fifteen minutes, which is right for an interactive
 /// login and wrong for a single-operator gateway's only credential — the
 /// renew story here is "mint again", and a 15-minute rotation on that story is
-/// 96 tokens a day for nothing. `Issue::ttl` is the knob; no CLI flag exposes
-/// it because the one caller who wants a different number is rotating on a
-/// schedule `mint` already serves.
-const GATE_TOKEN_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600);
+/// 96 tokens a day for nothing. `Issue::ttl` is the knob, and
+/// `keys mint --ttl-days` exposes it: `0` mints a token that does not expire,
+/// which is what a harness that reads its key from a file wants.
+const DEFAULT_TOKEN_TTL_DAYS: u32 = 30;
 
 /// `aroute keys arm-gate` — docs/15 phase 3: close the last shipped gap between
 /// "a gate exists" and "a command arms it".
@@ -415,7 +415,7 @@ pub fn arm_gate(cli: &Cli, key_id: &str, explicit: Option<&str>) -> anyhow::Resu
 }
 
 /// `aroute keys mint` — another client token from the stored gate master.
-pub fn keys_mint(cli: &Cli, key_id: &str) -> anyhow::Result<()> {
+pub fn keys_mint(cli: &Cli, key_id: &str, ttl_days: u32) -> anyhow::Result<()> {
     let Some(store) = credential_store(cli) else {
         return Err(fail(
             "no credential store to read the gate master from",
@@ -434,7 +434,7 @@ pub fn keys_mint(cli: &Cli, key_id: &str) -> anyhow::Result<()> {
             "run `aroute keys arm-gate` first; it generates and stores the master",
         ));
     };
-    let issued = mint_from(&master, key_id)?;
+    let issued = mint_from_with_ttl(&master, key_id, ttl_days)?;
     println!("key id: {key_id}");
     println!("token: {}", issued.access);
     println!("expires: {} (unix)", issued.expires_at);
@@ -448,16 +448,36 @@ pub fn keys_mint(cli: &Cli, key_id: &str) -> anyhow::Result<()> {
 /// pairing that makes a CLI-minted token pass the server's gate is structural,
 /// not tested-in.
 pub(crate) fn mint_from(master: &ar_keys::Secret, key_id: &str) -> anyhow::Result<ar_keys::Issued> {
+    mint_from_with_ttl(master, key_id, DEFAULT_TOKEN_TTL_DAYS)
+}
+
+/// The same minting path with a caller-chosen lifetime.
+///
+/// `0` days mints a token that does not expire. A harness that reads its key
+/// from a file wants exactly that: one credential, written once, valid until
+/// the operator rotates it deliberately. The shorter default stays for the
+/// case where a token is handed to something that may leak.
+pub(crate) fn mint_from_with_ttl(
+    master: &ar_keys::Secret,
+    key_id: &str,
+    ttl_days: u32,
+) -> anyhow::Result<ar_keys::Issued> {
     let tokens = ar_keys::Tokens::new(&ar_keys::MasterKey::new(
         master.to_owned_secret(),
         ar_keys::KeyMeta::generate(),
     )?);
-    tokens
+    let ttl = if ttl_days == 0 {
+        // Far enough out that "never" and "the year 2100" are the same claim to
+        // every reader, including a clock that is wrong by a decade.
+        std::time::Duration::from_secs(365 * 24 * 3600 * 100)
+    } else {
+        std::time::Duration::from_secs(u64::from(ttl_days) * 24 * 3600)
+    };    tokens
         .issue(ar_keys::Issue {
             key_id,
             scopes: ar_keys::ScopeSet::of([ar_keys::Scope::ExecuteCompletions]),
             device_id: None,
-            ttl: Some(GATE_TOKEN_TTL),
+            ttl: Some(ttl),
         })
         .map_err(|e| {
             fail(
@@ -721,7 +741,7 @@ pub fn dispatch(cli: &Cli) -> anyhow::Result<()> {
             crate::cli::KeysCommand::ArmGate(args) => {
                 arm_gate(cli, &args.key_id, args.key.as_deref())
             }
-            crate::cli::KeysCommand::Mint(args) => keys_mint(cli, &args.key_id),
+            crate::cli::KeysCommand::Mint(args) => keys_mint(cli, &args.key_id, args.ttl_days),
         },
         Some(Command::Limits(a)) => match &a.command {
             None => limits_view(cli),
