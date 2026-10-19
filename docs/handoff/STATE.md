@@ -88,3 +88,21 @@ open work had been spread over five documents with no row re-verified against th
 several of them had gone stale (A1 said "v0.1.16 is the newest tag" when `v0.1.17` was
 tagged; B6 said "14 orphan pages" when the count is now 0). The old documents keep the
 **history** of their pass and point at the ledger; the ledger owns the **state**.
+
+<!-- genome:zone status sha=d9eabd9f3e42 -->
+| status | items |
+|---|---|
+| open | 31 |
+| in-progress | 1 |
+
+- `UI-00` [open] **U0 — close the unauthenticated `/ui` write path** (AR-2 ingress 404 + AR-3 write handlers refuse o
+- `UI-01` [open] **U1 — gate `/ui` on the HTTP master** so the panel can be published deliberately (AR-1: bearer gate
+- `UI-02` [open] **Fix the accent contrast failure** — `--amber #e0900f` as text on `--panel #ffffff` is 2.6:1; `.sta
+- `UI-03` [open] **U2 — honest states**: four data states per view, errors that persist until dismissed, a write that
+- `UI-04` [open] **U3 — the operator's missing views**: resilience (breaker/cooldown), provider health/expiry, per-co
+- `UI-05` [open] **U4 — a settings pane over the yaml** (server, limits.default, timeouts, discovery, auth mode)
+- `UI-06` [open] **U5 — craft**: h1 to 28–32px, table buttons to 44px, footer paths get a title + copy button, a revi
+- `UI-07` [open] **Fix the doctor gate check** — it reports `gate,ok,armed` from the row's *name* while the row is un
+- `UI-08` [open] **Rule the canonical credential store on the VPS** and delete the other
+- `SEC-01` [open] **LIVE EXPOSURE — the public `/ui` mints working tokens.** `POST /ui/api/keys/mint` from the interne
+<!-- genome:end status -->
