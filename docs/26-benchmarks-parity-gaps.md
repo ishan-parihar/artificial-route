@@ -73,7 +73,7 @@ under [Known gaps](#known-gaps).
 ## Known gaps
 
 Stated plainly, because the alternative is a reader discovering them. The full
-explanation is [AUDIT-REPORT.md](AUDIT-REPORT.md).
+explanation is [AUDIT-REPORT.md](docs/audit/2026-10-01-AUDIT-REPORT.md).
 
 - **`bedrock` and `gitlab-duo` route, but are not verified live.** `bedrock` uses a
   Bedrock API key and the runtime endpoint of `base_url` (default `us-east-1`; set
@@ -148,13 +148,13 @@ is a different OmniRoute process state than the ~994 MiB above.
 > loopback or front it with an authenticating proxy. `$AR_MASTER_KEY` arms the
 > credential store, not HTTP auth.
 
-Full depth, OAuth mechanics, refresh triggers, quota tables, engine-catalog divergences and every gap with its fix: [AUDIT-REPORT.md](AUDIT-REPORT.md).
+Full depth, OAuth mechanics, refresh triggers, quota tables, engine-catalog divergences and every gap with its fix: [AUDIT-REPORT.md](docs/audit/2026-10-01-AUDIT-REPORT.md).
 
 Known gaps, stated once: every one of them — the OAuth executor inventory,
 `grok-cli` and `kilocode` dispatch wires, the `auto` pool fallback, the
 OpenAI-wire-only dispatch surface (including Anthropic-wire registry
 providers like `zenmux-free`), the stdio-only MCP plane, and the registry
 snapshot's lag — is listed as a bullet under [Known gaps](#known-gaps),
-with the full explanations in [AUDIT-REPORT.md](AUDIT-REPORT.md) and the
+with the full explanations in [AUDIT-REPORT.md](docs/audit/2026-10-01-AUDIT-REPORT.md) and the
 OAuth login flow and its `$VAR`-must-be-exported rule under
 [Configuration](#configuration).

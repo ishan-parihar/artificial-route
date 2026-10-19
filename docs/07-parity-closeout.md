@@ -62,7 +62,7 @@ The plan's original wording vs what the tree at `d24ea9a` actually holds:
 | H1 | quota: 429-marking + preflight cutoff, local state only — **verified present**: `classify_fault`'s terminal-code gate, the `lock_model(QuotaExhausted)` timestamp mark and the loop's `is_cooling_for` preflight skip all predate this wave; the commit adds the cross-request proof the acceptance names | forced-429 flips a provider to exhausted and the next request skips it (`a_quota_locked_provider_is_skipped_by_the_next_request`) |
 | J1 | upstream code + `Retry-After` passthrough, envelope shape unchanged | a 429 from upstream reaches the client with its code and retry window |
 | I1 | disconnect-aware abort: client-gone cancels the upstream token; mid-stream drop truncates cleanly | kill-upstream → clean close; client-drop → upstream abort observed |
-| M | README parity table, `AUDIT-REPORT.md`, `docs/audit-notes.md`, `docs/05` final state | every landed wave reflected; every divergence rowed |
+| M | README parity table, `docs/audit/2026-10-01-AUDIT-REPORT.md`, `docs/audit-notes.md`, `docs/05` final state | every landed wave reflected; every divergence rowed |
 | N | final full gates + serve boot + RSS + push | all green on origin/main |
 
 Deferred with owners, not dropped: H per-provider quota fetchers (one commit
