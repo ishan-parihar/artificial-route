@@ -1079,27 +1079,62 @@ fn findings(cfg: &Config, path: &str, store: &StoreProbe<'_>) -> Vec<Row> {
     rows.push(vec!["store".to_owned(), status, detail]);
 
     // The HTTP gate: armed when `aroute keys arm-gate` stored a master row.
-    // `skip` rather than `fail` when it is not — loopback-ungated is the default
-    // supported install, and doctor exits 1 on `fail` — but the detail says how
-    // to close it, because the row's job is to make the state visible. Names
-    // only, like every other doctor row: this listing never decrypts, so the
-    // row NAME is the armed state, and a row that will not decrypt under the
-    // current $AR_MASTER_KEY still lists as armed — `aroute serve`'s boot read
-    // is the surface that opens the row, and it is the one that reports that.
+    //
+    // **Decrypted, not named.** The old check read the row's *name* and called
+    // that "armed", so a store whose gate row could not be decrypted under the
+    // current `$AR_MASTER_KEY` listed as `gate,ok,armed` while `aroute serve`
+    // was booting with "serving ungated" in its own log. Two surfaces, two
+    // answers, and the operator had no way to tell which one was true.
+    //
+    // The row is now opened. Three answers, and the third is the one that
+    // matters:
+    //
+    // * no gate row — `skip`, the supported loopback-ungated install.
+    // * a gate row that decrypts — `ok`, armed.
+    // * a gate row that will not decrypt — **`fail`**, because the operator
+    //   believes the gate is on and it is not.
+    //
+    // `fail` rather than `skip` because `doctor` exits 1 on a `fail` and that
+    // exit is the point: a broken gate is a broken install, and an install that
+    // silently serves unauthenticated traffic is the thing an operator most
+    // needs a non-zero exit for.
     let gate = match store {
-        StoreProbe::Open { names, .. } => {
-            if names.iter().any(|n| n == GATE_ROW) {
-                (
+        StoreProbe::Open { path, names } if names.iter().any(|n| n == GATE_ROW) => {
+            match open_store(path).and_then(|s| s.get(GATE_ROW)) {
+                Ok(Some(_)) => (
                     "ok".to_owned(),
                     "armed — bearer tokens required (`keys mint` issues more)".to_owned(),
-                )
-            } else {
-                (
+                ),
+                Ok(None) => (
                     "skip".to_owned(),
                     "not armed — loopback only; `aroute keys arm-gate` arms it".to_owned(),
-                )
+                ),
+                Err(e) => (
+                    "fail".to_owned(),
+                    format!(
+                        "the gate row will not decrypt ({e}); the server is serving UNGATED — \
+                         re-arm with `aroute keys arm-gate --key $AR_HTTP_MASTER_KEY`"
+                    ),
+                ),
             }
         }
+        StoreProbe::Live { store, .. } => match store.get(GATE_ROW) {
+            Ok(Some(_)) => (
+                "ok".to_owned(),
+                "armed — bearer tokens required (`keys mint` issues more)".to_owned(),
+            ),
+            Ok(None) => (
+                "skip".to_owned(),
+                "not armed — loopback only; `aroute keys arm-gate` arms it".to_owned(),
+            ),
+            Err(e) => (
+                "fail".to_owned(),
+                format!(
+                    "the gate row will not decrypt ({e}); the server is serving UNGATED — \
+                     re-arm with `aroute keys arm-gate --key $AR_HTTP_MASTER_KEY`"
+                ),
+            ),
+        },
         _ => (
             "skip".to_owned(),
             "no store so no gate — loopback only".to_owned(),
@@ -3412,6 +3447,71 @@ mod tests {
             .expect("row stores");
         let read = gate_master(&store).unwrap().expect("row reads back");
         assert_eq!(read.as_bytes(), master.as_bytes());
+    }
+
+    #[test]
+    fn the_doctor_gate_check_fails_when_the_row_will_not_decrypt() {
+        // The bug this closes: the check read the row's NAME and called that
+        // "armed", so a store whose gate row was undecryptable listed as
+        // `gate,ok,armed` while the server was booting with "serving
+        // ungated" in its own log. Two surfaces, two answers.
+        let dir = tmpdir("doctor-gate");
+        let path = dir.join("credentials.db");
+        // The store is written with one master...
+        let store = ar_keys::CredentialStore::open_with_material(&path, &ar_keys::Secret::generate())
+            .expect("store opens");
+        store
+            .insert(GATE_PROVIDER, GATE_ROW, &ar_keys::Secret::generate())
+            .expect("row stores");
+        drop(store);
+        // ...and read back with a DIFFERENT one, which is the real situation:
+        // the operator's $AR_MASTER_KEY no longer matches the store.
+        let other = ar_keys::Secret::generate();
+        let store = ar_keys::CredentialStore::open_with_material(&path, &other).expect("store reopens");
+        let probe = StoreProbe::Live {
+            store: &store,
+            path,
+        };
+        let rows = findings(&ar_config::Config::default(), "doctor", &probe);
+        let gate = rows
+            .iter()
+            .find(|r| r.first().is_some_and(|c| c == "gate"))
+            .expect("a gate row");
+        assert_eq!(
+            gate.get(1).map(String::as_str),
+            Some("fail"),
+            "an undecryptable gate row must FAIL the check: {gate:?}"
+        );
+        assert!(
+            gate.get(2).is_some_and(|d| d.contains("UNGATED")),
+            "the detail must name the state the server is in: {gate:?}"
+        );
+    }
+
+    #[test]
+    fn the_doctor_gate_check_passes_when_the_row_decrypts() {
+        // The other side of the same check: a row that opens is `ok`, not
+        // `fail`. A check that always failed would be as useless as one that
+        // never did.
+        let dir = tmpdir("doctor-gate-ok");
+        let path = dir.join("credentials.db");
+        let master = ar_keys::Secret::generate();
+        let store = ar_keys::CredentialStore::open_with_material(&path, &master).expect("store opens");
+        store
+            .insert(GATE_PROVIDER, GATE_ROW, &ar_keys::Secret::generate())
+            .expect("row stores");
+        drop(store);
+        let store = ar_keys::CredentialStore::open_with_material(&path, &master).expect("store reopens");
+        let probe = StoreProbe::Live {
+            store: &store,
+            path,
+        };
+        let rows = findings(&ar_config::Config::default(), "doctor", &probe);
+        let gate = rows
+            .iter()
+            .find(|r| r.first().is_some_and(|c| c == "gate"))
+            .expect("a gate row");
+        assert_eq!(gate.get(1).map(String::as_str), Some("ok"), "{gate:?}");
     }
 
     #[test]

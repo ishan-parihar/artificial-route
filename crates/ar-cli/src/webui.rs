@@ -7,18 +7,28 @@
 //! same usage ledger — so there is nothing to bridge and nothing to sync.
 //!
 //! Scope discipline: read state, set provider credentials, edit combos,
-//! mint client keys, set per-key limits (rpm/spend/tokens), read usage. No analytics, no agent
+//! mint client keys, set per-key limits (rpm/spend/tokens), read usage, and
+//! report the resolver's live resilience state. No analytics, no agent
 //! tasks, no i18n. Every write validates before the file is touched, and
 //! the file is never rewritten when a body is rejected.
 //!
 //! Trust model: `serve` binds loopback only (its `bind_addr` call hardcodes
-//! `public: false`), so the page inherits the CLI's own trust boundary —
-//! whoever can reach the socket can already call the proxy. No second auth
-//! layer, for the same reason P0 has none.
+//! `public: false`), so on a box with no gate the page inherits the CLI's own
+//! trust boundary — whoever can reach the socket can already call the proxy.
+//!
+//! **When a gate IS armed, the panel carries its own** (see
+//! [`auth`]). The socket's boundary is not enough there: the panel mints the
+//! tokens that authorize `/v1` and rewrites the config that decides where
+//! `/v1` sends traffic, so a panel reachable without a credential is a
+//! panel that can hand out spend. The three-armed gate state — unarmed,
+//! armed, broken — is what makes the difference between those cases
+//! decidable at boot rather than at request time.
 //!
 //! Boot-built routing means a write changes the *file*, not the running
 //! tables: every save answers with `pending_restart`, and the banner shows
 //! the restart command until `ConfigHandle::watch` is attached (docs/16 P2).
+
+pub mod auth;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -28,12 +38,13 @@ use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Json, Query, State};
 use axum::http::{StatusCode, header};
-use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde_json::{Value, json};
 
 use ar_config::{Combo, Config, ProviderCfg};
 use ar_registry::global as registry;
+use ar_route::Resilience;
 
 use crate::commands;
 
@@ -84,9 +95,44 @@ pub struct Ctx {
     /// The encrypted credential store behind the gate. rusqlite connections
     /// are `Send` but not `Sync`, so the one connection rides a mutex.
     store: Option<Mutex<ar_keys::CredentialStore>>,
-    /// Whether the gate is armed at boot; the page refuses mints when off,
-    /// the same refusal `aroute keys mint` makes.
-    gate_armed: bool,
+    /// The panel's own gate, resolved at boot. `Unarmed` on a box that never
+    /// armed one, `Armed` when the row decrypts, `Broken` when it does not —
+    /// and `Broken` is the arm that refuses writes.
+    ///
+    /// The **only** source of the panel's armed-badge: the badge used to be
+    /// computed from a second `gate_master` call, and two calls could
+    /// disagree — a badge saying "unarmed" on a panel that was refusing every
+    /// request. One value, one source, no way to disagree.
+    gate: Arc<auth::GateState>,
+    /// The server's live resilience table, so the resilience view reports the
+    /// resolver's actual state rather than a guess read from the config.
+    resilience: Arc<Resilience>,
+    /// The server's live provider ids, so the resilience view names the
+    /// universe it reports on.
+    providers: Vec<String>,
+    /// The server's resolved config, for the settings view: the values the
+    /// proxy actually booted with, which are not always the values the file
+    /// spells (a discovered context window, a reduced model deadline).
+    settings: ServerSettings,
+}
+
+/// The settings the panel shows that do NOT live in the yaml.
+///
+/// The yaml-backed ones (`server:`, `limits:`) are read from the **live
+/// file** at request time, because the panel edits that file and a pane
+/// showing the boot snapshot would show the operator the wrong thing after
+/// their own edit. These four are the opposite: they are read at boot from
+/// the environment, and the panel names the variable that carries each one.
+#[derive(Debug, Clone, Default)]
+pub struct ServerSettings {
+    /// The router-wide request deadline, in seconds.
+    pub request_timeout_secs: u64,
+    /// Per-model deadlines, in seconds, by model or combo id.
+    pub timeouts: BTreeMap<String, u64>,
+    /// Whether `/v1/models` overlays the models.dev discovery catalog.
+    pub model_discovery: bool,
+    /// The gate's mode for a request with no usable credential.
+    pub auth_mode: String,
 }
 
 impl Ctx {
@@ -97,7 +143,6 @@ impl Ctx {
         config: PathBuf,
         ledger: Option<Arc<Mutex<ar_tokens::Ledger>>>,
         store: Option<ar_keys::CredentialStore>,
-        gate_armed: bool,
     ) -> Self {
         let env = config
             .parent()
@@ -110,14 +155,74 @@ impl Ctx {
             boot_text,
             ledger,
             store: store.map(Mutex::new),
-            gate_armed,
+            gate: Arc::new(auth::GateState::Unarmed),
+            resilience: Arc::new(Resilience::new()),
+            providers: Vec::new(),
+            settings: ServerSettings::default(),
         }
+    }
+
+    /// Whether the gate is armed, read from the one gate state.
+    ///
+    /// Derived rather than stored, so the badge and the gate cannot disagree:
+    /// there is no second copy of the fact to fall out of step.
+    #[must_use]
+    pub fn gate_armed(&self) -> bool {
+        self.gate.is_armed()
+    }
+
+    /// The gate's state, as the page names it: the label and the badge class.
+    #[must_use]
+    pub fn gate_badge(&self) -> (&'static str, &'static str) {
+        auth::gate_badge(&self.gate)
+    }
+
+    /// The reason the gate is broken, when it is.
+    #[must_use]
+    pub fn gate_broken_reason(&self) -> Option<&str> {
+        match self.gate.as_ref() {
+            auth::GateState::Broken(reason) => Some(reason),
+            _ => None,
+        }
+    }
+
+    /// The server's live state, attached after the server is built.
+    ///
+    /// The panel's read views report the *running* proxy — its resilience
+    /// table, its provider list, its resolved settings — not a second
+    /// derivation from the file. A file and a running proxy can disagree (the
+    /// file was edited, the proxy has not restarted), and a panel that
+    /// reported the file's version would show a state the proxy is not in.
+    ///
+    /// The combo table is deliberately absent: the panel reads combos from
+    /// the config file, which is the file it edits, and threading a second
+    /// copy of the combo table through the server's own shape would be a
+    /// second source of truth for the same thing.
+    pub fn attach_server(
+        &mut self,
+        resilience: Arc<Resilience>,
+        providers: Vec<String>,
+        settings: ServerSettings,
+    ) {
+        self.resilience = resilience;
+        self.providers = providers;
+        self.settings = settings;
+    }
+
+    /// The panel's gate state, set once the credential store has been read.
+    ///
+    /// Three arms, and the arm is decided by *decrypting* the gate row rather
+    /// than by finding its name: a row that will not open is a broken gate,
+    /// and a broken gate refuses writes.
+    pub fn set_gate(&mut self, gate: auth::GateState) {
+        self.gate = Arc::new(gate);
     }
 }
 
 /// The `/ui` routes on top of the proxy's router. `app()` has already
 /// applied its own state, so the merge is a plain stateless join.
 pub fn mount(proxy: Router, ctx: Ctx) -> Router {
+    let gate = Arc::clone(&ctx.gate);
     let ui = Router::new()
         .route("/ui", get(page))
         // Trailing-slash entries redirect instead of falling through to the
@@ -132,6 +237,10 @@ pub fn mount(proxy: Router, ctx: Ctx) -> Router {
         .route("/ui/api/usage", get(usage))
         .route("/ui/api/log", get(request_log))
         .route("/ui/api/models", get(models))
+        .route("/ui/api/resilience", get(resilience))
+        .route("/ui/api/health", get(health))
+        .route("/ui/api/budgets", get(budgets))
+        .route("/ui/api/settings", get(settings).post(save_settings))
         .route("/ui/api/combos", post(save_combos))
         .route("/ui/api/provider-key", post(provider_key))
         .route("/ui/api/provider-custom", post(provider_custom))
@@ -139,23 +248,210 @@ pub fn mount(proxy: Router, ctx: Ctx) -> Router {
         .route("/ui/api/keys/mint", post(mint_key))
         .route("/ui/api/limits", post(set_limits))
         .with_state(Arc::new(ctx));
-    // `app()` guards the proxy routes; this guards `/ui`, which is merged in
-    // after `app()` ran. The mint, provider-key and limits routes are the ones a
-    // rebinding page would reach, so they are the reason this layer exists.
-    ui.layer(axum::middleware::from_fn(ar_server::app::loopback_only))
+    // One guard for the whole panel, and it is NOT the proxy's `loopback_only`.
+    //
+    // `loopback_only` refuses a request whose `Origin` names a non-loopback
+    // authority. That is the right defence for a loopback service and the
+    // wrong one for a panel published through a reverse proxy: the browser
+    // attaches `Origin` to every same-origin `POST` and to a CSS-driven font
+    // fetch, so the check refused exactly the legitimate operator while
+    // admitting every script on the internet (which sends no `Origin` at
+    // all). That is the F2 finding, and it is why the panel was half-dead on
+    // its own public URL.
+    //
+    // So the panel's guard keeps the half of the rule that is a *rebinding*
+    // defence — the `Host` header, which a rebinding page cannot choose — and
+    // replaces the `Origin` half with the thing that is actually an access
+    // control: **the credential**. A cross-origin caller that presents a
+    // valid token is the operator's own browser; a cross-origin caller that
+    // does not is refused by the gate.
+    //
+    // The static assets carry no data, so they get the `Host` check and
+    // nothing else — refusing a font because a browser attached an `Origin`
+    // to it protects nothing and costs the panel its typography.
+    ui.layer(axum::middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
+        let gate = Arc::clone(&gate);
+        async move { ui_guard(&gate, req, next).await }
+    }))
         .merge(proxy)
+}
+
+/// The panel's own guard: the `Host` rebinding check, the credential on the
+/// API surface, and an `Origin` rule that only bites when there is no
+/// credential to check.
+///
+/// Four rules, and the order they fire in:
+///
+/// 1. **`Host` must be loopback.** The rebinding defence. A page that
+///    rebinds its own name to `127.0.0.1` cannot choose this header, so this
+///    is what stops a drive-by page from reaching the panel at all.
+/// 2. **An API request with a valid credential is admitted**, whatever its
+///    `Origin`. The credential is the access control, and it is in the
+///    request body of the caller's choosing — a cross-origin page cannot
+///    attach a token it cannot read.
+/// 3. **An API request with no valid credential is refused** with a 401.
+/// 4. **An API request on an UNARMED panel is admitted only when its
+///    `Origin` is absent or loopback.** This is the loopback install's only
+///    CSRF defence and it must not be traded away: the panel mints spendable
+///    tokens, and on a box with no gate the *socket* is the trust boundary,
+///    so a cross-site `POST` from the operator's own browser is exactly the
+///    attack the `Origin` header identifies.
+///
+/// Rule 4 is why the `Origin` check is not simply deleted. It used to be
+/// unconditional, and that was the F2 finding: a browser attaches `Origin`
+/// to every same-origin `POST` and to a CSS-driven font fetch, so the check
+/// refused the legitimate operator on the public URL while admitting every
+/// non-browser client (which sends no `Origin` at all). Now it fires only
+/// where there is no credential to check instead.
+async fn ui_guard(
+    gate: &auth::GateState,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let host_ok = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(loopback_authority);
+    if !host_ok {
+        return (
+            StatusCode::FORBIDDEN,
+            [(header::CONTENT_TYPE, "application/json")],
+            r#"{"error":{"type":"forbidden","code":"non_loopback_request","message":"this panel answers loopback clients only; the Host header names another host"}}"#,
+        )
+            .into_response();
+    }
+    if req.uri().path().starts_with("/ui/api/") {
+        // Two rules, and which one applies is decided by the gate's ARM, not
+        // by the outcome of the credential check. `auth::check` short-circuits
+        // to `Ok` for an unarmed panel (there is no token to ask for there),
+        // so a rule keyed on the check's *outcome* would never run on exactly
+        // the install it exists to protect.
+        if gate.requires_token() {
+            // Armed: the credential is the control. A valid token stands in
+            // for the CSRF check — a cross-origin page cannot attach a token
+            // it cannot read — so no `Origin` rule applies here.
+            if let Err(reason) = auth::check(req.headers(), gate) {
+                return unauthorized(reason);
+            }
+        } else if !origin_is_absent_or_loopback(req.headers()) {
+            // Unarmed: the socket's loopback bind is the trust boundary, and
+            // the `Origin` header is the only thing that says "this came from
+            // another page's browser". The panel mints spendable tokens, so
+            // this is the install's only CSRF defence and it must not be
+            // traded away.
+            return (
+                StatusCode::FORBIDDEN,
+                [(header::CONTENT_TYPE, "application/json")],
+                r#"{"error":{"type":"forbidden","code":"cross_site_request","message":"this panel refuses a cross-site request while its gate is unarmed"}}"#,
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
+}
+
+/// Whether a request's `Origin` is absent or names a loopback authority.
+///
+/// An absent `Origin` is a non-browser client — `curl`, a script, the CLI —
+/// and the loopback bind is its trust boundary. A present one must name
+/// loopback, which is what a browser on the operator's own machine sends.
+fn origin_is_absent_or_loopback(headers: &axum::http::HeaderMap) -> bool {
+    headers.get(header::ORIGIN).is_none_or(|v| {
+        v.to_str()
+            .ok()
+            .and_then(|o| o.split_once("://"))
+            .is_some_and(|(_, rest)| {
+                loopback_authority(rest.split('/').next().unwrap_or_default())
+            })
+    })
+}
+
+/// `true` when a `host[:port]` authority names the loopback interface.
+///
+/// The same rule `ar_server::app::loopback_only` applies, reimplemented here
+/// because that one is private and the panel's rule differs: the panel checks
+/// `Host` and not `Origin`.
+fn loopback_authority(authority: &str) -> bool {
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        match bracketed.split_once(']') {
+            Some((inner, _)) => inner,
+            None => return false,
+        }
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, port)) if !h.contains(':') && port.bytes().all(|b| b.is_ascii_digit()) => h,
+            _ => authority,
+        }
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// The 401 the panel's gate answers with.
+///
+/// The same envelope shape `/v1` uses, so one error renderer covers both
+/// surfaces, and `no-store` so a refusal the browser may keep does not also
+/// keep a successful response.
+fn unauthorized(reason: String) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        json!({
+            "error": {
+                "type": "invalid_request_error",
+                "code": "credential_rejected",
+                "message": reason,
+            }
+        })
+        .to_string(),
+    )
+        .into_response()
 }
 
 // ── assets ──────────────────────────────────────────────────────────────────
 
 /// One page, three files, embedded: a UI that must also work on an offline
 /// VPS cannot fetch fonts or bundles at runtime.
-async fn page() -> Html<&'static str> {
-    Html(include_str!("webui/page/index.html"))
+///
+/// The response carries the panel's two framing headers:
+///
+/// * `Referrer-Policy: no-referrer` — the page can be reached with a
+///   `?token=` on the URL, and the Referer of the next navigation would
+///   carry it. The page strips the token from the address bar, but the
+///   header is the guarantee rather than the habit.
+/// * `X-Frame-Options: DENY` — the panel is not a thing to embed in a
+///   frame, and a framed panel is a clickjacking surface over the write
+///   buttons.
+async fn page() -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (header::REFERRER_POLICY, "no-referrer"),
+            (header::X_FRAME_OPTIONS, "DENY"),
+        ],
+        include_str!("webui/page/index.html"),
+    )
+        .into_response()
 }
 
-async fn page_slash() -> impl IntoResponse {
-    Redirect::to("/ui")
+/// The trailing-slash form serves the page directly rather than redirecting.
+///
+/// A redirect would drop the query string, and the query string is how the
+/// panel's `?token=` first-paint flow arrives. It would also put the token
+/// in this server's access log and in every proxy log in front of it — the
+/// page strips the token from the address bar on arrival, but a redirect
+/// happens first. Serving the page is one fewer hop and one fewer copy of
+/// the secret.
+async fn page_slash() -> Response {
+    page().await
 }
 
 async fn css() -> Response {
@@ -238,6 +534,26 @@ fn render_failed(error: anyhow::Error) -> Response {
         })),
     )
         .into_response()
+}
+
+/// The refusal every write handler makes when the gate is broken.
+///
+/// AR-3: a store whose gate row will not decrypt leaves the operator
+/// believing the gate is armed while it is not — the boot log says "serving
+/// ungated". Reads may still degrade (a stale credential should not black out
+/// the operator's dashboard), but a **write** in that state is how the panel
+/// mints a token nobody can revoke and rewrites the routing nobody can
+/// audit. So the write path refuses, and it names the cause.
+///
+/// This is one function rather than a check in each handler because "every
+/// write refuses" is a property of the whole class, and a check per handler
+/// is a check one handler can forget.
+fn refuse_if_broken(ctx: &Ctx) -> Option<Response> {
+    let reason = ctx.gate.write_refusal()?;
+    Some(conflict(
+        format!("the credential store's gate row cannot be read: {reason}"),
+        "the panel cannot tell which credentials it is managing; fix $AR_MASTER_KEY or re-arm with `aroute keys arm-gate`",
+    ))
 }
 
 /// A body that did not parse is a 400 with the rejection's own words; the
@@ -344,7 +660,9 @@ async fn state(State(ctx): State<Arc<Ctx>>) -> Response {
         "config_path": ctx.config.display().to_string(),
         "env_path": ctx.env.display().to_string(),
         "pending_restart": doc != ctx.boot_text,
-        "gate_armed": ctx.gate_armed,
+        "gate_armed": ctx.gate_armed(),
+        "gate_badge": ctx.gate_badge().0,
+        "gate_broken": ctx.gate_broken_reason(),
         "providers": configured,
         "combos": combos,
         "limits": serde_json::to_value(&cfg.limits).unwrap_or_else(|_| json!({})),
@@ -430,6 +748,13 @@ async fn usage(State(ctx): State<Arc<Ctx>>, Query(q): Query<UsageQuery>) -> Resp
             "providers": a.providers.iter().map(|p| json!({
                 "name": p.name, "requests": p.requests, "tokens": p.tokens, "usd": p.cost_usd_micros as f64 / 1_000_000.0,
             })).collect::<Vec<_>>(),
+            // The per-combo figure: what each name the CLIENT asked for cost.
+            // Grouped by the recorded combo, so two combos sharing a target
+            // are still told apart — a join on the serving target would
+            // charge the same spend to both of them.
+            "combos": a.combos.iter().map(|c| json!({
+                "name": c.name, "requests": c.requests, "tokens": c.tokens, "usd": c.cost_usd_micros as f64 / 1_000_000.0,
+            })).collect::<Vec<_>>(),
         }))
         .map_err(|e| e.to_string())
         .unwrap_or_else(|e| json!({ "error": e }));
@@ -512,6 +837,512 @@ async fn request_log(State(ctx): State<Arc<Ctx>>, Query(q): Query<LogQuery>) -> 
     }
 }
 
+/// `GET /ui/api/resilience` — the resolver's live resilience state.
+///
+/// The three tables the router owns, read once: the key cooldowns, the
+/// `provider:model` lockouts and the per-provider breakers. This is the
+/// thing the failover rail *implies* — a rail shows the order the targets
+/// would be tried in, and this shows which of them is currently out of
+/// rotation and for how long.
+///
+/// Read from the server's own table rather than derived from the config or
+/// the ledger: the table is the only place that knows a provider was
+/// skipped. The ledger knows what was served; it does not know what was
+/// skipped.
+async fn resilience(State(ctx): State<Arc<Ctx>>) -> Response {
+    let ids: Vec<&str> = ctx.providers.iter().map(String::as_str).collect();
+    let snapshot = ctx.resilience.snapshot(&ids);
+    let rows: Vec<Value> = snapshot
+        .iter()
+        .map(|p| {
+            json!({
+                "provider": p.provider,
+                "breaker": match p.breaker {
+                    ar_route::BreakerState::Closed => "closed",
+                    ar_route::BreakerState::Open => "open",
+                    ar_route::BreakerState::HalfOpen => "half_open",
+                },
+                "breaker_failures": p.breaker_failures,
+                "breaker_threshold": p.breaker_threshold,
+                "breaker_reset_secs": p.breaker_reset_secs,
+                "retired": p.retired,
+                "retired_models": p.retired_models,
+                "coolings": p.coolings.iter().map(|c| json!({
+                    "model": c.model,
+                    "remaining_secs": c.remaining.as_secs(),
+                    "failures": c.failures,
+                })).collect::<Vec<_>>(),
+                "locks": p.locks.iter().map(|c| json!({
+                    "model": c.model,
+                    "remaining_secs": c.remaining.as_secs(),
+                    "failures": c.failures,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Json(json!({
+        "providers": rows,
+        "open_breakers": snapshot.iter().filter(|p| p.breaker != ar_route::BreakerState::Closed).count(),
+        "cooling": snapshot.iter().map(|p| p.coolings.len() + p.locks.len()).sum::<usize>(),
+    }))
+    .into_response()
+}
+
+/// `GET /ui/api/health` — per-provider credential health and expiry.
+///
+/// Two facts per provider, and they answer different questions:
+///
+/// * **health** — whether the credential is present, and whether the store can
+///   read it. A provider whose key is missing is a provider that will 401
+///   upstream; the panel shows that before the traffic does.
+/// * **expiry** — the OAuth session's expiry, when the provider has one. A
+///   session that expires in an hour is a routing decision the operator has
+///   to make today, not after the outage.
+///
+/// A provider with no session has no expiry, and says so rather than showing
+/// a dash that reads as "expired".
+async fn health(State(ctx): State<Arc<Ctx>>) -> Response {
+    let (doc, cfg) = match load_cfg(&ctx) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let env_set = env_vars_set(&ctx.env);
+    let keys = raw_keys(&doc);
+
+    // The store's own view of each credential. A row that will not decrypt is
+    // a *broken* credential, not a missing one, and the two need different
+    // advice — so the store is asked, and its refusal is the answer.
+    let store_state = ctx.store.as_ref().map(|store| {
+        let guard = store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut states: BTreeMap<String, String> = BTreeMap::new();
+        for name in keys.keys() {
+            states.insert(
+                name.clone(),
+                match guard.get_text(name) {
+                    Ok(Some(_)) => "ok".to_owned(),
+                    Ok(None) => "missing".to_owned(),
+                    Err(e) => format!("unreadable: {e}"),
+                },
+            );
+        }
+        states
+    });
+
+    let providers: Vec<Value> = cfg
+        .providers
+        .iter()
+        .map(|row| {
+            let refs: Vec<Value> = row
+                .key_refs()
+                .iter()
+                .map(|name| {
+                    let var = keys
+                        .get(*name)
+                        .map(|v| v.trim_start_matches('$').to_owned())
+                        .unwrap_or_default();
+                    let in_env = !var.is_empty() && env_set.contains(&var);
+                    let store = store_state
+                        .as_ref()
+                        .and_then(|s| s.get(*name))
+                        .cloned()
+                        .unwrap_or_else(|| "not_in_store".to_owned());
+                    json!({
+                        "ref": name,
+                        "var": var,
+                        "in_env": in_env,
+                        "store": store,
+                    })
+                })
+                .collect();
+            json!({ "id": row.id, "credentials": refs })
+        })
+        .collect();
+
+    // OAuth sessions: the store's own rows, with their terminal status and
+    // whatever expiry the session carries.
+    let sessions: Vec<Value> = ctx
+        .store
+        .as_ref()
+        .map(|store| {
+            let guard = store
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut out = Vec::new();
+            for provider in &cfg.providers {
+                match guard.get_session(&provider.id) {
+                    Ok(Some(session)) => out.push(json!({
+                        "provider": provider.id,
+                        "kind": session.kind().as_str(),
+                        "terminal_status": session.terminal_status(),
+                        "terminal_reason": session.terminal_reason(),
+                    })),
+                    Ok(None) => {}
+                    Err(e) => out.push(json!({
+                        "provider": provider.id,
+                        "kind": "unknown",
+                        "error": e.to_string(),
+                    })),
+                }
+            }
+            out
+        })
+        .unwrap_or_default();
+
+    Json(json!({
+        "providers": providers,
+        "sessions": sessions,
+        "store_open": ctx.store.is_some(),
+    }))
+    .into_response()
+}
+
+/// `GET /ui/api/settings` — the resolved settings, as the proxy booted them.
+/// `GET /ui/api/budgets` — what each key has spent against its ceiling, and
+/// what each provider's quota window says.
+///
+/// Two different questions, and they answer different ones:
+///
+/// * **The budget half** compares the ledger's cumulative spend for a key
+///   against the `limits:` row that key carries. The ceiling is
+///   **cumulative**, not a daily window — `ar_config::Limit`'s own
+///   semantics — so the figure shown is "spent of ceiling", and a key with no
+///   row inherits `limits.default`.
+/// * **The quota half** is the provider's own allowance: the freshest
+///   `quota_snapshots` row the credential store holds, with the percentage
+///   left and when the window resets.
+///
+/// The quota half is empty on a store that has never recorded a snapshot,
+/// which is the honest answer: nobody asked the provider, so nobody knows.
+async fn budgets(State(ctx): State<Arc<Ctx>>) -> Response {
+    let (_, cfg) = match load_cfg(&ctx) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+
+    // The spend half: the ledger's CUMULATIVE totals per key.
+    //
+    // `Ledger::spend(key_id)` is the exact query — a `SUM` over the key's
+    // whole history. `report(n)` is NOT: it returns the n most RECENT rows,
+    // so summing a truncated slice would show a key with 50 000 requests as
+    // having spent only its newest 1 000, and the operator would read a
+    // ceiling check against the wrong number.
+    let mut spend: BTreeMap<String, (f64, u64)> = BTreeMap::new();
+    if let Some(ledger) = ctx.ledger.clone() {
+        let guard = ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for key in cfg.limits.keys.keys() {
+            if let Ok(s) = guard.spend(key) {
+                spend.insert(
+                    key.clone(),
+                    (s.usd.micros as f64 / 1_000_000.0, s.tokens),
+                );
+            }
+        }
+    }
+
+    let rows: Vec<Value> = cfg
+        .limits
+        .keys
+        .iter()
+        .map(|(key, limit)| {
+            let (usd, tokens) = spend.get(key).copied().unwrap_or((0.0, 0));
+            budget_json(key, limit, usd, tokens)
+        })
+        .collect();
+    // The default row governs every key without one of its own, so it is
+    // shown on its own line rather than folded into the per-key rows.
+    let default_row = budget_json("(default)", &cfg.limits.default, 0.0, 0);
+
+    // The quota half: the freshest snapshot per provider, in the "default"
+    // window — the same window the router reads (`WINDOW_KEY` in
+    // `ar-server`'s config). A store that recorded a snapshot under a
+    // different window key is not shown here: the panel reports the window
+    // the router actually consults, and inventing a second reader would be
+    // a second answer to "what is the provider's allowance".
+    let quotas: Vec<Value> = ctx
+        .store
+        .as_ref()
+        .map(|store| {
+            let guard = store
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut out = Vec::new();
+            for provider in &cfg.providers {
+                let Ok(Some(snapshot)) = guard.latest_quota_snapshot(&provider.id, "default") else {
+                    continue;
+                };
+                out.push(json!({
+                    "provider": provider.id,
+                    "remaining_pct": snapshot.remaining_percentage,
+                    "exhausted": snapshot.exhausted,
+                    "next_reset_at": snapshot.next_reset_at,
+                    "recorded_at": snapshot.recorded_at,
+                    "stale": snapshot.is_stale(now_epoch()),
+                }));
+            }
+            out
+        })
+        .unwrap_or_default();
+
+    Json(json!({
+        "keys": rows,
+        "default": default_row,
+        "quotas": quotas,
+        "open": ctx.ledger.is_some(),
+    }))
+    .into_response()
+}
+
+/// One budget row: what a key has spent against what it may.
+fn budget_json(key: &str, limit: &ar_config::Limit, usd: f64, tokens: u64) -> Value {
+    let pct = |spent: u64, cap: Option<u64>| {
+        cap.filter(|c| *c > 0)
+            .map(|c| (spent as f64 / c as f64 * 100.0).min(100.0))
+    };
+    json!({
+        "key": key,
+        "usd": usd,
+        "tokens": tokens,
+        "usd_cap": limit.usd_micros,
+        "token_cap": limit.tokens,
+        "rpm": limit.rpm,
+        "model": limit.model,
+        "usd_pct": pct((usd * 1_000_000.0) as u64, limit.usd_micros),
+        "token_pct": pct(tokens, limit.tokens),
+    })
+}
+
+/// Unix seconds. The store's snapshots and the ledger's rows are both in
+/// seconds, and the panel's "as of" is a clock reading beside them.
+fn now_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// `GET /ui/api/settings` — the settings, as the FILE now reads them.
+///
+/// The yaml-backed values come from the **live file**, not from the boot
+/// snapshot: the panel edits that file, and a pane that showed the values
+/// the proxy booted with while `pending_restart` said "restart needed" would
+/// show the operator the wrong thing after their own edit.
+///
+/// The env-backed values are the opposite — they are read at boot and live
+/// in the environment — so they are marked as such in the payload, and the
+/// pane names the variable that carries each one.
+async fn settings(State(ctx): State<Arc<Ctx>>) -> Response {
+    let (_, cfg) = match load_cfg(&ctx) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let s = &ctx.settings;
+    Json(json!({
+        // Live, from the file the panel edits.
+        "host": cfg.server.host,
+        "port": cfg.server.port,
+        "limits": {
+            "default": limit_json(&cfg.limits.default),
+            "keys": cfg.limits.keys.iter().map(|(k, v)| (k.clone(), limit_json(v))).collect::<BTreeMap<_, _>>(),
+        },
+        // Read at boot, from the environment.
+        "request_timeout_secs": s.request_timeout_secs,
+        "timeouts": s.timeouts,
+        "model_discovery": s.model_discovery,
+        "auth_mode": s.auth_mode,
+        "pending_restart": std::fs::read_to_string(&ctx.config).unwrap_or_default() != ctx.boot_text,
+    }))
+    .into_response()
+}
+
+/// One ceiling row, in the shape the page edits it in.
+fn limit_json(limit: &ar_config::Limit) -> Value {
+    json!({
+        "rpm": limit.rpm,
+        "usd_micros": limit.usd_micros,
+        "tokens": limit.tokens,
+        "refuse_unpriced": limit.refuse_unpriced,
+        "model": limit.model,
+    })
+}
+
+/// `POST /ui/api/settings` — writes the yaml-backed settings.
+///
+/// **Only the yaml-backed ones are writable.** `server:` and `limits:` live in
+/// the config file; the per-model deadlines, the discovery overlay and the
+/// auth mode live in the **environment** (`AR_STREAM_TIMEOUT_SECS`,
+/// `AR_MODEL_DISCOVERY`, `AR_AUTH_MODE`) because that is where the systemd
+/// unit puts them and where they have always been read from. A settings pane
+/// that wrote those to the yaml would be editing a file nothing reads — the
+/// worst kind of editor, because it reports success and changes nothing.
+///
+/// The env-backed values are therefore shown, with the variable that carries
+/// them named, and they are **not** editable here. An operator changes them
+/// in the environment, which is the same place `aroute doctor` reads them
+/// from.
+async fn save_settings(
+    State(ctx): State<Arc<Ctx>>,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Response {
+    if let Some(refusal) = refuse_if_broken(&ctx) {
+        return refusal;
+    }
+    let body = match body {
+        Ok(Json(v)) => v,
+        Err(r) => return body_error(r),
+    };
+    let (doc, mut cfg) = match load_cfg(&ctx) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let mut next = doc.clone();
+
+    // `server:` — the listen address. Two fields, and a bad value is refused
+    // naming the field rather than written and left to fail at boot.
+    if let Some(server) = body.get("server") {
+        let host = server
+            .get("host")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or(cfg.server.host.as_str());
+        if host.is_empty() {
+            return bad_request(
+                "server.host is empty".into(),
+                "the listen address must be a host or an IP, e.g. 127.0.0.1",
+            );
+        }
+        let port = server
+            .get("port")
+            .and_then(Value::as_u64)
+            .unwrap_or(cfg.server.port as u64);
+        if port == 0 || port > u16::MAX as u64 {
+            return bad_request(
+                format!("server.port {port} is not a port"),
+                "the port must be between 1 and 65535",
+            );
+        }
+        let section = format!(
+            "server:\n  host: {}\n  port: {}\n",
+            serde_json::Value::from(host),
+            port
+        );
+        next = commands::splice_section(&next, "server", &section);
+        cfg.server.host = host.to_owned();
+        cfg.server.port = port as u16;
+    }
+
+    // `limits:` — the default row only. The per-key rows have their own
+    // endpoint (`/ui/api/limits`), because a per-key row is edited *with its
+    // key*, and a settings form that carried the whole map would be a second
+    // editor for the same data.
+    if let Some(default) = body.get("limits").and_then(|l| l.get("default")) {
+        let row = match limit_from(default, &cfg.limits.default) {
+            Ok(row) => row,
+            Err((message, help)) => return bad_request(message, &help),
+        };
+        cfg.limits.default = row;
+        next = commands::splice_section(
+            &next,
+            "limits",
+            &crate::import::limits::render(&cfg.limits),
+        );
+    }
+
+    if next == doc {
+        return Json(json!({ "ok": true, "pending_restart": false, "note": "identical" }))
+            .into_response();
+    }
+    if let Err(e) = commands::write_file(&ctx.config, &next) {
+        return bad_request(
+            format!("cannot write {}: {e}", ctx.config.display()),
+            "check permissions on the config directory",
+        );
+    }
+    // The write is only reported as done once the file says so. A handler
+    // that answers `ok` and hopes the write landed is how an operator ends up
+    // trusting a config that was never changed.
+    let reread = std::fs::read_to_string(&ctx.config).unwrap_or_default();
+    if reread != next {
+        return bad_request(
+            "the file was written but does not read back as written".into(),
+            "check for another process rewriting the config; nothing else was changed",
+        );
+    }
+    Json(json!({ "ok": true, "pending_restart": true })).into_response()
+}
+
+/// One ceiling row from a JSON body.
+///
+/// The arms are the same four `ar_config::Limit` carries, and the scope is
+/// checked against the config's own combos so a typo cannot arm a ceiling
+/// that never applies.
+fn limit_from(
+    body: &Value,
+    current: &ar_config::Limit,
+) -> Result<ar_config::Limit, (String, String)> {
+    let mut row = current.clone();
+    if let Some(v) = body.get("rpm") {
+        row.rpm = match v {
+            Value::Null => None,
+            Value::Number(n) => Some(n.as_u64().ok_or((
+                "rpm must be a whole number".to_owned(),
+                "the rpm arm is a requests-per-minute ceiling".to_owned(),
+            ))? as u32),
+            _ => {
+                return Err((
+                    "rpm must be a number or null".to_owned(),
+                    "the rpm arm is a requests-per-minute ceiling".to_owned(),
+                ));
+            }
+        };
+    }
+    if let Some(v) = body.get("usd_micros") {
+        row.usd_micros = match v {
+            Value::Null => None,
+            Value::Number(n) => Some(n.as_u64().ok_or((
+                "usd_micros must be a whole number".to_owned(),
+                "the spend arm is in micro-dollars; 1000000 is one dollar".to_owned(),
+            ))?),
+            _ => {
+                return Err((
+                    "usd_micros must be a number or null".to_owned(),
+                    "the spend arm is in micro-dollars; 1000000 is one dollar".to_owned(),
+                ));
+            }
+        };
+    }
+    if let Some(v) = body.get("tokens") {
+        row.tokens = match v {
+            Value::Null => None,
+            Value::Number(n) => Some(n.as_u64().ok_or((
+                "tokens must be a whole number".to_owned(),
+                "the token arm is a cumulative ceiling".to_owned(),
+            ))?),
+            _ => {
+                return Err((
+                    "tokens must be a number or null".to_owned(),
+                    "the token arm is a cumulative ceiling".to_owned(),
+                ));
+            }
+        };
+    }
+    if let Some(v) = body.get("refuse_unpriced") {
+        row.refuse_unpriced = match v {
+            Value::Bool(b) => *b,
+            Value::Null => false,
+            _ => {
+                return Err((
+                    "refuse_unpriced must be a boolean".to_owned(),
+                    "true fails closed on a model with no pricing row".to_owned(),
+                ));
+            }
+        };
+    }
+    Ok(row)
+}
+
 // ── writes ──────────────────────────────────────────────────────────────────
 
 /// Reads the config file and its parsed form. `Err` carries the refusal the
@@ -584,6 +1415,9 @@ async fn save_combos(
     State(ctx): State<Arc<Ctx>>,
     body: Result<Json<Vec<Combo>>, JsonRejection>,
 ) -> Response {
+    if let Some(refusal) = refuse_if_broken(&ctx) {
+        return refusal;
+    }
     let combos = match body {
         Ok(Json(v)) => v,
         Err(r) => return body_error(r),
@@ -707,6 +1541,9 @@ async fn provider_key(
     State(ctx): State<Arc<Ctx>>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Response {
+    if let Some(refusal) = refuse_if_broken(&ctx) {
+        return refusal;
+    }
     let body = match body {
         Ok(Json(v)) => v,
         Err(r) => return body_error(r),
@@ -821,6 +1658,9 @@ async fn mint_key(
     State(ctx): State<Arc<Ctx>>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Response {
+    if let Some(refusal) = refuse_if_broken(&ctx) {
+        return refusal;
+    }
     let body = match body {
         Ok(Json(v)) => v,
         Err(r) => return body_error(r),
@@ -899,6 +1739,9 @@ async fn set_limits(
     State(ctx): State<Arc<Ctx>>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Response {
+    if let Some(refusal) = refuse_if_broken(&ctx) {
+        return refusal;
+    }
     let body = match body {
         Ok(Json(v)) => v,
         Err(r) => return body_error(r),
@@ -1031,6 +1874,9 @@ async fn provider_custom(
     State(ctx): State<Arc<Ctx>>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Response {
+    if let Some(refusal) = refuse_if_broken(&ctx) {
+        return refusal;
+    }
     let body = match body {
         Ok(Json(v)) => v,
         Err(r) => return body_error(r),
@@ -1251,6 +2097,9 @@ async fn provider_remove(
     State(ctx): State<Arc<Ctx>>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Response {
+    if let Some(refusal) = refuse_if_broken(&ctx) {
+        return refusal;
+    }
     let body = match body {
         Ok(Json(v)) => v,
         Err(r) => return body_error(r),
@@ -1457,31 +2306,369 @@ mod http_tests {
 
     /// A `/ui` router over a fresh config file, and that file's path.
     fn ui(tag: &str, ledger: Option<ar_tokens::Ledger>) -> (Router, PathBuf) {
+        ui_with_gate(tag, ledger, auth::GateState::Unarmed)
+    }
+
+    /// The same, with an explicit gate state.
+    fn ui_with_gate(
+        tag: &str,
+        ledger: Option<ar_tokens::Ledger>,
+        gate: auth::GateState,
+    ) -> (Router, PathBuf) {
         let dir = std::env::temp_dir().join(format!("ar-webui-http-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         let config = dir.join("config.yaml");
         std::fs::write(&config, CONFIG).expect("config");
         let ledger = ledger.map(|l| Arc::new(Mutex::new(l)));
-        let app = mount(Router::new(), Ctx::new(config.clone(), ledger, None, false));
+        let mut ctx = Ctx::new(config.clone(), ledger, None);
+        ctx.set_gate(gate);
+        let app = mount(Router::new(), ctx);
         (app, config)
     }
 
+    /// A gate state that is armed, plus a token it admits.
+    fn armed_gate() -> (auth::GateState, String) {
+        let master = ar_keys::MasterKey::new(
+            ar_keys::Secret::from_slice(&[3u8; 32]).expect("32 bytes"),
+            ar_keys::KeyMeta::generate(),
+        )
+        .expect("master");
+        let tokens = ar_keys::Tokens::new(&master);
+        let token = tokens
+            .issue(ar_keys::Issue {
+                key_id: "panel",
+                scopes: ar_keys::ScopeSet::of([ar_keys::Scope::ExecuteCompletions]),
+                device_id: None,
+                ttl: None,
+            })
+            .expect("token")
+            .access;
+        (auth::GateState::Armed(tokens), token)
+    }
+
     async fn call(app: &Router, method: Method, uri: &str, body: &str) -> (StatusCode, Value) {
-        let req = Request::builder()
+        call_with_token(app, method, uri, body, None).await
+    }
+
+    /// The same request with an optional bearer token.
+    async fn call_with_token(
+        app: &Router,
+        method: Method,
+        uri: &str,
+        body: &str,
+        token: Option<&str>,
+    ) -> (StatusCode, Value) {
+        call_full(app, method, uri, body, token, None).await
+    }
+
+    /// The same request with an optional `Origin`, for the public-URL case.
+    async fn call_full(
+        app: &Router,
+        method: Method,
+        uri: &str,
+        body: &str,
+        token: Option<&str>,
+        origin: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let mut req = Request::builder()
             .header("host", "127.0.0.1:20128")
             .method(method)
             .uri(uri)
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_owned()))
-            .expect("request");
-        let resp = app.clone().oneshot(req).await.expect("router answers");
+            .header("content-type", "application/json");
+        if let Some(token) = token {
+            req = req.header("authorization", format!("Bearer {token}"));
+        }
+        if let Some(origin) = origin {
+            req = req.header("origin", origin);
+        }
+        let resp = app
+            .clone()
+            .oneshot(req.body(Body::from(body.to_owned())).expect("request"))
+            .await
+            .expect("router answers");
         let status = resp.status();
         let bytes = resp.into_body().collect().await.expect("body").to_bytes();
         (
             status,
             serde_json::from_slice(&bytes).unwrap_or(Value::Null),
         )
+    }
+
+    #[tokio::test]
+    async fn the_trailing_slash_form_should_serve_the_page_not_redirect() {
+        // A redirect would drop the `?token=` the panel's first-paint flow
+        // arrives on, and would put the token in this server's access log.
+        let (app, _) = ui("slash", None);
+        let req = Request::builder()
+            .header("host", "127.0.0.1:20128")
+            .uri("/ui/?token=secret")
+            .body(Body::empty())
+            .expect("request");
+        let resp = app.clone().oneshot(req).await.expect("router answers");
+        assert_eq!(resp.status(), StatusCode::OK, "the page is served, not redirected");
+        assert_eq!(
+            resp.headers().get("location"),
+            None,
+            "no redirect: the query must survive to the page"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_page_should_carry_the_referrer_and_framing_headers() {
+        // The page can be reached with a token on the URL, so the Referer of
+        // the next navigation must not carry it.
+        let (app, _) = ui("headers", None);
+        let req = Request::builder()
+            .header("host", "127.0.0.1:20128")
+            .uri("/ui")
+            .body(Body::empty())
+            .expect("request");
+        let resp = app.clone().oneshot(req).await.expect("router answers");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("referrer-policy").and_then(|v| v.to_str().ok()),
+            Some("no-referrer")
+        );
+        assert_eq!(
+            resp.headers().get("x-frame-options").and_then(|v| v.to_str().ok()),
+            Some("DENY")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_armed_panel_should_refuse_an_api_call_without_a_token() {
+        let (gate, _) = armed_gate();
+        let (app, _) = ui_with_gate("armed", None, gate);
+        let (status, body) = call(&app, Method::GET, "/ui/api/state", "").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "credential_rejected");
+    }
+
+    #[tokio::test]
+    async fn an_armed_panel_should_admit_an_api_call_with_a_valid_token() {
+        let (gate, token) = armed_gate();
+        let (app, _) = ui_with_gate("armed-ok", None, gate);
+        let (status, _) = call_with_token(
+            &app,
+            Method::GET,
+            "/ui/api/state",
+            "",
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn an_armed_panel_should_serve_the_page_without_a_token() {
+        // The page carries no data and no secret; a login wall in front of it
+        // would make the panel's own error handling unreadable.
+        let (gate, _) = armed_gate();
+        let (app, _) = ui_with_gate("armed-page", None, gate);
+        let req = Request::builder()
+            .header("host", "127.0.0.1:20128")
+            .uri("/ui")
+            .body(Body::empty())
+            .expect("request");
+        let resp = app.clone().oneshot(req).await.expect("router answers");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_broken_gate_should_refuse_a_write_and_admit_a_read() {
+        let (app, config) = ui_with_gate(
+            "broken",
+            None,
+            auth::GateState::Broken("authentication tag mismatch".to_owned()),
+        );
+        let (read_status, _) = call(&app, Method::GET, "/ui/api/state", "").await;
+        assert_eq!(read_status, StatusCode::OK, "a read still degrades");
+        let (write_status, body) = call(
+            &app,
+            Method::POST,
+            "/ui/api/limits",
+            r#"{"key":"ci","rpm":5}"#,
+        )
+        .await;
+        assert_eq!(write_status, StatusCode::CONFLICT);
+        assert!(
+            body["error"].as_str().unwrap_or_default().contains("cannot be read"),
+            "the refusal names the cause: {body}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("config"),
+            CONFIG,
+            "a refused write leaves the file alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unarmed_panel_should_refuse_a_cross_site_write() {
+        // The loopback install's ONLY CSRF defence. The panel mints spendable
+        // tokens, and on a box with no gate the socket is the trust boundary —
+        // so a drive-by page that POSTs /ui/api/keys/mint from the operator's
+        // own browser is exactly the attack this refuses.
+        //
+        // The refusal is a 403 (cross-site), not a 401 (needs a token): the
+        // panel has no token to ask for on an unarmed install, and the page
+        // has to be able to tell the two apart.
+        let (app, _) = ui("csrf", None);
+        let (status, body) = call_full(
+            &app,
+            Method::POST,
+            "/ui/api/keys/mint",
+            r#"{"key_id":"attacker"}"#,
+            None,
+            Some("https://evil.example.com"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["code"], "cross_site_request");
+    }
+
+    #[tokio::test]
+    async fn an_unarmed_panel_should_admit_a_loopback_origin_write() {
+        // The same request from the operator's own browser: a loopback
+        // `Origin` is the operator, not an attacker.
+        let (app, _) = ui("csrf-loopback", None);
+        let (status, _) = call_full(
+            &app,
+            Method::POST,
+            "/ui/api/keys/mint",
+            r#"{"key_id":"operator"}"#,
+            None,
+            Some("http://127.0.0.1:20128"),
+        )
+        .await;
+        // The mint itself refuses (no store in the fixture), but the guard let
+        // the request through — a 409 from the handler, not a 403 from the
+        // guard.
+        assert_ne!(status, StatusCode::FORBIDDEN, "the guard admitted it");
+    }
+
+    #[tokio::test]
+    async fn an_unarmed_panel_should_admit_a_request_with_no_origin() {
+        // A non-browser client sends no `Origin`, and the loopback bind is its
+        // trust boundary.
+        let (app, _) = ui("csrf-no-origin", None);
+        let (status, _) = call(&app, Method::GET, "/ui/api/state", "").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_public_origin_with_a_valid_token_should_be_admitted() {
+        // The F2 finding, measured: a browser on the public URL attaches
+        // `Origin` to every same-origin POST and to a CSS-driven font fetch.
+        // The old guard refused those on the Origin header while admitting
+        // every curl, so the panel was half-dead on its own public URL and
+        // fully open to a script. The credential is now the control, so a
+        // valid token is admitted whatever the Origin says.
+        let (gate, token) = armed_gate();
+        let (app, _) = ui_with_gate("public-origin", None, gate);
+        let (status, _) = call_full(
+            &app,
+            Method::GET,
+            "/ui/api/state",
+            "",
+            Some(&token),
+            Some("https://aroute.example.com"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_public_origin_without_a_token_should_be_refused() {
+        // The credential, not the Origin, is what decides.
+        let (gate, _) = armed_gate();
+        let (app, _) = ui_with_gate("public-origin-no-token", None, gate);
+        let (status, _) = call_full(
+            &app,
+            Method::GET,
+            "/ui/api/state",
+            "",
+            None,
+            Some("https://aroute.example.com"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_rebinding_host_should_be_refused_whatever_the_token() {
+        // The half of the rule that IS a rebinding defence: the `Host`
+        // header, which a drive-by page cannot choose.
+        let (gate, token) = armed_gate();
+        let (app, _) = ui_with_gate("rebind", None, gate);
+        let req = Request::builder()
+            .header("host", "evil.example.com")
+            .header("authorization", format!("Bearer {token}"))
+            .uri("/ui/api/state")
+            .body(Body::empty())
+            .expect("request");
+        let resp = app.clone().oneshot(req).await.expect("router answers");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn the_resilience_view_should_report_every_provider() {
+        let (app, _) = ui("resilience", None);
+        let (status, body) = call(&app, Method::GET, "/ui/api/resilience", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["providers"].is_array(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn the_settings_view_should_report_the_yaml_backed_settings() {
+        let (app, _) = ui("settings", None);
+        let (status, body) = call(&app, Method::GET, "/ui/api/settings", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["limits"].is_object(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn the_settings_view_should_read_the_file_and_not_the_boot_snapshot() {
+        // The panel EDITS the yaml, so the settings view must show the yaml
+        // as it reads NOW. A view that showed the boot snapshot would show
+        // the operator the old value after their own edit, while
+        // `pending_restart` said "restart needed" - two truths on one screen.
+        let (app, config) = ui("settings-live", None);
+        // The file is edited underneath the running panel, the way an editor
+        // or a `git pull` would: a `server:` block appears with a host the
+        // panel never booted with.
+        let text = std::fs::read_to_string(&config).expect("read");
+        let edited = format!("{text}server:\n  host: 0.0.0.0\n  port: 20128\n");
+        std::fs::write(&config, &edited).expect("write");
+
+        let (status, body) = call(&app, Method::GET, "/ui/api/settings", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["host"], "0.0.0.0",
+            "the settings view must show the file, not the boot snapshot: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_settings_write_should_refuse_a_port_that_is_not_a_port() {
+        let (app, config) = ui("settings-bad-port", None);
+        let (status, body) = call(
+            &app,
+            Method::POST,
+            "/ui/api/settings",
+            r#"{"server":{"host":"127.0.0.1","port":0}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"].as_str().unwrap_or_default().contains("port"),
+            "the refusal names the field: {body}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("config"),
+            CONFIG,
+            "a refused write leaves the file alone"
+        );
     }
 
     #[tokio::test]

@@ -124,13 +124,22 @@ Three separate lies, all fixed:
    `{"ok":true}` without re-reading the file. The settings write now
    **re-reads the file and compares** before it reports success, and a
    mismatch is a refusal that says the file does not read back as written.
+4. **The settings pane showed the boot snapshot.** The yaml-backed values
+   came from the server's `ServerConfig` — what the proxy booted with — so
+   after the operator's own edit the pane showed the **old** value while
+   `pending_restart` said "restart needed". Two truths on one screen. The
+   yaml-backed values now come from the **live file** at request time
+   (`load_cfg`), and the env-backed ones are marked "read at boot" in the
+   payload and name the variable that carries them.
+5. **The budgets pane said "every key is unrestricted"** when a
+   `limits.default` existed. It now draws the default row, first and
+   named, and the empty state says "No key has a ceiling row of its own."
 
 ### 2.3 The operator could not see what the rail implied (`UI-04`, `UI-05`)
 
 The failover rail shows the **order** targets are tried in. It said nothing
 about **which of them is currently out of rotation** — the thing the rail
 implies and the thing an operator opens a gateway dashboard for.
-
 **Resilience** (`GET /ui/api/resilience`) reads the router's own three
 tables: the key cooldowns, the `provider:model` lockouts and the per-provider
 breakers. It is a new read on `ar_route::Resilience` (`Resilience::snapshot`),
@@ -214,7 +223,7 @@ the score is reported as measured.
 
 | item | score | evidence |
 |---|---|---|
-| C1 Scale | **1** | `scale=2.2x` at 1440 and `2x` at 390, up from 1.6x. The rubric wants 6x for a hero; a control panel's h1 is a page title, not a hero, and inventing one would be a marketing page pretending to be a tool. 30px over a 13.5px body is the honest display size, and it clears the standing `type-scale` warn. |
+| C1 Scale | **1** | `scale=4x` at 1440 and 3.6x at 390, up from 1.6x. The h1 is 54px over a 13.5px body. The rubric's C1 bands are 2 at 6x (the hero band) and 1 at 4-6x, so **4x is the middle band and scores 1** — the score is reported as measured, not as the ceiling it nearly reached. What the change bought is real: the `type-scale` warn every probe run carried since phase A is **gone** (0 warns, not 1), and the panel reads as a designed surface rather than a document. It is still not a hero, and a control panel's title should not be one. |
 | C2 Signature | **2** | the failover rail: numbered, arrow-linked, ordered by the strategy, the live target lit, with a staggered entrance and a FLIP reorder. It is the resolver's own chain drawn in HTML, it is in the first viewport, and no other dashboard in the category has it. |
 | C3 Composition | **1** | nine panes over one shell, but the silhouette is the same in five of them: a heading, a block, a table. The rail (dashboard, combos) and the chart (usage) break it, and the ledger/programme/index moves are told apart by their heads rather than their shapes. `probe.mjs` reports no `repetition` warn, so the threshold is met, but only just. |
 | C4 Type voice | **2** | `fonts=sora\|inter\|ui-monospace` — three deliberate roles, and `bodyFont` computes to `Inter, ui-sans-serif, system-ui, sans-serif` with **no `font-fallback` FAIL** in either band. |
@@ -222,7 +231,7 @@ the score is reported as measured.
 | C6 Imagery | **2** | no stock, no blobs, no fake UI. The rail, the stat band and the spend chart are the real chain, the real resolver and the real ledger. |
 | C7 Rhythm | **1** | two content widths (the shell's column and the narrow forms) and two grounds (panel / panel-2), but the density is uniform: every view is a full-bleed list of equally-weighted cards. The dashboard's stat band is the one airy moment. |
 | C8 Motion | **2** | two moments, both with a reason: the staggered `pill-in` on the rail (it shows *order*) and the FLIP transition when a target is reordered (it shows *which* target moved). Both are `transform`/`opacity` only, both disabled under `prefers-reduced-motion: reduce`. |
-| C9 Details | **2** | 1px hairlines on every border, a 2px `:focus-visible` ring at 2px offset, a skip link, `role="alert"` errors that persist, `scope="col"` headers, tabular numerals on every figure, a real `→` in the rail, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`, a designed sidebar footer with the version, the gate badge and the two config paths, and both theme bands designed rather than inverted. **Added in this pass:** a `title` on the two footer paths (they were clipped), a 28px minimum input height (they were 19px), a Dismiss button on every error, a "copy it now" disclosure that is legible in the light band, and `::selection` in the accent. |
+| C9 Details | **2** | 1px hairlines on every border, a 2px `:focus-visible` ring at 2px offset, a skip link, `role="alert"` errors that persist, `scope="col"` headers, tabular numerals on every figure, a real `→` in the rail, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`, a designed sidebar footer with the version, the gate badge and the two config paths, and both theme bands designed rather than inverted. **Added in this pass:** a `title` on the two footer paths (they were clipped), a 28px minimum input height (they were 19px), a Dismiss button on every error, a "copy it now" disclosure that is legible in the light band, and a `badge.bad` for the **broken** gate — the one badge that must not read as a soft warning, because it is a security state. |
 | C10 Copy | **2** | every string is a fact about this gateway: "What the router is serving, on one screen.", "A combo is the model name a client asks for. Targets are tried in the strategy's order.", "The token shows once.", "Read from the router's own table." The logo-swap test **fails** for a competitor — replace "aroute" with any other name and the copy still describes this product exactly, which is what the test asks for. |
 
 **Total: 18/20, with no item at 0.** The bar is 16.
@@ -243,30 +252,45 @@ The three tests:
 | gate | result |
 |---|---|
 | `cargo clippy --all-targets --all-features --locked -- -D warnings` | **clean** |
-| `cargo test --workspace --locked` | **2246 passed, 0 failed** |
-| `probe.mjs` at 1440 / 1024 / 390, light | **0 FAIL** on every pane |
-| `probe.mjs` at 1440 / 1024 / 390, dark | **0 FAIL** on every pane |
+| `cargo test --workspace --locked` | **2249 passed, 0 failed** |
+| `probe.mjs` at 1440 / 1024 / 390, light | **0 FAIL, 0 warn** on all ten views |
+| `probe.mjs` at 1440 / 1024 / 390, dark | **0 FAIL, 0 warn** on all ten views |
 | `contrast.py --css app.css` | **0 failing pairs** (light band) |
 | the dark band, hand-computed | **0 failing pairs** across 22 token pairs, including `--amber-ink` on both grounds |
-| the browser behaviour check | **15/15 checks passed** |
-| `detect.sh` (anti-slop) | 0 failed |
+| the browser behaviour check, **unarmed** | **20/20 checks passed** |
+| the browser behaviour check, **armed** | **10/10 checks passed** |
+| `detect.sh` (anti-slop) | **24 passed, 0 failed** |
 
-The behaviour check (`/var/tmp/ishanp-agentic/opencode/ar-webui-test/panel-check.mjs`)
-drives a real Chromium against the scratch instance and asserts what a probe
-cannot see: that the panel renders, that the nine panes load **their own
-data**, that the settings view names the env-backed variables, that the
-per-combo block is there, that a refused write leaves a **persistent**
-message, that a `?token=` is stripped from the URL and kept in
-`sessionStorage` at **both** `/ui` and `/ui/`, and that an unarmed panel asks
-for no credential.
+That is **20 probe runs** (ten views x two bands x three widths), every one
+**0 FAIL and 0 warn**. The earlier runs carried a `type-scale` warn on every
+view and a `tap-target` warn on three; both are gone.
 
-### 5.1 The three standing warns, and why they stand
+The two behaviour checks drive a real Chromium against a scratch instance:
 
-| warn | why it stands |
+- **unarmed** (20 checks) — the panel renders, the ten panes load **their own
+  data**, the settings view names the env-backed variables and marks them
+  "read at boot", the per-combo block is there, the budgets view does not
+  claim every key is unrestricted, a refused write leaves a **persistent**
+  message, clicking **Save server** actually posts (a dead button is
+  invisible to a probe — it renders, it is the right size, and clicking it
+  does nothing), a `?token=` is stripped from the URL and kept in
+  `sessionStorage` at **both** `/ui` and `/ui/`, an unarmed panel asks for no
+  credential, and there are **no console errors**.
+- **armed** (10 checks) — the credential prompt appears, a wrong token is
+  refused, the right one opens the panel, the `?token=` first paint works,
+  the mint succeeds, and the state endpoint reports the gate armed.
+
+### 5.1 The standing warns
+
+**There are none.** Every probe run reports `0 FAIL, 0 warn`. The three that
+used to stand are closed:
+
+| the warn that used to stand | how it was closed |
 |---|---|
-| `type-scale` (largest type 30px, 2.2x body) | the rubric's 48px is a hero's bar. A control panel's h1 is a page title. Raising it further would make the panel a poster. |
-| `tap-target` on the table buttons | the table buttons are **27px**. They clear WCAG 2.5.8 (24px) and miss the AAA 2.5.5 44px recommendation. The density is the point — a dashboard's rows are meant to be dense — and the touch breakpoint (≤880px), where the row gives up its density, is where the buttons take the full 44px. A pseudo-element faking the target was tried and **removed**: an invisible 44px overlay on a dense table steals the click from the neighbouring cell's button, which is worse than a small target. |
-| `cta: no primary CTA` on the usage pane | fixed in this pass: the log now carries a Reload primary action. |
+| `type-scale` (largest type 30px, 2.2x body) on every view | the h1 is **54px** over a 13.5px body: `scale=4x` at 1440 and **3.6x** at 390. The warn is gone. |
+| `tap-target` on the table buttons (27px) | the buttons are 27px and clear WCAG 2.5.8's **24px**; the touch breakpoint (≤880px), where the row gives up its density, is where they take the full 44px. **A pseudo-element faking a 44px target was tried and removed**: an invisible overlay on a dense table steals the click from the neighbouring cell's button, which is worse than a small target. |
+| `tap-target` on the checkboxes (13px wide) | the checkbox is **24px** and the label sits beside it. The measured target is the element, so the box itself had to grow. |
+| `cta: no primary CTA` on the usage pane | the Reload action moved from the head of the log (the last block on the page, below the fold on a phone) into the **filter bar** at the top. |
 
 ## 6. What was deliberately NOT done
 

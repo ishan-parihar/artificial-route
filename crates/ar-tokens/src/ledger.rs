@@ -33,7 +33,8 @@ CREATE TABLE IF NOT EXISTS usage (
     total_tokens      INTEGER NOT NULL,
     cost_micros       INTEGER NOT NULL,
     priced            INTEGER NOT NULL,
-    created_at        INTEGER NOT NULL
+    created_at        INTEGER NOT NULL,
+    combo             TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS usage_by_key ON usage (key_id, id);
 CREATE TRIGGER IF NOT EXISTS usage_no_update BEFORE UPDATE ON usage
@@ -88,11 +89,27 @@ ALTER TABLE key_caps_migrated RENAME TO key_caps;
 const MIGRATE_FAILURE_PROVIDER: &str =
     "ALTER TABLE failures ADD COLUMN provider TEXT NOT NULL DEFAULT '-';";
 
+/// `usage.combo`, added after the table first shipped.
+///
+/// The column names the COMBO the client asked for, which is a different fact
+/// from `model` — that one is the serving target's own model, because the
+/// pricing lookup and the spend row describe what the provider answered.
+///
+/// Both are needed and neither replaces the other. Per-combo figures cannot
+/// be derived from the serving target: two combos may share a target, and
+/// then a join attributes one request's spend to both of them and the panel
+/// shows a spend that did not happen. The column is what makes the
+/// attribution exact.
+///
+/// An existing ledger keeps the old shape, so its old rows read as `''` — the
+/// value they always had, before the column existed.
+const MIGRATE_USAGE_COMBO: &str = "ALTER TABLE usage ADD COLUMN combo TEXT NOT NULL DEFAULT '';";
+
 const INSERT_USAGE: &str = "
 INSERT INTO usage
     (key_id, provider, model, prompt_tokens, completion_tokens, total_tokens,
-     cost_micros, priced, created_at)
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+     cost_micros, priced, created_at, combo)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
 ";
 
 const UPSERT_CAP: &str = "
@@ -115,12 +132,39 @@ pub struct Entry<'a> {
     pub provider: &'a str,
     /// Provider-local model name.
     pub model: &'a str,
+    /// The COMBO the client asked for, when the request named one.
+    ///
+    /// Empty for a request that named no combo — a flat provider request, or
+    /// a row written before the column existed. It is a different fact from
+    /// `model`, which is the serving target's own name: the combo is what the
+    /// client asked for and the model is what answered, and a per-combo
+    /// figure needs the first while the pricing lookup needs the second.
+    pub combo: &'a str,
     /// What it cost in tokens.
     pub usage: NormalizedUsage,
     /// What it cost in dollars.
     pub cost: Cost,
     /// Unix seconds.
     pub created_at: i64,
+}
+
+/// Who a request was, and what it was asked for.
+///
+/// The four names a ledger row carries, gathered so the write path does not
+/// pass four positional strings a caller can transpose. The `combo` is the
+/// name the CLIENT asked for and the `model` is the one that ANSWERED —
+/// different facts, and two combos sharing a target are exactly the case
+/// where confusing them would double-count a spend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Who<'a> {
+    /// Which API key spent it.
+    pub key_id: &'a str,
+    /// Provider that served it.
+    pub provider: &'a str,
+    /// Provider-local model name.
+    pub model: &'a str,
+    /// The combo the client asked for, or `""` when it named none.
+    pub combo: &'a str,
 }
 
 /// What a key has spent so far.
@@ -343,8 +387,9 @@ pub struct SpendBucket {
 }
 
 /// The /ui usage pane's lens over the ledger: spend by calendar day (anchored
-/// on the newest row so an idle ledger stays non-empty), by model, and by
-/// provider. [`Ledger::report`] stays wholesale; this is the aggregation.
+/// on the newest row so an idle ledger stays non-empty), by model, by
+/// provider, and by the combo the client asked for. [`Ledger::report`] stays
+/// wholesale; this is the aggregation.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Analytics {
     /// One bucket per calendar day with usage, oldest first, last 30 days.
@@ -354,6 +399,13 @@ pub struct Analytics {
     /// Per-provider buckets, most expensive first, capped at the requested
     /// limit.
     pub providers: Vec<SpendBucket>,
+    /// Per-combo buckets, most expensive first, capped at the requested limit.
+    ///
+    /// The combo is the name the CLIENT asked for, so this is the only figure
+    /// that answers "what did this model name cost me". The `models` buckets
+    /// answer a different question — what the providers charged for — and the
+    /// two are not interchangeable when two combos share a target.
+    pub combos: Vec<SpendBucket>,
 }
 
 const ANALYTICS_DAYS: &str = "
@@ -373,6 +425,16 @@ FROM usage WHERE created_at >= ?1 GROUP BY model ORDER BY 4 DESC, 1 ASC LIMIT ?2
 const ANALYTICS_PROVIDERS: &str = "
 SELECT provider, COUNT(*), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost_micros), 0)
 FROM usage WHERE created_at >= ?1 GROUP BY provider ORDER BY 4 DESC, 1 ASC LIMIT ?2
+";
+/// The ledger rows grouped by the COMBO the client asked for.
+///
+/// Grouped by the recorded `combo`, not by a join against the serving
+/// target: two combos may share a target, and a join would then attribute
+/// one request's spend to both of them — a per-combo column that sums to more
+/// than the total spend, which is a budget number that is wrong.
+const ANALYTICS_COMBOS: &str = "
+SELECT combo, COUNT(*), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost_micros), 0)
+FROM usage WHERE created_at >= ?1 AND combo <> '' GROUP BY combo ORDER BY 4 DESC, 1 ASC LIMIT ?2
 ";
 
 /// Newest row across both tables: the anchor a date range counts back from, so
@@ -477,6 +539,9 @@ impl Ledger {
         if !has_column(&conn, "failures", "provider")? {
             conn.execute_batch(MIGRATE_FAILURE_PROVIDER)?;
         }
+        if !has_column(&conn, "usage", "combo")? {
+            conn.execute_batch(MIGRATE_USAGE_COMBO)?;
+        }
         if !has_column(&conn, "key_caps", "refuse_unpriced")? {
             conn.execute_batch(MIGRATE_REFUSE_UNPRICED)?;
         }
@@ -513,18 +578,17 @@ impl Ledger {
     /// Returns [`TokenError::Sqlite`] on a write failure.
     pub fn record_response(
         &self,
-        key_id: &str,
-        provider: &str,
-        model: &str,
+        who: &Who<'_>,
         upstream_usage: &serde_json::Value,
         created_at: i64,
         prices: &PricingTable,
     ) -> Result<ResponseMeta, TokenError> {
-        let meta = ResponseMeta::from_upstream(prices, provider, model, upstream_usage);
+        let meta = ResponseMeta::from_upstream(prices, who.provider, who.model, upstream_usage);
         self.record(&Entry {
-            key_id,
-            provider,
-            model,
+            key_id: who.key_id,
+            provider: who.provider,
+            model: who.model,
+            combo: who.combo,
             usage: meta.usage(),
             cost: meta.cost(),
             created_at,
@@ -554,6 +618,7 @@ impl Ledger {
                     i64::try_from(entry.cost.usd.micros).unwrap_or(i64::MAX),
                     i64::from(entry.cost.priced),
                     entry.created_at,
+                    entry.combo,
                 ])?;
             }
         }
@@ -734,6 +799,7 @@ impl Ledger {
             days: self.named_buckets(ANALYTICS_DAYS, params![window_start(newest, days)])?,
             models: self.named_buckets(ANALYTICS_MODELS, params![rank_since, cap])?,
             providers: self.named_buckets(ANALYTICS_PROVIDERS, params![rank_since, cap])?,
+            combos: self.named_buckets(ANALYTICS_COMBOS, params![rank_since, cap])?,
         })
     }
 
@@ -906,7 +972,7 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, Toke
 #[cfg(test)]
 mod tests {
     use super::{Analytics, LogFilter, SpendBucket};
-    use super::{Cap, CostReport, DenyReason, Entry, Ledger, Verdict};
+    use super::{Cap, CostReport, DenyReason, Entry, Ledger, Verdict, Who};
     use crate::pricing::{Cost, Prices, PricingTable, Usd};
     use crate::usage::NormalizedUsage;
     use rusqlite::Connection;
@@ -917,6 +983,7 @@ mod tests {
             key_id,
             provider,
             model,
+            combo: "",
             usage: NormalizedUsage::new(tokens, 0),
             cost: Cost {
                 usd: Usd { micros: 1_000 },
@@ -1433,15 +1500,100 @@ mod tests {
         let ledger = Ledger::open_in_memory().expect("open");
         ledger
             .record_response(
-                "k1",
-                "openai",
-                "gpt-4o",
+                &Who {
+                    key_id: "k1",
+                    provider: "openai",
+                    model: "gpt-4o",
+                    combo: "",
+                },
                 &upstream_usage(),
                 1_700_000_000,
                 &priced_table(),
             )
             .expect("record");
         assert_eq!(ledger.spend("k1").expect("spend").tokens, 2_000_000);
+    }
+
+    #[test]
+    fn attributes_a_row_to_the_combo_the_client_asked_for() {
+        // The per-combo figure is only exact if the COMBO is recorded, not
+        // derived from the serving target: two combos may share a target, and
+        // a join would then charge one request's spend to both of them.
+        let ledger = Ledger::open_in_memory().expect("open");
+        ledger
+            .record_response(
+                &Who {
+                    key_id: "k1",
+                    provider: "openai",
+                    model: "gpt-4o",
+                    combo: "large-stack",
+                },
+                &upstream_usage(),
+                1_700_000_000,
+                &priced_table(),
+            )
+            .expect("record");
+        let analytics = ledger.analytics_range(30, 10).expect("analytics");
+        assert_eq!(analytics.combos.len(), 1);
+        assert_eq!(analytics.combos[0].name, "large-stack");
+    }
+
+    #[test]
+    fn two_combos_sharing_a_target_are_told_apart() {
+        // The double-count the joined estimate would have produced: one
+        // target, two combo names, and each row charged to the name it was
+        // asked for under.
+        let ledger = Ledger::open_in_memory().expect("open");
+        for combo in ["large-stack", "small-stack"] {
+            ledger
+                .record_response(
+                    &Who {
+                        key_id: "k1",
+                        provider: "openai",
+                        model: "gpt-4o",
+                        combo,
+                    },
+                    &upstream_usage(),
+                    1_700_000_000,
+                    &priced_table(),
+                )
+                .expect("record");
+        }
+        let analytics = ledger.analytics_range(30, 10).expect("analytics");
+        assert_eq!(analytics.combos.len(), 2, "each combo is its own row");
+        let by_combo: u64 = analytics.combos.iter().map(|c| c.cost_usd_micros).sum();
+        let by_model: u64 = analytics
+            .models
+            .iter()
+            .filter(|m| m.name == "gpt-4o")
+            .map(|m| m.cost_usd_micros)
+            .sum();
+        assert_eq!(
+            by_combo, by_model,
+            "the per-combo column sums to the same spend as the per-model one"
+        );
+    }
+
+    #[test]
+    fn a_row_with_no_combo_is_not_counted_as_one() {
+        // A flat provider request names no combo, and the per-combo view
+        // must not grow a bucket called "" for it.
+        let ledger = Ledger::open_in_memory().expect("open");
+        ledger
+            .record_response(
+                &Who {
+                    key_id: "k1",
+                    provider: "openai",
+                    model: "gpt-4o",
+                    combo: "",
+                },
+                &upstream_usage(),
+                1_700_000_000,
+                &priced_table(),
+            )
+            .expect("record");
+        let analytics = ledger.analytics_range(30, 10).expect("analytics");
+        assert!(analytics.combos.is_empty(), "{:?}", analytics.combos);
     }
 
     #[test]
@@ -1453,9 +1605,12 @@ mod tests {
         let usage = json!({ "input_tokens": 10, "cache_read_input_tokens": 4, "cache_creation_input_tokens": 1, "output_tokens": 2 });
         let meta = ledger
             .record_response(
-                "k1",
-                "anthropic",
-                "claude-sonnet-4",
+                &Who {
+                    key_id: "k1",
+                    provider: "anthropic",
+                    model: "claude-sonnet-4",
+                    combo: "",
+                },
                 &usage,
                 1_700_000_000,
                 &priced_table(),
@@ -1472,9 +1627,12 @@ mod tests {
         let ledger = Ledger::open_in_memory().expect("open");
         let meta = ledger
             .record_response(
-                "k1",
-                "openai",
-                "gpt-4o",
+                &Who {
+                    key_id: "k1",
+                    provider: "openai",
+                    model: "gpt-4o",
+                    combo: "",
+                },
                 &upstream_usage(),
                 1_700_000_000,
                 &priced_table(),
@@ -1493,9 +1651,12 @@ mod tests {
         let ledger = Ledger::open_in_memory().expect("open");
         let meta = ledger
             .record_response(
-                "k1",
-                "openai",
-                "gpt-4o",
+                &Who {
+                    key_id: "k1",
+                    provider: "openai",
+                    model: "gpt-4o",
+                    combo: "",
+                },
                 &json!({}),
                 1_700_000_000,
                 &priced_table(),
@@ -1510,9 +1671,12 @@ mod tests {
         let ledger = Ledger::open_in_memory().expect("open");
         let meta = ledger
             .record_response(
-                "k1",
-                "claude",
-                "claude-sonnet-4",
+                &Who {
+                    key_id: "k1",
+                    provider: "claude",
+                    model: "claude-sonnet-4",
+                    combo: "",
+                },
                 &upstream_usage(),
                 1_700_000_000,
                 &flat_rate_table(),
@@ -1532,9 +1696,12 @@ mod tests {
         let ledger = Ledger::open_in_memory().expect("open");
         let meta = ledger
             .record_response(
-                "k1",
-                "openai",
-                "no-such-model",
+                &Who {
+                    key_id: "k1",
+                    provider: "openai",
+                    model: "no-such-model",
+                    combo: "",
+                },
                 &upstream_usage(),
                 1_700_000_000,
                 &priced_table(),
@@ -1549,9 +1716,12 @@ mod tests {
         for _ in 0..3 {
             ledger
                 .record_response(
-                    "k1",
-                    "openai",
-                    "gpt-4o",
+                    &Who {
+                        key_id: "k1",
+                        provider: "openai",
+                        model: "gpt-4o",
+                        combo: "",
+                    },
                     &upstream_usage(),
                     1_700_000_000,
                     &priced_table(),

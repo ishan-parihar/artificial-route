@@ -178,9 +178,10 @@ impl BreakerClass {
 ///
 /// Named `BreakerState` rather than `CircuitState` because `crate::auto`
 /// already exports a `CircuitState` for the auto-combo health factor.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BreakerState {
     /// Dispatching normally.
+    #[default]
     Closed,
     /// Short-circuiting; the caller reroutes.
     Open,
@@ -658,6 +659,163 @@ impl Resilience {
         self.reset_override = Some(reset);
         self
     }
+
+    // ─── snapshot ─────────────────────────────────────────────────────
+
+    /// Every provider's current resilience state, as one read-only snapshot.
+    ///
+    /// The control panel's resilience view needs all three tables at once — the
+    /// key cooldowns, the `provider:model` lockouts and the provider breakers —
+    /// and asking for them one provider at a time would be three locks and
+    /// three answers that could disagree with each other between the reads.
+    /// This takes each table's lock once and returns a consistent view.
+    ///
+    /// `providers` is the caller's list of ids to report on: the resilience
+    /// table is keyed by whatever failed, and a table that failed on a provider
+    /// nobody configured is still worth showing. The caller names the universe
+    /// so the panel does not have to guess which ids exist.
+    ///
+    /// Read-only: no probe is spent, so calling this from a status endpoint
+    /// cannot change the routing decision it reports.
+    #[must_use]
+    pub fn snapshot(&self, providers: &[&str]) -> Vec<ProviderResilience> {
+        let now = Instant::now();
+        let mut out: Vec<ProviderResilience> = providers
+            .iter()
+            .map(|p| ProviderResilience {
+                provider: (*p).to_owned(),
+                ..ProviderResilience::default()
+            })
+            .collect();
+
+        // One lock per table, one pass each. The tables are independent by
+        // construction, so three short critical sections beat one long one that
+        // holds every table while a request path waits on it.
+        if let Ok(state) = self.state.lock() {
+            for (key, cooldown) in state.iter() {
+                let remaining = cooldown.until.saturating_duration_since(now);
+                if remaining.is_zero() {
+                    continue;
+                }
+                // The key table is keyed by whatever the attempt loop charged:
+                // a provider id, or a `provider:model` pair. Both are reported
+                // on the provider row they belong to.
+                let (provider, model) = split_scope_key(key);
+                for row in &mut out {
+                    if row.provider == provider {
+                        row.coolings.push(ScopeCooling {
+                            model: model.map(str::to_owned),
+                            remaining,
+                            failures: cooldown.failures,
+                        });
+                    }
+                }
+            }
+        }
+        if let Ok(scopes) = self.scopes.lock() {
+            for (key, lock) in scopes.locks.iter() {
+                let remaining = lock.until.saturating_duration_since(now);
+                if remaining.is_zero() {
+                    continue;
+                }
+                let (provider, model) = split_scope_key(key);
+                for row in &mut out {
+                    if row.provider == provider {
+                        row.locks.push(ScopeCooling {
+                            model: model.map(str::to_owned),
+                            remaining,
+                            failures: lock.failures,
+                        });
+                    }
+                }
+            }
+            for provider in &scopes.retired_providers {
+                for row in &mut out {
+                    if row.provider == provider.as_ref() {
+                        row.retired = true;
+                    }
+                }
+            }
+            for key in &scopes.retired_models {
+                let (provider, model) = split_scope_key(key);
+                for row in &mut out {
+                    if row.provider == provider {
+                        row.retired_models.push(model.unwrap_or_default().to_owned());
+                    }
+                }
+            }
+        }
+        if let Ok(breakers) = self.breakers.lock() {
+            for (provider, breaker) in breakers.iter() {
+                for row in &mut out {
+                    if row.provider == provider.as_ref() {
+                        row.breaker = breaker.state;
+                        row.breaker_failures = breaker.failures;
+                        row.breaker_threshold = breaker.class.threshold();
+                        row.breaker_reset_secs = self.reset_window(breaker.class, breaker.open_cycles).as_secs();
+                    }
+                }
+            }
+        }
+        for row in &mut out {
+            // A retired provider reads as an open breaker: that is what the
+            // routing path does with it, so the panel shows the same verdict
+            // rather than a second naming for one fact.
+            if row.retired {
+                row.breaker = BreakerState::Open;
+            }
+            row.coolings.sort_by_key(|c| std::cmp::Reverse(c.remaining));
+            row.locks.sort_by_key(|l| std::cmp::Reverse(l.remaining));
+            row.retired_models.sort();
+        }
+        out
+    }
+}
+
+/// One provider's resilience state, as the control panel reads it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProviderResilience {
+    /// The provider id.
+    pub provider: String,
+    /// The provider-scoped circuit breaker.
+    pub breaker: BreakerState,
+    /// Consecutive provider-scoped failures.
+    pub breaker_failures: u32,
+    /// Failures before the breaker opens.
+    pub breaker_threshold: u32,
+    /// How long an open breaker stays open before it admits a probe, in seconds.
+    pub breaker_reset_secs: u64,
+    /// Key-level cooldowns in force.
+    pub coolings: Vec<ScopeCooling>,
+    /// `provider:model` lockouts in force.
+    pub locks: Vec<ScopeCooling>,
+    /// Whether the provider itself is retired — nothing recovers it.
+    pub retired: bool,
+    /// Models retired under this provider.
+    pub retired_models: Vec<String>,
+}
+
+/// One cooldown or lockout, and how long it has left.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScopeCooling {
+    /// The model the scope covers, or `None` for a provider-wide scope.
+    pub model: Option<String>,
+    /// Time left before the scope is usable again.
+    pub remaining: Duration,
+    /// Consecutive failures behind it.
+    pub failures: u32,
+}
+
+/// Splits a resilience table key into its provider and model halves.
+///
+/// The tables use two key shapes: a bare provider id, and
+/// `provider`+U+001F+`model` (see [`model_key`]). A key with no separator is a
+/// provider-wide scope, which is reported with no model.
+fn split_scope_key(key: &str) -> (&str, Option<&str>) {
+    match key.split_once('\u{1f}') {
+        Some((provider, model)) => (provider, Some(model)),
+        None => (key, None),
+    }
 }
 
 /// Enters `Open` at `now`.
@@ -847,6 +1005,57 @@ mod tests {
         r.record_failure("k1", None);
         r.record_failure("k1", None);
         assert_eq!(r.failures("k1"), 2);
+    }
+
+    #[test]
+    fn snapshot_should_report_a_closed_breaker_for_a_healthy_provider() {
+        let r = Resilience::new();
+        let snap = r.snapshot(&["openai"]);
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].breaker, BreakerState::Closed);
+    }
+
+    #[test]
+    fn snapshot_should_report_the_model_lockout_under_its_provider() {
+        let r = Resilience::new();
+        r.lock_model("openai", "gpt-4o", LockReason::Throttled, Duration::from_secs(120));
+        let snap = r.snapshot(&["openai"]);
+        assert_eq!(snap[0].locks.len(), 1);
+        assert_eq!(
+            snap[0].locks[0].model.as_deref(),
+            Some("gpt-4o"),
+            "the lock names the model it covers"
+        );
+    }
+
+    #[test]
+    fn snapshot_should_not_spend_a_half_open_probe() {
+        // The snapshot is read by a status endpoint, and spending a probe there
+        // would let a dashboard refresh change the routing decision.
+        let r = Resilience::with_test_breaker_reset(Resilience::new(), Duration::from_secs(30));
+        for _ in 0..12 {
+            r.record_provider_failure("openai", BreakerClass::Key);
+        }
+        assert_eq!(r.breaker_state("openai"), BreakerState::Open);
+        let _ = r.snapshot(&["openai"]);
+        assert_eq!(
+            r.breaker_state("openai"),
+            BreakerState::Open,
+            "a snapshot must not admit a probe"
+        );
+    }
+
+    #[test]
+    fn snapshot_should_report_a_retired_provider_as_an_open_breaker() {
+        let r = Resilience::new();
+        r.retire_provider("openai");
+        let snap = r.snapshot(&["openai"]);
+        assert!(snap[0].retired);
+        assert_eq!(
+            snap[0].breaker,
+            BreakerState::Open,
+            "a retired provider is what the routing path sees"
+        );
     }
 
     #[test]

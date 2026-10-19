@@ -84,3 +84,34 @@ its credential store undecryptable (the 2026-10-19 prod incident).
   (`docs/27` §7.2). The evidence says the store **beside the config**
   (`~/.config/ar/credentials.db`) must win, because that is the one `aroute serve` opens.
 - After U0, re-run the audit probes and confirm the public `/ui` is 404 while `/v1` is 200.
+
+## Outcome — 2026-10-20 (U0-U5 shipped)
+
+The record of what shipped, with the evidence, is
+[`docs/30-ui-production-grade.md`](../30-ui-production-grade.md). The state of
+every open item is [`docs/28-gap-ledger.md`](../28-gap-ledger.md) §F; the
+register rows are `UI-00` … `UI-08` in `TODO.md`.
+
+**Shipped:** U0's `AR-3` (the write handlers refuse on a broken gate) and
+U0's doctor check (a store that is present but unreadable now makes the check
+**fail**); U1's whole gate (a three-state panel gate, the credential on
+`/ui/api/*`, the paste-a-token field, `sessionStorage`, the `?token=` first
+paint stripped from the URL); U2's four states, persistent errors, and the
+write that re-reads; U3's four new views; U4's settings pane over the
+yaml-backed sections; U5's craft pass.
+
+**Still the operator's:** U0's `AR-2` (the cloudflared ingress 404) — staged
+on the VPS, needs a **root** `systemctl restart cloudflared`. Until it runs,
+the public `/ui` is **gated** rather than **open**, which is a different
+thing and a smaller one. `UI-08` (which credential store is canonical) is
+also the operator's ruling.
+
+**The gates, as measured:** clippy clean; **2249** workspace tests green;
+**20** probe runs (ten views x two bands x three widths) at **0 FAIL, 0
+warn**; `contrast.py` 0 failing pairs; the anti-slop detector **24/24**; the
+browser behaviour checks **20/20** unarmed and **10/10** armed; CRAFT
+**18/20** with no item at 0.
+
+**U6 is not started** and stays out of scope until U0's ingress block is the
+operator's and the operator wants it.
+

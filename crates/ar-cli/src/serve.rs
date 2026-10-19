@@ -11,6 +11,7 @@
 //! does not carry: the port override and the prices, which come from the
 //! compiled-in registry rather than from a config the user hand-edits.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use ar_config::Config;
@@ -27,6 +28,45 @@ use crate::webui;
 /// Names the directory the observability write path uses: `ar-trace-*.jsonl`
 /// and `audit.redb`, side by side.
 pub const OBS_DIR_VAR: &str = "AR_OBS_DIR";
+
+/// The panel's gate state, resolved by reading the store's gate row.
+///
+/// Three arms, and the arm is decided by *decrypting* rather than by finding
+/// the row's name:
+///
+/// * **Unarmed** — no store, or no gate row in it. The socket's loopback bind
+///   is the trust boundary, exactly as it is for `/v1` on the same build.
+/// * **Armed** — the row decrypts. The panel's API then requires a token.
+/// * **Broken** — the row exists and will not decrypt. The server's own boot
+///   log already says "serving ungated", so the operator believes the gate
+///   is armed while it is not. The panel refuses its writes in that state.
+///
+/// The three-arm split is the point: "the store is missing" and "the store
+/// cannot be opened" are different problems, and collapsing them into
+/// "unarmed" would silently reopen the panel on a box whose operator
+/// believes it is closed.
+fn gate_state(cli: &Cli) -> webui::auth::GateState {
+    let Some(store) = commands::credential_store(cli) else {
+        return webui::auth::GateState::Unarmed;
+    };
+    match commands::gate_master(&store) {
+        Ok(None) => webui::auth::GateState::Unarmed,
+        Ok(Some(master)) => {
+            // The token engine needs a `MasterKey`, and the master bytes are
+            // what it signs with (`MasterKey::signing_key` returns the master
+            // itself), so this is the same key the server's `/v1` gate
+            // verifies against.
+            match ar_keys::MasterKey::new(
+                master.to_owned_secret(),
+                ar_keys::KeyMeta::generate(),
+            ) {
+                Ok(master) => webui::auth::GateState::Armed(ar_keys::Tokens::new(&master)),
+                Err(e) => webui::auth::GateState::Broken(e.to_string()),
+            }
+        }
+        Err(e) => webui::auth::GateState::Broken(e.to_string()),
+    }
+}
 
 /// Builds the server components from File-mode config.
 ///
@@ -168,22 +208,61 @@ pub async fn serve(cli: &Cli, args: &ServeArgs) -> anyhow::Result<()> {
     // The control page (docs/16 Option B): the ledger Arc is cloned before the
     // server consumes `Components`, and the credential store is a second
     // sqlite connection — `components` keeps its own, and sqlite takes
-    // concurrent readers. `gate_armed` is read the same way `components`
-    // reads it, so the badge and the gate can never disagree.
-    let gate_armed = commands::credential_store(cli)
-        .as_ref()
-        .and_then(|s| commands::gate_master(s).ok().flatten())
-        .is_some();
-    let ui_ctx = webui::Ctx::new(
+    // concurrent readers.
+    //
+    // The gate is resolved ONCE, into a `GateState`, and that value is the
+    // only thing the panel reads its armed-badge from. The old shape computed
+    // the badge from a separate `gate_master` call and the gate from another,
+    // and the two could disagree — a store that opened for one and not the
+    // other produced a badge saying "unarmed" on a panel that was refusing
+    // every request, which is the exact confusion this panel exists to
+    // remove.
+    let mut ui_ctx = webui::Ctx::new(
         cli.config.clone(),
         built.ledger.clone(),
         commands::credential_store(cli),
-        gate_armed,
     );
+
+    // The panel's own gate, resolved by *decrypting* the gate row rather than
+    // by finding its name. A row that will not decrypt under the current
+    // master is a broken gate: the server's own boot log says "serving
+    // ungated", so the operator believes the gate is on while it is not. The
+    // panel's answer to that is what `GateState::Broken` is for — reads
+    // degrade, writes refuse.
+    ui_ctx.set_gate(gate_state(cli));
 
     let server = ar_server::server(built);
     let count = server.state.config.providers.len();
     let port = server.state.config.port;
+
+    // The panel reports the *running* proxy, not the file: its resilience
+    // table, its provider list and its resolved settings are the live ones.
+    // The combo table is deliberately NOT threaded through here: the panel
+    // reads combos from the config file, which is the file it edits, and a
+    // second copy of the combo table in the server's shape would be a second
+    // source of truth for the same thing.
+    ui_ctx.attach_server(
+        Arc::clone(&server.state.resilience),
+        server
+            .state
+            .config
+            .providers
+            .iter()
+            .map(|p| p.id.as_str().to_owned())
+            .collect(),
+        webui::ServerSettings {
+            request_timeout_secs: server.state.config.max_deadline().as_secs(),
+            timeouts: server
+                .state
+                .config
+                .timeouts
+                .iter()
+                .map(|(k, v)| (k.clone(), v.as_secs()))
+                .collect(),
+            model_discovery: server.state.config.model_discovery,
+            auth_mode: server.state.auth_mode.as_str().to_owned(),
+        },
+    );
     let addr = ar_server::app::bind_addr(&cfg.server.host, port, false).map_err(|e| {
         commands::fail(
             e,

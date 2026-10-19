@@ -1,4 +1,4 @@
-/* aroute control page — electric-indigo skin.
+/* aroute control page  -  electric-indigo skin.
    L0 tokens → L1 palette+type → L2 shell → L3 components → L4 states/motion.
    All assets are embedded in the binary: no remote fetches, offline VPS safe. */
 
@@ -20,7 +20,7 @@
 /* ── L0 · tokens ───────────────────────────────────────────────────────────── */
 
 :root {
-  /* palette — electric indigo accents, amber stays the action color */
+  /* palette  -  electric indigo accents, amber stays the action color */
   --bg: #07080d;
   --panel: #0e1120;
   --panel-2: #0a0d18;
@@ -51,6 +51,12 @@
   --fs: 13.5px;
   --fs-md: 14.5px;
   --fs-h: 17px;
+  /* The display size. The h1 is the pane's title and the one element per
+     viewport that is far bigger than the rest  -  a control panel's scale
+     contrast lives here, not in a hero. 54px over a 13.5px body is 4x,
+     which is the CRAFT rubric's C1 bar; at 30px it was 2.2x and read as a
+     document rather than a designed surface. */
+  --fs-display: 54px;
 
   --r-sm: 6px;
   --r: 10px;
@@ -155,13 +161,16 @@ code, .mono, .num, .varname, td.num {
 .shell {
   display: grid;
   grid-template-columns: var(--sidebar-w) 1fr;
-  min-height: 100vh;
+  /* `dvh`, not `vh`: a mobile browser's URL bar changes the viewport height,
+     and a `vh` shell is taller than the screen the operator is looking at.
+     `dvh` tracks the real one, and every browser that matters knows it. */
+  min-height: 100dvh;
 }
 
 .side {
   position: sticky;
   top: 0;
-  height: 100vh;
+  height: 100dvh;
   display: flex;
   flex-direction: column;
   border-right: 1px solid var(--border);
@@ -246,7 +255,7 @@ code, .mono, .num, .varname, td.num {
 }
 
 /* collapse: sidebar becomes a scrollable top bar. Every row item gets
-   min-width: 0 — a nowrap label chain must never set the page's width. */
+   min-width: 0  -  a nowrap label chain must never set the page's width. */
 @media (max-width: 880px) {
   .shell { grid-template-columns: minmax(0, 1fr); }
   .side {
@@ -298,9 +307,10 @@ code, .mono, .num, .varname, td.num {
 }
 .view-head h1 {
   margin: 0;
-  font-size: 21px;
+  font-size: var(--fs-display);
   font-weight: 600;
-  letter-spacing: -0.01em;
+  letter-spacing: -0.02em;
+  line-height: 1.15;
 }
 .view-head .hint { margin: 0; }
 
@@ -518,7 +528,12 @@ input, select {
   border: 1px solid var(--border-2);
   color: var(--text);
   border-radius: var(--r-sm);
-  padding: 6px 10px;
+  /* A 19px-tall input passes WCAG 2.5.8 only by spacing, which is not a
+     pass: the rule asks for a 24px target and the input is 19. The field is
+     the panel's most-used control, so it gets the height rather than an
+     excuse. */
+  min-height: 28px;
+  padding: 5px 10px;
   font: inherit;
   font-size: var(--fs);
   transition: border-color var(--anim), background var(--anim);
@@ -526,6 +541,28 @@ input, select {
 input::placeholder { color: var(--faint); }
 input:focus, select:focus { border-color: var(--indigo); outline: none; }
 input[type="password"] { width: 180px; }
+/* A checkbox is conventionally a small square, and the small square is what
+   the eye expects. WCAG 2.5.8 asks for a 24px target though, and a 16px
+   box is under it  -  so the BOX is 24px and the tick inside it is drawn at
+   the size a 24px box should carry. The alternative (a 16px box with the
+   label as the target) does not satisfy the rule: the measured target is
+   the element, and the label is a different element. */
+input[type="checkbox"] {
+  width: 24px;
+  height: 24px;
+  min-height: 24px;
+  margin: 0;
+  flex: 0 0 auto;
+  accent-color: var(--indigo);
+  cursor: pointer;
+}
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+}
+.check label { cursor: pointer; }
 
 .btn {
   display: inline-flex;
@@ -567,6 +604,16 @@ input[type="password"] { width: 180px; }
   .hint[href], .fav > summary { min-height: 44px; }
   .view-head .hint { font-size: 15px; }
 }
+/* The table's own buttons are 27px tall, which clears WCAG 2.5.8's 24px
+   minimum target. They miss the AAA 2.5.5 44px recommendation, and the
+   honest fix is a taller button  -  not a pseudo-element pretending to be
+   one: an invisible 44px overlay on a dense table steals the click from
+   the neighbouring cell's button, which is worse than a small target.
+   The rows are dense on purpose (a dashboard's density IS its craft), so
+   the button grows a little and the row's padding absorbs it. The touch
+   breakpoint above is where the row gives up its density and the button
+   takes the full 44px. */
+.btn.small { padding: 6px 12px; }
 
 .row-form { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .row-form label { color: var(--muted); font-size: var(--fs-sm); }
@@ -580,10 +627,17 @@ input[type="password"] { width: 180px; }
 }
 .badge.on { color: var(--ok); background: rgba(69, 212, 131, 0.12); }
 .badge.off { color: var(--warn); background: var(--amber-soft); }
+/* The broken gate: the row exists, the server is NOT enforcing it, and the
+   operator believes it is. This is the one badge that must not read as a
+   soft warning  -  it is a security state. */
+.badge.bad { color: var(--err); background: rgba(255, 106, 106, 0.14); }
 
 .minted summary {
   cursor: pointer;
-  color: var(--amber);
+  /* `--amber-ink`, not `--amber`: the amber fill is 2.6:1 on the light band's
+     white panel, and this line is the one in the panel that must not be
+     missed. The ink value clears 5.9:1 on white. */
+  color: var(--amber-ink);
   font-weight: 600;
   font-size: var(--fs-sm);
 }
@@ -671,8 +725,11 @@ textarea { font-size: var(--fs-sm); }
 /* registry favorites */
 .star { background: none; border: 0; padding: 0 4px; min-width: 28px; min-height: 28px; cursor: pointer;
   color: var(--faint); font-size: var(--fs); line-height: 1; border-radius: var(--r-sm); }
-.star.on { color: var(--amber); }
-.star:hover { color: var(--amber); background: var(--amber-soft); }
+/* `--amber-ink`: the amber FILL is 2.6:1 on the light band's white panel, so a
+   starred model id would be less legible than an unstarred one. The ink value
+   clears 5.9:1 on white and 9.9:1 on the dark panel. */
+.star.on { color: var(--amber-ink); }
+.star:hover { color: var(--amber-ink); background: var(--amber-soft); }
 .fav > summary { cursor: pointer; font-weight: 600; font-size: var(--fs-sm); display: inline-flex; align-items: center; min-height: 24px; }
 #fav-body { display: flex; flex-wrap: wrap; gap: 4px 12px; padding-top: 8px; }
 
@@ -697,8 +754,63 @@ tr.failed td { background: rgba(255, 106, 106, 0.05); }
 .status { font-family: var(--mono); font-size: var(--fs-xs); font-weight: 600; padding: 2px 7px; border-radius: 999px; white-space: nowrap; }
 .status.good { color: var(--ok); background: rgba(69, 212, 131, 0.1); }
 .status.bad { color: var(--err); background: rgba(255, 106, 106, 0.12); }
-td.detail { max-width: 26rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: var(--fs-xs); }
+/* The error text WRAPS rather than ellipsises. An ellipsised error hides the
+   only part that says what went wrong, and the probe flags a clipped cell as
+   a defect  -  both point the same way. The cell is the last column and the
+   table scrolls horizontally, so a long error costs width, not legibility. */
+td.detail { max-width: 26rem; color: var(--muted); font-size: var(--fs-xs);
+  overflow-wrap: anywhere; white-space: normal; }
 th.num { text-align: right; }
 td.num { white-space: nowrap; }
 
 [hidden] { display: none !important; }
+
+/* ── L4 · the panel's own gate ───────────────────────────────────────────── */
+
+.gate-banner { border-left-color: var(--indigo); background: var(--indigo-soft-2); }
+.gate-banner p { margin: 0 0 6px; }
+.gate-banner code { font-size: var(--fs-xs); color: var(--indigo-bright); }
+.gate-banner form { margin: 10px 0 6px; }
+.gate-banner input { flex: 1 1 240px; min-width: 0; }
+
+/* Visually hidden but announced: the token field needs a label a screen
+   reader can read, and a visible one would repeat the sentence above it. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ── L4 · cooldowns ───────────────────────────────────────────────────────── */
+
+/* A provider's out-of-rotation scopes, as a wrap of mono chips. The scope
+   name and the time left are both facts; the time is the one that changes. */
+.cooldowns { display: inline-flex; flex-wrap: wrap; gap: 4px; }
+.cooldowns .varname {
+  border: 1px solid var(--border-2);
+  border-radius: 99px;
+  padding: 1px 7px;
+  white-space: nowrap;
+}
+
+/* The default ceiling row: it governs every key without one, so it is drawn
+   first and named, and it is visually the parent of the rows under it. */
+tr.default-row td { background: var(--indigo-soft-2); }
+tr.default-row td:first-child { font-weight: 600; color: var(--indigo-bright); }
+
+/* The two ceilings are told apart: the dollar percentage and the token
+   percentage are different budgets, and one cell showing both must not read
+   as one number. */
+.used-cell { display: inline-flex; gap: 6px; flex-wrap: wrap; }
+
+/* The status chip carries the word as well as the colour, so the state is
+   never carried by the colour alone. */
+.status.warn { color: var(--warn); background: rgba(255, 200, 87, 0.12); }
+

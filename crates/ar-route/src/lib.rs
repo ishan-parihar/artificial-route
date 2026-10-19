@@ -101,7 +101,10 @@ pub use pipeline::{
     StageExecutorArgs, StageExecutorResult, StageName, StagePrompt, StageResult, TaskType, Verdict,
     build_pipeline_config, execute_pipeline, parse_reflect_json,
 };
-pub use resilience::{DEFAULT_BASE_BACKOFF, DEFAULT_MAX_BACKOFF, Resilience};
+pub use resilience::{
+    DEFAULT_BASE_BACKOFF, DEFAULT_MAX_BACKOFF, BreakerState, ProviderResilience, Resilience,
+    ScopeCooling,
+};
 pub use simulate::{ChainTarget, RoutePlan, simulate_route};
 pub use attempt::attempt_loop_with_pins;
 pub use strategy::{

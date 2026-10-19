@@ -908,7 +908,14 @@ async fn handle_chat_inner(
         if let Some(source) = source {
             reframe_stream(&mut outcome, dialect, &canonical.model, source);
         }
-        account_stream(&mut outcome, state, dialect, key_id.as_deref(), dispatched);
+        account_stream(
+            &mut outcome,
+            state,
+            dialect,
+            key_id.as_deref(),
+            &canonical.model,
+            dispatched,
+        );
         ResponseMeta::default()
             .with_latency(dispatched.elapsed())
             .with_savings_tokens(savings_tokens)
@@ -917,7 +924,10 @@ async fn handle_chat_inner(
             state,
             &mut outcome,
             dialect,
-            key_id.as_deref(),
+            &Accounted {
+                key_id: key_id.as_deref(),
+                combo: &canonical.model,
+            },
             dispatched.elapsed(),
             savings_tokens,
             source,
@@ -958,6 +968,21 @@ async fn handle_chat_inner(
     .with_guard(guard_verdict)
 }
 
+/// What one served request is accounted against.
+///
+/// The names the request itself carries, gathered so the accounting path does
+/// not pass positional strings a caller can transpose. The `combo` is the
+/// name the CLIENT asked for; the serving target's own model comes from the
+/// attempt outcome, because it is what ANSWERED and the two are different
+/// facts — two combos sharing a target are exactly the case where confusing
+/// them would double-count a spend.
+struct Accounted<'a> {
+    /// The key the gate verified, or `None` for an anonymous request.
+    key_id: Option<&'a str>,
+    /// The combo the client asked for.
+    combo: &'a str,
+}
+
 /// Drains a non-streaming reply now that its usage can be counted, records it,
 /// and hands back the accounting figures — while the streamed arm keeps
 /// relaying untouched frames.
@@ -978,7 +1003,7 @@ async fn buffer_for_accounting(
     state: &AppState,
     outcome: &mut AttemptOutcome,
     dialect: Dialect,
-    key_id: Option<&str>,
+    accounted: &Accounted<'_>,
     elapsed: Duration,
     savings_tokens: u32,
     source: Option<ar_registry::WireFormat>,
@@ -1022,9 +1047,10 @@ async fn buffer_for_accounting(
     };
     let meta = read_and_record(
         state,
-        key_id,
+        accounted.key_id,
         provider.as_str(),
         &model,
+        accounted.combo,
         counted,
         &body,
         attempts,
@@ -1086,6 +1112,7 @@ fn read_and_record(
     key_id: Option<&str>,
     provider: &str,
     model: &str,
+    combo: &str,
     dialect: Dialect,
     body: &[u8],
     attempts: u16,
@@ -1129,9 +1156,12 @@ fn read_and_record(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .record_response(
-                key_id.unwrap_or("anonymous"),
-                provider,
-                model,
+                &ar_tokens::Who {
+                    key_id: key_id.unwrap_or("anonymous"),
+                    provider,
+                    model,
+                    combo,
+                },
                 usage,
                 epoch_now(),
                 pricing,
@@ -1240,6 +1270,13 @@ struct UsageTee {
     key_id: String,
     provider: String,
     model: Strng,
+    /// The COMBO the client asked for, recorded beside the serving model.
+    ///
+    /// A different fact from `model`: the model is what the provider answered
+    /// and the combo is what the client called. The pricing lookup needs the
+    /// first; a per-combo figure needs the second, and two combos sharing a
+    /// target would otherwise be indistinguishable.
+    combo: String,
     dialect: Dialect,
     /// Carried so the observation reports what the router actually spent, the
     /// same figure `ar_upstream_attempts_total` counts.
@@ -1359,9 +1396,12 @@ impl UsageTee {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .record_response(
-                &self.key_id,
-                &self.provider,
-                &self.model,
+                &ar_tokens::Who {
+                    key_id: &self.key_id,
+                    provider: &self.provider,
+                    model: &self.model,
+                    combo: &self.combo,
+                },
                 &usage,
                 epoch_now(),
                 &self.state.config.prices,
@@ -1387,6 +1427,7 @@ fn account_stream(
     state: &AppState,
     dialect: Dialect,
     key_id: Option<&str>,
+    combo: &str,
     dispatched: Instant,
 ) {
     // Before the destructure below, which holds the outcome's borrow.
@@ -1416,6 +1457,7 @@ fn account_stream(
         // `Arc<str>` copy is a refcount bump; `to_owned` on the borrowed tail
         // of the destructure would allocate a second one for nothing.
         model: model.clone(),
+        combo: combo.to_owned(),
         dialect,
         attempts,
         dispatched,
@@ -4682,9 +4724,12 @@ mod tests {
         let ledger = ar_tokens::Ledger::open_in_memory().expect("ledger");
         let meta = ledger
             .record_response(
-                "k1",
-                "openai",
-                "gpt-4o",
+                &ar_tokens::Who {
+                    key_id: "k1",
+                    provider: "openai",
+                    model: "gpt-4o",
+                    combo: "",
+                },
                 &serde_json::json!({ "prompt_tokens": 1_000_000 }),
                 1_700_000_000,
                 &priced_table(),
@@ -4714,9 +4759,12 @@ mod tests {
     fn record_million_token_completion(ledger: &ar_tokens::Ledger) -> ar_tokens::ResponseMeta {
         ledger
             .record_response(
-                "k1",
-                "openai",
-                "gpt-4o",
+                &ar_tokens::Who {
+                    key_id: "k1",
+                    provider: "openai",
+                    model: "gpt-4o",
+                    combo: "",
+                },
                 &serde_json::json!({ "prompt_tokens": 1_000_000, "completion_tokens": 1_000_000 }),
                 1_700_000_000,
                 &priced_table(),
@@ -6129,6 +6177,7 @@ mod tests {
             key_id: "anonymous".to_owned(),
             provider: "soak-stub".to_owned(),
             model: Strng::from("m"),
+            combo: "combo-under-test".to_owned(),
             dialect: Dialect::OpenAi,
             attempts: 2,
             dispatched: Instant::now(),
@@ -6176,6 +6225,7 @@ mod tests {
             key_id: "anonymous".to_owned(),
             provider: "p".to_owned(),
             model: Strng::from("m"),
+            combo: "combo-under-test".to_owned(),
             dialect: Dialect::OpenAi,
             attempts: 1,
             dispatched: Instant::now(),

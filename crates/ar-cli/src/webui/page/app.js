@@ -1,7 +1,7 @@
 /* aroute control page. Vanilla JS on purpose: no build step, no remote
-   fetches, works on an offline VPS. Phase A shell: hash-routed panes over
-   one state snapshot; single-threaded DOM through the H() builder keeps
-   everything XHR-safe with zero deps. */
+   fetches, works on an offline VPS. Hash-routed panes over one state
+   snapshot; single-threaded DOM through the H() builder keeps everything
+   XHR-safe with zero deps. */
 
 "use strict";
 
@@ -29,21 +29,122 @@ let EDITING = null;
 let MINTED = null;
 let PG_TOKEN = "";
 
+/* ── the panel's credential ───────────────────────────────────────────────── */
+
+/* The panel's own bearer, kept in sessionStorage: it is a live secret and it
+   must not outlive the tab, but it also must not be typed again on every
+   reload of the same tab. sessionStorage (not localStorage) is the right
+   scope  -  it dies with the tab, so a shared browser does not keep it.
+
+   A `?token=` on the first URL is the one path a token can arrive by that
+   does not involve typing it. The query is read once, moved into
+   sessionStorage, and then STRIPPED from the address bar: a token left in
+   the URL ends up in the browser history, in the "copy this URL" a support
+   request pastes, and in the Referer of the next navigation. The page sets
+   `Referrer-Policy: no-referrer` too, so even a stripped URL cannot leak
+   one. */
+const TOKEN_KEY = "ar-panel-token";
+
+function token() {
+  try { return sessionStorage.getItem(TOKEN_KEY) || ""; } catch { return ""; }
+}
+
+function setToken(value) {
+  try {
+    if (value) sessionStorage.setItem(TOKEN_KEY, value);
+    else sessionStorage.removeItem(TOKEN_KEY);
+  } catch { /* a blocked storage is a panel that asks again */ }
+}
+
+/** Reads a `?token=` off the URL, stores it, and removes it from the URL. */
+function takeTokenFromUrl() {
+  const params = new URLSearchParams(location.search);
+  const found = params.get("token");
+  if (!found) return "";
+  setToken(found);
+  params.delete("token");
+  const query = params.toString();
+  history.replaceState(null, "", location.pathname + (query ? "?" + query : "") + location.hash);
+  return found;
+}
+
+/* ── the api client ──────────────────────────────────────────────────────── */
+
+/** A 401 from the panel's own API: the panel needs a credential. */
+class NeedsToken extends Error {}
+
 async function api(path, body) {
+  const headers = {};
+  if (body !== undefined) headers["content-type"] = "application/json";
+  const bearer = token();
+  if (bearer) headers.authorization = "Bearer " + bearer;
   const opts = body === undefined
-    ? {}
-    : { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) };
+    ? { headers }
+    : { method: "POST", headers, body: JSON.stringify(body) };
   const res = await fetch(path, opts);
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401 && path.startsWith("/ui/api/")) {
+    // The panel's own gate. The message says which, so the page can show
+    // the token field rather than a generic failure.
+    throw new NeedsToken(data?.error?.message || "this panel needs a credential");
+  }
   if (!res.ok) throw Object.assign(new Error(data.error || res.statusText), { data });
   return data;
 }
 
+/* ── honest states ───────────────────────────────────────────────────────── */
+
+/* Four states, and the vocabulary is OmniRoute's (the reference dashboard's
+   own `EmptyState` / `CardSkeleton` split): loading, empty, error, populated.
+   The rule this panel follows is that a state must be DISTINGUISHABLE  -  an
+   error that vanishes after eight seconds is not a state, because a failed
+   write that is gone before it is read is indistinguishable from a write
+   that succeeded. So errors here persist until the operator dismisses them,
+   and every figure says when it was read. */
+
 function showError(id, err) {
   const p = $(id);
-  p.textContent = err.message + (err.data && err.data.help ? " - " + err.data.help : "");
+  if (!p) return;
+  p.textContent = "";
+  p.append(
+    document.createTextNode(err.message +
+      (err.data && err.data.help ? " - " + err.data.help : "")),
+    H("button", { class: "btn small ghost", type: "button", text: "Dismiss",
+      onclick: () => { p.hidden = true; } }));
   p.hidden = false;
-  setTimeout(() => { p.hidden = true; }, 8000);
+}
+
+/** The panel's token prompt, shown when the API refuses for want of one. */
+function showTokenGate(message) {
+  const gate = $("gate");
+  if (!gate) return;
+  const why = $("gate-why");
+  if (why) why.textContent = message || "paste a token from `aroute keys mint`";
+  gate.hidden = false;
+  const input = $("gate-token");
+  if (input && !input.value) input.focus();
+}
+
+function hideTokenGate() {
+  const gate = $("gate");
+  if (gate) gate.hidden = true;
+}
+
+/** One cell-wide message row: the loading, empty and error states share it. */
+function stateRow(cols, text, cls) {
+  return H("tr", null, H("td", { colspan: String(cols), class: "state " + cls, text }));
+}
+
+/** The four states as one helper, so every pane says them the same way. */
+function stateBlock(cols, { loading, empty, error, retry }) {
+  if (error) return stateRow(cols, error, "failed");
+  if (loading) return stateRow(cols, loading, "loading");
+  return stateRow(cols, empty, "empty");
+}
+
+/** The "as of" stamp every figure carries. */
+function asOf() {
+  return new Date().toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
 /* ── chrome (sidebar, banner) ─────────────────────────────────────────────── */
@@ -51,17 +152,36 @@ function showError(id, err) {
 function renderChrome(st) {
   STATE = st;
   $("ver").textContent = st.bin + " " + st.version;
+  // The badge names the gate's ACTUAL state, including the broken one: a row
+  // that exists and will not decrypt is a gate the server is not enforcing,
+  // and the operator needs to see that at a glance rather than read "unarmed"
+  // and wonder which of the two it is.
   const gate = $("gate-badge");
-  gate.textContent = st.gate_armed ? "gate armed" : "gate unarmed";
-  gate.className = "badge " + (st.gate_armed ? "on" : "off");
+  const broken = !!st.gate_broken;
+  gate.textContent = st.gate_badge || (st.gate_armed ? "gate armed" : "gate unarmed");
+  gate.className = "badge " + (broken ? "bad" : st.gate_armed ? "on" : "off");
+  if (broken) gate.title = st.gate_broken;
   $("banner").hidden = !st.pending_restart;
   $("foot-config").textContent = st.config_path;
+  $("foot-config").title = st.config_path;
   $("foot-env").textContent = st.env_path;
+  $("foot-env").title = st.env_path;
 }
 
 /* ── routing ──────────────────────────────────────────────────────────────── */
 
-const VIEWS = { dashboard: paneDashboard, combos: paneCombos, providers: paneProviders, keys: paneKeys, usage: paneUsage, playground: panePlayground };
+const VIEWS = {
+  dashboard: paneDashboard,
+  combos: paneCombos,
+  providers: paneProviders,
+  keys: paneKeys,
+  usage: paneUsage,
+  playground: panePlayground,
+  resilience: paneResilience,
+  health: paneHealth,
+  budgets: paneBudgets,
+  settings: paneSettings,
+};
 const TITLES = {
   dashboard: ["Dashboard", "What the router is serving, on one screen."],
   combos: ["Routing combos", "A combo is the model name a client asks for. Targets are tried in the strategy's order."],
@@ -69,6 +189,10 @@ const TITLES = {
   keys: ["Client keys", "Tokens minted from the gate master, verified on every request. The token shows once."],
   usage: ["Usage", "Straight from the ledger the proxy bills against, with the requests that failed beside it."],
   playground: ["Playground", "Chat completions through the real gateway, same origin. Streams natively; no proxy in between."],
+  resilience: ["Resilience", "What is out of rotation right now, and for how long. Read from the router's own table."],
+  health: ["Health", "Whether each credential is present, readable, and bound to a live session."],
+  budgets: ["Budgets", "What each key has spent against its ceiling, and what each provider's allowance says."],
+  settings: ["Settings", "The yaml the proxy boots from. Environment-backed values name the variable that carries them."],
 };
 
 function currentView() {
@@ -93,8 +217,26 @@ async function route() {
   VIEWS[view](root, STATE);
 }
 
+/** The refresh, with the panel's gate handled once at the top.
+ *
+ *  A 401 is not a per-pane error: it means the whole panel is locked, so
+ *  the token prompt is shown and the panes are not rebuilt. Every other
+ *  failure is a per-pane error and stays where it happened. */
 async function refresh() {
-  renderChrome(await api("/ui/api/state"));
+  try {
+    renderChrome(await api("/ui/api/state"));
+  } catch (err) {
+    if (err instanceof NeedsToken) {
+      showTokenGate(err.message);
+      return;
+    }
+    const root = $("view");
+    root.textContent = "";
+    root.append(H("p", { class: "error", role: "alert",
+      text: "The page could not read /ui/api/state. Is the proxy running?" }));
+    return;
+  }
+  hideTokenGate();
   await fillUsage(); // before route(): the dashboard's totals are built from USAGE
   await route();
 }
@@ -424,10 +566,12 @@ async function loadCatalog() {
   try {
     data = await api("/ui/api/models");
   } catch (err) {
+    if (!host.isConnected) return; // the operator navigated away mid-flight
     host.append(H("p", { class: "error", text: err.message }));
     return;
   }
   CATALOG = data.providers || [];
+  if (!host.isConnected) return; // the operator navigated away mid-flight
   $("catalog-head").textContent = "Registry catalog (" + CATALOG.length + ")";
   host.append(...CATALOG.map((p) => H("details", { class: "catalog-row", dataset: { pid: p.id } },
     H("summary", null,
@@ -637,7 +781,7 @@ function renderKeys(st) {
     rpmInput.value = cap.rpm == null ? "" : cap.rpm;
     usdInput.value = cap.usd_micros == null ? "" : cap.usd_micros;
     tokensInput.value = cap.tokens == null ? "" : cap.tokens;
-    const unpriced = H("input", { type: "checkbox", "aria-label": "refuse_unpriced for " + name });
+    const unpriced = H("input", { type: "checkbox", id: "unpriced-" + name, "aria-label": "refuse_unpriced for " + name });
     unpriced.checked = !!cap.refuse_unpriced;
     const scope = H("input", { "aria-label": "combo scope for " + name, placeholder: "all combos", spellcheck: "false", autocomplete: "off", style: "width:110px" });
     scope.value = cap.model || "";
@@ -720,6 +864,11 @@ function paneUsage(root) {
         H("div", { class: "fl check" }, errs, H("label", { for: "lg-error", text: "Failed requests only" })),
         H("button", { id: "lg-clear", class: "btn ghost small", type: "button", text: "Clear filters", hidden: true,
           onclick: () => { Object.assign(LOGQ, { days: 30, model: "", provider: "", error: false }); route(); } }),
+        // The reload sits in the FILTER BAR, not at the head of the log: the
+        // log is the last block on the page, and a primary action the operator
+        // has to scroll to find is not a primary action.
+        H("button", { id: "usage-reload", class: "btn btn-primary small", "data-cta": "primary",
+          type: "submit", text: "Reload" }),
         H("datalist", { id: "lg-models" }), H("datalist", { id: "lg-providers" }))),
     H("p", { id: "usage-error", class: "error", role: "alert", hidden: true }),
     H("section", { class: "block" },
@@ -732,6 +881,18 @@ function paneUsage(root) {
     H("div", { class: "col2" },
       rankBlock("Top models", "usage-models"),
       rankBlock("Top providers", "usage-providers")),
+    H("section", { class: "block" },
+      H("div", { class: "block-head" },
+        H("h2", { text: "Spend by combo" }),
+        H("span", { class: "hint", text: "What each name the client asked for cost." })),
+      H("div", { class: "block-body", style: "padding:0" },
+        H("div", { class: "table-wrap" }, H("table", null,
+          H("thead", null, H("tr", null,
+            H("th", { scope: "col", text: "Combo" }),
+            H("th", { scope: "col", class: "num", text: "Req" }),
+            H("th", { scope: "col", class: "num", text: "Tokens" }),
+            H("th", { scope: "col", class: "num", text: "USD" }))),
+          H("tbody", { id: "usage-combos" }))))),
     H("section", { class: "block" },
       H("div", { class: "block-head" },
         H("h2", { text: "Request log" }),
@@ -803,6 +964,7 @@ async function loadUsageView() {
   paintUsageChart(usage.analytics);
   paintRank("usage-models", usage.analytics);
   paintRank("usage-providers", usage.analytics);
+  paintRank("usage-combos", usage.analytics);
   paintSuggestions(usage.analytics, log.rows);
   paintLog(log);
 }
@@ -810,6 +972,7 @@ async function loadUsageView() {
 function paintSuggestions(analytics, rows) {
   const fill = (id, names) => {
     const dl = $(id);
+    if (!dl || !dl.isConnected) return;
     dl.textContent = "";
     for (const n of new Set(names)) if (n && n !== "-") dl.append(H("option", { value: n }));
   };
@@ -836,7 +999,6 @@ function logRow(r) {
     H("td", { class: "num", text: bad ? "-" : r.priced ? "$" + Number(r.usd).toFixed(6) : "unpriced" }),
     H("td", { class: "detail", text: r.error, title: r.error }));
 }
-
 function logMoreRow(offset) {
   return H("tr", { class: "more" },
     H("td", { colspan: "8" },
@@ -844,11 +1006,14 @@ function logMoreRow(offset) {
 }
 
 function paintLogTotals() {
-  $("usage-totals").textContent = LOG_SHOWN ? "Showing " + LOG_SHOWN + " · " + LOG_FAILED + " failed" : "";
+  const box = $("usage-totals");
+  if (!box) return;
+  box.textContent = LOG_SHOWN ? "Showing " + LOG_SHOWN + " · " + LOG_FAILED + " failed" : "";
 }
 
 function paintLog(log) {
   const body = $("usage-rows");
+  if (!body || !body.isConnected) return;
   body.textContent = "";
   LOG_SHOWN = log.rows.length;
   LOG_FAILED = log.rows.filter((r) => r.status >= 400).length;
@@ -896,7 +1061,7 @@ async function loadOlderLog(offset) {
 function paintUsageChart(analytics) {
   const days = (analytics && analytics.days) || [];
   const chart = $("usage-days");
-  if (!chart) return;
+  if (!chart || !chart.isConnected) return;
   chart.textContent = "";
   $("usage-days-caption").textContent = "";
   $("usage-asof").textContent = days.length
@@ -923,8 +1088,8 @@ function paintUsageChart(analytics) {
 
 function paintRank(tbodyId, analytics) {
   const body = $(tbodyId);
-  if (!body || !analytics) return;
-  const rows = analytics[tbodyId.replace("usage-", "")]; // models | providers
+  if (!body || !body.isConnected || !analytics) return;
+  const rows = analytics[tbodyId.replace("usage-", "")]; // models | providers | combos
   if (!rows) return;
   body.textContent = "";
   if (!rows.length) {
@@ -940,6 +1105,409 @@ function paintRank(tbodyId, analytics) {
   }
 }
 
+/* ── pane: resilience ─────────────────────────────────────────────────────── */
+
+/* The failover rail on the dashboard shows the ORDER targets are tried in.
+   This shows what that order currently MEANS: which targets are out of
+   rotation, and for how long. Both are read from the router's own tables,
+   so the panel reports the resolver's actual state rather than a guess. */
+
+function paneResilience(root, st) {
+  root.append(
+    H("section", { class: "block" },
+      H("div", { class: "block-head" },
+        H("h2", { text: "Breakers and cooldowns" }),
+        H("span", { id: "res-asof", class: "hint" }),
+        H("button", { id: "res-refresh", class: "btn ghost small", type: "button",
+          text: "Refresh", onclick: () => loadResilience() })),
+      H("div", { class: "block-body", style: "padding:0" },
+        H("div", { class: "table-wrap" }, H("table", null,
+          H("thead", null, H("tr", null,
+            H("th", { scope: "col", text: "Provider" }),
+            H("th", { scope: "col", text: "Breaker" }),
+            H("th", { scope: "col", text: "Failures" }),
+            H("th", { scope: "col", text: "Resets in" }),
+            H("th", { scope: "col", text: "Cooldowns" }),
+            H("th", { scope: "col", text: "Locks" }),
+            H("th", { scope: "col", text: "Retired" }))),
+          H("tbody", { id: "res-rows" })))),
+      H("div", { class: "block-body" }, H("p", { id: "res-error", class: "error", role: "alert", hidden: true }))));
+  loadResilience();
+}
+
+async function loadResilience() {
+  const body = $("res-rows");
+  if (!body) return;
+  body.textContent = "";
+  body.append(stateRow(7, "Loading the router's tables…", "loading"));
+  let data;
+  try {
+    data = await api("/ui/api/resilience");
+  } catch (err) {
+    if (err instanceof NeedsToken) { showTokenGate(err.message); return; }
+    body.textContent = "";
+    body.append(stateRow(7, "Could not read the router's resilience tables.", "failed"));
+    showError("res-error", err);
+    return;
+  }
+  body.textContent = "";
+  if (!body.isConnected) return; // the operator navigated away mid-flight
+  $("res-asof").textContent = "as of " + asOf();
+  const rows = data.providers || [];
+  if (!rows.length) {
+    body.append(stateRow(7, "No providers are configured, so there is nothing to be out of rotation.", "empty"));
+    return;
+  }
+  const cooling = (list) => {
+    if (!list || !list.length) return H("span", { class: "varname", text: "-" });
+    return H("span", { class: "cooldowns" }, ...list.map((c) =>
+      H("span", { class: "varname", text: (c.model || "provider") + " " + c.remaining_secs + "s" })));
+  };
+  for (const r of rows) {
+    const breaker = r.breaker;
+    const cls = breaker === "closed" ? "good" : breaker === "half_open" ? "warn" : "bad";
+    const label = breaker === "closed" ? "closed" : breaker === "half_open" ? "half-open" : "open";
+    body.append(H("tr", null,
+      H("td", { text: r.provider }),
+      H("td", null, H("span", { class: "status " + cls, text: label })),
+      H("td", { class: "num", text: r.breaker_failures + " / " + r.breaker_threshold }),
+      H("td", { class: "num", text: r.breaker === "closed" ? "-" : r.breaker_reset_secs + "s" }),
+      H("td", null, cooling(r.coolings)),
+      H("td", null, cooling(r.locks)),
+      H("td", { class: "varname", text: r.retired ? "provider" : (r.retired_models || []).join(", ") || "-" })));
+  }
+}
+
+/* ── pane: health ────────────────────────────────────────────────────────── */
+
+/* Whether each credential is present, readable and bound to a live session.
+   The store is asked, and its refusal is the answer  -  a credential that will
+   not decrypt is BROKEN, which is a different fact from a missing one and
+   needs different advice. */
+
+function paneHealth(root, st) {
+  root.append(
+    H("section", { class: "block" },
+      H("div", { class: "block-head" },
+        H("h2", { text: "Credentials" }),
+        H("span", { id: "health-asof", class: "hint" }),
+        H("button", { class: "btn ghost small", type: "button", text: "Refresh",
+          onclick: () => loadHealth() })),
+      H("div", { class: "block-body", style: "padding:0" },
+        H("div", { class: "table-wrap" }, H("table", null,
+          H("thead", null, H("tr", null,
+            H("th", { scope: "col", text: "Provider" }),
+            H("th", { scope: "col", text: "Binding" }),
+            H("th", { scope: "col", text: "Env" }),
+            H("th", { scope: "col", text: "Store" }))),
+          H("tbody", { id: "health-rows" }))))),
+    H("section", { class: "block" },
+      H("div", { class: "block-head" }, H("h2", { text: "Sessions" })),
+      H("div", { class: "block-body", style: "padding:0" },
+        H("div", { class: "table-wrap" }, H("table", null,
+          H("thead", null, H("tr", null,
+            H("th", { scope: "col", text: "Provider" }),
+            H("th", { scope: "col", text: "Kind" }),
+            H("th", { scope: "col", text: "Terminal status" }),
+            H("th", { scope: "col", text: "Reason" }))),
+          H("tbody", { id: "session-rows" }))))),
+    H("p", { id: "health-error", class: "error", role: "alert", hidden: true }));
+  loadHealth();
+}
+
+async function loadHealth() {
+  const body = $("health-rows");
+  if (!body) return;
+  body.textContent = "";
+  body.append(stateRow(4, "Reading the credential store…", "loading"));
+  let data;
+  try {
+    data = await api("/ui/api/health");
+  } catch (err) {
+    if (err instanceof NeedsToken) { showTokenGate(err.message); return; }
+    body.textContent = "";
+    body.append(stateRow(4, "Could not read the credential store.", "failed"));
+    showError("health-error", err);
+    return;
+  }
+  body.textContent = "";
+  if (!body.isConnected) return; // the operator navigated away mid-flight
+  $("health-asof").textContent = "as of " + asOf();
+  const providers = data.providers || [];
+  if (!providers.length) {
+    body.append(stateRow(4, "No providers are configured in this file.", "empty"));
+  }
+  const storeClass = (s) => s === "ok" ? "good" : s === "missing" ? "warn" : "bad";
+  const storeLabel = (s) => s === "ok" ? "readable" : s === "missing" ? "absent" : s;
+  for (const p of providers) {
+    for (const c of p.credentials || []) {
+      body.append(H("tr", null,
+        H("td", { text: p.id }),
+        H("td", { class: "varname", text: c.ref + (c.var ? " → " + c.var : "") }),
+        H("td", null, H("span", { class: "status " + (c.in_env ? "good" : "warn"),
+          text: c.in_env ? "set" : "unset" })),
+        H("td", null, H("span", { class: "status " + storeClass(c.store),
+          text: storeLabel(c.store) }))));
+    }
+  }
+  const sessions = $("session-rows");
+  sessions.textContent = "";
+  const list = data.sessions || [];
+  if (!list.length) {
+    sessions.append(stateRow(4, "No browser sessions are stored. API-key providers do not use one.", "empty"));
+  }
+  for (const s of list) {
+    sessions.append(H("tr", null,
+      H("td", { text: s.provider }),
+      H("td", { class: "varname", text: s.kind }),
+      H("td", { class: "num", text: s.terminal_status == null ? "-" : String(s.terminal_status) }),
+      H("td", { class: "detail", text: s.terminal_reason || s.error || "-" })));
+  }
+}
+
+/* ── pane: budgets ───────────────────────────────────────────────────────── */
+
+/* Two questions on one screen: what a key has SPENT against its ceiling, and
+   what a provider's own ALLOWANCE says. They are different budgets  -  one is
+   ours, one is the provider's  -  and the panel says which is which. */
+
+function paneBudgets(root, st) {
+  root.append(
+    H("section", { class: "block" },
+      H("div", { class: "block-head" },
+        H("h2", { text: "Key budgets" }),
+        H("span", { id: "budget-asof", class: "hint" }),
+        H("button", { class: "btn ghost small", type: "button", text: "Refresh",
+          onclick: () => loadBudgets() })),
+      H("div", { class: "block-body", style: "padding:0" },
+        H("div", { class: "table-wrap" }, H("table", null,
+          H("thead", null, H("tr", null,
+            H("th", { scope: "col", text: "Key" }),
+            H("th", { scope: "col", class: "num", text: "Spent" }),
+            H("th", { scope: "col", class: "num", text: "$ cap" }),
+            H("th", { scope: "col", class: "num", text: "Tokens" }),
+            H("th", { scope: "col", class: "num", text: "Token cap" }),
+            H("th", { scope: "col", text: "Scope" }),
+            H("th", { scope: "col", text: "Used" }))),
+          H("tbody", { id: "budget-rows" }))))),
+    H("section", { class: "block" },
+      H("div", { class: "block-head" },
+        H("h2", { text: "Provider allowances" }),
+        H("span", { class: "hint", text: "The freshest reading the credential store holds." })),
+      H("div", { class: "block-body", style: "padding:0" },
+        H("div", { class: "table-wrap" }, H("table", null,
+          H("thead", null, H("tr", null,
+            H("th", { scope: "col", text: "Provider" }),
+            H("th", { scope: "col", class: "num", text: "Remaining" }),
+            H("th", { scope: "col", text: "Resets" }),
+            H("th", { scope: "col", text: "Reading" }))),
+          H("tbody", { id: "quota-rows" }))))),
+    H("p", { id: "budget-error", class: "error", role: "alert", hidden: true }));
+  loadBudgets();
+}
+
+async function loadBudgets() {
+  const body = $("budget-rows");
+  if (!body) return;
+  body.textContent = "";
+  body.append(stateRow(7, "Reading the ledger and the store…", "loading"));
+  let data;
+  try {
+    data = await api("/ui/api/budgets");
+  } catch (err) {
+    if (err instanceof NeedsToken) { showTokenGate(err.message); return; }
+    body.textContent = "";
+    body.append(stateRow(7, "Could not read the budgets.", "failed"));
+    showError("budget-error", err);
+    return;
+  }
+  body.textContent = "";
+  if (!body.isConnected) return; // the operator navigated away mid-flight
+  $("budget-asof").textContent = "as of " + asOf();
+  const rows = data.keys || [];
+  if (!rows.length) {
+    body.append(stateRow(7, "No key has a ceiling row of its own.", "empty"));
+  }
+  // The default row governs every key without one, so it is drawn FIRST and
+  // named. Leaving it out while claiming "every key is unrestricted" would
+  // be false the moment a `limits.default` exists.
+  const def = data.default;
+  if (def && (def.rpm != null || def.usd_cap != null || def.token_cap != null)) {
+    body.append(H("tr", { class: "default-row" },
+      H("td", { text: "every other key" }),
+      H("td", { class: "num", text: "-" }),
+      H("td", { class: "num", text: def.usd_cap == null ? "unset" : "$" + def.usd_cap / 1000000 }),
+      H("td", { class: "num", text: "-" }),
+      H("td", { class: "num", text: def.token_cap == null ? "unset" : Number(def.token_cap).toLocaleString() }),
+      H("td", { class: "varname", text: def.model || "all" }),
+      H("td", { class: "varname", text: "the default ceiling" })));
+  }
+  // The "used" column reports BOTH ceilings, each against its own arm.
+  // Falling back from the dollar percentage to the token percentage would
+  // conflate two different budgets into one number, and an operator reading
+  // "40%" would not know which ceiling it referred to.
+  const usedCell = (r) => {
+    const parts = [];
+    if (r.usd_pct != null) {
+      parts.push(H("span", { class: "status " + pctClass(r.usd_pct), text: "$ " + r.usd_pct.toFixed(0) + "%" }));
+    }
+    if (r.token_pct != null) {
+      parts.push(H("span", { class: "status " + pctClass(r.token_pct), text: r.token_pct.toFixed(0) + "% tok" }));
+    }
+    if (!parts.length) return H("span", { class: "varname", text: "no ceiling" });
+    return H("span", { class: "used-cell" }, ...parts);
+  };
+  const pctClass = (pct) => (pct >= 90 ? "bad" : pct >= 60 ? "warn" : "good");
+  for (const r of rows) {
+    body.append(H("tr", null,
+      H("td", { text: r.key }),
+      H("td", { class: "num", text: "$" + Number(r.usd).toFixed(6) }),
+      H("td", { class: "num", text: r.usd_cap == null ? "unset" : "$" + r.usd_cap / 1000000 }),
+      H("td", { class: "num", text: Number(r.tokens).toLocaleString() }),
+      H("td", { class: "num", text: r.token_cap == null ? "unset" : Number(r.token_cap).toLocaleString() }),
+      H("td", { class: "varname", text: r.model || "all" }),
+      H("td", null, usedCell(r))));
+  }
+  const quotas = $("quota-rows");
+  quotas.textContent = "";
+  const list = data.quotas || [];
+  if (!list.length) {
+    quotas.append(stateRow(4, "No provider has reported an allowance. The store holds no quota reading yet.", "empty"));
+  }
+  for (const q of list) {
+    const reset = q.next_reset_at
+      ? new Date(q.next_reset_at * 1000).toLocaleString()
+      : "-";
+    quotas.append(H("tr", null,
+      H("td", { text: q.provider }),
+      H("td", { class: "num", text: q.remaining_pct == null ? "-" : (q.remaining_pct * 100).toFixed(0) + "%" }),
+      H("td", { class: "varname", text: reset }),
+      H("td", { class: "varname", text: (q.stale ? "stale" : "fresh") + (q.exhausted ? " - EXHAUSTED" : "") })));
+  }
+}
+
+/* ── pane: settings ──────────────────────────────────────────────────────── */
+
+/* The yaml the proxy boots from. Two kinds of setting live in two different
+   places, and the pane says which is which: the yaml-backed ones are
+   editable here, and the environment-backed ones are shown with the variable
+   that carries them, because a form that wrote them to the yaml would edit
+   a file nothing reads. */
+
+function paneSettings(root, st) {
+  root.append(
+    H("section", { class: "block" },
+      H("div", { class: "block-head" },
+        H("h2", { text: "Server" }),
+        H("span", { class: "hint", text: "Written to config.yaml. The proxy applies it at boot." })),
+      H("div", { class: "block-body" },
+        H("form", { id: "settings-form", class: "row-form" },
+          H("label", { for: "set-host", text: "Host" }),
+          H("input", { id: "set-host", spellcheck: "false", style: "width:160px" }),
+          H("label", { for: "set-port", text: "Port" }),
+          H("input", { id: "set-port", type: "number", min: "1", max: "65535", style: "width:100px" }),
+          H("button", { type: "submit", class: "btn", text: "Save server" })),
+        H("p", { id: "settings-error", class: "error", role: "alert", hidden: true }))),
+    H("section", { class: "block" },
+      H("div", { class: "block-head" },
+        H("h2", { text: "Default ceilings" }),
+        H("span", { class: "hint", text: "The ceiling every key without a row of its own inherits." })),
+      H("div", { class: "block-body" },
+        H("form", { id: "limits-default-form", class: "row-form" },
+          H("label", { for: "def-rpm", text: "rpm" }),
+          H("input", { id: "def-rpm", type: "number", min: "1", placeholder: "unset", style: "width:100px" }),
+          H("label", { for: "def-usd", text: "$ cap (µ$)" }),
+          H("input", { id: "def-usd", type: "number", min: "0", placeholder: "unset", style: "width:120px" }),
+          H("label", { for: "def-tokens", text: "token cap" }),
+          H("input", { id: "def-tokens", type: "number", min: "0", placeholder: "unset", style: "width:120px" }),
+          H("label", { for: "def-unpriced", text: "refuse unpriced" }),
+          H("input", { id: "def-unpriced", type: "checkbox" }),
+          H("button", { type: "submit", class: "btn", text: "Save ceilings" })))),
+    H("section", { class: "block" },
+      H("div", { class: "block-head" },
+        H("h2", { text: "Environment-backed" }),
+        H("span", { class: "hint", text: "Read from the environment at boot. Edit the variable, then restart." })),
+      H("div", { class: "block-body", style: "padding:0" },
+        H("div", { class: "table-wrap" }, H("table", null,
+          H("thead", null, H("tr", null,
+            H("th", { scope: "col", text: "Setting" }),
+            H("th", { scope: "col", text: "Value" }),
+            H("th", { scope: "col", text: "Variable" }))),
+          H("tbody", { id: "env-rows" }))))));
+  loadSettings();
+  // The form exists only now, so the submit listeners are attached here and
+  // not at boot: at boot `#settings-form` is null, the listener was never
+  // attached, and "Save server" did nothing.
+  wireSettings();
+}
+
+async function loadSettings() {
+  let data;
+  try {
+    data = await api("/ui/api/settings");
+  } catch (err) {
+    if (err instanceof NeedsToken) { showTokenGate(err.message); return; }
+    showError("settings-error", err);
+    return;
+  }
+  // The operator navigated away while this was in flight: the pane's fields
+  // are gone, and writing to them would be a crash on a page that is fine.
+  if (!$("set-host")) return;
+  $("set-host").value = data.host || "";
+  $("set-port").value = data.port || "";
+  const def = (data.limits && data.limits.default) || {};
+  $("def-rpm").value = def.rpm == null ? "" : def.rpm;
+  $("def-usd").value = def.usd_micros == null ? "" : def.usd_micros;
+  $("def-tokens").value = def.tokens == null ? "" : def.tokens;
+  $("def-unpriced").checked = !!def.refuse_unpriced;
+
+  const env = $("env-rows");
+  env.textContent = "";
+  const timeouts = data.timeouts || {};
+  // These are read AT BOOT from the environment, not from the yaml. The
+  // column says so, so the operator does not look for a yaml key that is
+  // not there.
+  const rows = [
+    ["Model deadlines", Object.keys(timeouts).length
+      ? Object.entries(timeouts).map(([k, v]) => k + " " + v + "s").join(", ")
+      : "none", "AR_STREAM_TIMEOUT_SECS"],
+    ["Request timeout", data.request_timeout_secs + "s", "(built in)"],
+    ["Model discovery", data.model_discovery ? "on" : "off", "AR_MODEL_DISCOVERY"],
+    ["Auth mode", data.auth_mode || "required", "AR_AUTH_MODE"],
+  ];
+  for (const [label, value, variable] of rows) {
+    env.append(H("tr", null,
+      H("td", { text: label }),
+      H("td", { class: "varname", text: String(value) }),
+      H("td", { class: "varname", text: variable + " (read at boot)" })));
+  }
+}
+
+function wireSettings() {
+  const form = $("settings-form");
+  if (form) form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const host = $("set-host").value.trim();
+    const port = Number($("set-port").value);
+    try {
+      await api("/ui/api/settings", { server: { host, port } });
+      await refresh();
+    } catch (err) { showError("settings-error", err); }
+  });
+  const limits = $("limits-default-form");
+  if (limits) limits.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const num = (id) => $(id).value === "" ? null : Number($(id).value);
+    try {
+      await api("/ui/api/settings", { limits: { default: {
+        rpm: num("def-rpm"), usd_micros: num("def-usd"), tokens: num("def-tokens"),
+        refuse_unpriced: $("def-unpriced").checked,
+      } } });
+      await refresh();
+    } catch (err) { showError("settings-error", err); }
+  });
+}
+
 /* ── boot ─────────────────────────────────────────────────────────────────── */
 
 $("copy-restart").addEventListener("click", async () => {
@@ -952,6 +1520,21 @@ $("copy-restart").addEventListener("click", async () => {
 
 window.addEventListener("hashchange", route);
 
+/* The panel's token prompt. A `?token=` on the URL is accepted once, moved
+   into sessionStorage and stripped from the address bar  -  a token left in a
+   URL ends up in the browser history and in the Referer of the next
+   navigation. */
+takeTokenFromUrl();
+
+$("gate-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const value = $("gate-token").value.trim();
+  if (!value) return;
+  setToken(value);
+  $("gate-token").value = "";
+  await refresh();
+});
+
 /* The dashboard's numbers move while it sits open. Only the spend and usage totals
  * are refreshed, never the whole view, so a form the operator is typing into survives. */
 setInterval(async () => {
@@ -960,10 +1543,12 @@ setInterval(async () => {
   const totals = document.querySelector("#view .totals");
   if (totals) totals.replaceChildren(usageSummary());
 }, 15000);
+
 refresh().catch(() => {
   const root = $("view");
   root.textContent = "";
-  root.append(H("p", { class: "error", text: "The page could not read /ui/api/state. Is the proxy running?" }));
+  root.append(H("p", { class: "error", role: "alert",
+    text: "The page could not read /ui/api/state. Is the proxy running?" }));
 });
 
 /* ── pane: playground ───────────────────────────────────────────────────── */
