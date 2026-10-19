@@ -42,4 +42,5 @@ mode = "immutable"         # or "amendable" (dated ## Amendment sections)
 warn_until = "2026-11-18"  # warn until rollout+30d; after it a stale manual blocks close
 
 [card]
+architecture = "docs/04-subsystems.md"
 status_into = "docs/handoff/STATE.md"
