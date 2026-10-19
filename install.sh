@@ -670,12 +670,21 @@ providers:
 # A combo is a routable model name: providers alone are never addressable, so an
 # install without one leaves `aroute doctor` reporting "no model is routable" and
 # `aroute serve` with nothing to dispatch. Targets are `<provider>/<model>`.
+#
+# The standalone single-target combos after `default` are the models this
+# project operates on its own gateway; exposing each as its own combo is what
+# puts a bare id in `/v1/models` and keeps harness model pickers working when a
+# stack combo changes shape. `glm-5.3` rides nvidia's free NIM lane.
 combos:
   - id: default
     strategy: lkgp
     targets:
       - openai/gpt-5.4
       - anthropic/claude-sonnet-5
+  - id: glm-5.3
+    strategy: priority
+    targets:
+      - nvidia/z-ai/glm-5.3
 YAML
   echo "config:    wrote $CONFIG"
 fi

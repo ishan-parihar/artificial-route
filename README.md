@@ -65,6 +65,8 @@ curl -fsSL https://raw.githubusercontent.com/ishan-parihar/artificial-route/main
 
 Static musl binary, checksum-verified, no runtime deps. Lands in `~/.local/bin/aroute` and does the whole job in one command: installs the newest release, writes a working `config.yaml` under `~/.config/ar/` (never overwriting an existing one), writes a `600` env file for credentials, installs a **systemd unit** so the proxy starts on boot, and finishes by running `aroute doctor` so the result is proved rather than asserted.
 
+The written config carries two routable combos out of the box: `default` (an `openai/gpt-5.4` → `anthropic/claude-sonnet-5` least-used chain that you re-point at your own keys) and `glm-5.3` (`nvidia/z-ai/glm-5.3`, a standalone single-target combo — one combo per bare id is the house pattern that keeps harness model pickers stable as stacks change). With the `AR_MODEL_DISCOVERY=1` env line (set it in the env file), `/v1/models` reports each model's real context window — provider-native catalogs first, [models.dev](https://models.dev) second, a 128K floor last.
+
 | flag | effect |
 | --- | --- |
 | `--version <tag>` | pin an exact tag instead of the newest release |
