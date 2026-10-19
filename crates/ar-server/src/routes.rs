@@ -59,7 +59,7 @@ use ar_compress::Step;
 use ar_route::{
     ArExec, AttemptOutcome, AutoCandidate, AutoSelector, Candidate, CanonicalRequest, ChainTarget,
     ChunkStream, CutFlag, JudgeOutcome, JudgePanel, JudgeTarget, ProviderId, Resilience,
-    RouteError, Strategy, Strng, attempt_loop, pick, settle_stream, simulate_route, synthesize,
+    RouteError, Strategy, Strng, pick_for_model, settle_stream, simulate_route, synthesize,
     virtual_combo,
 };
 use ar_tokens::ResponseMeta;
@@ -812,13 +812,25 @@ async fn handle_chat_inner(
         .await
         .with_guard(guard_verdict);
     }
+    // `pipeline` is the other strategy with no chain semantics: each target is
+    // a *stage*, and each stage's answer is the next stage's input. Routing it
+    // through the ordinary attempt loop would turn the stages into fallbacks —
+    // the second stage would answer the client's question rather than the
+    // first stage's — so a `strategy: pipeline` combo silently did something
+    // other than what it said. The engine is [`ar_route::dispatch_pipeline`].
+    if plan.strategy == Strategy::Pipeline {
+        return pipeline_response(state, &canonical, &plan, dialect, dispatched)
+            .await
+            .with_guard(guard_verdict);
+    }
     let mut outcome = match tokio::time::timeout(
         state.config.stream_deadline(canonical.model.as_ref()),
-        attempt_loop(
+        ar_route::attempt_loop_with_pins(
             &canonical,
             &plan.chain,
             state.exec.as_ref(),
             &state.resilience,
+            Some(&state.lkgp),
         ),
     )
     .await
@@ -851,6 +863,17 @@ async fn handle_chat_inner(
     if matches!(outcome, AttemptOutcome::Failover { .. }) {
         state.metrics.observe_failover();
     }
+    // Feed the router's per-target load table.
+    //
+    // The table existed and had a reader, but nothing ever wrote to it on the
+    // request path: `reliability` and `latency_inv` were `None` on every
+    // request, so every candidate scored the neutral pair and `p2c` — whose
+    // whole claim is that it picks the *healthier* of two choices — degenerated
+    // to "whichever of the two random indices came first", i.e. `random`.
+    //
+    // The two numbers are now observed from what the request actually
+    // measured: whether it succeeded, and how long it took.
+    observe_target_outcome(&outcome, &plan.chain, dispatched.elapsed());
     // Pin only on success, and only when the client actually sent a session
     // key — an empty-string key would collapse every anonymous client onto one
     // provider.
@@ -1483,6 +1506,113 @@ fn usage_from_frames(
                 .find(|frame| frame.get("done").and_then(serde_json::Value::as_bool) == Some(true))
         }),
     }
+}
+
+/// Runs one `pipeline` request: each target is a stage, in order.
+///
+/// The engine is [`ar_route::dispatch_pipeline`]: the chain is strictly
+/// sequential, stage N+1's request carries stage N's answer as its only
+/// turn, and only the final stage's response is the answer. A failed stage
+/// ends the chain — a fallback here would be a different strategy wearing a
+/// pipeline's name, because the next provider answers a *different* question
+/// when it receives the previous stage's output.
+async fn pipeline_response(
+    state: &AppState,
+    canonical: &CanonicalRequest,
+    plan: &RoutePlan,
+    dialect: Dialect,
+    dispatched: Instant,
+) -> Response {
+    let combo = state.config.combo(canonical.model.as_ref());
+    let stage_candidates = state.config.candidates(combo);
+    if stage_candidates.is_empty() {
+        return error_because(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_provider",
+            "nothing_configured",
+            "the pipeline has no dispatchable stage; `ar doctor` lists what is missing",
+        );
+    }
+    let outcome = match tokio::time::timeout(
+        state.config.stream_deadline(canonical.model.as_ref()),
+        ar_route::dispatch_pipeline(&stage_candidates, canonical, state.exec.as_ref()),
+    )
+    .await
+    {
+        Err(_elapsed) => {
+            let deadline = state.config.stream_deadline(canonical.model.as_ref());
+            return error_because(
+                StatusCode::GATEWAY_TIMEOUT,
+                "upstream_timeout",
+                "model_deadline",
+                &format!(
+                    "model {:?} produced no pipeline answer within {}s",
+                    canonical.model.as_ref(),
+                    deadline.as_secs()
+                ),
+            );
+        }
+        Ok(outcome) => outcome,
+    };
+    state
+        .metrics
+        .observe_attempts(u64::try_from(outcome.trace.len()).unwrap_or(u64::MAX));
+
+    // A chain that ended early has no answer to relay: the stage that failed
+    // is named, because a client that sent a pipeline wants to know *where* it
+    // stopped, not that the gateway is unwell.
+    let Some(upstream) = outcome.upstream else {
+        let failed = outcome.failed_at.unwrap_or(0);
+        let reason = outcome
+            .trace
+            .get(failed)
+            .and_then(|v| v.error.clone())
+            .unwrap_or_else(|| "the pipeline stopped before its last stage".to_owned());
+        return error_because(
+            outcome.status(),
+            "pipeline_failed",
+            "stage_failed",
+            &format!("stage {} of {} failed: {reason}", failed + 1, outcome.trace.len()),
+        );
+    };
+
+    let outcome = AttemptOutcome::Succeeded {
+        // The **last** stage served the answer — the earlier stages are
+        // inputs to it, not the answer. Naming the first stage would put a
+        // provider in the `x-ar-decision` header that did not serve the
+        // client, which is the one field an operator reads to find out who
+        // answered.
+        provider: outcome
+            .trace
+            .last()
+            .map_or_else(|| ProviderId::new("-"), |v| v.provider.clone()),
+        model: plan
+            .chain
+            .last()
+            .map_or_else(|| ar_route::Strng::from("-"), |t| t.model.clone()),
+        attempts: u16::try_from(outcome.trace.len()).unwrap_or(u16::MAX),
+        upstream,
+    };
+    let meta = ResponseMeta::default().with_latency(dispatched.elapsed());
+    decorate(
+        outcome,
+        state.resilience.clone(),
+        canonical.stream,
+        dialect,
+        plan.strategy,
+        Stages {
+            failures: FailureSink::none(),
+            continuation: None,
+            compression: "default;engines=-".to_owned(),
+            cache_state: ar_cache::CacheState::Bypass,
+            cache_key: None,
+            planned_target: None,
+            cache: None,
+            model: ar_route::Strng::from(canonical.model.as_ref()),
+            cache_control: CacheControl::default(),
+            meta,
+        },
+    )
 }
 
 /// Runs one `fusion` request: fan the panel out, then optionally synthesize.
@@ -2318,24 +2448,104 @@ pub(crate) fn resolve(
         // A combo table is authoritative: a model that is not one of its ids is
         // a client error, not a hint.
         DefaultChain::Combo(_) => match state.config.combo(model) {
-            Some(combo) => Ok(RoutePlan {
-                chain: chain(state, combo),
-                strategy: combo.strategy,
-                compression: combo.compression,
-                judge: judge(state, combo),
-            }),
+            Some(combo) => {
+                // A combo whose *strategy* is an `auto/*` family name routes
+                // through the virtual factory over its own targets — the same
+                // sixteen-factor score the `auto/*` *model* name uses. Before
+                // this, the two parsers disagreed about the name
+                // (`ar-config` said `Auto`, `ar-route` said `Deferred`), the
+                // server used the router's answer, and every request through
+                // such a combo answered 501 naming a strategy this build
+                // ships.
+                let chain = match combo.strategy {
+                    Strategy::Auto(variant) => {
+                        auto_chain_over(state, combo, variant).unwrap_or_else(|| {
+                            chain(state, combo, canonical.session.as_deref(), model)
+                        })
+                    }
+                    _ => chain(state, combo, canonical.session.as_deref(), model),
+                };
+                Ok(RoutePlan {
+                    chain,
+                    strategy: combo.strategy,
+                    compression: combo.compression,
+                    judge: judge(state, combo),
+                })
+            }
             None => Err(RouteReject::UnknownModel(unknown_model(
                 model,
                 &state.config.combo_ids(),
             ))),
         },
         DefaultChain::Flat => Ok(RoutePlan {
-            chain: order(state, state.config.strategy, state.config.candidates(None)),
+            chain: order(
+                state,
+                state.config.strategy,
+                state.config.candidates(None),
+                canonical.session.as_deref(),
+                model,
+            ),
             strategy: state.config.strategy,
             compression: None,
             judge: None,
         }),
     }
+}
+
+/// Records what a request measured about the target that served it.
+///
+/// Two numbers, both from the request itself: whether the target succeeded,
+/// and how long the request took. The success share is a running average per
+/// target, so one failure does not erase a hundred successes and one success
+/// does not erase a hundred failures.
+///
+/// The inverse-latency factor is `1.0` for an instant answer and `0.0` for
+/// the slowest answer the target has produced, so the scale is relative: a
+/// target that answers in 50 ms is `1.0` until something beats it.
+fn observe_target_outcome(
+    outcome: &AttemptOutcome,
+    chain: &[ChainTarget],
+    elapsed: Duration,
+) {
+    let (Some(provider), Some(model)) = (outcome.provider(), outcome.serving_model()) else {
+        return;
+    };
+    let Some(target) = chain.iter().find(|t| {
+        t.provider.as_str() == provider.as_str() && t.model.as_ref() == model
+    }) else {
+        return;
+    };
+    let candidate = ar_route::Candidate::new(target.provider.clone(), target.model.as_ref());
+    let loads = ar_route::TargetLoads::global();
+    let previous = loads.load(&candidate);
+    let succeeded = matches!(outcome, AttemptOutcome::Succeeded { .. });
+    // The running success share: the previous share weighted by the requests
+    // behind it is not tracked, so this is a bounded update — the previous
+    // share moves a quarter of the way toward the new observation. It is a
+    // smoothed signal, not an exact count, and the point is to distinguish a
+    // target that keeps failing from one that mostly works.
+    let observed = if succeeded { 1.0 } else { 0.0 };
+    let reliability = match previous.reliability {
+        Some(share) => (share * 3.0 + observed) / 4.0,
+        None => observed,
+    };
+    // The latency factor is relative to the target's own best: the first
+    // observation is `1.0` (nothing to compare against), and a later, slower
+    // answer pulls it down.
+    let latency_inv = match previous.latency_inv {
+        Some(previous_best) => {
+            let millis = elapsed.as_millis() as f64;
+            if millis <= 0.0 {
+                previous_best
+            } else {
+                // `1 / (1 + millis/1000)` is the inverse-latency shape the
+                // auto scorer uses: 1.0 at zero, 0.5 at one second.
+                (1.0 / (1.0 + millis / 1000.0)).min(previous_best.max(1.0))
+            }
+        }
+        None => 1.0,
+    };
+    loads.observe_outcome(&candidate, reliability, latency_inv);
 }
 
 /// The `fusion` combo's judge provider, when it named one.
@@ -2373,8 +2583,19 @@ fn judge(state: &AppState, combo: &RouteCombo) -> Option<ProviderId> {
 ///
 /// A pool provider already in the chain is skipped: the loop must not spend two
 /// of its three attempt slots on one endpoint.
-fn chain(state: &AppState, combo: &RouteCombo) -> Vec<ChainTarget> {
-    let mut chain = order(state, combo.strategy, state.config.candidates(Some(combo)));
+fn chain(
+    state: &AppState,
+    combo: &RouteCombo,
+    session: Option<&str>,
+    model: &str,
+) -> Vec<ChainTarget> {
+    let mut chain = order(
+        state,
+        combo.strategy,
+        state.config.candidates(Some(combo)),
+        session,
+        model,
+    );
     for target in state.config.pool(combo) {
         if !chain.iter().any(|t| t.provider == target.provider) {
             chain.push(ChainTarget::new(
@@ -2392,11 +2613,33 @@ fn chain(state: &AppState, combo: &RouteCombo) -> Vec<ChainTarget> {
 /// deduplicated: attempting the same provider twice with a different model
 /// spelling is a second round trip to an endpoint that already refused this
 /// request shape.
-fn order(state: &AppState, strategy: Strategy, candidates: Vec<Candidate>) -> Vec<ChainTarget> {
+fn order(
+    state: &AppState,
+    strategy: Strategy,
+    candidates: Vec<Candidate>,
+    session: Option<&str>,
+    model: &str,
+) -> Vec<ChainTarget> {
     if candidates.is_empty() {
         return Vec::new();
     }
-    match pick(strategy, None, &candidates, &state.rr, Some(&state.lkgp)) {
+    // The session and the model are what the pin-shaped strategies rank on:
+    // `lkgp` reads the pin this server wrote for the last provider that
+    // served the session, and the two affinity strategies hash the pair into
+    // an HRW key. Passing `None` for the session — as this did — made all
+    // three unreachable on the request path while their unit tests still
+    // passed, because the unit tests call `pick` directly with a session.
+    // `pick_for_model` is the model-scoped entry point: a conversation that
+    // changes model gets a fresh pin instead of inheriting the old model's
+    // provider.
+    match pick_for_model(
+        strategy,
+        session,
+        model,
+        &candidates,
+        &state.rr,
+        Some(&state.lkgp),
+    ) {
         Ok(picked) => build_chain(&picked, &candidates),
         Err(e) => {
             // `pick` refuses an empty list, which is checked above; anything else
@@ -2486,6 +2729,53 @@ fn auto_chain(state: &AppState, model: &str) -> Option<Vec<ChainTarget>> {
         variant = %combo.variant.as_str(),
         chain = plan.chain().len(),
         "auto variant resolved"
+    );
+    Some(plan.chain().to_vec())
+}
+
+/// The `auto/*` family's chain over one combo's own targets.
+///
+/// The same factory the `auto/*` *model* name uses ([`virtual_combo`] and
+/// [`simulate_route`]), pointed at this combo's candidates rather than the
+/// server's default pool — a combo that names `auto/cheap` means "score
+/// *these* targets the cheap way", not "ignore my targets and use the
+/// server's pool".
+///
+/// `None` when the variant is not one this build carries, or the pool is
+/// empty: the caller falls back to the ordinary chain, which is the config
+/// order — a documented fallback rather than a 500.
+fn auto_chain_over(
+    state: &AppState,
+    combo: &RouteCombo,
+    variant: &str,
+) -> Option<Vec<ChainTarget>> {
+    let auto = virtual_combo(variant).ok()?;
+    let candidates = state.config.candidates(Some(combo));
+    if candidates.is_empty() {
+        return None;
+    }
+    let pool: Vec<AutoCandidate> = candidates
+        .iter()
+        .map(|c| {
+            let a = AutoCandidate::new(c.provider.clone(), c.model.as_ref()).with_rank(c.rank);
+            match c.input_usd_per_mtok {
+                Some(price) => a.with_price(price),
+                None => a,
+            }
+        })
+        .collect();
+    // No latency or circuit-history signal exists yet, so the fitness
+    // callback reports a neutral 0.5 rather than an invented number.
+    // ponytail: constant task fitness; wire real per-provider latency when
+    // `ar-obs` records it, and the ranking gains its other axis.
+    let plan = simulate_route(&auto, &pool, &AutoSelector::new(), |_| 0.5).ok()?;
+    if plan.chain().is_empty() {
+        return None;
+    }
+    tracing::info!(
+        variant = %auto.variant.as_str(),
+        chain = plan.chain().len(),
+        "auto strategy resolved"
     );
     Some(plan.chain().to_vec())
 }
@@ -3640,7 +3930,7 @@ mod tests {
         TOKENS_OUT_HEADER, TOKENS_PER_SECOND_HEADER, USAGE_FRAME_CAP, UsageTee, VERSION_HEADER,
         accept_forces_stream, build_chain, card_json, completion_seen, declares_stream, decorate,
         error, error_because, kind_for, model, models_head, not_found, outcome_label, require_json,
-        unknown_model, usage_from_frames,
+        resolve, unknown_model, usage_from_frames,
     };
     use super::{Continuation, SentText, resume_body, resumed};
     use crate::app::{AppState, Components};
@@ -3729,7 +4019,7 @@ mod tests {
             _content_type: &'a str,
             _body: &'a [u8],
         ) -> Pin<Box<dyn Future<Output = Result<MediaReply, ExecError>> + Send + 'a>> {
-            Box::pin(async move { Err(ExecError("no media dispatch in this fixture".to_owned())) })
+            Box::pin(async move { Err(ExecError::Transport("no media dispatch in this fixture".to_owned())) })
         }
     }
 
@@ -3754,6 +4044,38 @@ mod tests {
             vec![ComboTarget::new(ProviderId::new("p"), "m")],
         )];
         config
+    }
+
+    /// A two-provider server whose combo routes with `lkgp`, so the pin
+    /// table is what decides the chain.
+    fn lkgp_state() -> AppState {
+        let mut config = ServerConfig::single(
+            0,
+            Strategy::Lkgp,
+            vec![
+                crate::exec::ProviderConfig::new(
+                    ProviderId::new("first"),
+                    "http://127.0.0.1:1/v1",
+                    "k",
+                )
+                .with_model("m"),
+                crate::exec::ProviderConfig::new(
+                    ProviderId::new("second"),
+                    "http://127.0.0.1:1/v1",
+                    "k",
+                )
+                .with_model("m"),
+            ],
+        );
+        config.combos = vec![crate::config::RouteCombo::new(
+            "combo",
+            Strategy::Lkgp,
+            vec![
+                ComboTarget::new(ProviderId::new("first"), "m"),
+                ComboTarget::new(ProviderId::new("second"), "m"),
+            ],
+        )];
+        Components::unconfigured(config).into_state()
     }
 
     /// A config whose combo is a `fusion` panel over two providers, with an
@@ -3788,6 +4110,139 @@ mod tests {
         combo.judge_model = judge.map(str::to_owned);
         config.combos = vec![combo];
         config
+    }
+
+    /// A two-stage pipeline server, and an executor that answers each stage
+    /// with its own provider's name.
+    fn pipeline_config() -> ServerConfig {
+        let mut config = ServerConfig::single(
+            0,
+            Strategy::Pipeline,
+            vec![
+                crate::exec::ProviderConfig::new(
+                    ProviderId::new("a"),
+                    "http://127.0.0.1:1/v1",
+                    "k",
+                )
+                .with_model("m"),
+                crate::exec::ProviderConfig::new(
+                    ProviderId::new("b"),
+                    "http://127.0.0.1:1/v1",
+                    "k",
+                )
+                .with_model("m"),
+            ],
+        );
+        config.combos = vec![crate::config::RouteCombo::new(
+            "m",
+            Strategy::Pipeline,
+            vec![
+                ComboTarget::new(ProviderId::new("a"), "m"),
+                ComboTarget::new(ProviderId::new("b"), "m"),
+            ],
+        )];
+        config
+    }
+
+    /// Answers each stage with a body naming the provider that served it, and
+    /// records the bodies it was handed so a test can see what the *next*
+    /// stage received.
+    struct StagedExec {
+        seen: Mutex<Vec<(String, String)>>,
+    }
+
+    impl StagedExec {
+        fn new() -> Self {
+            Self {
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ArExec for StagedExec {
+        fn post_chat<'a>(
+            &'a self,
+            provider: &'a ProviderId,
+            canonical: &'a CanonicalRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<Upstream, ExecError>> + Send + 'a>> {
+            let body = String::from_utf8_lossy(&canonical.body).into_owned();
+            let name = provider.as_str().to_owned();
+            if let Ok(mut seen) = self.seen.lock() {
+                seen.push((name.clone(), body));
+            }
+            let answer = format!(
+                r#"{{"choices":[{{"message":{{"content":"from {name}"}}}}]}}"#
+            );
+            Box::pin(async move {
+                Ok(Upstream::success(Box::pin(futures::stream::once(async move {
+                    bytes::Bytes::from(answer)
+                }))))
+            })
+        }
+
+        fn post_media<'a>(
+            &'a self,
+            _provider: &'a ProviderId,
+            _model: Option<&'a str>,
+            _endpoint: &'a str,
+            _content_type: &'a str,
+            _body: &'a [u8],
+        ) -> Pin<Box<dyn Future<Output = Result<MediaReply, ExecError>> + Send + 'a>> {
+            Box::pin(async move {
+                Err(ExecError::Transport("no media in this fixture".to_owned()))
+            })
+        }
+    }
+
+    /// The regression that pins `pipeline` as a **staged** dispatch.
+    ///
+    /// It used to be wired to nothing: the server had no `Strategy::Pipeline`
+    /// branch, so a `strategy: pipeline` combo went through the ordinary
+    /// attempt loop, where the stages became *fallbacks* — the second stage
+    /// answered the client's question instead of the first stage's. A combo
+    /// that said `pipeline` silently did something else.
+    ///
+    /// The proof is the second stage's input: it must carry the **first
+    /// stage's answer**, not the client's question.
+    #[tokio::test]
+    async fn a_pipeline_stage_feeds_the_next_stage() {
+        let exec = Arc::new(StagedExec::new());
+        let router = crate::app::app(
+            Components {
+                exec: exec.clone(),
+                ..Components::unconfigured(pipeline_config())
+            }
+            .into_state(),
+        );
+        let resp = drive(
+            &router,
+            chat(
+                r#"{"model":"m","messages":[{"role":"user","content":"the question"}]}"#,
+                &[],
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_of(resp).await;
+        assert_eq!(
+            body["choices"][0]["message"]["content"], "from b",
+            "the LAST stage's answer is the client's answer"
+        );
+
+        let seen = exec.seen.lock().map(|s| s.clone()).unwrap_or_default();
+        assert_eq!(seen.len(), 2, "both stages ran: {seen:?}");
+        assert_eq!(seen[0].0, "a", "the first stage is the first target");
+        assert_eq!(seen[1].0, "b", "the second stage is the second target");
+        assert!(
+            seen[1].1.contains("from a"),
+            "the second stage must receive the first stage's answer: {:?}",
+            seen[1].1
+        );
+        assert!(
+            !seen[1].1.contains("the question"),
+            "the second stage must NOT receive the client's question again: {:?}",
+            seen[1].1
+        );
     }
 
     fn routed_fusion(exec: Arc<dyn ArExec>, judge: Option<&str>) -> AppState {
@@ -3827,7 +4282,7 @@ mod tests {
             _content_type: &'a str,
             _body: &'a [u8],
         ) -> Pin<Box<dyn Future<Output = Result<MediaReply, ExecError>> + Send + 'a>> {
-            Box::pin(async move { Err(ExecError("no media dispatch in this fixture".to_owned())) })
+            Box::pin(async move { Err(ExecError::Transport("no media dispatch in this fixture".to_owned())) })
         }
     }
 
@@ -3868,9 +4323,7 @@ mod tests {
             // The chat recorder is only pointed at chat paths; a media dispatch
             // reaching it means a test wired the wrong route.
             Box::pin(async move {
-                Err(ExecError(
-                    "the recording exec serves no media path".to_owned(),
-                ))
+                Err(ExecError::Transport("the recording exec serves no media path".to_owned()))
             })
         }
     }
@@ -3944,6 +4397,70 @@ mod tests {
             chain.len(),
             2,
             "a same-provider fallback that dedupes away is no fallback: {chain:?}"
+        );
+    }
+
+    /// The regression that pins the session reaching the strategy.
+    ///
+    /// The `lkgp` strategy reads the pin the server wrote for the session's
+    /// last good provider. The server *wrote* that pin on every success, and
+    /// the strategy's own unit tests passed, because the unit tests call
+    /// `pick` directly with a session. The request path did not: it called
+    /// `pick(strategy, None, …)`, so the pin was never read and `lkgp` behaved
+    /// exactly like `priority` on every live request.
+    ///
+    /// This test drives the *server's* chain builder, so it fails on the old
+    /// code (the chain leads with the config order) and passes on the fixed
+    /// code (the chain leads with the pinned provider).
+    #[test]
+    fn the_lkgp_pin_reaches_the_live_routing_path() {
+        let state = lkgp_state();
+        // The pin names the *second* provider, so a config-order chain and a
+        // pin-honouring chain differ.
+        state
+            .lkgp
+            .record("sess-1", &ProviderId::new("second"));
+        let plan = resolve(
+            &state,
+            &CanonicalRequest {
+                model: Strng::from("combo"),
+                body: Bytes::new(),
+                stream: false,
+                session: Some(Strng::from("sess-1")),
+            },
+        )
+        .expect("the combo resolves");
+        assert_eq!(
+            plan.chain.first().map(|t| t.provider.as_str()),
+            Some("second"),
+            "the pinned provider must lead the chain: {:?}",
+            plan.chain
+        );
+    }
+
+    /// The same path, with no session: a client that sent no stickiness key
+    /// must get the config order, not somebody else's pin.
+    #[test]
+    fn a_request_without_a_session_ignores_the_pin() {
+        let state = lkgp_state();
+        state
+            .lkgp
+            .record("sess-1", &ProviderId::new("second"));
+        let plan = resolve(
+            &state,
+            &CanonicalRequest {
+                model: Strng::from("combo"),
+                body: Bytes::new(),
+                stream: false,
+                session: None,
+            },
+        )
+        .expect("the combo resolves");
+        assert_eq!(
+            plan.chain.first().map(|t| t.provider.as_str()),
+            Some("first"),
+            "an anonymous request must not inherit a session's pin: {:?}",
+            plan.chain
         );
     }
 
@@ -5740,7 +6257,7 @@ mod tests {
             _content_type: &'a str,
             _body: &'a [u8],
         ) -> Pin<Box<dyn Future<Output = Result<MediaReply, ExecError>> + Send + 'a>> {
-            Box::pin(async move { Err(ExecError("no media here".to_owned())) })
+            Box::pin(async move { Err(ExecError::Transport("no media here".to_owned())) })
         }
     }
 
@@ -5926,7 +6443,7 @@ mod tests {
             _content_type: &'a str,
             _body: &'a [u8],
         ) -> Pin<Box<dyn Future<Output = Result<MediaReply, ExecError>> + Send + 'a>> {
-            Box::pin(async move { Err(ExecError("no media here".to_owned())) })
+            Box::pin(async move { Err(ExecError::Transport("no media here".to_owned())) })
         }
     }
 
@@ -6531,7 +7048,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
-            Box::pin(async move { next.ok_or_else(|| ExecError("no second target".to_owned())) })
+            Box::pin(async move { next.ok_or_else(|| ExecError::Transport("no second target".to_owned())) })
         }
 
         fn post_media<'a>(
@@ -6542,7 +7059,7 @@ mod tests {
             _content_type: &'a str,
             _body: &'a [u8],
         ) -> Pin<Box<dyn Future<Output = Result<MediaReply, ExecError>> + Send + 'a>> {
-            Box::pin(async move { Err(ExecError("no media dispatch in this fixture".to_owned())) })
+            Box::pin(async move { Err(ExecError::Transport("no media dispatch in this fixture".to_owned())) })
         }
     }
 
@@ -6841,7 +7358,7 @@ mod tests {
                 _body: &'a [u8],
             ) -> Pin<Box<dyn Future<Output = Result<MediaReply, ExecError>> + Send + 'a>>
             {
-                Box::pin(async move { Err(ExecError("no media in this fixture".to_owned())) })
+                Box::pin(async move { Err(ExecError::Transport("no media in this fixture".to_owned())) })
             }
         }
 

@@ -89,7 +89,7 @@ pub use hash::{
 };
 pub use revoke::{DEFAULT_CAP, Revocation};
 pub use secret::{KEY_LEN, KeyMeta, MasterKey, MasterKeySource, Salt, Secret};
-pub use store::{CredentialStore, MASTER_KEY_VAR, OAuthSession, SessionKind};
+pub use store::{CredentialStore, MASTER_KEY_VAR, OAuthSession, QuotaSnapshot, SessionKind};
 pub use token::{
     ACCESS_TTL, DEFAULT_LEEWAY, Issue, Issued, REFRESH_TTL, Scope, ScopeSet, Tokens, Verified,
 };

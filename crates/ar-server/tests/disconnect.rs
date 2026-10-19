@@ -64,7 +64,7 @@ impl ArExec for SlowExec {
         _content_type: &'a str,
         _body: &'a [u8],
     ) -> Pin<Box<dyn Future<Output = Result<MediaReply, ExecError>> + Send + 'a>> {
-        Box::pin(async move { Err(ExecError("no media in this fixture".to_owned())) })
+        Box::pin(async move { Err(ExecError::Transport("no media in this fixture".to_owned())) })
     }
 }
 

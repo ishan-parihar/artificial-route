@@ -551,7 +551,7 @@ impl ArExec for NullExec {
         >,
     > {
         Box::pin(async move {
-            Err(ar_route::ExecError(format!(
+            Err(ar_route::ExecError::Transport(format!(
                 "no provider is configured; refusing to dispatch to {provider}"
             )))
         })
@@ -567,7 +567,7 @@ impl ArExec for NullExec {
     ) -> Pin<Box<dyn Future<Output = Result<ar_route::MediaReply, ar_route::ExecError>> + Send + 'a>>
     {
         Box::pin(async move {
-            Err(ar_route::ExecError(format!(
+            Err(ar_route::ExecError::Transport(format!(
                 "no provider is configured; refusing media dispatch to {provider}"
             )))
         })

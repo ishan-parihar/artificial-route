@@ -464,9 +464,50 @@ impl Upstream {
 /// Failure that is not an HTTP status — transport error, TLS failure, or a
 /// provider whose body never arrived. Always fail-over-able: no provider ever
 /// produced a verdict on the request.
+///
+/// The abort is a **separate variant**, not another string, because it is the
+/// one transport-shaped failure that is **not the provider's fault**: the
+/// client hung up. Charging it to the provider cools a healthy endpoint and
+/// can trip its breaker, so a burst of cancelled requests would take a
+/// provider out of rotation for every other client. The reference makes the
+/// same distinction — `isLocalStreamLifecycleError` treats an `AbortError` and
+/// a client disconnect as *not* a provider failure
+/// (`src/shared/utils/circuitBreaker.ts`).
 #[derive(Debug, thiserror::Error)]
-#[error("upstream transport error: {0}")]
-pub struct ExecError(pub String);
+pub enum ExecError {
+    /// The client went away before the provider answered.
+    ///
+    /// The attempt loop stops here rather than failing over: there is nobody
+    /// left to receive the failover's answer, and the provider did nothing
+    /// wrong.
+    #[error("upstream call aborted by caller")]
+    Aborted,
+    /// A transport-level failure the provider is responsible for.
+    #[error("upstream transport error: {0}")]
+    Transport(String),
+}
+
+impl From<String> for ExecError {
+    fn from(message: String) -> Self {
+        Self::Transport(message)
+    }
+}
+
+impl ExecError {
+    /// The message without the variant's prefix.
+    ///
+    /// The `Display` impl names the *kind* ("upstream transport error: …"),
+    /// which is right for a log line and wrong for a message a client reads:
+    /// the client's own text is the provider's reason, not our taxonomy. This
+    /// is what the surfaces that echo the reason use.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Aborted => "upstream call aborted by caller",
+            Self::Transport(message) => message,
+        }
+    }
+}
 
 /// Inbound-wire → canonical request.
 ///

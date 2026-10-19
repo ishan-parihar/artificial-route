@@ -229,6 +229,17 @@ pub struct ComboTarget {
     pub weight: u32,
     /// Current quota window, when one is known.
     pub quota: Option<QuotaWindow>,
+    /// The usable prompt size this target accepts, in tokens.
+    ///
+    /// `0` = unknown, which the strategies treat as "no claim" rather than as
+    /// "no room": `context-optimized` prefers the largest window, so an
+    /// unknown window must not outrank a known one *and* must not outrank it
+    /// by default either — the tiebreak is the rank, which is the config
+    /// order.
+    ///
+    /// Filled from the registry's per-provider declaration when the config
+    /// does not state one.
+    pub context_window: u32,
 }
 
 impl ComboTarget {
@@ -241,6 +252,7 @@ impl ComboTarget {
             input_usd_per_mtok: None,
             weight: 1,
             quota: None,
+            context_window: 0,
         }
     }
 
@@ -1132,6 +1144,22 @@ impl ServerConfig {
         if let Some(quota) = target.quota {
             c = c.with_quota(quota);
         }
+        // The usable prompt size, so `context-optimized` has something to
+        // rank on. It used to be `0` on every candidate, and a comparator that
+        // maximises a signal nobody sets is `priority` in disguise: the
+        // strategy meant to send a long prompt to a big model instead of
+        // discovering the limit as a 400.
+        let window = if target.context_window > 0 {
+            Some(target.context_window)
+        } else {
+            ar_registry::meta::global()
+                .get(target.provider.as_str())
+                .map(|m| m.context_length)
+                .filter(|w| *w > 0)
+        };
+        if let Some(window) = window {
+            c = c.with_context_window(window);
+        }
         c.input_usd_per_mtok = explicit_price
             .or(target.input_usd_per_mtok)
             .or_else(|| self.price_of(&target.provider, &target.model));
@@ -1523,7 +1551,62 @@ fn resolve_target(
         providers.push(entry);
     }
 
-    Ok(ComboTarget::new(ProviderId::new(provider), model).with_weight(weight))
+    // The quota window, when the store has a reading for this provider.
+    //
+    // The store already records quota snapshots (`quota_snapshots`) and
+    // already had a reader for them, but nothing ever asked: so
+    // `Candidate::quota` was `None` on every production request, and the
+    // seven strategies that rank on a quota window — `headroom`,
+    // `reset-window`, `reset-aware`, `quota-weighted`, `quota-share-fair`,
+    // `expiry-first` — all degenerated to `priority`, because an absent
+    // window scores every candidate identically.
+    //
+    // The reading is the *newest* one for the provider's window; a snapshot
+    // older than its own TTL is still returned, because "stale" and
+    // "unknown" are different answers and the strategy layer is the one that
+    // decides what to do with each.
+    let quota = store.and_then(|s| {
+        s.latest_quota_snapshot(provider, WINDOW_KEY)
+            .ok()
+            .flatten()
+            .and_then(|snapshot| quota_window(&snapshot))
+    });
+
+    let mut target = ComboTarget::new(ProviderId::new(provider), model).with_weight(weight);
+    if let Some(quota) = quota {
+        target = target.with_quota(quota);
+    }
+    Ok(target)
+}
+
+/// The window key the quota snapshots are recorded under.
+///
+/// One key for the whole provider: the router ranks *targets*, and a target
+/// is a provider/model pair, so a per-model window would need a per-model
+/// lookup. The provider-level window is the coarser signal the strategies
+/// that exist here rank on.
+const WINDOW_KEY: &str = "default";
+
+/// A stored reading as a routing window.
+///
+/// The store records a **fraction** still free; the router wants a limit and
+/// a used count, because that is what a rollover is expressed in. The
+/// fraction is scaled onto a 100-point window so the arithmetic is exact
+/// enough to compare and the reset window is the snapshot's own.
+///
+/// `None` when the reading carries no fraction: an unmetered provider is not
+/// an exhausted one, and the router's own convention is that an absent quota
+/// sorts after every metered candidate.
+fn quota_window(snapshot: &ar_keys::QuotaSnapshot) -> Option<QuotaWindow> {
+    let remaining = snapshot.remaining_percentage?;
+    if snapshot.exhausted {
+        // Spent: a window with nothing left. The strategies rank it last and
+        // the attempt loop's cooling gate skips it.
+        return Some(QuotaWindow::new(100, 100, snapshot.next_reset_at.unwrap_or(0)));
+    }
+    let limit = 100_u64;
+    let used = limit.saturating_sub((remaining.clamp(0.0, 1.0) * limit as f64).round() as u64);
+    Some(QuotaWindow::new(limit, used, snapshot.next_reset_at.unwrap_or(0)))
 }
 
 /// The outbound headers a catalogued provider dispatches with.
@@ -1814,6 +1897,165 @@ oauth:
         let err = ar_config::Config::parse(&yaml, |_| Ok(Some(String::new())))
             .expect_err("contradictory");
         assert!(err.to_string().contains("holds no account"), "{err}");
+    }
+
+    /// A combo whose strategy is an `auto/*` family name.
+    const AUTO_STRATEGY_YAML: &str = r#"
+server:
+  host: 127.0.0.1
+  port: 20128
+
+keys:
+  openai: k-openai
+  anthropic: k-anthropic
+
+providers:
+  - id: openai
+    key: openai
+  - id: anthropic
+    key: anthropic
+
+combos:
+  - id: default
+    strategy: auto/cheap
+    targets:
+      - openai/gpt-5.4
+      - anthropic/claude-sonnet-4-5
+"#;
+
+    /// The regression that pins the `auto/*` **strategy** name.
+    ///
+    /// `ar-config` parses `auto/cheap` as [`ar_config::Strategy::Auto`] and
+    /// `ar-route` parses the same string as `Deferred` — the two parsers
+    /// disagreed, and the server converts through `as_str()`, so the config's
+    /// verdict was the losing one: a combo naming `auto/cheap` loaded, and
+    /// every request through it answered **501 Not Implemented** naming a
+    /// strategy this build actually ships.
+    ///
+    /// The `auto/*` *model* name (`model: auto/cheap` in a request) is a
+    /// different axis and has always worked — it resolves through
+    /// `virtual_combo`. This test is about the *strategy* field.
+    #[test]
+    fn an_auto_family_strategy_name_loads_as_a_routable_strategy() {
+        let cfg = parse(AUTO_STRATEGY_YAML).expect("config parses");
+        let server =
+            ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("combos build");
+        let combo = server.combo("default").expect("default combo exists");
+        assert!(
+            !matches!(combo.strategy, ar_route::Strategy::Deferred(_)),
+            "an auto/* strategy must not load as a deferred strategy: {:?}",
+            combo.strategy
+        );
+    }
+
+    /// The two parsers must agree, or the strategy that loads is not the
+    /// strategy that routes. This is the invariant the defect broke: the
+    /// config side said `Auto`, the router side said `Deferred`, and the
+    /// server used the router's answer.
+    #[test]
+    fn the_config_and_router_parsers_agree_on_an_auto_family_name() {
+        let config_side = ar_config::Strategy::parse("auto/cheap");
+        let route_side = ar_route::Strategy::parse(config_side.as_str());
+        assert!(
+            !matches!(route_side, ar_route::Strategy::Deferred(_)),
+            "the config parsed {config_side:?} as {:?}, but the router deferred it",
+            route_side
+        );
+    }
+
+    /// The regression that pins the quota signal reaching the candidate.
+    ///
+    /// The store already recorded quota snapshots and already had a reader for
+    /// them, but nothing ever asked: `Candidate::quota` was `None` on every
+    /// production request, so the seven strategies that rank on a quota
+    /// window — `headroom`, `reset-window`, `reset-aware`, `quota-weighted`,
+    /// `quota-share-fair`, `expiry-first` — all degenerated to `priority`,
+    /// because an absent window scores every candidate identically.
+    ///
+    /// The config path is where the signal has to enter: the router reads
+    /// `Candidate::quota`, and a candidate is built from a `ComboTarget`.
+    #[test]
+    fn a_stored_quota_reading_reaches_the_target() {
+        let store = CredentialStore::open_in_memory(&StoreSecret::generate()).expect("store opens");
+        store
+            .insert_quota_snapshot(&ar_keys::QuotaSnapshot::new(
+                "openai",
+                "default",
+                Some(0.25),
+                false,
+                Some(1_800_000_000),
+                1_700_000_000,
+            ))
+            .expect("the snapshot writes");
+
+        let cfg = parse(TWO_COMBO_YAML).expect("config parses");
+        let server = ServerConfig::from_ar_config(&cfg, None, None, false, Some(&store))
+            .expect("combos build");
+        let combo = server.combo("default").expect("default combo exists");
+        let openai = combo
+            .targets
+            .iter()
+            .find(|t| t.provider.as_str() == "openai")
+            .expect("the openai target exists");
+        let quota = openai.quota.expect("the stored reading reached the target");
+        assert_eq!(quota.limit, 100, "the window is scaled onto 100 points");
+        assert_eq!(
+            quota.used, 75,
+            "a reading of 25% free means 75 of 100 used"
+        );
+        assert_eq!(
+            quota.reset_at_secs, 1_800_000_000,
+            "the snapshot's own reset window is carried"
+        );
+    }
+
+    /// The end-to-end proof that a quota signal makes a quota-shaped
+    /// strategy real: with two candidates, one carrying a nearly-spent
+    /// window and one carrying a roomy one, `headroom` must prefer the
+    /// roomy one. Before the signal was wired, both candidates had no
+    /// window, both scored `1.0`, and the tiebreak (`rank`) decided — so
+    /// `headroom` was `priority` in disguise.
+    #[test]
+    fn a_quota_signal_makes_the_headroom_strategy_rank() {
+        use ar_route::{Candidate, ProviderId, Strategy};
+        use std::sync::atomic::AtomicU64;
+        let exhausted = Candidate::new(ProviderId::new("a"), "m")
+            .with_rank(0)
+            .with_quota(ar_route::QuotaWindow::new(100, 100, 0));
+        let roomy = Candidate::new(ProviderId::new("b"), "m")
+            .with_rank(1)
+            .with_quota(ar_route::QuotaWindow::new(100, 1, 0));
+        let cands = [exhausted, roomy];
+        let picked = ar_route::pick(
+            Strategy::Headroom,
+            None,
+            &cands,
+            &AtomicU64::new(0),
+            None,
+        )
+        .expect("a candidate");
+        assert_eq!(
+            picked.as_str(),
+            "b",
+            "the roomy window must win, not the config order"
+        );
+    }
+
+    /// A provider with no reading is **unmetered**, not exhausted: the
+    /// strategies treat an absent window as "unknown", and the routing must
+    /// not invent an exhausted one.
+    #[test]
+    fn a_provider_without_a_reading_carries_no_quota() {
+        let store = CredentialStore::open_in_memory(&StoreSecret::generate()).expect("store opens");
+        let cfg = parse(TWO_COMBO_YAML).expect("config parses");
+        let server = ServerConfig::from_ar_config(&cfg, None, None, false, Some(&store))
+            .expect("combos build");
+        let combo = server.combo("default").expect("default combo exists");
+        assert!(
+            combo.targets.iter().all(|t| t.quota.is_none()),
+            "a target with no reading must carry no window: {:?}",
+            combo.targets
+        );
     }
 
     const TWO_COMBO_YAML: &str = r#"

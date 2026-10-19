@@ -290,9 +290,9 @@ pub async fn synthesize<E: Executor + ?Sized>(
     let canonical = CanonicalRequest::new("", Bytes::from(body));
     let upstream = match exec.call(judge.provider_id(), &canonical).await {
         Ok(upstream) => upstream,
-        Err(ExecError(e)) => {
+        Err(e) => {
             return JudgeOutcome {
-                error: Some(format!("judge call failed: {e}")),
+                error: Some(format!("judge call failed: {}", e.message())),
                 ..JudgeOutcome::default()
             };
         }
@@ -427,11 +427,24 @@ fn synthesized_sources(panel: &JudgePanel) -> String {
         .join("\n\n")
 }
 
-/// Buffers one upstream body. The judge's own request is non-streaming, so this
-/// is one body, read once — the same cost the non-stream chat arm already pays.
+/// Buffers one upstream body, bounded.
+///
+/// The judge's own request is non-streaming, so this is one body, read once —
+/// but "read once" is not a bound. A provider answering 100 MB had 100 MB
+/// resident per concurrent fusion request, which is the heap blowup the
+/// panel's own body cap exists to prevent. The same cap applies here, and the
+/// overflow is reported rather than silently truncated: a judge that read a
+/// truncated body would be judging a different question.
+const JUDGE_BODY_BYTES: usize = 256 * 1024;
+
 async fn read_all(mut stream: crate::contract::ChunkStream) -> Result<Bytes, ExecError> {
     let mut out = Vec::new();
     while let Some(chunk) = stream.next().await {
+        if out.len() + chunk.len() > JUDGE_BODY_BYTES {
+            return Err(ExecError::Transport(format!(
+                "judge body exceeded {JUDGE_BODY_BYTES} bytes"
+            )));
+        }
         out.extend_from_slice(&chunk);
     }
     Ok(Bytes::from(out))
@@ -489,7 +502,7 @@ mod tests {
             *self.seen.lock().expect("recorder") =
                 String::from_utf8_lossy(&canonical.body).into_owned();
             if self.fail {
-                return Box::pin(async { Err(ExecError("judge refused".to_owned())) });
+                return Box::pin(async { Err(ExecError::Transport("judge refused".to_owned())) });
             }
             let reply = self.reply.clone();
             let status = self.status;

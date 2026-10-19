@@ -451,7 +451,7 @@ mod tests {
             _provider: &'a ProviderId,
             _canonical: &'a CanonicalRequest,
         ) -> Pin<Box<dyn Future<Output = Result<Upstream, ExecError>> + Send + 'a>> {
-            Box::pin(async move { Err(ExecError("no chat dispatch in a media test".to_owned())) })
+            Box::pin(async move { Err(ExecError::Transport("no chat dispatch in a media test".to_owned())) })
         }
 
         fn post_media<'a>(
@@ -474,7 +474,7 @@ mod tests {
             let error = self.error || self.refuse == Some(provider.as_str());
             Box::pin(async move {
                 if error {
-                    return Err(ExecError("connection refused".to_owned()));
+                    return Err(ExecError::Transport("connection refused".to_owned()));
                 }
                 Ok(MediaReply {
                     status,

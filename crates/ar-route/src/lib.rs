@@ -103,7 +103,8 @@ pub use pipeline::{
 };
 pub use resilience::{DEFAULT_BASE_BACKOFF, DEFAULT_MAX_BACKOFF, Resilience};
 pub use simulate::{ChainTarget, RoutePlan, simulate_route};
+pub use attempt::attempt_loop_with_pins;
 pub use strategy::{
-    FusionOutcome, PanelVerdict, PipelineOutcome, StageVerdict, Strategy, dispatch_fusion,
-    dispatch_pipeline, pick, pick_filtered, pick_for_model,
+    FusionOutcome, PanelVerdict, PipelineOutcome, StageVerdict, Strategy, TargetLoad, TargetLoads,
+    dispatch_fusion, dispatch_pipeline, pick, pick_filtered, pick_for_model,
 };

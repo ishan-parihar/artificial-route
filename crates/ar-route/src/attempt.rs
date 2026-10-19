@@ -355,8 +355,29 @@ fn classify_status(status: u16, body: &str) -> Step {
 #[must_use]
 fn error_status_in_body(body: &str) -> Option<u16> {
     const MAX_BODY_SCAN: usize = 2048;
-    let body = body.get(..body.len().min(MAX_BODY_SCAN)).unwrap_or(body);
+    let body = scan_prefix(body, MAX_BODY_SCAN);
     error_status_in_json(body).or_else(|| error_status_in_sse(body))
+}
+
+/// The first `limit` bytes of `body`, cut on a character boundary.
+///
+/// `str::get(..n)` returns `None` when `n` lands inside a multi-byte
+/// character, and the obvious `unwrap_or(body)` then hands back the **whole**
+/// body — so a body whose 2048th byte fell mid-character was parsed in full,
+/// which is exactly the megabyte scan the cap exists to prevent.
+///
+/// The cut is therefore walked back to the nearest boundary, and the result is
+/// at most `limit` bytes: a cap that silently does not cap is worse than no
+/// cap, because the caller believes it is bounded.
+fn scan_prefix(body: &str, limit: usize) -> &str {
+    if body.len() <= limit {
+        return body;
+    }
+    let mut end = limit;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    &body[..end]
 }
 
 /// `Some(status)` when the whole body is a JSON error object, else `None`.
@@ -678,6 +699,21 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
     exec: &E,
     resilience: &Resilience,
 ) -> Result<AttemptOutcome, RouteError> {
+    attempt_loop_with_pins(canonical, fallback_chain, exec, resilience, None).await
+}
+
+/// [`attempt_loop`] with the pin table it may need to clear.
+///
+/// The pin table is an optional argument rather than a required one so the
+/// router's own callers (and the unit tests) do not have to own a pin table to
+/// drive a chain. The server passes the one it writes pins into.
+pub async fn attempt_loop_with_pins<E: Executor + ?Sized>(
+    canonical: &CanonicalRequest,
+    fallback_chain: &[ChainTarget],
+    exec: &E,
+    resilience: &Resilience,
+    pins: Option<&crate::lkgp::LkgpPins>,
+) -> Result<AttemptOutcome, RouteError> {
     if fallback_chain.is_empty() {
         return Ok(AttemptOutcome::Abort(AbortReport {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -772,6 +808,12 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
         // One clone per attempt (at most [`MAX_ATTEMPTS`]) is cheaper than
         // teaching the executor that a request can disagree with its own body.
         let attempt = canonical.clone().with_model(model);
+        // The live load: this target now has one more request in flight, and
+        // the router's load-shaped strategies can see it. The release is
+        // paired with every exit below, so a target never looks busy because
+        // of a request that finished.
+        let load_key = crate::contract::Candidate::new(provider.clone(), model);
+        crate::strategy::TargetLoads::global().acquire(&load_key);
         let verdict = match exec.call(provider, &attempt).await {
             Ok(mut upstream) => {
                 // A non-streaming attempt's body is drainable here and nowhere
@@ -784,12 +826,12 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
                     String::new()
                 } else {
                     let body = drain_success_body(&mut upstream).await;
-                    // Re-wrap the exact bytes so the relay below is
-                    // byte-identical to what the upstream sent: the scan borrows,
-                    // the client keeps the original.
-                    let text = String::from_utf8_lossy(&body).into_owned();
-                    upstream.stream = Box::pin(futures::stream::once(async move { body }));
-                    text
+                    // `drain_success_body` leaves the stream holding the whole
+                    // body again — the head it scanned, the tail past the cap,
+                    // and whatever the upstream had left — so the relay below
+                    // needs no re-wrap of its own. The head is what the scan
+                    // reads; the client keeps the original.
+                    String::from_utf8_lossy(&body).into_owned()
                 };
                 let scan = if drained.is_empty() {
                     body_text(&upstream)
@@ -850,6 +892,8 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
                         } else {
                             resilience.record_provider_success(provider.as_str());
                         }
+                        // The request is done with this target.
+                        crate::strategy::TargetLoads::global().release(&load_key);
                         return Ok(AttemptOutcome::Succeeded {
                             provider: provider.clone(),
                             // One allocation, on the request path, at most
@@ -864,6 +908,7 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
                         });
                     }
                     Step::Abort { status } => {
+                        crate::strategy::TargetLoads::global().release(&load_key);
                         return Ok(AttemptOutcome::Abort(AbortReport {
                             status,
                             reason: abort_reason(status),
@@ -880,6 +925,9 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
                             &body_text(&upstream),
                             upstream.retry_after,
                         );
+                        clear_stale_pin(pins, canonical.session.as_deref(), provider);
+                        // This target is done: the request moves to the next one.
+                        crate::strategy::TargetLoads::global().release(&load_key);
                         tracing::warn!(
                             provider = %provider,
                             model,
@@ -898,11 +946,28 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
                     }
                 }
             }
-            Err(ExecError(msg)) => {
+            Err(ExecError::Aborted) => {
+                // The client hung up. The provider did nothing wrong, so it is
+                // neither cooled nor given a breaker tick — charging a client
+                // disconnect to the provider would take a healthy endpoint out
+                // of rotation for every other client. And there is nobody to
+                // fail over to, so the request ends here.
+                tracing::debug!(provider = %provider, model, "client aborted the request");
+                crate::strategy::TargetLoads::global().release(&load_key);
+                return Ok(AttemptOutcome::Abort(AbortReport {
+                    status: StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
+                    reason: "client disconnected".to_owned(),
+                    tried,
+                    last_provider: Some(provider.clone()),
+                }));
+            }
+            Err(ExecError::Transport(msg)) => {
                 // No verdict from the provider at all: charge a cooldown so the
                 // next request does not walk into the same dead socket, and a
                 // breaker tick so enough dead sockets take the provider out.
                 let (cooldown, _) = charge_failure(resilience, provider, model, 502, "", None);
+                clear_stale_pin(pins, canonical.session.as_deref(), provider);
+                crate::strategy::TargetLoads::global().release(&load_key);
                 tracing::warn!(provider = %provider, model, error = %msg, "transport failure, failing over");
                 (502, provider.clone(), cooldown, false, Bytes::new(), None)
             }
@@ -923,6 +988,34 @@ pub async fn attempt_loop<E: Executor + ?Sized>(
         earliest_skipped,
         skipped_by,
     ))
+}
+
+/// Clears the session's pin when the pin names the provider that just failed.
+///
+/// A pin that outlives the provider it names is a routing bug that reports
+/// itself as a 502 much later: every request in the session walks to the dead
+/// provider, and the pin's own TTL (30 minutes) is a long time to keep paying
+/// for it. The reference clears the same pin at the same moment — its
+/// `clearStaleLKGP` runs in the target gates and in the classifier
+/// (`executeTargetGates.ts`, `executeTargetClassify.ts`).
+///
+/// The clear is **scoped**: it fires only when the pin for this session
+/// *is* the failed provider. A session pinned to a healthy provider must keep
+/// its pin when some *other* target in the chain fails, or the pin would
+/// thrash between providers on every failover and the strategy would be a
+/// no-op with extra steps.
+fn clear_stale_pin(
+    pins: Option<&crate::lkgp::LkgpPins>,
+    session: Option<&str>,
+    failed: &ProviderId,
+) {
+    let (Some(pins), Some(session)) = (pins, session) else {
+        return;
+    };
+    if pins.get(session).as_ref() == Some(failed) {
+        pins.clear(session);
+        tracing::debug!(provider = %failed, "cleared a stale lkgp pin");
+    }
 }
 
 /// Collapses the chain's verdicts into the loop's terminal outcome.
@@ -1004,6 +1097,24 @@ fn terminate(
 /// exists to catch.
 const FIRST_BYTE_WINDOW: Duration = Duration::from_secs(10);
 
+/// Upper bound on the success body the loop buffers for its own scan.
+///
+/// The loop drains a non-streaming 2xx so it can look for an error-shaped body
+/// and for an empty completion before it classifies the attempt. The scan
+/// itself only ever reads 2 KB of it, so buffering more than that buys
+/// nothing — but the *drain* is where the memory goes: an upstream that
+/// answers 2xx with a 200 MB body (a model that ignores `max_tokens`, a
+/// misconfigured endpoint that returns a file) would have the whole thing
+/// resident in one `Vec` on every request, which is exactly the RAM blowup
+/// `docs/00-overview.md` budgets against.
+///
+/// The cap is generous enough for a real answer: 8 MiB is roughly 2M tokens
+/// of JSON text, far past any `max_tokens` a client sets. A body past the cap
+/// is **truncated for the scan** and the rest is relayed intact — the client
+/// still gets every byte, and the scan judges the head, which is where an
+/// error object or an empty completion lives.
+const MAX_SUCCESS_BUFFER: usize = 8 * 1024 * 1024;
+
 /// The first-byte gate's verdict for one streamed attempt.
 enum StreamGate {
     /// A byte crossed; it is re-wrapped in front of the stream.
@@ -1036,12 +1147,44 @@ async fn gate_first_byte(upstream: &mut Upstream, window: Duration) -> StreamGat
 async fn drain_success_body(upstream: &mut Upstream) -> Bytes {
     use futures::StreamExt as _;
     let mut buffered = Vec::new();
+    let mut overflow: Vec<Bytes> = Vec::new();
     let stream: &mut crate::contract::ChunkStream = &mut upstream.stream;
     let mut stream = stream.as_mut();
     while let Some(chunk) = stream.next().await {
-        buffered.extend_from_slice(&chunk);
+        if buffered.len() < MAX_SUCCESS_BUFFER {
+            let room = MAX_SUCCESS_BUFFER - buffered.len();
+            let take = room.min(chunk.len());
+            buffered.extend_from_slice(&chunk[..take]);
+            if take < chunk.len() {
+                // The chunk that crossed the cap is split: the head is scanned
+                // and the tail is relayed, so nothing is dropped.
+                overflow.push(Bytes::copy_from_slice(&chunk[take..]));
+                break;
+            }
+        } else {
+            overflow.push(chunk);
+            break;
+        }
     }
-    Bytes::from(buffered)
+    // The head goes back in front of the tail, so the stream holds the
+    // **complete** body again.
+    //
+    // Doing the re-wrap here rather than at the call site is the point: the
+    // invariant "after this call the stream is the whole body the upstream
+    // sent" then belongs to one function, and a caller that forgets to
+    // re-wrap cannot silently truncate the client's answer. The head is
+    // returned as well as re-chained, and `Bytes::clone` is a refcount bump,
+    // so the body is not copied to satisfy both.
+    let rest = std::mem::replace(&mut upstream.stream, Box::pin(futures::stream::empty()));
+    let head = Bytes::from(buffered);
+    let scan = head.clone();
+    let tail = futures::stream::iter(overflow);
+    upstream.stream = Box::pin(
+        futures::stream::once(async move { head })
+            .chain(tail)
+            .chain(rest),
+    );
+    scan
 }
 
 /// UTF-8 body of a failed upstream, lossily decoded and capped.
@@ -1075,8 +1218,8 @@ mod tests {
     use http::StatusCode;
 
     use super::{
-        Fault, MAX_ATTEMPTS, Step, Terminal, attempt_loop, classify_fault, classify_status,
-        error_status_in_body, is_degenerate_text,
+        Fault, MAX_ATTEMPTS, Step, Terminal, attempt_loop, attempt_loop_with_pins, classify_fault,
+        classify_status, error_status_in_body, is_degenerate_text,
     };
     use crate::AttemptOutcome;
     use crate::contract::{CanonicalRequest, ExecError, Executor, ProviderId, Strng, Upstream};
@@ -1102,6 +1245,8 @@ mod tests {
         RateLimited(Option<Duration>),
         Status(u16, &'static str),
         Transport(&'static str),
+        /// The client hung up. Not the provider's fault.
+        Aborted,
     }
 
     impl Verdict {
@@ -1128,7 +1273,8 @@ mod tests {
                     Bytes::from_static(body.as_bytes()),
                     None,
                 )),
-                Self::Transport(msg) => Err(ExecError(msg.to_owned())),
+                Self::Transport(msg) => Err(ExecError::Transport(msg.to_owned())),
+                Self::Aborted => Err(ExecError::Aborted),
             }
         }
     }
@@ -1221,6 +1367,188 @@ mod tests {
         assert!(
             !String::from_utf8_lossy(&error_body).contains("insufficient_quota"),
             "the FIRST upstream's body must not survive the failover"
+        );
+    }
+
+    /// The regression that pins the stale-pin clear.
+    ///
+    /// A pin that outlives the provider it names is a routing bug that reports
+    /// itself much later: every request in the session walks to the dead
+    /// provider, and the pin's own TTL (30 minutes) is a long time to keep
+    /// paying for it. The reference clears the same pin at the same moment —
+    /// its `clearStaleLKGP` runs in the target gates and in the classifier
+    /// (`executeTargetGates.ts`, `executeTargetClassify.ts`).
+    ///
+    /// Before the fix this build had the clear *function* and never called it,
+    /// so a pinned provider that failed stayed pinned for the whole TTL.
+    #[test]
+    fn a_failed_target_clears_the_pin_that_names_it() {
+        let pins = crate::lkgp::LkgpPins::new();
+        pins.record("s1", &ProviderId::new("p1"));
+        let r = Resilience::new();
+        let exec = Scripted::new(vec![Verdict::Transport("dead socket")]);
+        let mut request = req();
+        request.session = Some(Strng::from("s1"));
+        let got = block(attempt_loop_with_pins(
+            &request,
+            &chain(&["p1"]),
+            &exec,
+            &r,
+            Some(&pins),
+        ));
+        assert!(
+            matches!(got, Ok(AttemptOutcome::Failover { .. })),
+            "the attempt failed over: {got:?}"
+        );
+        assert!(
+            pins.get("s1").is_none(),
+            "the pin named the provider that just failed, so it must be gone"
+        );
+    }
+
+    /// The clear is **scoped**: a session pinned to a healthy provider keeps
+    /// its pin when some *other* target in the chain fails, or the pin would
+    /// thrash on every failover and the strategy would be a no-op with extra
+    /// steps.
+    #[test]
+    fn a_failure_of_another_target_keeps_the_pin() {
+        let pins = crate::lkgp::LkgpPins::new();
+        pins.record("s1", &ProviderId::new("p1"));
+        let r = Resilience::new();
+        let exec = Scripted::new(vec![Verdict::Transport("dead socket")]);
+        let mut request = req();
+        request.session = Some(Strng::from("s1"));
+        // The chain leads with `p2`, and `p2` is the one that fails. The pin
+        // names `p1`, which was never tried.
+        let got = block(attempt_loop_with_pins(
+            &request,
+            &chain(&["p2"]),
+            &exec,
+            &r,
+            Some(&pins),
+        ));
+        assert!(
+            matches!(got, Ok(AttemptOutcome::Failover { .. })),
+            "the attempt failed over: {got:?}"
+        );
+        assert_eq!(
+            pins.get("s1").map(|p| p.as_str().to_owned()),
+            Some("p1".to_owned()),
+            "a pin naming a healthy provider must survive another target's failure"
+        );
+    }
+
+    /// The regression that pins the success-body cap.
+    ///
+    /// The loop drains a non-streaming 2xx so it can look for an error-shaped
+    /// body before it classifies the attempt. The drain used to buffer the
+    /// *whole* body: an upstream that answered 2xx with a 200 MB body — a model
+    /// that ignores `max_tokens`, a misconfigured endpoint that returns a file
+    /// — had the whole thing resident in one `Vec` on every request, which is
+    /// the RAM blowup `docs/00-overview.md` budgets against.
+    ///
+    /// The cap must bound the *scan* without truncating the *relay*: the
+    /// client still gets every byte the upstream sent.
+    #[tokio::test]
+    async fn a_success_body_past_the_cap_is_truncated_for_the_scan_not_the_relay() {
+        // A body comfortably past the cap, in two chunks so the split path
+        // runs: the first chunk ends exactly on the cap.
+        let head = vec![b'a'; crate::attempt::MAX_SUCCESS_BUFFER];
+        let tail = b"the tail the client must still receive".to_vec();
+        let total = head.len() + tail.len();
+        let mut upstream = Upstream::success(Box::pin(futures::stream::iter([
+            Bytes::from(head),
+            Bytes::from(tail.clone()),
+        ])));
+
+        let drained = crate::attempt::drain_success_body(&mut upstream).await;
+        assert_eq!(
+            drained.len(),
+            crate::attempt::MAX_SUCCESS_BUFFER,
+            "the scan buffer must stop at the cap"
+        );
+
+        // The relay keeps everything: the head the scan took, then the tail
+        // that was never buffered.
+        let mut relayed = Vec::new();
+        use futures::StreamExt as _;
+        while let Some(chunk) = upstream.stream.next().await {
+            relayed.extend_from_slice(&chunk);
+        }
+        assert_eq!(relayed.len(), total, "the client must receive every byte");
+        assert!(
+            relayed.ends_with(&tail),
+            "the tail must be the last thing the client reads"
+        );
+    }
+
+    /// A body *under* the cap is untouched: the scan sees all of it and the
+    /// relay is byte-identical to what the upstream sent.
+    #[tokio::test]
+    async fn a_success_body_under_the_cap_is_untouched() {
+        let body = b"{\"choices\":[{\"message\":{\"content\":\"hi\"}}]}".to_vec();
+        let mut upstream = Upstream::success(Box::pin(futures::stream::once({
+            let body = body.clone();
+            async move { Bytes::from(body) }
+        })));
+        let drained = crate::attempt::drain_success_body(&mut upstream).await;
+        assert_eq!(drained.as_ref(), body.as_slice());
+    }
+
+    /// The regression that pins the abort's exemption.
+    ///
+    /// A client that hangs up is not the provider's fault. Before the fix the
+    /// executor's typed `Aborted` was flattened into an opaque string, so the
+    /// attempt loop could not tell a client disconnect from a dead socket —
+    /// and it charged the provider: a cooldown on the key, a lockout on the
+    /// model, and a breaker tick. A burst of cancelled requests would then
+    /// take a healthy provider out of rotation for every other client.
+    ///
+    /// The reference draws the same line: its breaker counts an `AbortError`
+    /// and a client disconnect as *not* a provider failure
+    /// (`isLocalStreamLifecycleError`, `src/shared/utils/circuitBreaker.ts`).
+    #[test]
+    fn a_client_abort_neither_cools_nor_ticks_the_breaker() {
+        let r = Resilience::new();
+        let exec = Scripted::new(vec![Verdict::Aborted]);
+        let got = block(attempt_loop(&req(), &chain(&["p1"]), &exec, &r));
+        assert!(
+            matches!(got, Ok(AttemptOutcome::Abort(_))),
+            "an abort is an abort, not a failover: {got:?}"
+        );
+        assert!(
+            !r.is_cooling_for("p1", "m"),
+            "a client disconnect must not cool the provider: {:?}",
+            r.model_cooling("p1", "m")
+        );
+        assert_eq!(
+            r.failures("p1"),
+            0,
+            "a client disconnect must not count as a provider failure"
+        );
+        assert_eq!(
+            r.breaker_state("p1"),
+            crate::resilience::BreakerState::Closed,
+            "a client disconnect must not tick the breaker"
+        );
+    }
+
+    /// The contrast: a **transport** failure is the provider's fault and is
+    /// charged as one. Without this, the abort test above would pass on a
+    /// loop that simply stopped charging anything.
+    #[test]
+    fn a_transport_failure_is_still_charged_to_the_provider() {
+        let r = Resilience::new();
+        let exec = Scripted::new(vec![Verdict::Transport("dead socket")]);
+        let got = block(attempt_loop(&req(), &chain(&["p1"]), &exec, &r));
+        assert!(
+            matches!(got, Ok(AttemptOutcome::Failover { .. })),
+            "a transport failure fails over: {got:?}"
+        );
+        assert!(
+            r.is_cooling_for("p1", "m"),
+            "a dead socket must cool the provider: {:?}",
+            r.model_cooling("p1", "m")
         );
     }
 

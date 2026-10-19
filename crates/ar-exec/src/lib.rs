@@ -712,6 +712,39 @@ async fn await_start(
     }
 }
 
+/// Reads at most `cap` bytes of a response body, and stops reading there.
+///
+/// The cap is a **read** bound, not a slice bound: `response.bytes()` pulls
+/// the whole body into memory and only then does the caller truncate it, so
+/// a provider's 20 MB error page was fully resident on every failed attempt.
+/// This reads in chunks and abandons the stream as soon as the cap is
+/// reached, so the memory a hostile or broken upstream can cost is bounded
+/// by `cap` rather than by its imagination.
+///
+/// A body shorter than the cap is returned whole. A body that errors
+/// mid-read yields what was read so far: the error path wants a fragment to
+/// classify, not a transport failure to replace it.
+async fn read_capped(response: reqwest::Response, cap: usize) -> Bytes {
+    use futures::StreamExt as _;
+    let mut stream = response.bytes_stream();
+    let mut out: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else {
+            break;
+        };
+        let room = cap.saturating_sub(out.len());
+        if room == 0 {
+            break;
+        }
+        let take = room.min(chunk.len());
+        out.extend_from_slice(&chunk[..take]);
+        if take < chunk.len() {
+            break;
+        }
+    }
+    Bytes::from(out)
+}
+
 /// Turns a non-2xx reply into [`ExecError::Upstream`], reading only as much of
 /// the body as the error path needs.
 ///
@@ -720,8 +753,15 @@ async fn await_start(
 /// RFC, no second place to drift.
 async fn upstream_error(response: reqwest::Response, retry_after: Option<Duration>) -> ExecError {
     let status = response.status().as_u16();
-    let raw = response.bytes().await.unwrap_or_default();
-    let body = String::from_utf8_lossy(&raw[..raw.len().min(ERROR_BODY_CAP)]);
+    // Read at most `ERROR_BODY_CAP` bytes, and **stop reading** there.
+    //
+    // `response.bytes()` reads the whole body and the cap only bounded what
+    // was *kept*, so a provider whose error page is 20 MB had all 20 MB
+    // resident on every failed attempt — the exact heap blowup the cap was
+    // written to prevent. The stream is read in chunks and abandoned as soon
+    // as the cap is reached.
+    let raw = read_capped(response, ERROR_BODY_CAP).await;
+    let body = String::from_utf8_lossy(&raw);
 
     // OpenAI-shaped errors nest the message under `error`; falling back to the
     // truncated raw body means a non-JSON upstream still yields something.
@@ -785,9 +825,10 @@ impl ChatStream {
     pub async fn into_failure(self) -> (StatusCode, Bytes, Option<Duration>) {
         let retry_after = self.retry_after;
         let status = self.status();
-        let raw = self.into_response().bytes().await.unwrap_or_default();
-        let end = raw.len().min(FAILURE_BODY_CAP);
-        (status, Bytes::copy_from_slice(&raw[..end]), retry_after)
+        // Bounded at the *read*, not only at the slice: `bytes()` would pull
+        // the whole error page into memory before the cap was applied.
+        let raw = read_capped(self.into_response(), FAILURE_BODY_CAP).await;
+        (status, raw, retry_after)
     }
 
     /// Relays the body as raw chunks, ending the stream on abort or EOF.

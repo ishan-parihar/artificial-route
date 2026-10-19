@@ -864,7 +864,7 @@ impl ArRouteExec for HttpExec {
             let cfg = self
                 .by_id
                 .get(provider)
-                .ok_or_else(|| ExecError(format!("no such provider: {provider}")))?;
+                .ok_or_else(|| ExecError::Transport(format!("no such provider: {provider}")))?;
 
             // MW4: a fully auth-locked key set is refused here, before any
             // socket is spent. The loop's transport arm charges this like any
@@ -875,7 +875,7 @@ impl ArRouteExec for HttpExec {
             // OAuth rows never strike `key_state` (they are exempt from
             // `note_key_result`), so the gate cannot refuse a session row.
             if !self.oauth.contains_key(provider) && cfg.all_keys_auth_blocked() {
-                return Err(ExecError(format!(
+                return Err(ExecError::Transport(format!(
                     "all {} credentials for {provider} are in auth lockout; \
                      refusing without a round trip",
                     cfg.api_keys.len()
@@ -1033,21 +1033,19 @@ impl ArRouteExec for HttpExec {
             let cfg = self
                 .by_id
                 .get(provider)
-                .ok_or_else(|| ExecError(format!("no such provider: {provider}")))?;
+                .ok_or_else(|| ExecError::Transport(format!("no such provider: {provider}")))?;
 
             // No media executor exists behind an OAuth session in this build,
             // and the failure has to say so: a session that fell through to the
             // API-key branch would send an empty bearer and report the
             // provider's own 401 as if it were a media verdict.
             if self.oauth.contains_key(provider) {
-                return Err(ExecError(
-                    "oauth sessions do not serve media endpoints in this build; configure an api-key provider for media"
-                        .to_owned(),
-                ));
+                return Err(ExecError::Transport("oauth sessions do not serve media endpoints in this build; configure an api-key provider for media"
+                    .to_owned()));
             }
 
             let endpoint = ar_exec::MediaEndpoint::from_path(endpoint)
-                .ok_or_else(|| ExecError(format!("unknown media endpoint path: {endpoint}")))?;
+                .ok_or_else(|| ExecError::Transport(format!("unknown media endpoint path: {endpoint}")))?;
 
             let shape = cfg.dispatch(false);
             // The caller's model wins over the provider's configured one. The
@@ -1143,15 +1141,24 @@ fn rewrite_json_model(body: &[u8], content_type: &str, upstream_model: &str) -> 
     serde_json::to_vec(&value).ok()
 }
 
-/// Flattens `ar_exec::ExecError` into the router's string-carrying error.
+/// Flattens `ar_exec::ExecError` into the router's typed error.
 ///
-/// The router's taxonomy is one opaque string by design (`ar_route::ExecError`),
-/// so there is nothing to map *to* — but the message must keep the typed
-/// detail, because "provider wire format custom has no renderer" and
-/// "upstream produced no headers within 110s" send an operator to two entirely
-/// different places.
+/// The router's taxonomy has two variants, and the split matters: an **abort**
+/// is the client hanging up, which is not the provider's fault and must not
+/// cool it or tick its breaker, while a **transport** failure is the
+/// provider's. `ar-exec` already draws that line with its own `Aborted`
+/// variant; flattening it into a string would throw the distinction away, and
+/// a burst of cancelled requests would then take a healthy provider out of
+/// rotation for every other client.
+///
+/// The message still carries the typed detail, because "provider wire format
+/// custom has no renderer" and "upstream produced no headers within 110s"
+/// send an operator to two entirely different places.
 fn flatten(e: ar_exec::ExecError) -> ExecError {
-    ExecError(e.to_string())
+    match e {
+        ar_exec::ExecError::Aborted => ExecError::Aborted,
+        other => ExecError::Transport(other.to_string()),
+    }
 }
 
 // The executor is shared across tasks; prove it at compile time rather than

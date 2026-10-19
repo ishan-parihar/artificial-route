@@ -132,6 +132,12 @@ pub struct TargetLoad {
     pub reliability: Option<f64>,
     /// Observed inverse latency in `0.0..=1.0`, or `None` when never observed.
     pub latency_inv: Option<f64>,
+    /// Requests currently dispatched to this target and not yet finished.
+    ///
+    /// The live load, distinct from `served`: `served` is cumulative and
+    /// `in_flight` is the present count. `p2c`'s load term is this one, and
+    /// `least-used`'s tiebreak is it too.
+    pub in_flight: u32,
 }
 
 impl TargetLoad {
@@ -141,6 +147,7 @@ impl TargetLoad {
             served: 0,
             reliability: None,
             latency_inv: None,
+            in_flight: 0,
         }
     }
 
@@ -209,30 +216,92 @@ impl TargetLoads {
         Self::default()
     }
 
+    /// Records that a request is **in flight** on `target`.
+    ///
+    /// The live load `p2c`'s load term is made of, and the one signal no
+    /// observation could supply: an observation is a *past* measurement, while
+    /// in-flight is a *present* count. It used to be `0` on every candidate
+    /// because nothing ever wrote it, so `p2c`'s load term was always zero
+    /// and the strategy had no way to prefer an idle target over a busy one.
+    ///
+    /// The count is decremented by [`Self::release`], so a request that
+    /// fails over — or whose client disconnects — must release the target it
+    /// left.
+    pub fn acquire(&self, target: &Candidate) {
+        if let Ok(mut rows) = self.rows.lock() {
+            let row = rows
+                .entry(Strng::from(execution_key(target)))
+                .or_insert(TargetLoad::unknown());
+            row.in_flight = row.in_flight.saturating_add(1);
+        }
+    }
+
+    /// Records that a request on `target` is no longer in flight.
+    ///
+    /// Saturating: a double release must not wrap the counter to `u32::MAX`
+    /// and make the target look permanently saturated.
+    pub fn release(&self, target: &Candidate) {
+        if let Ok(mut rows) = self.rows.lock() {
+            let key = execution_key(target);
+            if let Some(row) = rows.get_mut(key.as_str()) {
+                row.in_flight = row.in_flight.saturating_sub(1);
+            }
+        }
+    }
+
+    /// The live in-flight count for `target`.
+    ///
+    /// The table's count, and **the candidate's own field** when the table has
+    /// no row for it: a caller that builds a candidate with an explicit load
+    /// (a test, a dry run, a caller outside this crate) means it, and the
+    /// table is the *live* count that only the router itself can know.
+    ///
+    /// `0` when neither knows, which is the neutral value every unpopulated
+    /// optional signal carries.
+    #[must_use]
+    pub fn in_flight(&self, target: &Candidate) -> u32 {
+        let live = self.load(target).in_flight;
+        if live > 0 {
+            live
+        } else {
+            target.in_flight
+        }
+    }
+
     /// Records what is known about `target` from an already-scored factor set.
     ///
     /// Takes [`Factors`] rather than two loose `f64`s so the two numbers cannot
     /// be transposed at the call site; [`Factors::load_signals`] is where the
     /// pair is named.
     ///
-    /// `allow(dead_code)`: the producer is the server's telemetry path, which
-    /// reads outcome and latency data this crate never sees and lives in files
-    /// outside the change this landed in. Until it calls in, `p2c` reads the
-    /// documented neutral pair and degrades to the load term it always had —
-    /// the same contract every unpopulated optional signal in [`Candidate`]
-    /// carries.
-    #[allow(
-        dead_code,
-        reason = "write path for the caller's telemetry; no producer in-crate yet"
-    )]
+    /// The auto-scoring path is one producer of this pair; the server's own
+    /// telemetry is the other, and it has the two numbers directly rather
+    /// than a factor set — so it uses [`Self::observe_outcome`] instead.
     pub fn observe(&self, target: &Candidate, factors: &Factors) {
         let (reliability, latency_inv) = factors.load_signals();
+        self.observe_outcome(target, reliability, latency_inv);
+    }
+
+    /// Records one observation of `target`: its success share so far and its
+    /// inverse latency.
+    ///
+    /// This is the write side `p2c` was missing. Before it, the table was
+    /// only ever written by the auto-scoring path, which no production caller
+    /// uses — so `reliability` and `latency_inv` were `None` on every request,
+    /// every candidate scored the neutral pair, and `p2c` degenerated to
+    /// "whichever of the two random indices came first": `random` again.
+    ///
+    /// `reliability` is a *share* in `0.0..=1.0`, so a caller that has seen
+    /// three successes and one failure passes `0.75`. `latency_inv` is the
+    /// inverse-latency factor the same scorer uses: `1.0` is instant and
+    /// `0.0` is the slowest observed.
+    pub fn observe_outcome(&self, target: &Candidate, reliability: f64, latency_inv: f64) {
         if let Ok(mut rows) = self.rows.lock() {
             let row = rows
                 .entry(Strng::from(execution_key(target)))
                 .or_insert(TargetLoad::unknown());
-            row.reliability = Some(reliability);
-            row.latency_inv = Some(latency_inv);
+            row.reliability = Some(reliability.clamp(0.0, 1.0));
+            row.latency_inv = Some(latency_inv.clamp(0.0, 1.0));
         }
     }
 
@@ -308,6 +377,19 @@ pub enum Strategy {
     /// draining whichever it started on (#7015).
     LeastUsed,
     /// Uniform draw.
+    ///
+    /// A **Fisher-Yates shuffle** over the candidates, so the winner is a
+    /// genuine draw rather than a counter's next value. It used to share
+    /// `round-robin`'s comparator verbatim, which made the two names one
+    /// behaviour: `fetch_add % len` walks the list in order, so "random" was
+    /// a deterministic cycle wearing a random name. The reference's `random`
+    /// is a shuffle (`applyStrategyOrdering.ts`, `fisherYatesShuffle`), and
+    /// the two are now different strategies again.
+    ///
+    /// The shuffle is seeded from the shared cursor rather than from a
+    /// cryptographic RNG, for the same reason every other draw here is: a
+    /// decision an operator cannot re-derive from its inputs is a decision
+    /// nobody can debug. The distribution is still uniform over the pool.
     Random,
     /// Uniform draw over *distinct providers*, so two models on one provider
     /// cannot come up back to back.
@@ -351,7 +433,18 @@ pub enum Strategy {
     /// First stage of a chain: config order, among the same kept targets.
     Pipeline,
 
-    /// A strategy this build does not carry: an `auto/*` variant or a typo.
+    /// The `auto/*` family: the sixteen-factor virtual factory, resolved per
+    /// request.
+    ///
+    /// The name carries the spelling because the family has variants
+    /// (`auto/cheap`, `auto/coding`, …) and the request path needs to know
+    /// *which* one. `as_str` hands the spelling back; the server resolves it
+    /// through [`crate::virtual_combo`], the same factory the `auto/*` *model*
+    /// name uses.
+    Auto(&'static str),
+
+    /// A strategy this build does not carry: a typo, or a name upstream
+    /// spells and this build does not.
     Deferred(&'static str),
 }
 
@@ -401,13 +494,32 @@ impl Strategy {
             "fusion" => Self::Fusion,
             "pipeline" => Self::Pipeline,
             "expiry-first" => Self::ExpiryFirst,
-            // The reference's adaptive strategy. This build has no adaptive
-            // engine yet, and the closest shipped dynamic policy is
-            // `least-used` — a live count that spreads load across accounts.
-            // Mapping it keeps `strategy: auto` in a combo from silently
-            // collapsing to config order via `Deferred`'s fallback.
-            "auto" => Self::LeastUsed,
-            other if other.starts_with("auto/") => Self::Deferred("auto"),
+            // The reference's adaptive strategy. The bare `auto` resolves
+            // through the virtual factory, exactly like the `auto/*` model
+            // names do — a config naming it must not silently collapse to
+            // config order.
+            "auto" => Self::Auto("auto"),
+            other if other.starts_with("auto/") => {
+                // Only a name this build carries becomes an `Auto` strategy:
+                // `auto/quality` is not one of the eight variants, and
+                // resolving it to the factory would silently serve `auto`'s
+                // weights under a name that promised something else. It stays
+                // `Deferred` so the 501 names what the operator wrote.
+                if crate::auto::AutoVariant::parse(other).is_some() {
+                    Self::Auto(match other {
+                        "auto/coding" => "auto/coding",
+                        "auto/fast" => "auto/fast",
+                        "auto/cheap" => "auto/cheap",
+                        "auto/smart" => "auto/smart",
+                        "auto/chaos" => "auto/chaos",
+                        "auto/offline" => "auto/offline",
+                        "auto/lkgp" => "auto/lkgp",
+                        _ => "auto",
+                    })
+                } else {
+                    Self::Deferred("auto")
+                }
+            }
             _ => Self::Deferred("unknown"),
         }
     }
@@ -437,6 +549,7 @@ impl Strategy {
             Self::CacheOptimized => "cache-optimized",
             Self::Fusion => "fusion",
             Self::Pipeline => "pipeline",
+            Self::Auto(name) => name,
             Self::Deferred(_) => "deferred",
         }
     }
@@ -597,7 +710,8 @@ fn route(
 
     let winner = match strategy {
         Strategy::Priority | Strategy::FillFirst => by_rank(candidates, first),
-        Strategy::RoundRobin | Strategy::Random => by_cursor(candidates, rr),
+        Strategy::RoundRobin => by_cursor(candidates, rr),
+        Strategy::Random => by_shuffle(candidates, rr),
         Strategy::CostOptimized => by_price(candidates, first),
         Strategy::Lkgp => by_lkgp(session, candidates, lkgp, first),
 
@@ -618,6 +732,17 @@ fn route(
         Strategy::CacheOptimized => by_cached_prefix(candidates, session, model, first),
         Strategy::Fusion => fusion_leader(candidates, session, model, first),
         Strategy::Pipeline => pipeline_head(candidates, first),
+
+        // The `auto/*` family is not a comparator: it is a sixteen-factor
+        // score over a pool this function does not have (the pool carries
+        // latency, circuit state, quota windows and task fitness that a
+        // `Candidate` does not carry). The caller resolves it through
+        // [`crate::simulate_route`] — the same factory the `auto/*` *model*
+        // name uses — and hands the router a finished chain. Reaching here
+        // means the caller did not, so the answer is the family's own
+        // balanced fallback: the highest-ranked candidate, which is what the
+        // factory produces for a single-candidate pool.
+        Strategy::Auto(_) => by_rank(candidates, first),
 
         Strategy::Deferred(_) => return Err(RouteError::DeferredStrategy(strategy)),
     };
@@ -747,7 +872,10 @@ fn by_p2c<'a>(candidates: &'a [Candidate], rr: &AtomicU64) -> &'a Candidate {
     }
     let (a, b) = (&candidates[first], &candidates[second]);
     let loads = TargetLoads::global();
-    let score = |c: &'a Candidate| loads.load(c).p2c_score(c.in_flight);
+    // The live count comes from the table, not from the candidate: the
+    // candidate is built per request and knows nothing about what is running
+    // right now, while the table does.
+    let score = |c: &'a Candidate| loads.load(c).p2c_score(loads.in_flight(c));
     // Strict `>`, so a tie keeps `a` — the reference's `score(second) >
     // score(first) ? secondIndex : firstIndex` spelled the same way round.
     if score(b) > score(a) { b } else { a }
@@ -771,7 +899,7 @@ fn by_least_used<'a>(candidates: &'a [Candidate], first: &'a Candidate) -> &'a C
     let loads = TargetLoads::global();
     candidates
         .iter()
-        .min_by_key(|c| (loads.load(c).served, c.in_flight, c.rank))
+        .min_by_key(|c| (loads.load(c).served, loads.in_flight(c), c.rank))
         .unwrap_or(first)
 }
 
@@ -927,14 +1055,33 @@ const EXPIRY_MIN_HOURS: f64 = 0.25;
 /// a nearly-empty pool about to refresh — "who will be useful soon", where this
 /// answers "whose quota is about to be thrown away".
 fn by_expiry_first<'a>(candidates: &'a [Candidate], first: &'a Candidate) -> &'a Candidate {
+    // The clock is read **once**, here, and the score is computed against
+    // that instant. Reading it inside the comparator meant two reads per
+    // comparison — so a 40-candidate pool read the wall clock 78 times for
+    // one request, and two candidates scored a second apart could disagree
+    // about which was more urgent. It also made the strategy's decision
+    // unreproducible from its inputs, which is the one thing this crate's
+    // comparators promise: everything else here is a pure function of the
+    // candidate list.
+    let now = now_secs() as f64;
     candidates
         .iter()
         .max_by(|a, b| {
-            expiry_first_score(a)
-                .total_cmp(&expiry_first_score(b))
+            expiry_first_score_at(a, now)
+                .total_cmp(&expiry_first_score_at(b, now))
                 .then_with(|| a.rank.cmp(&b.rank))
         })
         .unwrap_or(first)
+}
+
+/// The wall clock, in Unix seconds.
+///
+/// One function so the read has one place: the comparators that need "now"
+/// take the instant as an argument, and this is where it comes from.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// The `expiry-first` score for one candidate: **higher is more urgent to spend.**
@@ -944,7 +1091,13 @@ fn by_expiry_first<'a>(candidates: &'a [Candidate], first: &'a Candidate) -> &'a
 /// two infinities would then fall through to `rank`, which is the ordering the
 /// reference's tieband produces anyway — pinned by
 /// `an_exhausted_window_never_outranks_a_spendable_one`.
-fn expiry_first_score(c: &Candidate) -> f64 {
+/// The `expiry-first` score for one candidate, against a given instant.
+///
+/// The instant is an argument rather than a read: the comparator takes one
+/// snapshot per ranking, so two candidates scored a second apart cannot
+/// disagree about which is more urgent, and the decision is reproducible
+/// from the inputs.
+fn expiry_first_score_at(c: &Candidate, now: f64) -> f64 {
     let Some(quota) = c.quota else {
         // No quota record: nothing known to waste, so nothing to spend first.
         return 0.0;
@@ -953,7 +1106,7 @@ fn expiry_first_score(c: &Candidate) -> f64 {
     if usable <= EXPIRY_FLOOR {
         return f64::NEG_INFINITY;
     }
-    match hours_until_reset(quota.reset_at_secs) {
+    match hours_until_reset_at(quota.reset_at_secs, now) {
         None => usable,
         Some(hours) => (usable / hours.max(EXPIRY_MIN_HOURS)).min(EXPIRY_MAX_SCORE),
     }
@@ -964,13 +1117,11 @@ fn expiry_first_score(c: &Candidate) -> f64 {
 /// A past instant yields [`EXPIRY_MIN_HOURS`]: the snapshot predates the reset
 /// it describes, and treating that as maximally urgent is the safe direction —
 /// a just-rolled window is full, and re-reading it costs nothing.
-fn hours_until_reset(reset_at_secs: u64) -> Option<f64> {
+/// Hours until `reset_at_secs`, against a given instant.
+fn hours_until_reset_at(reset_at_secs: u64, now: f64) -> Option<f64> {
     if reset_at_secs == 0 {
         return None;
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0.0, |d| d.as_secs_f64());
     Some((reset_at_secs as f64 - now) / SECONDS_PER_HOUR)
 }
 
@@ -1531,7 +1682,7 @@ pub async fn dispatch_fusion<E: Executor + ?Sized>(
             Ok(mut u) if u.status.is_success() => {
                 let body = match read_body(u.stream).await {
                     Ok(body) => body,
-                    Err(ExecError(e)) => {
+                    Err(e) => {
                         trace.push(PanelVerdict {
                             provider: candidate.provider.clone(),
                             status: Some(u.status.as_u16()),
@@ -1546,7 +1697,7 @@ pub async fn dispatch_fusion<E: Executor + ?Sized>(
                 (Some(u.status.as_u16()), Some((text, u)))
             }
             Ok(u) => (Some(u.status.as_u16()), None),
-            Err(ExecError(_)) => (None, None),
+            Err(_) => (None, None),
         };
         let winner = upstream.is_none() && text.is_some();
         if let Some((panel_text, response)) = text {
@@ -1610,7 +1761,7 @@ async fn read_body(mut stream: ChunkStream) -> Result<Bytes, ExecError> {
     let mut out = Vec::new();
     while let Some(chunk) = stream.next().await {
         if out.len() + chunk.len() > PANEL_BODY_BYTES {
-            return Err(ExecError(format!(
+            return Err(ExecError::Transport(format!(
                 "panel member body exceeded {PANEL_BODY_BYTES} bytes"
             )));
         }
@@ -1717,11 +1868,11 @@ pub async fn dispatch_pipeline<E: Executor + ?Sized>(
 
         let response = match exec.call(&stage.provider, &request).await {
             Ok(response) => response,
-            Err(ExecError(message)) => {
+            Err(e) => {
                 trace.push(StageVerdict {
                     provider: stage.provider.clone(),
                     status: None,
-                    error: Some(message),
+                    error: Some(e.to_string()),
                 });
                 return PipelineOutcome {
                     upstream: None,
@@ -1839,19 +1990,44 @@ fn chained_request(canonical: &CanonicalRequest, answer: &str) -> Option<Canonic
 /// The canonical answer is `{"message":{"content":…}}`; the raw body is the
 /// fallback for a dialect this crate does not model. A body that yields no text
 /// at all is an error, not an empty turn — see [`dispatch_pipeline`].
+///
+/// The body is bounded at the same cap the panel uses: a stage's answer is
+/// handed to the *next* stage as a prompt, so an unbounded one is a prompt
+/// that can be arbitrarily large, paid for twice (once in RAM, once in the
+/// next provider's tokens).
 async fn stage_answer(upstream: Upstream) -> Result<String, String> {
     let mut raw = Vec::new();
     let mut stream = upstream.stream;
     while let Some(chunk) = stream.next().await {
+        if raw.len() + chunk.len() > PANEL_BODY_BYTES {
+            return Err(format!(
+                "stage response exceeded {PANEL_BODY_BYTES} bytes"
+            ));
+        }
         raw.extend_from_slice(&chunk);
     }
     let text = String::from_utf8_lossy(&raw).into_owned();
     match serde_json::from_str::<serde_json::Value>(&text) {
-        Ok(value) => value
-            .pointer("/message/content")
-            .and_then(serde_json::Value::as_str)
-            .map(ToOwned::to_owned)
-            .ok_or_else(|| "stage response carried no readable turn".to_owned()),
+        Ok(value) => {
+            // Two shapes, because the executor speaks OpenAI and the pipeline
+            // is dialect-agnostic: the canonical Anthropic shape
+            // (`{"message":{"content":…}}`) and the OpenAI chat shape
+            // (`{"choices":[{"message":{"content":…}}]}`).
+            //
+            // Reading only the first meant an OpenAI-shaped stage answer — the
+            // shape every provider in this build actually returns — was
+            // unreadable, so the stage failed with "no readable turn" and the
+            // chain stopped after one stage. A pipeline against an OpenAI
+            // provider could never have run two stages.
+            value
+                .pointer("/message/content")
+                .or_else(|| value.pointer("/choices/0/message/content"))
+                .or_else(|| value.pointer("/content/0/text"))
+                .or_else(|| value.pointer("/output/0/content/0/text"))
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| "stage response carried no readable turn".to_owned())
+        }
         // A non-JSON body is a provider that answered in its own dialect; the
         // whole body is the turn.
         Err(_) if text.trim().is_empty() => Err("stage response was empty".to_owned()),
@@ -1869,6 +2045,36 @@ async fn stage_answer(upstream: Upstream) -> Result<String, String> {
 /// which is fine: the modulus keeps the index valid.
 fn by_cursor<'a>(candidates: &'a [Candidate], rr: &AtomicU64) -> &'a Candidate {
     &candidates[(rr.fetch_add(1, Ordering::Relaxed) % candidates.len() as u64) as usize]
+}
+
+/// `random`: a Fisher-Yates shuffle, the head of it.
+///
+/// The reference's `random` is `fisherYatesShuffle([...orderedTargets])`
+/// (`applyStrategyOrdering.ts`) — a genuine permutation, not a counter. Ours
+/// shared `round-robin`'s comparator, so the two names were one behaviour:
+/// `fetch_add % len` walks the list in order, which is a cycle, not a draw.
+///
+/// The shuffle is seeded from the shared cursor rather than from a
+/// cryptographic RNG, for the reason every other draw here is: a routing
+/// decision an operator cannot re-derive from its inputs is one nobody can
+/// debug. The distribution over the pool is uniform.
+///
+/// The shuffle is over **indices**, not over the candidates: the candidates
+/// are borrowed, and a shuffle that moved them would have to clone the whole
+/// pool to permute it.
+fn by_shuffle<'a>(candidates: &'a [Candidate], rr: &AtomicU64) -> &'a Candidate {
+    let n = candidates.len();
+    if n < 2 {
+        return &candidates[0];
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    // Fisher-Yates, walking from the end: each step swaps the tail element
+    // with a uniformly chosen one from the prefix.
+    for i in (1..n).rev() {
+        let j = (splitmix(rr) % (i as u64 + 1)) as usize;
+        order.swap(i, j);
+    }
+    &candidates[order[0]]
 }
 
 /// Lowest `rank`, falling back to `first` on an empty slice.
@@ -1968,8 +2174,9 @@ mod tests {
 
     use super::{
         DeficitMap, EXPIRY_MAX_SCORE, Factors, MAX_DRR_COMBOS, MODEL_SCOPE, PANEL_BODY_BYTES,
-        Strategy, TargetLoad, TargetLoads, affinity_key, dispatch_fusion, dispatch_pipeline,
-        expiry_first_score, hours_until_reset, pick, pick_filtered, pick_for_model,
+        Strategy, TargetLoad, TargetLoads, affinity_key, by_cursor, by_p2c, by_shuffle,
+        dispatch_fusion, dispatch_pipeline,
+        expiry_first_score_at, hours_until_reset_at, pick, pick_filtered, pick_for_model,
         reset_aware_score, splitmix,
     };
     use crate::contract::{
@@ -2373,18 +2580,204 @@ mod tests {
     // ---- deferred surface ----
 
     #[test]
-    fn errors_when_strategy_deferred() {
+    fn resolves_every_auto_family_name_this_build_carries() {
+        // The `auto/*` family is eight named variants plus the bare `auto`.
+        // Every one of them is a strategy this build routes with, so a config
+        // naming one loads and dispatches instead of answering 501.
+        for name in [
+            "auto",
+            "auto/coding",
+            "auto/fast",
+            "auto/cheap",
+            "auto/smart",
+            "auto/chaos",
+            "auto/offline",
+            "auto/lkgp",
+        ] {
+            assert!(
+                matches!(Strategy::parse(name), Strategy::Auto(_)),
+                "{name} must resolve to the auto family"
+            );
+        }
+    }
+
+    #[test]
+    fn an_auto_name_this_build_does_not_carry_stays_deferred() {
+        // `auto/quality` is not one of the eight variants. Resolving it to
+        // the family would serve `auto`'s weights under a name that promised
+        // something else, so it stays deferred and the 501 names it.
+        assert_eq!(
+            Strategy::parse("auto/quality"),
+            Strategy::Deferred("auto")
+        );
+    }
+
+    #[test]
+    fn the_auto_family_ranks_by_the_config_order_when_the_caller_did_not_resolve_it() {
+        // The family is a sixteen-factor score, not a comparator: the caller
+        // resolves it through the virtual factory and hands the router a
+        // finished chain. Reaching the router with an unresolved `Auto`
+        // means the caller did not, and the answer is the config order —
+        // which is what the factory produces for a one-candidate pool.
         let got = pick(
-            Strategy::parse("auto/coding"),
+            Strategy::parse("auto/cheap"),
             None,
             &cands(),
             &AtomicU64::new(0),
             None,
         );
-        assert!(matches!(
-            got,
-            Err(RouteError::DeferredStrategy(Strategy::Deferred("auto")))
-        ));
+        assert!(got.is_ok(), "the auto family must not 501: {got:?}");
+    }
+
+    /// The regression that pins the load table's write path.
+    ///
+    /// The table had a reader and a writer, but no production caller of the
+    /// writer: `reliability` and `latency_inv` were `None` on every request,
+    /// so every candidate scored the neutral pair and `p2c` degenerated to
+    /// "whichever of the two random indices came first" — `random` again.
+    ///
+    /// The observation API is the fix: a caller that has measured an outcome
+    /// and a latency writes them, and the next pick sees them.
+    #[test]
+    fn an_observed_outcome_reaches_the_load_table() {
+        let loads = TargetLoads::new();
+        let target = Candidate::new(ProviderId::new("p"), "m");
+        loads.observe_outcome(&target, 0.25, 0.5);
+        let seen = loads.load(&target);
+        assert_eq!(seen.reliability, Some(0.25));
+        assert_eq!(seen.latency_inv, Some(0.5));
+    }
+
+    /// The observation is **clamped**: a caller that passes a share outside
+    /// `0.0..=1.0` would otherwise write a score the comparators cannot
+    /// order against.
+    #[test]
+    fn an_observed_outcome_is_clamped_into_range() {
+        let loads = TargetLoads::new();
+        let target = Candidate::new(ProviderId::new("p"), "m");
+        loads.observe_outcome(&target, 4.0, -2.0);
+        let seen = loads.load(&target);
+        assert_eq!(seen.reliability, Some(1.0));
+        assert_eq!(seen.latency_inv, Some(0.0));
+    }
+
+    /// The regression that pins the `p2c` comparator's use of the table.
+    ///
+    /// With two candidates, one observed as reliable and one not, `p2c`
+    /// must prefer the reliable one. Before the write path existed both
+    /// scored the neutral pair, so the tie decided it — the table's contents
+    /// were irrelevant.
+    #[test]
+    fn p2c_prefers_the_observed_healthier_target() {
+        // The comparator reads the **global** table — the same one the server's
+        // telemetry writes — so the test writes that one.
+        let loads = TargetLoads::global();
+        let healthy = Candidate::new(ProviderId::new("p2c-healthy"), "m");
+        let flaky = Candidate::new(ProviderId::new("p2c-flaky"), "m");
+        loads.observe_outcome(&healthy, 1.0, 1.0);
+        loads.observe_outcome(&flaky, 0.0, 0.0);
+        let cands = [healthy, flaky];
+        let got = by_p2c(&cands, &AtomicU64::new(0));
+        assert_eq!(
+            got.provider.as_str(),
+            "p2c-healthy",
+            "the healthier target must win"
+        );
+    }
+
+    /// The regression that pins `random` as a draw rather than a cycle.
+    ///
+    /// It used to share `round-robin`'s comparator verbatim, so `fetch_add %
+    /// len` walked the list in order: the two names were one behaviour, and
+    /// "random" was a deterministic cycle. The reference's `random` is a
+    /// Fisher-Yates shuffle (`applyStrategyOrdering.ts`), and the two must
+    /// differ again.
+    ///
+    /// The proof is the *distribution*: over many draws every candidate must
+    /// win sometimes, and no candidate may win every time. A cycle fails both
+    /// halves — the first candidate wins every draw.
+    #[test]
+    fn random_spreads_its_draws_across_the_whole_pool() {
+        let cands = [
+            Candidate::new(p("a"), "m"),
+            Candidate::new(p("b"), "m"),
+            Candidate::new(p("c"), "m"),
+        ];
+        let mut counts = [0_usize; 3];
+        for seed in 0..300_u64 {
+            let got = by_shuffle(&cands, &AtomicU64::new(seed));
+            let index = cands
+                .iter()
+                .position(|c| c.provider == got.provider)
+                .expect("the winner is one of the candidates");
+            counts[index] += 1;
+        }
+        assert!(
+            counts.iter().all(|c| *c > 0),
+            "every candidate must win sometimes: {counts:?}"
+        );
+        assert!(
+            counts.iter().all(|c| *c < 300),
+            "no candidate may win every draw: {counts:?}"
+        );
+    }
+
+    /// `random` and `round-robin` must be different strategies. Before the
+    /// split they were the same comparator, so this pins the difference
+    /// rather than the accident.
+    #[test]
+    fn random_is_not_round_robin() {
+        let cands = [
+            Candidate::new(p("a"), "m"),
+            Candidate::new(p("b"), "m"),
+            Candidate::new(p("c"), "m"),
+        ];
+        let mut same = 0;
+        for seed in 0..64_u64 {
+            let cursor = AtomicU64::new(seed);
+            let round_robin = by_cursor(&cands, &cursor);
+            let random = by_shuffle(&cands, &cursor);
+            if round_robin.provider == random.provider {
+                same += 1;
+            }
+        }
+        assert!(
+            same < 64,
+            "the two strategies agree on every draw: they are one comparator"
+        );
+    }
+
+    /// The regression that pins the live in-flight count.
+    ///
+    /// The count is the one signal an *observation* cannot supply: an
+    /// observation is a past measurement, in-flight is a present count. It
+    /// used to be `0` on every candidate because nothing ever wrote it, so
+    /// `p2c`'s load term was always zero and the strategy could not prefer
+    /// an idle target over a busy one.
+    #[test]
+    fn the_live_in_flight_count_is_tracked() {
+        let loads = TargetLoads::new();
+        let target = Candidate::new(ProviderId::new("p"), "m");
+        assert_eq!(loads.in_flight(&target), 0, "nothing is in flight yet");
+        loads.acquire(&target);
+        assert_eq!(loads.in_flight(&target), 1);
+        loads.acquire(&target);
+        assert_eq!(loads.in_flight(&target), 2);
+        loads.release(&target);
+        assert_eq!(loads.in_flight(&target), 1);
+        loads.release(&target);
+        assert_eq!(loads.in_flight(&target), 0);
+    }
+
+    /// A double release must not wrap the counter: a target that looks
+    /// permanently saturated is worse than one that looks idle.
+    #[test]
+    fn a_double_release_does_not_wrap_the_in_flight_count() {
+        let loads = TargetLoads::new();
+        let target = Candidate::new(ProviderId::new("p"), "m");
+        loads.release(&target);
+        loads.release(&target);
+        assert_eq!(loads.in_flight(&target), 0);
     }
 
     #[test]
@@ -2468,7 +2861,8 @@ mod tests {
             )),
         ];
         assert_eq!(winner("expiry-first", &cands).as_str(), "b");
-        let ranked = [expiry_first_score(&cands[0]), expiry_first_score(&cands[1])];
+        let ranked = [expiry_first_score_at(&cands[0], now as f64),
+            expiry_first_score_at(&cands[1], now as f64)];
         assert!(
             ranked[0] == f64::NEG_INFINITY,
             "an exhausted window scores -inf by contract: {ranked:?}"
@@ -2502,7 +2896,7 @@ mod tests {
         ];
         assert_eq!(winner("expiry-first", &cands).as_str(), "a");
         assert!(
-            expiry_first_score(&cands[0]) <= EXPIRY_MAX_SCORE,
+            expiry_first_score_at(&cands[0], now as f64) <= EXPIRY_MAX_SCORE,
             "a past reset must clamp, not diverge"
         );
     }
@@ -2518,7 +2912,7 @@ mod tests {
         let now = now_secs();
         let hour_away =
             Candidate::new(p("a"), "m").with_quota(QuotaWindow::new(100, 20, now + 3600));
-        let score = expiry_first_score(&hour_away);
+        let score = expiry_first_score_at(&hour_away, now as f64);
         assert!(
             (score - 0.8).abs() < 0.01,
             "80% usable one hour out must score ~0.8/h, got {score}"
@@ -2526,17 +2920,17 @@ mod tests {
 
         // The two boundary readings the unit decides.
         assert_eq!(
-            hours_until_reset(0),
+            hours_until_reset_at(0, now as f64),
             None,
             "no reset reported is no deadline"
         );
         let rolled = Candidate::new(p("a"), "m").with_quota(QuotaWindow::new(100, 20, now));
         assert!(
-            expiry_first_score(&rolled) > score,
+            expiry_first_score_at(&rolled, now as f64) > score,
             "a just-rolled window must outrank an hour of runway"
         );
         assert!(
-            expiry_first_score(&rolled) <= EXPIRY_MAX_SCORE,
+            expiry_first_score_at(&rolled, now as f64) <= EXPIRY_MAX_SCORE,
             "the 15-minute floor must bound the urgency, not the 4.0 clamp"
         );
     }
@@ -2712,6 +3106,7 @@ mod tests {
             served: 0,
             reliability: Some(0.8),
             latency_inv: Some(0.6),
+            in_flight: 0,
         };
         assert_eq!(load.p2c_score(3), load.p2c_score(3));
         assert!(
@@ -2722,6 +3117,7 @@ mod tests {
             served: 0,
             reliability: Some(0.0),
             latency_inv: Some(0.0),
+            in_flight: 0,
         };
         assert!(
             TargetLoad::unknown().p2c_score(0) > failing.p2c_score(0),

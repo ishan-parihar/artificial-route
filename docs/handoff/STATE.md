@@ -5,11 +5,79 @@ what `genome wake` shows.
 
 ## State — (date)
 
-Date: 2026-10-19. Branch `main` @ 8784b3f. The proxy runs **only** on the VPS (`racknerd`),
+Date: 2026-10-19. Branch `main` @ `e8192ff` (the routing work below). The proxy runs
+**only** on the VPS (`racknerd`), public at
+`https://aroute.ishanparihar.com/v1` behind a cloudflared tunnel; the gate is
+armed and every harness holds a non-expiring token.
+
+**This iteration made the ROUTER production-grade.** The request: fix the route
+implementation gaps and issues, and make the routing production-grade like OmniRoute's
+but tailored to this system. Outcome: **code changed** — eleven fixes in
+`crates/ar-route`, `crates/ar-server` and `crates/ar-exec`, each with a regression test
+that was run against the unfixed code and failed there. The rationale and the evidence
+are in [`docs/29-routing-quality.md`](../29-routing-quality.md); the state of each item
+is in [`docs/28-gap-ledger.md`](../28-gap-ledger.md) §D1b–D1h.
+
+The audit's core finding: **of twenty-two strategy names, the reachable routing surface
+was roughly seven distinct behaviours.** The comparators were correct; the *signals*
+they rank on were never populated. `quota`, `in_flight`, `context_window`,
+`reliability` and `latency_inv` were `0`/`None` on every production request, so
+`headroom`, `reset-window`, `reset-aware`, `quota-weighted`, `quota-share-fair`,
+`expiry-first`, `context-optimized` and `cache-optimized` all degenerated to
+`priority` — a comparator that maximises a signal nobody sets is `priority` in
+disguise. Two names were exact duplicates (`fill-first` ≡ `priority`, `random` ≡
+`round-robin`), and one (`pipeline`) was wired to nothing.
+
+What changed, in the order it matters:
+
+1. **The session now reaches the strategy** (`ROUTE-02`). `ar-server` called
+   `pick(strategy, None, …)` — a hardcoded `None` — so `lkgp`, `context-relay` and
+   `cache-optimized` were unreachable on the request path, while their unit tests
+   passed. The LKG pin was written on every success and **never read**.
+2. **The quota signal exists** (`ROUTE-01`). The credential store has carried a
+   `quota_snapshots` table since it was ported, with a reader; nothing ever asked. Now
+   the config path reads the newest reading and puts it on the target, so six strategies
+   have a signal for the first time.
+3. **The load signal exists** (`ROUTE-01`). The server observes each outcome and
+   latency; the attempt loop tracks a live in-flight count and releases it on every
+   exit. `p2c` was reading three constant inputs, so every candidate scored identically.
+4. **A client disconnect is charged to nobody** (`ROUTE-04`). `ar-exec` had a typed
+   `ExecError::Aborted`; the bridge flattened it into a string, so the loop cooled the
+   key, locked the model and ticked the breaker for a cancelled request.
+5. **A stale pin is cleared** (`ROUTE-03`). `LkgpPins::clear` existed with no caller,
+   so a failed provider stayed pinned for the whole 30-minute TTL.
+6. **`pipeline` is a staged dispatch** (`ROUTE-05`). The server had no
+   `Strategy::Pipeline` branch, so a pipeline combo's stages became *fallbacks*. Wiring
+   it surfaced a second bug: the stage answer read only the Anthropic shape, so a
+   pipeline against an OpenAI provider could never have run two stages.
+7. **`auto/*` is routable** (`ROUTE-01`/`GAP-01`). The two parsers disagreed about the
+   name and the server used the router's answer, so a combo naming a strategy this
+   build ships answered **501**.
+8. **Every body read is bounded** (`ROUTE-07`): the success, error, failure, judge and
+   pipeline-stage bodies are capped **at the read**, not only at the slice; and the 2 KB
+   scan cap no longer silently scans the whole body when the cut lands mid-character.
+9. **`random` is a shuffle** (`ROUTE-06`), as the reference's is. `fill-first` ≡
+   `priority` is *faithful* to the reference and stays.
+
+**Still open** (`ROUTE-08`): `cached_prefix_tokens` is always 0, so `cache-optimized`
+still degrades to `context-relay`. The signal needs the cache layer to publish the
+prefix length it already computes — a change to `ar-cache`, not to the router.
+
+**Not yet deployed.** The routing work is committed on `main` but the VPS still runs
+`v0.1.17`; it ships with the next release (register `OPS-01` — 14 commits were already
+unreleased before this, so the release carries both). The live smoke that proved the
+fixes ran against a **scratch instance** over the operator's own config and keys, not
+against the deployed proxy.
+
+---
+
+## Earlier state — 2026-10-19 (the `/ui` panel audit)
+
+Branch `main` @ 8784b3f. The proxy runs **only** on the VPS (`racknerd`),
 public at `https://aroute.ishanparihar.com/v1` behind a cloudflared tunnel; the gate is
 armed and every harness holds a non-expiring token.
 
-**This iteration audited the `/ui` control panel** (the request: contrast the OmniRoute
+**That iteration audited the `/ui` control panel** (the request: contrast the OmniRoute
 dashboard with ours, and land the plans/bugs/audit in the knowledge base so the upgrade
 can start). Outcome: an audit, a contrast, and a seven-phase plan. **No code changed.**
 
@@ -89,11 +157,12 @@ several of them had gone stale (A1 said "v0.1.16 is the newest tag" when `v0.1.1
 tagged; B6 said "14 orphan pages" when the count is now 0). The old documents keep the
 **history** of their pass and point at the ledger; the ledger owns the **state**.
 
-<!-- genome:zone status sha=d9eabd9f3e42 -->
+<!-- genome:zone status sha=70415ace5f46 -->
 | status | items |
 |---|---|
 | open | 31 |
 | in-progress | 1 |
+| done | 8 |
 
 - `UI-00` [open] **U0 — close the unauthenticated `/ui` write path** (AR-2 ingress 404 + AR-3 write handlers refuse o
 - `UI-01` [open] **U1 — gate `/ui` on the HTTP master** so the panel can be published deliberately (AR-1: bearer gate

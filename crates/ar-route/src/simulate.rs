@@ -161,7 +161,7 @@ mod tests {
             _canonical: &'a CanonicalRequest,
         ) -> Pin<Box<dyn Future<Output = Result<Upstream, ExecError>> + Send + 'a>> {
             self.0.fetch_add(1, Ordering::Relaxed);
-            Box::pin(async { Err(ExecError("dry run must not dispatch".to_owned())) })
+            Box::pin(async { Err(ExecError::Transport("dry run must not dispatch".to_owned())) })
         }
     }
 
