@@ -1,5 +1,11 @@
 # 24 — Remaining gaps: execution record (2026-10-18)
 
+> **Superseded for state.** This doc owns the **history** of the 2026-10-18 pass. The
+> **state** of every open item — which rows are still open, and how each was re-verified —
+> is in [`docs/28-gap-ledger.md`](28-gap-ledger.md) (consolidated 2026-10-19). Read the
+> ledger before acting on a row here: several states below have moved on (A1, B6, E8 and
+> D6 were re-measured).
+
 Status: first audit (earlier revision) and execution of its suggested order. Every
 row carries a **State**: `done <sha>` (committed on `main`), `fixed (other)` (closed by
 a commit from another session, verified), `open` (not started, no decision needed),

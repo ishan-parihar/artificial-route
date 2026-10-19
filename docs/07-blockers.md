@@ -1,5 +1,10 @@
 # Remaining blockers: plan
 
+> **The state of every open item is in [`docs/28-gap-ledger.md`](28-gap-ledger.md)**
+> (consolidated 2026-10-19). This doc owns the provider blockers and their isolation
+> steps. The ledger's §E carries the probe-shaped ones (E3 = B2 below, E4 = the known
+> `glm-5.3` trait).
+
 Written 2026-10-05 against the ported `free-stack` / `small-stack` on `origin/main`
 (`daddb0b`). Every number below was measured on this machine, not inherited from
 a doc.

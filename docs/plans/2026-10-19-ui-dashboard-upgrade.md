@@ -7,6 +7,10 @@ in genome.toml `core.living_plans` and keep a 'Resume here' section).
 §6** — that doc says *why* and *in what order*; this one says *what must pass*. Do not
 duplicate a gate here that already lives in the code; cite the file.
 
+**The state of every open item, across the whole project, is in
+[`docs/28-gap-ledger.md`](../28-gap-ledger.md)** — this plan is the panel's slice of it
+(ledger §F), and the register rows are `UI-00` … `UI-08`.
+
 The subject: `crates/ar-cli/src/webui.rs` and `crates/ar-cli/src/webui/page/*`. The two
 shipped UI plans this continues: `docs/19-ui-upgrade-plan.md` (phases A–E) and
 `docs/23-ui-round-two-plan.md` (G1–G5). The audit that produced this plan:

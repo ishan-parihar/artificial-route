@@ -8,6 +8,10 @@ one row per finding, each with the evidence that produced it. The plan that cons
 `docs/plans/2026-10-19-ui-dashboard-upgrade.md`. Evidence artefacts:
 `docs/audit/2026-10-19-ui-dashboard/` (probe JSON + 13 screenshots, light and dark).
 
+**The state of every open item these findings produced** is tracked in
+[`docs/28-gap-ledger.md`](../28-gap-ledger.md) — §A (security) and §F (the panel), with
+the register rows `SEC-01`…`SEC-04` and `UI-00`…`UI-08`.
+
 ## Scope
 
 - The subject: `crates/ar-cli/src/webui.rs`, `crates/ar-cli/src/webui/page/{index.html,app.js,app.css}`.
@@ -81,7 +85,7 @@ it gates the dashboard's future auth, but it is not a dashboard defect.
 - **[verified] F6 — an accent-colour contrast failure in the light band.** `--amber
   #e0900f` on `--panel #ffffff` is **2.6:1** (body text needs 4.5:1). Amber is used as
   *text* by `.star.on` (the favourite marker, `app.css:674`) and `.minted summary` (the
-  "copy it now" disclosure, `app.css:586`). Measured: a starred item is **less** legible
+  "copy it now" disclosure, `app.css:584`). Measured: a starred item is **less** legible
   than an unstarred one (`rgb(224,144,15)` vs `rgb(100,107,136)`). `contrast.py` does not
   catch it — it pairs tokens, not token-on-ground. The fix is the token layer: `--amber`
   stays the fill, a new `--amber-ink` becomes the text colour (the dark band already has
@@ -118,7 +122,7 @@ it gates the dashboard's future auth, but it is not a dashboard defect.
   whole-section replace and the YAML renderer emits block-style lists where the hand-written
   file used flow-style, so posting the config's own combo list back changed 39 lines
   (`targets: [x]` → a two-line block) and the `identical` short-circuit did not fire
-  (`crates/ar-cli/src/webui.rs:603`). Semantically identical, not byte-identical. **The
+  (`crates/ar-cli/src/webui.rs:604`). Semantically identical, not byte-identical. **The
   prod config was restored byte-exact afterwards** (`config.yaml.1` copied back; both files
   now `sha256 767a402a966d53aac803f169d38111ed59b1d9b690ec5957fa47dce1a8168e84`; the
   service was verified healthy: `healthz` 200, unit `active`, 20 combos, 266 providers,
@@ -156,7 +160,7 @@ it gates the dashboard's future auth, but it is not a dashboard defect.
   The gap that matters is not feature count but two *conventions* `/ui` lacks: the four
   states of every data view (loading / empty / error / populated — `/ui` has the
   vocabulary in `stateRow`, but the populated and loading states are not distinct, and an
-  error auto-hides after 8 seconds, `app.js:48-51`), and a write that proves itself by
+  error auto-hides after 8 seconds, `app.js:46`), and a write that proves itself by
   re-reading the file. The other two OmniRoute strengths — settings-as-data and a React
   component library — are **deliberate non-goals** for `/ui` (a file-backed proxy wants
   reviewable, revertible file edits; and `H()` + no build step + one binary + offline

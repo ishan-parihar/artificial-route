@@ -1,5 +1,9 @@
 # Benchmarks, parity and known gaps
 
+> **The open gaps below are tracked in [`docs/28-gap-ledger.md`](28-gap-ledger.md)**
+> (consolidated 2026-10-19). This doc owns the **measured numbers** and the **parity
+> comparison**; the ledger owns the state of each open item.
+
 Measured numbers, the feature comparison against OmniRoute and agentgateway, and the open gaps. Moved here from the README to keep it in its length band; the figures are dated and the same machine as in the text.
 
 ## Benchmarks

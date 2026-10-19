@@ -1,5 +1,9 @@
 # 21 — Remaining implementation gaps (register, 2026-10-17)
 
+> **Superseded for state.** This doc owns the **history** of the 2026-10-17 register. The
+> **state** of every open item is in [`docs/28-gap-ledger.md`](28-gap-ledger.md)
+> (consolidated 2026-10-19).
+
 Status: register, not plan. Each row names its authority (the doc that owns
 the decision) so this file stays an index, and stale rows here lose to their
 owner. Written after v0.1.16's branch landed /ui, per-model attribution and

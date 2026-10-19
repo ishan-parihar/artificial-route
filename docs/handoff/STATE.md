@@ -73,9 +73,18 @@ the audit's own probe tokens. Tracked as **Q10**.
 
 | question | owner |
 |---|---|
+| **what is actually still open, across the whole project** | **`docs/28-gap-ledger.md`** — one row per open item, each re-verified against the tree on 2026-10-19 |
+| the work items, and their state | `TODO.md` (32 open: `UI-00`…`UI-08`, `SEC-01`…`SEC-04`, `DEC-01`…`DEC-04`, `OPS-01`…`OPS-06`, `GAP-01`…`GAP-09`) |
 | what the audit found, and the evidence | `docs/audit/2026-10-19-ui-dashboard-contrast.md` (+ `docs/audit/2026-10-19-ui-dashboard/`, probe JSON + 13 screenshots) |
 | the contrast with OmniRoute, the CRAFT score, the design baseline, the reasoning | `docs/27-dashboard-contrast-and-upgrade-plan.md` |
 | the executable phases and their gates | `docs/plans/2026-10-19-ui-dashboard-upgrade.md` |
-| the open work items | `TODO.md` (`UI-00` … `UI-08`) |
-| the operator's decisions | `docs/kb/ASKS.md` (Q7 publish or not, Q8 which store, Q9 restart-from-the-panel) |
+| the operator's decisions | `docs/kb/ASKS.md` (Q7 publish or not, Q8 which store, Q9 restart-from-the-panel, Q10 the urgent tunnel restart) |
+| what was tried and rejected | `docs/kb/CLOSED.md` |
 | what shipped before this | `docs/19-ui-upgrade-plan.md` (A–E), `docs/23-ui-round-two-plan.md` (G1–G5) |
+
+**The ledger is the one answer to "what is still open?".** It was consolidated on
+2026-10-19 from `docs/21`, `docs/24`, `docs/07`, `docs/26` and the register, because the
+open work had been spread over five documents with no row re-verified against the tree —
+several of them had gone stale (A1 said "v0.1.16 is the newest tag" when `v0.1.17` was
+tagged; B6 said "14 orphan pages" when the count is now 0). The old documents keep the
+**history** of their pass and point at the ledger; the ledger owns the **state**.

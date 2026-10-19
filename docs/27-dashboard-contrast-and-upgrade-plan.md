@@ -10,6 +10,11 @@ Route taken: the `website-design` skill, dashboard/tool-UI branch, **redesign** 
 (audit first, then plan). Mode is `preserve`: the shipped visual language (electric-indigo
 skin, Sora/Inter, the failover rail) is the brand and stays.
 
+> **This doc owns the `/ui` audit, the contrast and the design baseline.** The state of
+> every open item it found is in [`docs/28-gap-ledger.md`](28-gap-ledger.md) §F (the
+> register rows are `UI-00` … `UI-08`); the executable phases are in
+> [`docs/plans/2026-10-19-ui-dashboard-upgrade.md`](plans/2026-10-19-ui-dashboard-upgrade.md).
+
 ---
 
 ## 0. How to verify every claim in this doc
@@ -116,7 +121,7 @@ Every one of these was executed against the live VPS and returned success:
 
 The last row is the proof, and it is not a simulation: the handler ran, validated, rendered
 the `combos:` section, spliced it into `~/.config/ar/config.yaml`, and wrote the file. The
-`identical` short-circuit (`crates/ar-cli/src/webui.rs:603`) did not fire because the YAML
+`identical` short-circuit (`crates/ar-cli/src/webui.rs:604`) did not fire because the YAML
 renderer emits block-style lists where the hand-written file used flow-style
 (`targets: [nvidia/z-ai/glm-5.3-flash]` → a two-line block). Semantically identical, not
 byte-identical.
@@ -466,7 +471,7 @@ where amber is used as **text**:
   sits at 2.6:1 on white. Measured in a real browser: an unstarred star computes to
   `rgb(100,107,136)` (`--faint`, 4.9:1, passes) and a starred one to `rgb(224,144,15)` —
   **the favourite is less legible than the non-favourite.**
-- `.minted summary { color: var(--amber) }` (`app.css:586`) — the "copy it now" disclosure
+- `.minted summary { color: var(--amber) }` (`app.css:584`) — the "copy it now" disclosure
   that reveals a freshly minted token, the one line in the panel that must not be missed.
 
 The fix is small and belongs in the token layer, not in a component: the light band needs
@@ -530,7 +535,7 @@ where it counts:
    `/ui` has `stateRow(cols, text, cls)` with `.loading` / `.empty` / `.failed`
    (`app.js:763-765`) — the vocabulary exists, but the *populated* and *loading* states are
    not distinct, and the error state is a single shared paragraph per pane with an 8-second
-   auto-hide (`app.js:48-51`). **An error that vanishes after 8 seconds is not a state.** A
+   auto-hide (`app.js:46`). **An error that vanishes after 8 seconds is not a state.** A
    failed write that is gone before it is read is indistinguishable from a write that
    succeeded.
 2. **A write must not half-apply.** OmniRoute validates the whole object before it writes

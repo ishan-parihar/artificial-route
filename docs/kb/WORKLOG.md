@@ -19,3 +19,4 @@ Append-only: `genome log "<entry>"`, one per unit of work.
 - **2026-10-19T20:04** — 2026-10-19 plan file date-stamped: docs/plans/racknerd-public-endpoint.md → docs/plans/2026-10-19-racknerd-public-endpoint.md. The plan asks for a dated filename; the undated name failed lint E004. The two earlier worklog entries cite the old path and are append-only, so they keep it.
 - **2026-10-19T20:08** — 2026-10-19 /ui dashboard audit: three verified findings, a contrast with OmniRoute, and a seven-phase upgrade plan
 - **2026-10-19T20:29** — 2026-10-19 /ui exposure escalation: the mint refusal was an accident that ended at 20:07:58, and the exposure is now complete
+- **2026-10-19T20:49** — 2026-10-19 gap ledger: one owner for every open item, 32 register rows, four new asks
