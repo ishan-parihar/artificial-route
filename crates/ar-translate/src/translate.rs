@@ -987,9 +987,9 @@ fn anthropic_role(raw: &str) -> Result<Role, TranslateError> {
 ///
 /// `text` accumulates into the parent turn; `tool_use` becomes a canonical call on
 /// that turn; `tool_result` becomes its own tool turn, correlated by id; `image`
-/// crosses as a carried part. `thinking` is still rejected — it is
-/// provider-internal bookkeeping with no place in the request this proxy makes,
-/// and forwarding it would leak a prior turn's reasoning.
+/// crosses as a carried part. A block that names no modality — `thinking`,
+/// `tool_addition`, `server_tool_use` and the rest of Anthropic's
+/// client-side vocabulary — is dropped: see the `other` arm below.
 fn anthropic_blocks(blocks: &[AnthropicBlock]) -> Result<AnthropicSplit, TranslateError> {
     let mut tool_msgs = Vec::new();
     let mut text_parts: Vec<&str> = Vec::new();
@@ -1019,7 +1019,34 @@ fn anthropic_blocks(blocks: &[AnthropicBlock]) -> Result<AnthropicSplit, Transla
                 None => media.push(MediaPart::new("tool_use", json!(block))),
             },
             other => {
-                require_routable(other)?;
+                // A block that names no modality is **dropped** — not carried,
+                // not rejected.
+                //
+                // Dropped, because carrying it does not work: a carried part is
+                // re-spelled verbatim for the upstream wire
+                // ([`MediaPart::to_wire`]), and an OpenAI-shaped upstream
+                // answers an Anthropic-only part with its own 400. The failure
+                // would move downstream, fail over the whole target chain, and
+                // leave the client waiting.
+                //
+                // Not rejected, because the client, not the proxy, decides what
+                // to send. Anthropic's vocabulary grows faster than any routing
+                // table — `thinking`, `tool_addition`, `server_tool_use`,
+                // `container_upload`, `web_search_tool_result` — and a client
+                // that replays its history verbatim sends them on every later
+                // request. Rejecting one 400'd the whole conversation over
+                // bookkeeping the upstream never has to see, and the client had
+                // no way to opt out: `CLAUDE_CODE_DISABLE_THINKING` suppresses
+                // the request *field*, not the blocks already in the history.
+                //
+                // Dropping `thinking` in particular is also the privacy-correct
+                // answer: it is a prior turn's private reasoning, and this
+                // proxy never renders reasoning back to a client (see the
+                // `reframe` module's note on `reasoning_content`), so there is
+                // none of ours to preserve.
+                if Modality::of_part(other).is_none() {
+                    continue;
+                }
                 media.push(MediaPart::new(other, json!(block)));
             }
         }
@@ -1373,16 +1400,56 @@ mod tests {
     }
 
     #[test]
-    fn rejects_anthropic_thinking_when_not_routable() {
+    fn drops_anthropic_thinking_instead_of_rejecting_the_request() {
+        // A session that spent a turn on a reasoning-capable model replays its
+        // thinking blocks on every later request. Rejecting them 400'd the whole
+        // conversation, with no client-side opt-out.
         let raw = r#"{"model":"m","messages":[{"role":"assistant","content":[
-                      {"type":"thinking","thinking":"hmm"}]}]}"#;
+                      {"type":"thinking","thinking":"hmm"},
+                      {"type":"text","text":"answer"},
+                      {"type":"redacted_thinking","data":"xxx"}]}]}"#;
         let req: AnthropicMessages =
             serde_json::from_str(raw).expect("fixture is valid Anthropic Messages");
 
-        assert!(matches!(
-            anthropic_to_canonical(req),
-            Err(TranslateError::UnsupportedPart { kind }) if kind == "thinking"
-        ));
+        let canonical = anthropic_to_canonical(req).expect("thinking is dropped, not fatal");
+
+        assert_eq!(canonical.messages[0].content, "answer");
+        assert!(canonical.messages[0].media.is_empty());
+    }
+
+    #[test]
+    fn drops_anthropic_blocks_that_name_no_modality() {
+        // Anthropic's block vocabulary grows faster than any routing table.
+        // A client that replays its history sends these on every later
+        // request, so rejecting one 400s the whole conversation — and
+        // carrying one to the upstream 400s there instead, because a carried
+        // part is re-spelled verbatim for a wire that has no place for it.
+        let raw = r#"{"model":"m","messages":[{"role":"assistant","content":[
+                      {"type":"tool_addition","name":"Bash"},
+                      {"type":"server_tool_use","id":"s1","name":"web_search"},
+                      {"type":"text","text":"answer"}]}]}"#;
+        let req: AnthropicMessages =
+            serde_json::from_str(raw).expect("fixture is valid Anthropic Messages");
+
+        let canonical = anthropic_to_canonical(req).expect("a non-modality block is dropped, not fatal");
+
+        assert_eq!(canonical.messages[0].content, "answer");
+        assert!(canonical.messages[0].media.is_empty());
+    }
+
+    #[test]
+    fn drops_anthropic_thinking_inside_a_tool_result_payload() {
+        let raw = r#"{"model":"m","messages":[
+                      {"role":"user","content":[
+                        {"type":"tool_result","tool_use_id":"t1","content":[
+                          {"type":"thinking","thinking":"hmm"},
+                          {"type":"text","text":"result"}]}]}]}"#;
+        let req: AnthropicMessages =
+            serde_json::from_str(raw).expect("fixture is valid Anthropic Messages");
+
+        let canonical = anthropic_to_canonical(req).expect("thinking is dropped, not fatal");
+
+        assert_eq!(canonical.messages[0].content, "result");
     }
 
     #[test]
