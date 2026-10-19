@@ -1,0 +1,81 @@
+# Canonical MCP server registry for every agent harness on this machine.
+#
+# This file is the ONLY place an MCP server is defined. `harness-sync` reads
+# it and writes the per-harness configs, so adding or removing a server is one
+# edit here and one run of the tool.
+#
+# Why it exists: the four harnesses each keep MCP servers in their own
+# format (omp json, opencode json, jcode/claude json, codex toml). Before this
+# file they drifted — a server added to one harness was missing from another,
+# and a dead port kept a harness printing a connection error on every start.
+#
+# Fields
+#   name      the id every harness uses
+#   transport http  -> a URL the harness calls
+#             stdio -> a local command the harness spawns
+#   url       for http
+#   command   for stdio (absolute path, resolved at run time)
+#   args      for stdio
+#   env       for stdio
+#   enabled   false -> present in the config but switched off
+#
+# `harness-sync check` reports drift; `harness-sync apply` writes.
+
+# Servers that used to be configured and are now gone. A harness carrying one
+# of these is drift to REMOVE, not to keep disabled: a dead entry in an MCP
+# list is a connection error on every start of that harness.
+retired:
+  - cloakctl
+
+servers:
+  browseros-neo:
+    transport: http
+    url: http://127.0.0.1:9012/mcp
+    enabled: true
+
+  memory-wire:
+    transport: http
+    url: http://127.0.0.1:8888/mcp/omp
+    enabled: true
+
+  sourcehound:
+    transport: stdio
+    command: sourcehound
+    args: [mcp]
+    enabled: true
+
+  headroom:
+    transport: stdio
+    command: /home/ishanp/.local/bin/headroom
+    args: [mcp, serve]
+    env:
+      HEADROOM_PROXY_URL: http://127.0.0.1:8788
+    enabled: true
+
+  token-savior:
+    transport: stdio
+    command: /home/ishanp/.local/bin/token-savior
+    args: []
+    env:
+      TOKEN_SAVIOR_CLIENT: claude-code
+      TOKEN_SAVIOR_PROFILE: optimized
+      TS_BASH_COMPACT: "0"
+      TS_BASH_REWRITE: "0"
+    enabled: true
+
+  # A project-scoped remote (Supabase project ref) that only opencode carried.
+  # It is in the registry so the harnesses agree on it; `only:` keeps it in the
+  # harness that actually uses it — a server the others load is a connection
+  # error on their every start.
+  supabase:
+    transport: http
+    url: https://mcp.supabase.com/mcp?project_ref=ksdapieyvdmznyowyzbu&features=docs%2Caccount%2Cdatabase%2Cdebugging%2Cdevelopment%2Cfunctions%2Cbranching%2Cstorage
+    only: [opencode]
+
+  # A code-navigation server codex carries: it runs through uvx, so the
+  # command is `uvx` and the package is the first argument.
+  serena:
+    transport: stdio
+    command: uvx
+    args: ["--from", "serena-agent", "serena", "start-mcp-server", "--project-from-cwd", "--context", "codex", "--open-web-dashboard", "False"]
+    only: [codex]

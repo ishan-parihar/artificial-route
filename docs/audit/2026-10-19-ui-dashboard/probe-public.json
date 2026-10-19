@@ -1,0 +1,199 @@
+[
+  {
+    "url": "https://aroute.ishanparihar.com/ui/",
+    "width": 1440,
+    "scheme": "light",
+    "fail": [
+      {
+        "k": "font-fallback",
+        "m": "\"sora\" is asked for by 5 text nodes but its @font-face never loaded: the page renders in a fallback face"
+      },
+      {
+        "k": "font-fallback",
+        "m": "\"inter\" is asked for by 78 text nodes but its @font-face never loaded: the page renders in a fallback face"
+      }
+    ],
+    "warn": [
+      {
+        "k": "clipped-text",
+        "m": "p#foot-config clips its text (\"/home/nerd/.config/ar/config\")"
+      },
+      {
+        "k": "clipped-text",
+        "m": "p#foot-env clips its text (\"/home/nerd/.config/ar/ar.env\")"
+      },
+      {
+        "k": "type-scale",
+        "m": "largest type in the first viewport is 21px (1.6x body); under 48px at desktop reads as a document, not a designed page"
+      },
+      {
+        "k": "http",
+        "m": "403 https://aroute.ishanparihar.com/ui/fonts/inter-var-latin.woff2"
+      },
+      {
+        "k": "console",
+        "m": "Failed to load resource: the server responded with a status of 403 ()"
+      },
+      {
+        "k": "request",
+        "m": "net::ERR_ABORTED https://aroute.ishanparihar.com/ui/fonts/inter-var-latin.woff2"
+      },
+      {
+        "k": "http",
+        "m": "403 https://aroute.ishanparihar.com/ui/fonts/sora-var-latin.woff2"
+      },
+      {
+        "k": "console",
+        "m": "Failed to load resource: the server responded with a status of 403 ()"
+      },
+      {
+        "k": "request",
+        "m": "net::ERR_ABORTED https://aroute.ishanparihar.com/ui/fonts/sora-var-latin.woff2"
+      }
+    ],
+    "info": {
+      "textNodes": 159,
+      "contrastUnknownOverImage": 30,
+      "fonts": [
+        "sora",
+        "inter",
+        "ui-monospace"
+      ],
+      "heroScale": 1.6,
+      "typeSizes": 7,
+      "textColors": 6,
+      "lengthVp": 2.4,
+      "primaryCtaVp": 0.27,
+      "primaryCtaLabel": "Edit",
+      "pinnedCta": null,
+      "distinctExits": 0,
+      "screenshot": "/var/tmp/ishanp-agentic/opencode/probe-out/ui-baseline-20261019/ui-1440.png"
+    }
+  },
+  {
+    "url": "https://aroute.ishanparihar.com/ui/",
+    "width": 1024,
+    "scheme": "light",
+    "fail": [
+      {
+        "k": "font-fallback",
+        "m": "\"sora\" is asked for by 5 text nodes but its @font-face never loaded: the page renders in a fallback face"
+      },
+      {
+        "k": "font-fallback",
+        "m": "\"inter\" is asked for by 78 text nodes but its @font-face never loaded: the page renders in a fallback face"
+      }
+    ],
+    "warn": [
+      {
+        "k": "clipped-text",
+        "m": "p#foot-config clips its text (\"/home/nerd/.config/ar/config\")"
+      },
+      {
+        "k": "clipped-text",
+        "m": "p#foot-env clips its text (\"/home/nerd/.config/ar/ar.env\")"
+      },
+      {
+        "k": "http",
+        "m": "403 https://aroute.ishanparihar.com/ui/fonts/inter-var-latin.woff2"
+      },
+      {
+        "k": "console",
+        "m": "Failed to load resource: the server responded with a status of 403 ()"
+      },
+      {
+        "k": "request",
+        "m": "net::ERR_ABORTED https://aroute.ishanparihar.com/ui/fonts/inter-var-latin.woff2"
+      },
+      {
+        "k": "http",
+        "m": "403 https://aroute.ishanparihar.com/ui/fonts/sora-var-latin.woff2"
+      },
+      {
+        "k": "console",
+        "m": "Failed to load resource: the server responded with a status of 403 ()"
+      },
+      {
+        "k": "request",
+        "m": "net::ERR_ABORTED https://aroute.ishanparihar.com/ui/fonts/sora-var-latin.woff2"
+      }
+    ],
+    "info": {
+      "textNodes": 159,
+      "contrastUnknownOverImage": 30,
+      "fonts": [
+        "sora",
+        "inter",
+        "ui-monospace"
+      ],
+      "heroScale": 1.6,
+      "typeSizes": 7,
+      "textColors": 6,
+      "lengthVp": 2.4,
+      "primaryCtaVp": 0.27,
+      "primaryCtaLabel": "Edit",
+      "pinnedCta": null,
+      "distinctExits": 0,
+      "screenshot": "/var/tmp/ishanp-agentic/opencode/probe-out/ui-baseline-20261019/ui-1024.png"
+    }
+  },
+  {
+    "url": "https://aroute.ishanparihar.com/ui/",
+    "width": 390,
+    "scheme": "light",
+    "fail": [
+      {
+        "k": "font-fallback",
+        "m": "\"sora\" is asked for by 5 text nodes but its @font-face never loaded: the page renders in a fallback face"
+      },
+      {
+        "k": "font-fallback",
+        "m": "\"inter\" is asked for by 78 text nodes but its @font-face never loaded: the page renders in a fallback face"
+      }
+    ],
+    "warn": [
+      {
+        "k": "http",
+        "m": "403 https://aroute.ishanparihar.com/ui/fonts/inter-var-latin.woff2"
+      },
+      {
+        "k": "console",
+        "m": "Failed to load resource: the server responded with a status of 403 ()"
+      },
+      {
+        "k": "request",
+        "m": "net::ERR_ABORTED https://aroute.ishanparihar.com/ui/fonts/inter-var-latin.woff2"
+      },
+      {
+        "k": "http",
+        "m": "403 https://aroute.ishanparihar.com/ui/fonts/sora-var-latin.woff2"
+      },
+      {
+        "k": "console",
+        "m": "Failed to load resource: the server responded with a status of 403 ()"
+      },
+      {
+        "k": "request",
+        "m": "net::ERR_ABORTED https://aroute.ishanparihar.com/ui/fonts/sora-var-latin.woff2"
+      }
+    ],
+    "info": {
+      "textNodes": 157,
+      "contrastUnknownOverImage": 28,
+      "fonts": [
+        "sora",
+        "inter",
+        "ui-monospace"
+      ],
+      "heroScale": 1.4,
+      "typeSizes": 7,
+      "textColors": 6,
+      "lengthVp": 4.3,
+      "primaryCtaVp": 0.62,
+      "primaryCtaLabel": "Edit",
+      "pinnedCta": null,
+      "distinctExits": 0,
+      "screenshot": "/var/tmp/ishanp-agentic/opencode/probe-out/ui-baseline-20261019/ui-390.png"
+    }
+  }
+]

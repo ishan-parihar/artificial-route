@@ -1,0 +1,507 @@
+#!/usr/bin/env python3
+"""Render the canonical MCP registry into every harness's own config format.
+
+The harnesses disagree about how an MCP server is spelled:
+
+  omp       ~/.omp/agent/mcp.json          {"mcpServers": {...}, "enabledServers": [...]}
+  opencode  ~/.config/opencode/opencode.json  {"mcp": {name: {"type": "local"|"remote", ...}}}
+  jcode     ~/.claude.json                 {"mcpServers": {name: {"type": "http"|"stdio", ...}}}
+  codex     ~/.codex/config.toml           [mcp_servers.name]
+
+A server that exists in one of these and not the others is drift, and drift is
+how a harness ends up carrying a dead port or missing a tool. This tool reads
+one registry and writes all four, so the registry is the only place a server is
+named.
+
+  harness-sync check   report drift and unreachable servers, change nothing
+  harness-sync apply   write every harness config from the registry
+  harness-sync list    show the registry and each harness's current state
+
+The registry is `config/harness/mcp-servers.yaml` in this repository, so it is
+versioned with the code and can be copied to a remote host rather than living
+only in one machine's filesystem.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - python < 3.11
+    tomllib = None  # type: ignore[assignment]
+
+def _default_registry() -> Path:
+    """The registry that ships with the code.
+
+    Order: the repository this script lives in (so a checkout or an installed
+    copy next to the repo finds the versioned file), then the user's home
+    copy. `HARNESS_MCP_REGISTRY` overrides both.
+    """
+    here = Path(__file__).resolve()
+    for parent in (here.parent.parent, *here.parents):
+        candidate = parent / "config/harness/mcp-servers.yaml"
+        if candidate.is_file():
+            return candidate
+    return Path.home() / ".config/harness/mcp-servers.yaml"
+
+
+REGISTRY = Path(os.environ.get("HARNESS_MCP_REGISTRY", str(_default_registry())))
+
+OMP_MCP = Path.home() / ".omp/agent/mcp.json"
+OPENCODE_JSON = Path.home() / ".config/opencode/opencode.json"
+CLAUDE_JSON = Path.home() / ".claude.json"
+CODEX_TOML = Path.home() / ".codex/config.toml"
+PI_MCP = Path.home() / ".pi/agent/mcp.json"
+AGY_MCP = Path.home() / ".gemini/config/mcp_config.json"
+
+# A harness may legitimately carry servers this tool does not manage (an
+# OAuth-only remote, a project-scoped server). Those are left alone; the
+# registry only decides the servers it names.
+MANAGED = {
+    "omp": OMP_MCP,
+    "opencode": OPENCODE_JSON,
+    "jcode": CLAUDE_JSON,
+    "codex": CODEX_TOML,
+    "pi": PI_MCP,
+    "agy": AGY_MCP,
+}
+
+
+def load_registry() -> tuple[dict, list]:
+    """Read the YAML registry. PyYAML is optional; the file is simple enough
+    that a tiny parser keeps the dependency out of the loop."""
+    text = REGISTRY.read_text()
+    try:
+        import yaml  # type: ignore
+
+        data = yaml.safe_load(text)
+    except ModuleNotFoundError:
+        data = _mini_yaml(text)
+    servers = (data or {}).get("servers") or {}
+    retired = (data or {}).get("retired") or []
+    if not servers:
+        raise SystemExit(f"harness-sync: {REGISTRY} defines no servers")
+    return servers, list(retired)
+
+
+def _mini_yaml(text: str) -> dict:
+    """Parse the registry's small subset: nested maps, inline lists, scalars."""
+    root: dict = {}
+    stack: list[tuple[int, dict]] = [(-1, root)]
+    for raw in text.splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip())
+        line = raw.strip()
+        while stack and indent <= stack[-1][0]:
+            stack.pop()
+        parent = stack[-1][1]
+        if line.startswith("- "):
+            # a list item under the last key
+            key = next((k for k in reversed(parent) if isinstance(parent[k], list)), None)
+            if key is None:
+                continue
+            parent[key].append(_scalar(line[2:].strip()))
+            continue
+        key, _, value = line.partition(":")
+        key = key.strip()
+        value = value.strip()
+        if not value:
+            child: dict = {}
+            parent[key] = child
+            stack.append((indent, child))
+        else:
+            parent[key] = _scalar(value)
+    # second pass: keys whose value is a list need the list created
+    return _fix_lists(text, root)
+
+
+def _fix_lists(text: str, root: dict) -> dict:
+    """The mini parser stores list keys inline; normalise them here."""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("- ") and ":" in stripped:
+            continue
+        if stripped.endswith("]"):
+            key, _, value = stripped.partition(":")
+            key = key.strip()
+            if key in root and isinstance(root[key], str) and root[key].startswith("["):
+                root[key] = [_scalar(x) for x in root[key][1:-1].split(",") if x.strip()]
+    return root
+
+
+def _scalar(text: str):
+    text = text.strip()
+    if text.startswith("[") and text.endswith("]"):
+        return [_scalar(x) for x in text[1:-1].split(",") if x.strip()]
+    if text.startswith('"') and text.endswith('"'):
+        return text[1:-1]
+    if text in ("true", "True"):
+        return True
+    if text in ("false", "False"):
+        return False
+    if text in ("null", "~", ""):
+        return None
+    if text.isdigit():
+        return int(text)
+    return text
+
+
+def backup(path: Path) -> None:
+    if path.exists():
+        shutil.copy2(path, path.with_suffix(path.suffix + ".bak-harness-sync"))
+
+
+def write_json(path: Path, data: dict) -> None:
+    backup(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n")
+
+
+# ---------------------------------------------------------------- per harness
+
+
+def scoped(servers: dict, harness: str) -> dict:
+    """The servers this harness should carry.
+
+    A server with `only: [...]` belongs to the named harnesses and to no
+    other; every other server belongs to all of them."""
+    out = {}
+    for name, spec in servers.items():
+        only = spec.get("only")
+        if only is None or harness in only:
+            out[name] = spec
+    return out
+
+
+def apply_omp(servers: dict, retired: list) -> None:
+    data = json.loads(OMP_MCP.read_text()) if OMP_MCP.exists() else {}
+    existing = data.get("mcpServers", {})
+    mine = scoped(servers, "omp")
+    rendered = {}
+    for name, spec in mine.items():
+        if spec.get("transport") == "http":
+            rendered[name] = {"type": "http", "url": spec["url"]}
+        else:
+            entry = {"type": "stdio", "command": spec["command"]}
+            if spec.get("args"):
+                entry["args"] = list(spec["args"])
+            if spec.get("env"):
+                entry["env"] = dict(spec["env"])
+            rendered[name] = entry
+    # servers the registry does not name stay in the file, switched off rather
+    # than deleted: an operator may keep one for a single session. A server the
+    # registry lists as retired is deleted — a dead entry is a start-up error.
+    for name, entry in existing.items():
+        if name in rendered:
+            continue
+        if name in retired or name in servers:
+            continue
+        entry = dict(entry)
+        entry["enabled"] = False
+        rendered[name] = entry
+    data["mcpServers"] = rendered
+    enabled = [n for n, s in mine.items() if s.get("enabled", True)]
+    data["enabledServers"] = enabled + [
+        n for n in existing if n not in enabled and n not in servers and n not in retired
+    ]
+    write_json(OMP_MCP, data)
+
+
+def apply_opencode(servers: dict, retired: list) -> None:
+    data = json.loads(OPENCODE_JSON.read_text()) if OPENCODE_JSON.exists() else {}
+    mcp = data.get("mcp", {})
+    for name in retired:
+        mcp.pop(name, None)
+    for name, spec in servers.items():
+        if name not in scoped(servers, "opencode"):
+            mcp.pop(name, None)
+            continue
+        if spec.get("transport") == "http":
+            mcp[name] = {
+                "type": "remote",
+                "url": spec["url"],
+                "enabled": bool(spec.get("enabled", True)),
+            }
+        else:
+            entry = {
+                "type": "local",
+                "command": [spec["command"], *spec.get("args", [])],
+                "enabled": bool(spec.get("enabled", True)),
+            }
+            if spec.get("env"):
+                entry["environment"] = dict(spec["env"])
+            mcp[name] = entry
+    data["mcp"] = mcp
+    write_json(OPENCODE_JSON, data)
+
+
+def apply_jcode(servers: dict, retired: list) -> None:
+    data = json.loads(CLAUDE_JSON.read_text()) if CLAUDE_JSON.exists() else {}
+    mcp = data.get("mcpServers", {})
+    for name in retired:
+        mcp.pop(name, None)
+    for name, spec in servers.items():
+        if name not in scoped(servers, "jcode"):
+            mcp.pop(name, None)
+            continue
+        if spec.get("transport") == "http":
+            mcp[name] = {"type": "http", "url": spec["url"]}
+        else:
+            entry = {"type": "stdio", "command": spec["command"]}
+            if spec.get("args"):
+                entry["args"] = list(spec["args"])
+            if spec.get("env"):
+                entry["env"] = dict(spec["env"])
+            mcp[name] = entry
+    data["mcpServers"] = mcp
+    write_json(CLAUDE_JSON, data)
+
+
+def apply_pi(servers: dict, retired: list) -> None:
+    """pi reads the same shape as omp: mcpServers plus an enabled list."""
+    data = json.loads(PI_MCP.read_text()) if PI_MCP.exists() else {}
+    existing = data.get("mcpServers", {})
+    mine = scoped(servers, "pi")
+    rendered = {}
+    for name, spec in mine.items():
+        if spec.get("transport") == "http":
+            rendered[name] = {"type": "http", "url": spec["url"]}
+        else:
+            entry = {"type": "stdio", "command": spec["command"]}
+            if spec.get("args"):
+                entry["args"] = list(spec["args"])
+            if spec.get("env"):
+                entry["env"] = dict(spec["env"])
+            rendered[name] = entry
+    for name, entry in existing.items():
+        if name in rendered or name in retired or name in servers:
+            continue
+        entry = dict(entry)
+        entry["enabled"] = False
+        rendered[name] = entry
+    data["mcpServers"] = rendered
+    enabled = [n for n, s in mine.items() if s.get("enabled", True)]
+    data["enabledServers"] = enabled + [
+        n for n in existing if n not in enabled and n not in servers and n not in retired
+    ]
+    write_json(PI_MCP, data)
+
+
+def apply_agy(servers: dict, retired: list) -> None:
+    """agy (the antigravity/gemini family) names the endpoint `serverUrl` and
+    has no separate enabled list — presence in the file is being enabled."""
+    data = json.loads(AGY_MCP.read_text()) if AGY_MCP.exists() else {}
+    mcp = data.get("mcpServers", {})
+    for name in retired:
+        mcp.pop(name, None)
+    for name, spec in servers.items():
+        if name not in scoped(servers, "agy"):
+            mcp.pop(name, None)
+            continue
+        if spec.get("transport") == "http":
+            mcp[name] = {"serverUrl": spec["url"]}
+        else:
+            entry = {"command": spec["command"]}
+            if spec.get("args"):
+                entry["args"] = list(spec["args"])
+            if spec.get("env"):
+                entry["env"] = dict(spec["env"])
+            mcp[name] = entry
+    data["mcpServers"] = mcp
+    write_json(AGY_MCP, data)
+
+
+def apply_codex(servers: dict, retired: list) -> None:
+    if tomllib is None:
+        print("harness-sync: python 3.11+ is required for the codex toml", file=sys.stderr)
+        return
+    if not CODEX_TOML.exists():
+        return
+    backup(CODEX_TOML)
+    lines = CODEX_TOML.read_text().splitlines()
+    out: list[str] = []
+    skipping = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[mcp_servers."):
+            skipping = True
+            continue
+        if skipping:
+            if stripped.startswith("["):
+                skipping = False
+            else:
+                continue
+        out.append(line)
+    for name, spec in servers.items():
+        if name in retired:
+            continue
+        if name not in scoped(servers, "codex"):
+            continue
+        if spec.get("transport") == "http":
+            out.append(f"[mcp_servers.{name}]")
+            out.append(f'url = "{spec["url"]}"')
+            out.append("")
+        else:
+            out.append(f"[mcp_servers.{name}]")
+            out.append(f'command = "{spec["command"]}"')
+            if spec.get("args"):
+                # codex wants a SEQUENCE here; a bare string is rejected with
+                # "invalid type: string, expected a sequence".
+                rendered = ", ".join(f'"{a}"' for a in spec["args"])
+                out.append(f"args = [{rendered}]")
+            out.append("")
+    CODEX_TOML.write_text("\n".join(out).rstrip() + "\n")
+
+
+# ---------------------------------------------------------------- reporting
+
+
+def reachable(spec: dict) -> bool:
+    if spec.get("transport") != "http":
+        return shutil.which(spec["command"]) is not None or Path(spec["command"]).exists()
+    url = spec["url"]
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "harness-sync", "version": "1"},
+                },
+            }
+        ).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            return resp.status < 500
+    except urllib.error.HTTPError as exc:
+        return exc.code < 500
+    except Exception:
+        return False
+
+
+def current_state() -> dict:
+    state: dict = {}
+    if OMP_MCP.exists():
+        data = json.loads(OMP_MCP.read_text())
+        state["omp"] = {
+            "servers": sorted(data.get("mcpServers", {})),
+            "enabled": sorted(data.get("enabledServers", [])),
+        }
+    if OPENCODE_JSON.exists():
+        data = json.loads(OPENCODE_JSON.read_text())
+        state["opencode"] = {
+            "servers": sorted(data.get("mcp", {})),
+            "enabled": sorted(
+                n for n, v in data.get("mcp", {}).items() if v.get("enabled", True)
+            ),
+        }
+    if CLAUDE_JSON.exists():
+        data = json.loads(CLAUDE_JSON.read_text())
+        # jcode also keeps PROJECT-scoped servers; those are the operator's
+        # per-project choice and are not registry drift.
+        scoped_elsewhere = set()
+        for project in (data.get("projects") or {}).values():
+            scoped_elsewhere |= set((project.get("mcpServers") or {}))
+        state["jcode"] = {
+            "servers": sorted(set(data.get("mcpServers", {})) | scoped_elsewhere),
+            "scoped": sorted(scoped_elsewhere),
+        }
+    if CODEX_TOML.exists() and tomllib is not None:
+        data = tomllib.loads(CODEX_TOML.read_text())
+        state["codex"] = {"servers": sorted(data.get("mcp_servers", {}))}
+    if PI_MCP.exists():
+        data = json.loads(PI_MCP.read_text())
+        state["pi"] = {
+            "servers": sorted(data.get("mcpServers", {})),
+            "enabled": sorted(data.get("enabledServers", [])),
+        }
+    if AGY_MCP.exists():
+        data = json.loads(AGY_MCP.read_text())
+        state["agy"] = {"servers": sorted(data.get("mcpServers", {}))}
+    return state
+
+
+def main() -> int:
+    action = sys.argv[1] if len(sys.argv) > 1 else "check"
+    servers, retired = load_registry()
+    wanted = set(servers)
+
+    if action == "list":
+        print("registry:")
+        for name, spec in servers.items():
+            where = spec.get("url") or spec.get("command")
+            print(f"  {name:<16} {spec.get('transport'):<6} {where}")
+        print("\nharnesses:")
+        for harness, state in current_state().items():
+            print(f"  {harness:<10} {state['servers']}")
+        return 0
+
+    if action == "apply":
+        apply_omp(servers, retired)
+        apply_opencode(servers, retired)
+        apply_jcode(servers, retired)
+        apply_codex(servers, retired)
+        apply_pi(servers, retired)
+        apply_agy(servers, retired)
+        print(
+            f"harness-sync: applied {len(servers)} servers to {len(MANAGED)} harnesses"
+            + (f", retired {retired}" if retired else "")
+        )
+        return 0
+
+    if action != "check":
+        print(__doc__)
+        return 2
+
+    problems: list[str] = []
+    state = current_state()
+    for harness, info in state.items():
+        mine = set(scoped(servers, harness))
+        extra = set(info["servers"]) - mine - set(retired)
+        missing = mine - set(info["servers"])
+        gone = set(info["servers"]) & set(retired)
+        if harness == "jcode":
+            # a project-scoped server is not drift
+            extra -= set(info.get("scoped", []))
+            missing -= set(info.get("scoped", []))
+        if extra:
+            problems.append(f"{harness}: not in the registry -> {sorted(extra)}")
+        if missing:
+            problems.append(f"{harness}: missing -> {sorted(missing)}")
+        if gone:
+            problems.append(f"{harness}: retired but still present -> {sorted(gone)}")
+    for name, spec in servers.items():
+        if not spec.get("enabled", True):
+            continue
+        if not reachable(spec):
+            problems.append(f"{name}: not reachable at {spec.get('url') or spec.get('command')}")
+    if problems:
+        print("harness-sync: drift found")
+        for p in problems:
+            print(f"  - {p}")
+        return 1
+    print("harness-sync: every harness matches the registry and every server answers")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
