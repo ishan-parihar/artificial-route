@@ -31,7 +31,19 @@ set -euo pipefail
 CANONICAL="${AR_GATE_TOKEN_FILE:-$HOME/.config/ar/racknerd-gate-token.jwt}"
 OPENCODE_JSON="${AR_OPENCODE_JSON:-$HOME/.config/opencode/opencode.json}"
 OMP_MODELS="${AR_OMP_MODELS:-$HOME/.omp/agent/models.yml}"
-JCODE_ENV="${AR_JCODE_ENV:-$HOME/.jcode/provider-omniroute.env}"
+# jcode resolves a profile's `env_file` against its **config home**, which on
+# this box is `~/.config/jcode/` — not `~/.jcode/`, where the config file
+# itself lives. The two drifted: the token was written to `~/.jcode/` and the
+# file jcode actually read, `~/.config/jcode/provider-omniroute.env`, kept an
+# old `sk-omni-` Dashboard key. The symptom was a 401
+# `credential_rejected` on every jcode request while `gate-token.sh verify`
+# reported "ok" — because verify checked the file it wrote, not the file
+# jcode read.
+#
+# So: write the one jcode reads, and keep the other in step so a consumer
+# that resolves either way finds a live token.
+JCODE_ENV="${AR_JCODE_ENV:-$HOME/.config/jcode/provider-omniroute.env}"
+JCODE_ENV_LEGACY="${AR_JCODE_ENV_LEGACY:-$HOME/.jcode/provider-omniroute.env}"
 CLAUDE_SETTINGS="${AR_CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
 AROUTE_BIN="${AROUTE_BIN:-$HOME/.local/bin/aroute}"
 KEY_ID="${AR_GATE_KEY_ID:-racknerd-harness}"
@@ -78,10 +90,17 @@ open(path, "w").write("\n".join(out))
 PY
   fi
 
-  if [ -f "$JCODE_ENV" ]; then
-    printf 'OMNIROUTE_API_KEY=%s\n' "$token" > "$JCODE_ENV"
-    chmod 600 "$JCODE_ENV"
-  fi
+  # Both jcode paths are written: the one jcode reads and the legacy one.
+  # The write is unconditional rather than guarded on the file existing —
+  # a missing env file is the state that produced the 401, and skipping it
+  # is how the drift survived a `verify` that said "ok".
+  for env_file in "$JCODE_ENV" "$JCODE_ENV_LEGACY"; do
+    if [ "$(dirname "$env_file")" = "$HOME/.jcode" ] && [ ! -d "$HOME/.jcode" ]; then
+      continue
+    fi
+    printf 'OMNIROUTE_API_KEY=%s\n' "$token" > "$env_file"
+    chmod 600 "$env_file"
+  done
 
   if [ -f "$CLAUDE_SETTINGS" ]; then
     python3 - "$CLAUDE_SETTINGS" "$token" <<'PY'
@@ -131,8 +150,17 @@ case "${1:-}" in
     [ -f "$CANONICAL" ] || die "no canonical token file at $CANONICAL"
     token="$(cat "$CANONICAL")"
     printf 'canonical : %s (%s bytes)\n' "$CANONICAL" "${#token}"
-    for f in "$OPENCODE_JSON" "$OMP_MODELS" "$JCODE_ENV" "$CLAUDE_SETTINGS"; do
-      if [ ! -f "$f" ]; then printf '  %-44s (absent)\n' "$f"; continue; fi
+    for f in "$OPENCODE_JSON" "$OMP_MODELS" "$JCODE_ENV" "$JCODE_ENV_LEGACY" "$CLAUDE_SETTINGS"; do
+      if [ ! -f "$f" ]; then
+        # The legacy jcode path is optional: it only exists because the two
+        # homes drifted. Its absence is not a failure.
+        if [ "$f" = "$JCODE_ENV_LEGACY" ]; then
+          printf '  %-44s (absent, optional)\n' "$f"
+          continue
+        fi
+        printf '  %-44s (absent)\n' "$f"
+        continue
+      fi
       if grep -qF "$token" "$f"; then
         printf '  %-44s ok\n' "$f"
       elif [ "$f" = "$OPENCODE_JSON" ] && grep -qF "{file:$CANONICAL}" "$f"; then
@@ -154,6 +182,7 @@ case "${1:-}" in
     printf 'opencode  : %s\n' "$OPENCODE_JSON"
     printf 'omp       : %s\n' "$OMP_MODELS"
     printf 'jcode     : %s\n' "$JCODE_ENV"
+    printf 'jcode (legacy): %s\n' "$JCODE_ENV_LEGACY"
   printf 'claude    : %s\n' "$CLAUDE_SETTINGS"
     printf 'key id    : %s\n' "$KEY_ID"
     ;;

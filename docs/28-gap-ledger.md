@@ -118,6 +118,26 @@ Detail in `docs/27-dashboard-contrast-and-upgrade-plan.md`; the plan in
 
 ---
 
+## F2. The context window and the harness surfaces (2026-10-20)
+
+Found while adding a model to the catalog. All four rows are **closed**; they are
+recorded because each one is a way the same question ("how big a prompt may I
+send?") gets a different answer depending on which surface asks.
+
+| # | item | status | what is true now |
+|---|---|---|---|
+| **F2.1** | **A provider with no registry ceiling fell to the 128K floor** | **closed** | The chain is: the per-model figure models.dev published → the per-provider ceiling in `providerMeta.json` → the `ModelCard::UNKNOWN_CONTEXT` floor of 128K (`crates/ar-server/src/models.rs:144`). `providerMeta.json` carries **no** `contextLength` for `kilocode` or `nvidia` — 169 of its 276 providers have none, because OmniRoute's own registry entries declare none either (75 of 272 there). So those two providers' windows came only from the models.dev overlay, and **a failed discovery refresh dropped them to 128K**: the VPS log shows `model discovery refresh failed; serving the cached catalog` (the 5-second client timeout, `DISCOVERY_WAIT_SECS`, against a 5.8 MB document). Measured: with discovery on, `ctx-kilo` reported 1,000,000; with it off, 128,000. |
+| **F2.2** | **The durable place for a window is the config, not the registry** | **closed** | `providerMeta.json` is **generated** — `aroute import --from omniroute` rewrites it wholesale from OmniRoute's tree — so a hand-edit there is clobbered on the next import. The combo's own `context_length:` is the operator-owned, durable place, and it **overrides** the reduction (`crates/ar-server/src/config.rs:970-973`). Every `nvidia`/`kilocode`-routed combo now carries one: `glm-5.3` 1M, `glm-5.3-flash` 1M, `step-5-preview` 1M, `beam-free` 1M, `minimax-m3.1-flash` 1M, `nemotron-3.5-super-vl` 1M, `laguna-s-2-1` 262144, `deepseek-v4-1-flash` 1M, `browser-stack-2` 1M. Verified with discovery **off**: every window survives. |
+| **F2.3** | **The two static harness model lists had drifted** | **closed** | omp resolves the catalog live (`discovery: openai-models-list`) so it needed no edit; it shows all 21. opencode's `provider.ar.models` carried **12** of 21 (9 missing, including `browser-stack-2` and every `jev`/`clef`/`weaver`/decisions model) and jcode's `[[providers.omniroute.models]]` carried **20** of 21. The lists were hand-maintained. `~/.local/bin/harness-models-sync` now renders them from the live gateway — the authority — so the window is never a guess; `--check` reports drift and changes nothing. A **wrong** window is worse than a missing entry: the harness sizes a request off it and the upstream refuses one it would have accepted. |
+| **F2.4** | **jcode read a token file the token script never wrote** | **closed** | jcode resolves a profile's `env_file` against its **config home**, which is `~/.config/jcode/` — not `~/.jcode/`, where `~/.jcode/config.toml` itself lives. `scripts/gate-token.sh` wrote the token to `~/.jcode/provider-omniroute.env`, so the file jcode actually read, `~/.config/jcode/provider-omniroute.env`, kept an old `sk-omni-` Dashboard key from 13:41. The symptom was a 401 `credential_rejected` on **every** jcode request while `gate-token.sh verify` said `ok` — because verify checked the file it wrote, not the file jcode read. The script now writes both paths and `verify` checks both; the stale file is gone. |
+
+The general lesson, and the thing to check first next time: **a harness can hold
+a valid token and still 401, because "valid" was measured against a file the
+harness does not read.** A credential check is only evidence about the surface
+that made the request.
+
+---
+
 ## G. Not gaps — recorded so they are not re-litigated
 
 Moved to `docs/kb/CLOSED.md` (append-only) or kept in the doc that owns them. The ones that
