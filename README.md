@@ -53,9 +53,9 @@ Full flag table, service details and `--uninstall` are further down under
 - **Agent-native CLI** — TOON output, `--fields` narrowing, stdout data / stderr diagnostics, exit 0/1/2, fail-loud flags
 - **Hot-reload config** — `config.yaml` watched live; secrets stay in `$VAR`, never in the file
 
-## Benchmarks, parity and known gaps
+## Benchmarks, parity and open gaps
 
-Memory figures, the streaming battery, the OmniRoute and agentgateway comparison, and the open gaps are in [26 benchmarks, parity and known gaps](docs/26-benchmarks-parity-gaps.md).
+Memory figures, the streaming battery, the OmniRoute and agentgateway comparison, and the open gaps are in [26 benchmarks, parity and known gaps](docs/26-benchmarks-parity-gaps.md). The dashboard front end, contrasted against the OmniRoute UI and audited against this one, is in [27 dashboard contrast and upgrade plan](docs/27-dashboard-contrast-and-upgrade-plan.md).
 
 ## Installation
 
