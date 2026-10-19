@@ -106,7 +106,7 @@ the public `/ui` is **gated** rather than **open**, which is a different
 thing and a smaller one. `UI-08` (which credential store is canonical) is
 also the operator's ruling.
 
-**The gates, as measured:** clippy clean; **2249** workspace tests green;
+**The gates, as measured:** clippy clean; **2251** workspace tests green;
 **20** probe runs (ten views x two bands x three widths) at **0 FAIL, 0
 warn**; `contrast.py` 0 failing pairs; the anti-slop detector **24/24**; the
 browser behaviour checks **20/20** unarmed and **10/10** armed; CRAFT
