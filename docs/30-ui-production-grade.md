@@ -248,7 +248,7 @@ The three tests:
 | `probe.mjs` at 1440 / 1024 / 390, dark | **0 FAIL** on every pane |
 | `contrast.py --css app.css` | **0 failing pairs** (light band) |
 | the dark band, hand-computed | **0 failing pairs** across 22 token pairs, including `--amber-ink` on both grounds |
-| the browser behaviour check | **13/13 checks passed** |
+| the browser behaviour check | **15/15 checks passed** |
 | `detect.sh` (anti-slop) | 0 failed |
 
 The behaviour check (`/var/tmp/ishanp-agentic/opencode/ar-webui-test/panel-check.mjs`)
@@ -265,7 +265,7 @@ for no credential.
 | warn | why it stands |
 |---|---|
 | `type-scale` (largest type 30px, 2.2x body) | the rubric's 48px is a hero's bar. A control panel's h1 is a page title. Raising it further would make the panel a poster. |
-| `tap-target` on the table buttons | the buttons are 27px and the *targets* are 44px via a pseudo-element, so the row keeps its density. WCAG 2.5.8 (24px) passes; the AAA 2.5.5 (44px) is met by the target, not by the row's height. |
+| `tap-target` on the table buttons | the table buttons are **27px**. They clear WCAG 2.5.8 (24px) and miss the AAA 2.5.5 44px recommendation. The density is the point — a dashboard's rows are meant to be dense — and the touch breakpoint (≤880px), where the row gives up its density, is where the buttons take the full 44px. A pseudo-element faking the target was tried and **removed**: an invisible 44px overlay on a dense table steals the click from the neighbouring cell's button, which is worse than a small target. |
 | `cta: no primary CTA` on the usage pane | fixed in this pass: the log now carries a Reload primary action. |
 
 ## 6. What was deliberately NOT done
