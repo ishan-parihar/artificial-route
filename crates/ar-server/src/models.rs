@@ -15,6 +15,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ar_registry::discovery::{self, DiscoveryError, LiveCatalog};
+
+/// One provider row the native-catalog poll targets.
+struct NativeProviderRef<'a> {
+    id: &'a str,
+    base_url: &'a str,
+    keys: &'a [String],
+}
 use serde::Serialize;
 
 /// Freshness window for `/v1/models`, per `docs/05-roadmap.md` P0.
@@ -236,6 +243,13 @@ pub struct DiscoveredCatalog {
     /// void `wait_secs` and let a refresh hang forever on an unreachable
     /// models.dev, the one thing the bound exists to prevent.
     client: Option<reqwest::Client>,
+    /// Providers whose native `/models` catalogs this cache polls each tick.
+    ///
+    /// `(provider id, base_url, first api key)` captured at boot from the
+    /// dispatchable provider rows — the executor already proves both the URL
+    /// and the credential on every dispatch, so re-deriving them per tick buys
+    /// nothing. Empty in the default configuration (tests, CLI imports).
+    native: Vec<(String, String, String)>,
 }
 
 impl std::fmt::Debug for DiscoveredCatalog {
@@ -290,6 +304,20 @@ impl DiscoveredCatalog {
         ttl: Duration,
         wait_secs: u64,
     ) -> Self {
+        Self::with_native(configured, ttl, wait_secs, Vec::new())
+    }
+
+    /// [`Self::with_builder`] plus the native-catalog poll list.
+    ///
+    /// `(provider id, base_url, first api key)` triples captured at boot; see
+    /// the `native` field for why they are fixed rather than re-derived.
+    #[must_use]
+    pub fn with_native(
+        configured: Box<dyn Fn() -> Vec<ModelCard> + Send + Sync>,
+        ttl: Duration,
+        wait_secs: u64,
+        native: Vec<(String, String, String)>,
+    ) -> Self {
         // Built through [`client`] exactly as `with_bounds` builds it, so the two
         // constructors cannot drift apart again.
         let client = client(wait_secs);
@@ -299,6 +327,7 @@ impl DiscoveredCatalog {
             ttl,
             wait_secs,
             client,
+            native,
         }
     }
 
@@ -314,6 +343,7 @@ impl DiscoveredCatalog {
             // case a fetch failure is, so the proxy still boots and still serves
             // its configured cards; every refresh then reports the failure.
             client: client(wait_secs),
+            native: Vec::new(),
         }
     }
 
@@ -341,7 +371,72 @@ impl DiscoveredCatalog {
     /// already-populated [`LiveCatalog`]. No request-path thread ever waits on a
     /// socket.
     pub async fn prefetch(&self) -> Result<usize, String> {
-        self.prefetch_with(|| self.fetch_once()).await
+        let r = self.prefetch_with(|| self.fetch_once()).await;
+        // Native fetches run after the overlay fetch so their windows are the
+        // last thing published per provider — native outranks models.dev.
+        self.fetch_provider_native().await;
+        r
+    }
+
+    /// Fetches every dispatchable provider's native `/models` catalog and
+    /// publishes the windows it carries.
+    ///
+    /// Operator ruling (docs/plans/2026-10-19-provider-native-discovery.md):
+    /// provider-native figures outrank models.dev. Each fetch is independent —
+    /// one provider's failure neither blocks the others nor clears what
+    /// models.dev already published; a body with no window fields (nvidia and
+    /// cline answer bare lists) parses to zero models and is simply skipped by
+    /// the lookup, so no per-provider special cases exist.
+    async fn fetch_provider_native(&self) {
+        let Some(client) = self.client.as_ref() else {
+            return;
+        };
+        for provider in self.native_providers() {
+            let url = format!("{}/models", provider.base_url.trim_end_matches('/'));
+            let mut req = client.get(&url);
+            // The first credential is the one the executor would use; a keyless
+            // provider sends no header (empty key means no auth by contract).
+            if let Some(key) = provider.keys.first().filter(|k| !k.is_empty()) {
+                req = req.bearer_auth(key);
+            }
+            let sent = req.send().await;
+            let outcome = async {
+                let resp = sent?.error_for_status()?;
+                resp.text().await
+            }
+            .await;
+            match outcome {
+                Ok(body) => match discovery::parse_native_catalog(provider.id, &body) {
+                    Ok(entry) if !entry.models.is_empty() => {
+                        discovery::publish_native(provider.id, entry);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::debug!(provider = %provider.id, error = %e, "native catalog parse failed")
+                    }
+                },
+                Err(e) => {
+                    tracing::debug!(provider = %provider.id, error = %e, "native catalog fetch failed")
+                }
+            }
+        }
+    }
+
+    /// The providers whose native catalogs are worth one GET per tick.
+    ///
+    /// `(id, base_url, first api key)` from the config's dispatchable provider
+    /// rows — the same rows the executor dispatches through, so the credential
+    /// and the URL are already proven. OAuth providers are skipped: their
+    /// credential is a session, not a bearer key this loop holds.
+    fn native_providers(&self) -> Vec<NativeProviderRef<'_>> {
+        self.native
+            .iter()
+            .map(|(id, base_url, key)| NativeProviderRef {
+                id: id.as_str(),
+                base_url,
+                keys: std::slice::from_ref(key),
+            })
+            .collect()
     }
 
     /// [`Self::prefetch`] with the fetch injected.

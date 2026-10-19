@@ -34,6 +34,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 
 use ar_route::{ArExec, LkgpPins, Resilience};
+use ar_registry::WireFormat;
 
 use crate::config::ServerConfig;
 use crate::keys::AuthGate;
@@ -408,10 +409,11 @@ impl Components {
                 Box::new(move || config.model_cards_with(Some(&discovered_window)))
                     as Box<dyn Fn() -> Vec<crate::models::ModelCard> + Send + Sync>
             };
-            let discovered = Arc::new(DiscoveredCatalog::with_builder(
+            let discovered = Arc::new(DiscoveredCatalog::with_native(
                 builder,
                 crate::models::DISCOVERY_TTL,
                 crate::models::DISCOVERY_WAIT_SECS,
+                native_poll_list(&config),
             ));
             discovery = Some(discovered.clone());
             discovered
@@ -1025,6 +1027,30 @@ pub fn server(components: Components) -> Server {
     let state = components.into_state();
     let router = app(state.clone());
     Server { router, state }
+}
+
+/// The providers whose native `/models` catalogs discovery polls, captured at
+/// boot.
+///
+/// One triple per API-key provider the config dispatches through: its id, its
+/// base URL, and its first credential. OAuth providers are skipped — their
+/// credential is a rotating session this loop does not hold — and keyless rows
+/// keep an empty key, which the fetcher treats as no auth header. The catalog
+/// polling rides the same credential the executor proves on every dispatch, so
+/// no second credential surface exists.
+fn native_poll_list(config: &ServerConfig) -> Vec<(String, String, String)> {
+    config
+        .providers
+        .iter()
+        .filter(|p| p.oauth.is_none() && p.wire_format != WireFormat::Custom)
+        .map(|p| {
+            (
+                p.id.to_string(),
+                p.base_url.clone(),
+                p.api_keys.first().cloned().unwrap_or_default(),
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]

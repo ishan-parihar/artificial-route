@@ -201,12 +201,38 @@ pub fn latest() -> Option<std::sync::Arc<Catalog>> {
 /// the next source rather than report zero.
 #[must_use]
 pub fn published_window(view: &Catalog, provider: &str, model: &str) -> Option<u32> {
-    let entry = view.get(provider)?;
-    let (_, meta) = entry
+    // Direct spelling first: the common path, and the only one where a second
+    // provider publishing the same model id cannot steal the answer.
+    if let Some(entry) = view.get(provider)
+        && let Some((_, meta)) = find_model(entry, model)
+        && meta.context_length > 0
+    {
+        return Some(meta.context_length);
+    }
+    // models.dev keys providers by *its own* ids (`kilo`), the registry by its
+    // compiled-in ones (`kilocode`) — a spelling mismatch, not an absence, left
+    // every kilocode-routed combo at the 128K floor while the data sat one key
+    // away. The catalog itself is the alias authority: a document that names the
+    // model under another provider key is the same fact, so scan for it. One
+    // model published by two keys is resolved by taking the first that names it
+    // in sorted-key order, which is deterministic if not always the newest.
+    view.iter()
+        .filter(|(key, _)| key.as_ref() != provider)
+        .find_map(|(_, entry)| {
+            find_model(entry, model)
+                .filter(|(_, meta)| meta.context_length > 0)
+                .map(|(_, meta)| meta.context_length)
+        })
+}
+
+/// The entry for `model`, spelled bare (`glm-5.3`) or qualified
+/// (`nvidia/z-ai/glm-5.3`) — a config target and a catalog id spell the same
+/// model differently and the caller should not have to know which it holds.
+fn find_model<'a>(entry: &'a Discovered, model: &str) -> Option<&'a (Strng, DiscoveredModel)> {
+    entry
         .models
         .iter()
-        .find(|(id, _)| &**id == model || model.ends_with(&format!("/{id}")))?;
-    (meta.context_length > 0).then_some(meta.context_length)
+        .find(|(id, _)| &**id == model || model.ends_with(&format!("/{id}")))
 }
 
 /// Parses a models.dev `api.json` document into a [`Catalog`].
@@ -216,6 +242,97 @@ pub fn parse_catalog(body: &str) -> Result<Catalog, DiscoveryError> {
         .into_iter()
         .map(|(id, p)| (Strng::from(id.as_str()), p.into()))
         .collect())
+}
+
+/// One row of a provider's native `/models` catalog, reduced to the window
+/// figures routing needs.
+///
+/// OpenRouter-shaped gateways (kilocode among them) publish
+/// `context_length` and `top_provider.context_length` per row; the plain
+/// OpenAI `/v1/models` shape (nvidia, cline) carries neither, so those rows
+/// parse to a zero window and contribute nothing — the same "absent must not
+/// fail the rest" rule [`DiscoveredModel::from_raw`] applies to models.dev.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct NativeModel {
+    /// Model id as the provider spells it.
+    pub id: String,
+    /// Prompt window the provider declares; `None` when unstated.
+    #[serde(default)]
+    pub context_length: Option<u64>,
+    /// OpenRouter's per-row provider cap block; `None` when absent.
+    #[serde(default)]
+    pub top_provider: Option<NativeTopProvider>,
+}
+
+/// OpenRouter's `top_provider` object, reduced to its window.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct NativeTopProvider {
+    /// Prompt window the gateway enforces; `None` when unstated.
+    #[serde(default)]
+    pub context_length: Option<u64>,
+}
+
+impl NativeModel {
+    /// The window this row declares, native field first, `top_provider` second.
+    fn window(&self) -> Option<u32> {
+        self.context_length
+            .or_else(|| self.top_provider.as_ref().and_then(|t| t.context_length))
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|v| *v > 0)
+    }
+}
+
+/// Parses one provider's native `/models` body into a [`Discovered`] entry.
+///
+/// Accepts both shapes the routed gateways speak: a bare OpenAI list (no
+/// window fields — the entry ends up with no models and is skipped by the
+/// lookup) and an OpenRouter-shaped one whose rows carry windows. A single
+/// model is a provider catalog, not a full models.dev document, so the entry
+/// is keyed under exactly one provider id and carries no `base_url`/`env_hint`
+/// — those describe a models.dev row, and the caller already knows both.
+pub fn parse_native_catalog(_provider: &str, body: &str) -> Result<Discovered, DiscoveryError> {
+    #[derive(Deserialize)]
+    struct Wrapper {
+        #[serde(default)]
+        data: Vec<NativeModel>,
+    }
+    let rows: Vec<NativeModel> = serde_json::from_str::<Wrapper>(body)
+        .map(|w| w.data)
+        .or_else(|_| serde_json::from_str(body))?;
+    Ok(Discovered {
+        base_url: None,
+        env_hint: None,
+        models: rows
+            .into_iter()
+            .filter_map(|row| {
+                let window = row.window()?;
+                Some((
+                    Strng::from(row.id.as_str()),
+                    DiscoveredModel {
+                        context_length: window,
+                        ..DiscoveredModel::default()
+                    },
+                ))
+            })
+            .collect(),
+    })
+}
+
+/// Publishes one provider's native catalog so [`latest`]-backed lookups see it.
+///
+/// Native figures outrank models.dev: the overlay fetch publishes models.dev
+/// first, then the native fetches call this per provider, each call replacing
+/// only its own provider's entry — so a provider whose catalog carries windows
+/// wins without erasing the models.dev data for the others.
+pub fn publish_native(provider: &str, entry: Discovered) {
+    if let Ok(slot) = LATEST.write() {
+        let mut catalog: Catalog = slot
+            .as_ref()
+            .map(|c| c.as_ref().clone())
+            .unwrap_or_default();
+        catalog.insert(Strng::from(provider), entry);
+        publish(std::sync::Arc::new(catalog));
+    }
 }
 
 /// Stale-while-revalidate cache over a [`Catalog`].
@@ -474,5 +591,58 @@ mod tests {
         // makes each row's own value the thing under test.
         assert_eq!(models[0].1.context_length, 64_000);
         assert_eq!(models[1].1, DiscoveredModel::default());
+    }
+
+    /// The native `/models` shape kilocode serves: top-level `data` rows with
+    /// `context_length` and an OpenRouter `top_provider` block. Windows must
+    /// survive the parse; a bare OpenAI row must contribute nothing rather than
+    /// fail.
+    #[test]
+    fn parses_native_openrouter_rows() {
+        reset_latest();
+        let body = r#"{"data":[
+            {"id":"poolside/laguna-s-2.1:free","context_length":262144,
+             "top_provider":{"context_length":262144,"max_completion_tokens":32768}},
+            {"id":"top-provider-only","top_provider":{"context_length":131072}},
+            {"id":"bare-openai-row","object":"model"}
+        ]}"#;
+        let entry = parse_native_catalog("kilocode", body).unwrap();
+        let models: Vec<_> = entry.models.iter().map(|(id, m)| (id.to_string(), m.context_length)).collect();
+        assert_eq!(
+            models,
+            vec![
+                ("poolside/laguna-s-2.1:free".to_owned(), 262_144),
+                ("top-provider-only".to_owned(), 131_072),
+            ],
+            "the bare row is dropped, not an error, and windows survive"
+        );
+    }
+
+    /// The lookup must resolve through the alias spellings (`kilocode` →
+    /// `kilo`): models.dev keys providers by its own ids, and the miss on that
+    /// spelling is what left every kilocode combo at the 128K floor.
+    #[test]
+    fn window_lookup_resolves_through_alias() {
+        let view: Catalog = [(Strng::from("kilo"), Discovered {
+            base_url: None,
+            env_hint: None,
+            models: vec![(Strng::from("poolside/laguna-s-2.1:free"), DiscoveredModel {
+                context_length: 262_144,
+                ..DiscoveredModel::default()
+            })],
+        })]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            published_window(&view, "kilocode", "poolside/laguna-s-2.1:free"),
+            Some(262_144),
+            "provider id resolves through the models.dev spelling"
+        );
+        assert_eq!(
+            published_window(&view, "kilocode", "nvidia/poolside/laguna-s-2.1:free"),
+            Some(262_144),
+            "qualified combo-target spelling resolves too"
+        );
+        assert_eq!(published_window(&view, "kilocode", "no-such-model"), None);
     }
 }
