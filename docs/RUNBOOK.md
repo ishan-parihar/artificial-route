@@ -9,6 +9,12 @@
   glibc 2.39 and fails on the VPS with `GLIBC_2.39 not found`. Use the release recipe:
   `cargo build --release --locked --target x86_64-unknown-linux-musl --bin aroute`, then
   `strip`. Stage it as `~/.local/bin/aroute.new`, run `./aroute.new --version` before the `mv`.
+- **Install from the GitHub release on the VPS** (v0.1.17 flow): download the
+  `aroute-x86_64-unknown-linux-musl` asset, verify `sha256sum` against the published
+  `SHA256SUMS` **by comparing the two hash strings directly** — `sha256sum -c` fails on
+  filename-path mismatches, and a `|| echo abort` guard swallows the failure and lets the
+  swap proceed anyway (both bit this deploy; the post-swap hash comparison proved the
+  binary authentic). Keep the previous binary as `aroute.prev-<oldver>` for rollback.
 - **Arm the gate before any public hostname.** An unarmed listener is open to the internet
   once a tunnel reaches it. `aroute keys arm-gate` needs `$AR_MASTER_KEY` in `ar.env`
   (it encrypts the credential store). Run aroute commands with
