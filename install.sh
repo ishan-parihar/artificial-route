@@ -593,6 +593,18 @@ else
 fi
 echo "checksum verified"
 
+# A checksum only proves the bytes match the release; it does not prove they
+# will run on this host. The published asset is static (musl) precisely so it
+# runs on any glibc — a dynamically-linked build fails on an older host with
+# `GLIBC_2.39 not found` and takes the service into a crash-loop, which is
+# worse than a refusal. Caught before the binary is ever installed.
+if command -v file >/dev/null 2>&1; then
+  if file "$ASSET" | grep -qiE 'dynamically linked'; then
+    die "$ASSET is dynamically linked; this host needs the static build — report at github.com/${REPO}/issues"
+  fi
+  echo "static link verified"
+fi
+
 # Opt-in provenance check. A checksum only proves the file matches SHA256SUMS,
 # and that file is published beside it; the attestation is signed by the release
 # workflow's identity, so it also proves which workflow built the bytes.
@@ -619,6 +631,14 @@ fi
 # the old binary or the new one, never a truncated file that cannot exec.
 cp "$ASSET" "$DIR/.aroute.new"
 chmod +x "$DIR/.aroute.new"
+# The binary must run on THIS host before it replaces a working one. A
+# dynamically-linked build against an older glibc exits here with a loader
+# error instead of silently replacing a good binary and crash-looping the
+# unit; the previous install stays in place because the swap never happened.
+if ! "$DIR/.aroute.new" --version >/dev/null 2>&1; then
+  rm -f "$DIR/.aroute.new"
+  die "the downloaded binary does not run on this host (loader mismatch?) — the previous install was left untouched"
+fi
 mv "$DIR/.aroute.new" "$TARGET"
 INSTALLED="$("$TARGET" --version)"
 if [ "$DASH_WAS_ACTIVE" -eq 1 ]; then
