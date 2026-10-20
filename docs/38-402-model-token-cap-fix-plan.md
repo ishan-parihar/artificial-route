@@ -51,20 +51,48 @@ this model."*
 `~/.config/ar/config.yaml` on the VPS carries a `limits:` block at **line 932** that caps
 `racknerd-harness` at 6 B tokens/24 h with four per-model ceilings, one of which is
 `kilocode/minimax/minimax-m3.1-flash:free` at **5 000 000 000**. That model's measured
-24 h spend is **5 198 861 995** tokens, so `spent >= cap` is true and the target is dropped
-from the chain. Every other capped target in the chain is also over its ceiling, so the
+24 h spend crossed it, so `spent >= cap` is true and the target is dropped from the chain.
+The `minimax-m3.1-flash` combo has **exactly one** target, so with that target gone the
 chain is empty and the request is refused outright.
+
+**Two arms, and this distinction matters — it was wrong in the first draft of this
+document, and a second validation pass corrected it.** The `limits:` block arms a
+**key-wide** ceiling *and* four per-model ceilings, and the two produce different 402s:
+
+| Arm | Code | Message | 402 rows in the ledger | Window |
+|---|---|---|---|---|
+| key-wide (`Limit.tokens`) | `token_cap` | *"this key has spent N tokens, which reaches its M-token ceiling"* | **478** | 2026-10-19 20:43:06 → 2026-10-20 13:43:45 |
+| per-target (`Limit.model_tokens`) | `model_token_cap` | *"every model this key may use has reached its own token ceiling: …"* | **9** | 2026-10-20 15:43:04 → 19:30:02 |
+
+**Every one of the 9 per-target 402s is `minimax-m3.1-flash`, and `large-stack` has ZERO
+of them.** So the refusal the operator saw, and the refusal this document is about, is the
+**per-target** arm firing on a **single-target combo** — not a chain being emptied. The
+`large-stack` 402s (170 of them) all carry the **key-wide** wording, the **5 B** ceiling, and
+stop at **13:43:45**, which is *before* the per-target block existed (the 15:42 write) and
+*before* the guard (19:19). They belong to the earlier incident, not this one.
+
+The per-target figures, measured on the VPS `~/.config/ar/usage.sqlite`:
 
 ```sql
 -- measured on the VPS, ~/.config/ar/usage.sqlite
-SELECT model, SUM(total_tokens) FROM usage
+SELECT provider||'/'||model, SUM(total_tokens) FROM usage
 WHERE key_id='racknerd-harness' AND created_at > now-86400;
-kilocode/minimax/minimax-m3.1-flash:free | 5198861995   <-- cap 5000000000  >=  REFUSED
-nvidia/z-ai/glm-5.3                       |  321031377   <-- cap  500000000  ok
-nvidia/stepfun-ai/step-5-preview           |   89506587   <-- cap  200000000  ok
+kilocode/minimax/minimax-m3.1-flash:free | 5542205019   <-- cap 5000000000  >=  REFUSED
+nvidia/z-ai/glm-5.3                       |  395632699   <-- cap  500000000  ok
+nvidia/stepfun-ai/step-5-preview           |   94086021   <-- cap  200000000  ok
 kilocode/reflection/beam-free              |    7203483   <-- cap  200000000  ok
 kilocode/nvidia/nemotron-3.5-super-vl:free |      23519   (no ceiling)       ok
 ```
+
+**Only `minimax` was over its own per-target ceiling.** The other three capped targets were
+well inside theirs. The chain emptied for a different reason: `minimax-m3.1-flash` is a
+**one-target** combo (`targets: [kilocode/minimax/minimax-m3.1-flash:free]`), so dropping it
+left nothing to fail over to. `large-stack` — which has four targets and three of them
+under budget — was **not** refused by this arm at all.
+
+The key-wide arm was over too (**6 039 651 311** against the 6 B key cap), and it runs
+**first** in the request path (`routes.rs:806`, before the per-target filter at `:849`), so
+on the current numbers it would have refused first had the key ceiling been the binding one.
 
 The decision surface that fires is `Strategy::none` (`x-ar-decision: strategy=none`), which
 is the same state this proxy returns for a *non-200 upstream* — so the 402 looks like a
@@ -154,9 +182,12 @@ disable it, and nothing in the tree will ever detect it.
 
 ## 2. The engine gaps that make this block unusually destructive
 
-These are pre-existing and recorded, but they are what turns one mis-armed row into a
-**total inability to use any of the four main models**, which is why the incident reads as
-"the proxy is broken". All verified against the running `aroute 0.1.20` binary.
+These are pre-existing and recorded, and they shape how the incident reads — but the first
+draft of this document claimed they produced a *"total inability to use any of the four main
+models"*, and **a second validation pass found that overstated**. Measured: the per-target
+arm refused **only** `minimax-m3.1-flash` (9 rows). `large-stack` — which has four targets,
+three of them under budget — was never refused by it. All verified against the running
+`aroute 0.1.20` binary and the VPS's own ledger.
 
 ### 2.1 `model_tokens` applies to **every** model the key requests (not just that model)
 
@@ -167,13 +198,23 @@ These are pre-existing and recorded, but they are what turns one mis-armed row i
 `policy.rs:85`, `row_for` at `:104`/`:130`/`:142`/`:151`). Recorded in `docs/35` §2.2 and
 Ask **Q16** Gap 1, still open.
 
-### 2.2 A chain with all targets capped is refused with no fallback
+### 2.2 A chain whose every target is capped is refused with no fallback
 
 `filter_by_target_budget` (`routes.rs:2842-2870`) drops each target whose own ceiling is
 spent; when nothing survives, `budget_filtered_candidates` returns **402** rather than
-letting the request reach an uncapped sibling. Measured live: `small-stack` and `glm-5.3`
-still return **200** — they simply are not in the capped chain the harness calls. So the
-proxy is *selectively* dead: exactly the models the org uses, dead.
+letting the request reach an uncapped sibling.
+
+**This gap did not fire in the incident, and the first draft of this document said it did.**
+Measured: `large-stack` has **zero** per-target 402s. Its three sibling targets were all
+under their own ceilings (GLM 395 M of 500 M, step-5 94 M of 200 M, beam-free 7 M of
+200 M), so the chain would have failed over to one of them. What actually refused
+`minimax-m3.1-flash` is that the combo has **one** target and it was over its ceiling — the
+"no fallback" case, but for a target set of size one.
+
+The gap is still real and still worth fixing: a combo whose every target is individually
+capped **is** refused outright, and the refusal is terminal rather than a fail-over to an
+uncapped sibling elsewhere in the config. The correct statement is narrower than the one
+this document first made.
 
 ### 2.3 The refusal is indistinguishable from a provider outage
 
@@ -196,10 +237,11 @@ config caps chat but not media, so the ceiling is not even a reliable statement 
 
 | Item | State |
 |---|---|
-| `racknerd-harness` key | the only key with a `limits:` row; its four ceilings all live |
-| `minimax-m3.1-flash` (combo alias) | **402**, confirmed |
-| `large-stack` combo | **402** (all four targets capped) |
-| `small-stack`, `glm-5.3` | **200** — unaffected, not in the capped chain |
+| `racknerd-harness` key | the only key with a `limits:` row; its key-wide ceiling **and** its four per-model ceilings were all live |
+| `minimax-m3.1-flash` (combo alias) | **402** — the **per-target** arm, `model_token_cap`, 9 rows 15:43:04 → 19:30:02. A one-target combo whose only target was over its ceiling |
+| `large-stack` combo | **200** under the per-target block — 3 of its 4 targets were under budget and it would have failed over. Its 170 recorded 402s are the **key-wide** arm (`token_cap`, 5 B ceiling) and all stop at **13:43:45**, before the per-target block existed |
+| `small-stack`, `glm-5.3` | **200** — unaffected |
+| key-wide arm | **over** — 6 039 651 311 against the 6 B key cap. It runs **first** (`routes.rs:806`), so on the current numbers it is the arm that would refuse |
 | `/v1/*` media family | uncapped by design (§2.4) |
 | `aroute` binary on VPS | `0.1.20` — **same as repo (`git tag v0.1.20`). No version skew. The repo is not the cause.** |
 | repo `config.yaml`, dev-box `~/.config/ar/config.yaml` | **no `limits:` block** — clean, the code is fine |
