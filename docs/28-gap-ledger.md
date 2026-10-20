@@ -4,6 +4,8 @@ Status: **consolidated 2026-10-19.** Owner: this doc, for the *state* of every o
 Companions: `TODO.md` (the register — the *work items*, which point here for detail),
 [`docs/29-routing-quality.md`](29-routing-quality.md) (the **routing audit** and the
 eleven fixes, with the live smoke evidence),
+[`docs/32-per-model-token-budgets.md`](32-per-model-token-budgets.md) (the **per-model
+token budgets** — the design, the measurements and the test plan for the D10 arm),
 `docs/27-dashboard-contrast-and-upgrade-plan.md` (the `/ui` audit and contrast),
 `docs/24-remaining-gaps-outline.md` (the **execution record** of the 2026-10-18 pass),
 [`docs/31-remaining-gaps-execution-outline.md`](31-remaining-gaps-execution-outline.md)

@@ -33,6 +33,7 @@
 | [`29-routing-quality.md`](29-routing-quality.md) | LIVE | Routing quality: the audit and the fixes — Dated-frozen: written 2026-10-19. The state of every item below is in [docs/28-gap-ledger.md](28-gap… |
 | [`30-ui-production-grade.md`](30-ui-production-grade.md) | LIVE | 30 — /ui production-grade: the design brief, the direction, and what shipped — Status: written 2026-10-20. The record of the U0-U5 pass over the control panel.… |
 | [`31-remaining-gaps-execution-outline.md`](31-remaining-gaps-execution-outline.md) | LIVE | 31 — Remaining gaps: the execution outline — Status: written 2026-10-20. Owns the **order and shape** of the remaining work; the ledger owns the state. Six phases… |
+| [`32-per-model-token-budgets.md`](32-per-model-token-budgets.md) | LIVE | 32 — Per-model token budgets: a ceiling that names the model it stopped — Status: built 2026-10-20. The design, the measurements and the test plan for the per-target spend arm… |
 | [`2026-10-19-skill-redundancy-audit.md`](audit/2026-10-19-skill-redundancy-audit.md) | LIVE | Skill redundancy audit — 2026-10-19 — The library is large but the aroute and harness clusters were the fragmented ones: 27 aroute-named s… |
 | [`2026-10-19-ui-dashboard-contrast.md`](audit/2026-10-19-ui-dashboard-contrast.md) | LIVE | ui dashboard contrast — Dated-frozen: audited 2026-10-19; findings mark verified vs asserted.… |
 | [`STATE.md`](handoff/STATE.md) | LIVE | State — Current snapshot only (no history: that is the worklog). The first ## block is what genome wake show… |
