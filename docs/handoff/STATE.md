@@ -5,8 +5,10 @@ what `genome wake` shows.
 
 ## State — 2026-10-20
 
-Date: 2026-10-20. Branch `main` @ `638a284` (three new plans; the six commits after
-`v0.1.20` are unreleased). The proxy runs **only** on the VPS (`racknerd`), public at
+Date: 2026-10-20. Branch `feat/per-model-token-budgets` @ `ebc14dd` (local `main` is
+`d24e854`; `origin/main` is `2bec852`). The three plans were committed at `638a284`.
+**15 commits after `v0.1.20` are unreleased** — 7 already on `origin/main`, 8 more on
+this branch and unpushed. The proxy runs **only** on the VPS (`racknerd`), public at
 `https://aroute.ishanparihar.com/v1` behind a cloudflared tunnel; the gate is armed
 and every harness holds a non-expiring token.
 
@@ -58,17 +60,19 @@ the new per-target `model_token_cap` form ("every model this key may use has
 reached its own token ceiling") — at **15:43:04**, **17:52:50**, **18:18:56**,
 **18:37:33**, **18:51:48**, **19:18:17**, **19:18:18**, **19:27:34** and
 **19:30:02 IST**. Every one of them falls inside a window in which the `limits:`
-block was armed again by the writer the next paragraph names; the **last**,
-**19:30:02 IST**, is **13 seconds before the final clear**, and there has been
-**none since** (re-measured 19:5x IST). The old arm is gone; the new arm fired
-**because the `limits:` block was armed again** — the next paragraph explains why.
+block was armed again; the **last**, **19:30:02 IST**, is **13 seconds before the
+final clear**, and there has been **none since** (re-measured 19:5x IST). The old
+arm is gone; the new arm fired **because a `limits:` block was armed again** — the
+next paragraph names the writer and says when it took over.
 (The figure "18" in
 `docs/33` and the ledger is the same window read at 13:49, so it counted 30
 minutes ending *after* the restart; the boundary is the same, the window was not
 anchored to the restart.) The live failover probe
-passed: a target's ceiling set below its current spend served the request from a
-**sibling** — re-verified 2026-10-20 through the public endpoint, `large-stack` →
-**200** with `x-ar-decision: strategy=priority;outcome=ok;provider=nvidia;model=stepfun-ai/step-5-preview;attempts=1`.
+passed: a target's per-target ceiling set below its current spend served the request
+from a **sibling** — `model_tokens["nvidia/z-ai/glm-5.3"]` set to `1` against a spend
+already past it was answered `x-ar-decision: …;provider=kilocode;model=minimax/minimax-m3.1-flash:free`
+rather than refused (`docs/33` step 8). `large-stack` was **never** refused by the
+per-target arm — it holds **zero** of the 9 (`docs/38` §0): it would have failed over.
 
 **Resolved — the `limits:` block is GONE, and the writer that kept putting it back
 is identified and disarmed (measured 2026-10-20).** The operator ruled on 2026-10-20
@@ -76,22 +80,23 @@ that the deployed system must hold **no** spend budgets or limits; the audit tha
 established this is `docs/34-spend-cap-audit.md` and the plan for the paths that
 could put it back is `docs/35-cap-surface-removal-plan.md` (the audit found the
 block was an **audit probe's own `tokens: 1` fixture**, later inflated to 5 B and
-6 B and never an operator decision). The block was removed at ~13:06
-(`aroute limits clear`; the pre-change file is kept at
-`~/.config/ar/config.yaml.bak-20261020-limits`) and came back — **present and
-armed at the measured times 15:42:40, 19:07:58, 19:13:59 and 19:23:36 IST**,
-each time carrying `tokens: 6000000000`, `spend_window: 24h` and four
+6 B and never an operator decision). The block was removed **once** at ~13:06
+with the same verb (`aroute limits clear`; that pre-change file is kept at
+`~/.config/ar/config.yaml.bak-20261020-limits`, and the block it removed carried
+a bare `tokens: 5000000000`). It **came back** by a whole-file write at
+**15:42:40** and was measured **armed** at **15:42:40**, **19:07:58**, **19:13:59**
+and **19:23:36 IST**, carrying `tokens: 6000000000`, `spend_window: 24h` and four
 `model_tokens` ceilings (minimax 5 B, GLM 500 M, step-5 200 M, beam-free 200 M)
-and each time **enforcing 402s**: a live `POST /v1/chat/completions` for
+and **enforcing 402s**: a live `POST /v1/chat/completions` for
 `minimax-m3.1-flash` through the public endpoint answered **402**
 `model_token_cap` ("every model this key may use has reached its own token
 ceiling: kilocode/minimax/minimax-m3.1-flash:free"), with the 24 h spend at the
 ceiling (minimax **5 198 861 995** against 5 B, the key **5 582 699 399** against
-6 B). **It is now removed and the writer is disarmed.** The block was cleared with
-the product's own verb — `aroute limits clear --config ~/.config/ar/config.yaml`
-→ `limits: block removed`, exit 0 — and **no YAML text edit was ever made**; the
-diff after the removal was **11 lines** (`932,941d931` — the 10-line `limits:`
-block deleted, nothing else changed). The writer was a **5-minute systemd `--user`
+6 B). **It is now removed, and the writer that kept putting it back is
+disarmed.** The final clear was the same product verb — `aroute limits clear
+--config ~/.config/ar/config.yaml` → `limits: block removed`, exit 0 — and **no
+YAML text edit was ever made**; the diff after the removal was **11 lines**
+(`932,941d931` — the 10-line `limits:` block deleted, nothing else changed). The writer was a **5-minute systemd `--user`
 timer** `aroute-limits-guard.timer` (enabled) running
 `~/.local/bin/aroute-limits-guard.py`, which did a whole-file `yaml.safe_load` →
 inject `limits.keys.racknerd-harness` → `yaml.safe_dump` → `os.replace`; that
@@ -108,12 +113,12 @@ backups, the guard's original script and units, the guard's unit journal, the
 SSH sessions, and the staged `/tmp/artest*` copies. **The model that was being
 refused now works**: one request through the public endpoint → **HTTP/2 200**,
 `x-ar-decision: strategy=priority;outcome=ok;provider=kilocode;model=minimax/minimax-m3.1-flash:free;attempts=1`,
-no `x-ar-deny-reason`, and a real completion in the body. The **newest 402 is
-19:30:02 IST, 13 seconds before the final clear**, and there has been **none
-since**; 749 successful usage rows in the last hour, 75 049 855 tokens, all
-successful. The config's mtime is **2026-10-20 19:30:15 IST** and was
-**unchanged through 19:46:12**, across more than one former guard period — the
-fix holds. `aroute limits` now reports `count: 1 of 1 total; default row:
+no `x-ar-deny-reason`, and a real completion in the body. The **newest 402 of
+any kind is 19:30:02 IST**, 13 seconds before the final clear, and there has
+been **none since**; 749 successful usage rows in the last hour, 75 049 855
+tokens, all successful. The config's mtime is **2026-10-20 19:30:15 IST** and
+was **unchanged through 19:49:28** — 19 minutes later, past three-plus of the
+guard's former 5-minute tick windows — so the fix holds. `aroute limits` now reports `count: 1 of 1 total; default row:
 rpm=- usd_micros=- tokens=- refuse_unpriced=false model=- model_tokens=-
 spend_window=-` — **no spend arms anywhere**.
 
@@ -135,13 +140,20 @@ dev box's `~/.config/ar/config.yaml`** — the VPS's 15:38 file is **byte-identi
 to it (`sha256 a407596c…`) — but the **write was staged on the VPS, not fetched
 to it**: `/tmp/artest/config.yaml` and `/tmp/artest2/config.yaml` (mtimes
 **15:39:49** and **15:40:09 IST**) hold a `yaml.safe_dump` re-serialization of
-that file with a trailing `limits:` block. The writer is now **identified**: the
-**`aroute-limits-guard.timer`** unit ran `~/.local/bin/aroute-limits-guard.py`
-every five minutes, and its own unit journal records `limits missing or drifted —
-restoring` at **19:23:36 IST**. It was installed by the **`shrimp` jcode session**
-working in `/home/ishanp/Documents/github/my-projects/paperclip-zeroclaw-adapter`
-(commit `99f89e5`, 19:19:13) as a deliberate fault-injection attempt to prove the
-block would be restored — and it succeeded. **The lesson, once: a config can be
+that file with a trailing `limits:` block. **Two writers, and they must not be
+confused.** (1) The **15:42:40** write was that hand-run PyYAML rewrite — staged
+on the VPS, not fetched to it — and it pre-dates the timer. (2) The
+**`aroute-limits-guard.timer`** unit then ran `~/.local/bin/aroute-limits-guard.py`
+every five minutes; its own unit journal records `limits missing or drifted —
+restoring` at **19:23:36 IST**, and it is the writer that kept re-arming the
+block after it was installed at **19:19:13** (commit `99f89e5` in
+`/home/ishanp/Documents/github/my-projects/paperclip-zeroclaw-adapter`) as a
+deliberate fault-injection attempt to prove the block would be restored — and it
+succeeded. The three earlier re-arms (**15:42:40**, **19:07:58**, **19:13:59**)
+all pre-date that install, so the timer cannot be their writer; they are the
+same whole-file rewrite run by hand, and the `/tmp/artest*` copies are the
+surviving staged artifacts of it. The fourth (**19:23:36**) is the timer's own
+journal entry, and it post-dates the install. **The lesson, once: a config can be
 re-armed by something OUTSIDE the application, so the code's write paths are not
 the whole attack surface, and a config that silently reverts is a timer or a
 script, not a mystery.** The five `docs/35` write paths are still real work, but
@@ -172,7 +184,8 @@ as-found file in `~/.config/ar/evidence-20261020-limits-restore/`.
   uses the unscoped accessors (`policy.rs:85` `for_key`; `:104`, `:130`, `:142`, `:151`
   `row_for`). A row scoped to `model: jev` therefore applies to **every** model that
   key asks for. Recorded in `docs/35` §2.2 — a separate issue from the panel/limits
-  work.
+  work, and **it did not contribute to the 402**: neither version of the live config
+  carried a `model:` scope at all, so there was no scope to mis-apply (`docs/38` §2.1).
 - **The compiled web dashboard ships its GATEWAY tier OPEN** — `REQUIRE_API_KEY` has
   `defaultValue:"false"` in the compiled bundle, and the gateway policy falls through
   to `allow({kind:"anonymous",id:"local"})` when the flag is off, so an anonymous
@@ -186,6 +199,17 @@ as-found file in `~/.config/ar/evidence-20261020-limits-restore/`.
   surface at all**. Verified on the deployed binary: `error: unrecognized subcommand
   'mcp'`. CI's test job likewise passes no `--features`, so the MCP surface is
   untested in CI too.
+- **A silent ceiling is still invisible** — `aroute doctor`'s `findings()` never reads
+  `cfg.limits` (no `limits|model_tokens|spend_window` reference in
+  `crates/ar-cli/src/commands.rs:1250-1490`), so no row anywhere in `doctor` names an
+  armed ceiling, its key or its window. That is the code half of the out-of-tree
+  writer, and it is why the block was invisible for a day (`CAP-06`).
+- **The platform's own instruction corpus has no law that reaches an unregistered
+  workspace** — measured on the VPS, the two strongest laws that would each have
+  stopped the guard are pool-scoped, and the repo it was installed from is in no
+  registry entry, so `arch route` found no owner; its enforcement tool cannot even
+  refuse (it prints "No owning system pool found" and **exits 0**). Six laws (L1–L6)
+  are specified in `docs/39` §7 (`CAP-07`, ledger **D15**).
 
 **What to read next.** The three plans committed at `638a284` are the executor's
 inputs, in this order: **`docs/35-cap-surface-removal-plan.md`** — closing every path
@@ -194,14 +218,23 @@ the VPS is the reason it is urgent, not theoretical); **`docs/36-cli-agentic-wor
 — the CLI as an agent-facing surface (eleven findings, four blocking, an eight-step
 plan of record); **`docs/37-dashboard-deployability-plan.md`** — the compiled
 dashboard's deployability and auth surface (three hard blockers and a twelve-row
-security control set). Then the ledger: **`docs/28-gap-ledger.md`** owns the *state*
-of every open item, **`TODO.md`** the register of the *work items* (rows `CAP-01`–`CAP-05`,
-`CLI-01`–`CLI-08`, `DASH-01`–`DASH-04`), and the operator's open decisions are
-`docs/kb/ASKS.md` **Q15**–**Q18**. For the forensic record of the `limits:` block and
-its writer, read **`~/.config/ar/evidence-20261020-limits-restore/`** on the VPS —
-it holds the as-found config, the backups, the guard's original script and units
-(`aroute-limits-guard.timer` / `.service`) and the unit journal that recorded
-`limits missing or drifted — restoring`.
+security control set). Two newer documents own the questions the plans do not:
+**`docs/38-402-model-token-cap-fix-plan.md`** — why the `402 model_token_cap` came
+back at all, the two arms it hides behind (key-wide `token_cap` vs per-target
+`model_token_cap`), and the out-of-tree guard that wrote it (Phase 1 applied and
+verified; Phases 2–3 open); **`docs/39-organism-instruction-audit.md`** — whether
+any instruction in the platform's own corpus *compelled* an agent to install the
+guard, and the six laws (L1–L6) that would have stopped it. Then the ledger:
+**`docs/28-gap-ledger.md`** owns the *state* of every open item (the 402 arms are
+**D14**, the instruction corpus **D15**, the cap write paths **D11**/**D12**, the
+CLI surface **D13**, the dashboard **F9**/**F10**), **`TODO.md`** the register of the
+*work items* (rows `CAP-01`–`CAP-07`, `CLI-01`–`CLI-08`, `DASH-01`–`DASH-04` —
+`CAP-06` is the out-of-tree writer, `CAP-07` the six laws), and the operator's open
+decisions are `docs/kb/ASKS.md` **Q15**–**Q18**. For the forensic record of the
+`limits:` block and its writer, read **`~/.config/ar/evidence-20261020-limits-restore/`**
+on the VPS — it holds the as-found config, the backups, the guard's original script
+and units (`aroute-limits-guard.timer` / `.service`) and the unit journal that
+recorded `limits missing or drifted — restoring`.
 
 ---
 
