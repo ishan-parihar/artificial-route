@@ -775,6 +775,38 @@ impl ServerConfig {
             combos.push(route);
         }
 
+        // A `model_tokens:` entry must name a target the server can actually
+        // dispatch, or it is a ceiling that never applies: the operator believes
+        // they capped a model that is in fact uncapped.
+        //
+        // Checked HERE rather than at parse time because only the resolved
+        // target is known — the registry decides which provider-local model a
+        // bare provider name means, and the model half of the key may itself
+        // contain `/`. The check is against the **resolved** `provider/model`,
+        // which is the spelling the ledger records, so the key the operator
+        // writes is the same key the spend is counted under.
+        let routable: std::collections::BTreeSet<String> = combos
+            .iter()
+            .flat_map(|c| c.targets.iter().chain(c.pool.iter()))
+            .map(|t| format!("{}/{}", t.provider.as_str(), t.model))
+            .collect();
+        for (name, limit) in cfg
+            .limits
+            .keys
+            .iter()
+            .map(|(k, l)| (k.as_str(), l))
+            .chain(std::iter::once(("default", &cfg.limits.default)))
+        {
+            for target in limit.model_tokens.keys() {
+                if !routable.contains(target) {
+                    return Err(ComboError::UnknownLimitTarget {
+                        key: name.to_owned(),
+                        target: target.clone(),
+                    });
+                }
+            }
+        }
+
         Ok(Self {
             port: port.unwrap_or(cfg.server.port),
             strategy: combos.first().map_or(Strategy::Priority, |c| c.strategy),
@@ -1396,6 +1428,18 @@ pub enum ComboError {
         id: String,
         /// The judge's target string as written.
         judge: String,
+    },
+    /// A `limits:` row's `model_tokens:` names a target nothing routes to.
+    ///
+    /// Refused at load because a ceiling for a target nothing serves is a
+    /// ceiling that never applies: the operator believes they capped a model
+    /// that is in fact uncapped, and nothing would ever tell them otherwise.
+    #[error("limits {key:?} model_tokens names {target:?}, which no combo routes to")]
+    UnknownLimitTarget {
+        /// The key the row governs, or "default".
+        key: String,
+        /// The target the entry names.
+        target: String,
     },
 
     /// A provider's credential is in neither the credential store nor `keys:`.

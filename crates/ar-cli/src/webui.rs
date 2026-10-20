@@ -1263,6 +1263,10 @@ fn limit_json(limit: &ar_config::Limit) -> Value {
         "tokens": limit.tokens,
         "refuse_unpriced": limit.refuse_unpriced,
         "model": limit.model,
+        // The per-target ceilings, as a map the page edits in one field: the
+        // target is the map's key, so the shape IS the scope.
+        "model_tokens": limit.model_tokens,
+        "spend_window": limit.spend_window,
     })
 }
 
@@ -2041,6 +2045,58 @@ async fn set_limits(
             }
         };
     }
+    // The per-target ceilings and the window. Both are optional: an absent
+    // field keeps what the row already carried, an explicit `null` clears the
+    // window, and `model_tokens` is a whole-map replacement — the page edits
+    // the map, so a partial map is not a thing the panel can send.
+    let model_tokens = match body.get("model_tokens") {
+        Some(Value::Null) => Some(BTreeMap::new()),
+        Some(Value::Object(map)) => {
+            let mut out = BTreeMap::new();
+            for (target, ceiling) in map {
+                let Some(ceiling) = ceiling.as_u64() else {
+                    return bad_request(
+                        format!("the ceiling for {target:?} is not a whole number"),
+                        "a token ceiling is a whole number of tokens",
+                    );
+                };
+                if ceiling == 0 {
+                    return bad_request(
+                        format!("the ceiling for {target:?} is 0"),
+                        "0 means \"never\" to an operator and \"unlimited\" to the engine",
+                    );
+                }
+                out.insert(target.clone(), ceiling);
+            }
+            Some(out)
+        }
+        Some(_) => {
+            return bad_request(
+                "model_tokens must be an object or null".into(),
+                "map each target to its ceiling, e.g. { \"nvidia/z-ai/glm-5.3\": 500000000 }",
+            );
+        }
+        None => None,
+    };
+    let spend_window = match body.get("spend_window") {
+        Some(Value::Null) => Some(None),
+        Some(Value::String(raw)) => {
+            if ar_config::parse_window(raw).is_none() {
+                return bad_request(
+                    format!("spend_window {raw:?} is not a window"),
+                    "a window is a length: 30m, 24h, 7d, or a whole number of seconds",
+                );
+            }
+            Some(Some(raw.clone()))
+        }
+        Some(_) => {
+            return bad_request(
+                "spend_window must be a string or null".into(),
+                "a window is a length: 30m, 24h, 7d, or a whole number of seconds",
+            );
+        }
+        None => None,
+    };
     // Scope: omitted keeps, null or "" clears, a string sets. Checked against
     // the config below, so a typo cannot arm a ceiling that never applies.
     let scope_present = body.get("model").is_some();
@@ -2078,6 +2134,12 @@ async fn set_limits(
     }
     if present[3] {
         row.refuse_unpriced = refuse_unpriced;
+    }
+    if let Some(model_tokens) = model_tokens {
+        row.model_tokens = model_tokens;
+    }
+    if let Some(spend_window) = spend_window {
+        row.spend_window = spend_window;
     }
     if row.is_empty() {
         cfg.limits.keys.retain(|_, r| !r.is_empty());
@@ -3445,6 +3507,63 @@ mod http_tests {
                 .expect("config")
                 .contains("model:"),
             "null clears the scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn limits_should_write_the_per_target_ceilings_and_the_window() {
+        // The panel edits the same arms the CLI does, so the per-target map
+        // and the window have to survive a round trip through the config file.
+        let (app, config) = ui("limits-model-tokens", None);
+        let (status, _) = call(
+            &app,
+            Method::POST,
+            "/ui/api/limits",
+            r#"{"key":"ci","tokens":5000000000,"model_tokens":{"nvidia/z-ai/glm-5.3":500000000},"spend_window":"24h"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let written = std::fs::read_to_string(&config).expect("config");
+        assert!(
+            written.contains("model_tokens:") && written.contains("nvidia/z-ai/glm-5.3"),
+            "the per-target ceiling was written: {written}"
+        );
+        assert!(
+            written.contains("spend_window: 24h"),
+            "the window was written: {written}"
+        );
+
+        // A second write that omits them keeps them — the panel edits a row,
+        // it does not replace the row.
+        let (status, _) = call(
+            &app,
+            Method::POST,
+            "/ui/api/limits",
+            r#"{"key":"ci","rpm":7}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let kept = std::fs::read_to_string(&config).expect("config");
+        assert!(
+            kept.contains("nvidia/z-ai/glm-5.3") && kept.contains("spend_window: 24h"),
+            "an omitted arm is kept: {kept}"
+        );
+    }
+
+    #[tokio::test]
+    async fn limits_should_refuse_a_zero_or_unreadable_per_target_ceiling() {
+        let (app, config) = ui("limits-model-tokens-bad", None);
+        for bad in [
+            r#"{"key":"ci","model_tokens":{"nvidia/z-ai/glm-5.3":0}}"#,
+            r#"{"key":"ci","model_tokens":{"nvidia/z-ai/glm-5.3":"lots"}}"#,
+            r#"{"key":"ci","spend_window":"soon"}"#,
+        ] {
+            let (status, _) = call(&app, Method::POST, "/ui/api/limits", bad).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} was accepted");
+        }
+        assert!(
+            !std::fs::read_to_string(&config).expect("config").contains("model_tokens"),
+            "a refused write changed nothing"
         );
     }
 

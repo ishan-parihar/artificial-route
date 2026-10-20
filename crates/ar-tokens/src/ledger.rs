@@ -105,6 +105,20 @@ const MIGRATE_FAILURE_PROVIDER: &str =
 /// value they always had, before the column existed.
 const MIGRATE_USAGE_COMBO: &str = "ALTER TABLE usage ADD COLUMN combo TEXT NOT NULL DEFAULT '';";
 
+/// The covering index a per-target budget reads through.
+///
+/// `usage_by_key` is `(key_id, id)`, so the key-wide `SUM` has to visit every
+/// row the key ever recorded — on a busy key that is tens of thousands of rows
+/// per request. This index carries every column the grouped query needs
+/// (`total_tokens`, `created_at`, `cost_micros`) alongside the three it filters
+/// on, so the aggregate never touches the table at all: the plan is
+/// `SEARCH usage USING COVERING INDEX`.
+///
+/// It is **not** a replacement for `usage_by_key`: the per-key log still needs
+/// the row order that one gives.
+const INDEX_USAGE_BY_TARGET: &str = "CREATE INDEX IF NOT EXISTS usage_by_target \
+     ON usage (key_id, provider, model, total_tokens, created_at, cost_micros);";
+
 const INSERT_USAGE: &str = "
 INSERT INTO usage
     (key_id, provider, model, prompt_tokens, completion_tokens, total_tokens,
@@ -174,6 +188,57 @@ pub struct Spend {
     pub usd: Usd,
     /// Tokens recorded against the key.
     pub tokens: u64,
+}
+
+/// One target's share of a key's spend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TargetSpend {
+    /// The spend this target accrued, over all time.
+    pub total: Spend,
+    /// The spend this target accrued inside the window, when one was asked for.
+    pub windowed: Spend,
+}
+
+/// One target's row in a [`SpendBreakdown`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetSpendRow {
+    /// The provider that served.
+    pub provider: String,
+    /// The provider-local model that served.
+    pub model: String,
+    /// The spend, split by window.
+    pub spend: TargetSpend,
+}
+
+/// A key's whole spend, and each target's share of it.
+///
+/// The shape a budget needs: the total is the key-wide ceiling, and each
+/// target's row is its own ceiling. One read of the ledger, so the two
+/// ceilings cannot be evaluated against different views of the same table.
+///
+/// The rows are a `Vec` rather than a map because the lookup happens on the
+/// request path: a map keyed by `(String, String)` would allocate a pair of
+/// owned strings on every lookup, and there is one lookup per target in the
+/// chain — a handful, against a ledger whose rows are already in memory.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SpendBreakdown {
+    /// The key's total, over every target and all time.
+    pub total: Spend,
+    /// The key's total inside the window, when one was asked for.
+    pub windowed: Spend,
+    /// Each target's share, in the order the ledger grouped them.
+    pub targets: Vec<TargetSpendRow>,
+}
+
+impl SpendBreakdown {
+    /// One target's spend, or zero when the target has never served.
+    #[must_use]
+    pub fn target(&self, provider: &str, model: &str) -> TargetSpend {
+        self.targets
+            .iter()
+            .find(|r| r.provider == provider && r.model == model)
+            .map_or_else(TargetSpend::default, |r| r.spend)
+    }
 }
 
 /// A per-key ceiling. `None` on either arm means that arm is unlimited.
@@ -545,6 +610,12 @@ impl Ledger {
         if !has_column(&conn, "key_caps", "refuse_unpriced")? {
             conn.execute_batch(MIGRATE_REFUSE_UNPRICED)?;
         }
+        // The covering index the per-target budget reads through. `CREATE INDEX
+        // IF NOT EXISTS` on an existing ledger is a no-op, so this is the one
+        // statement that has to run on every open: the index is not a schema
+        // change to a column, and there is no `PRAGMA table_info` question to
+        // ask about it.
+        conn.execute_batch(INDEX_USAGE_BY_TARGET)?;
         Ok(Self { conn })
     }
 
@@ -687,6 +758,68 @@ impl Ledger {
         })
     }
 
+    /// The key's whole spend, and each target's share of it, in ONE query.
+    ///
+    /// A budget needs both halves at once: the key-wide ceiling is the total,
+    /// and the per-target ceiling is one row of the split. Two queries would
+    /// mean two passes over the key's rows on every request, so this reads the
+    /// whole key once and groups it.
+    ///
+    /// `since` bounds the windowed half only: the cumulative figures are every
+    /// token the key ever spent, and the windowed figure is the spend inside
+    /// the window. Both are returned because a ceiling may be measured over
+    /// either, and the window is optional.
+    ///
+    /// Reads through the `usage_by_target` covering index, so neither the
+    /// aggregate nor the grouping touches the table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TokenError::Sqlite`] on a read failure.
+    pub fn spend_breakdown(
+        &self,
+        key_id: &str,
+        since: Option<i64>,
+    ) -> Result<SpendBreakdown, TokenError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT provider, model, \
+                    COALESCE(SUM(total_tokens), 0), \
+                    COALESCE(SUM(cost_micros), 0), \
+                    COALESCE(SUM(CASE WHEN created_at >= ?2 THEN total_tokens ELSE 0 END), 0), \
+                    COALESCE(SUM(CASE WHEN created_at >= ?2 THEN cost_micros ELSE 0 END), 0) \
+             FROM usage WHERE key_id = ?1 GROUP BY provider, model",
+        )?;
+        let mut rows = stmt.query(params![key_id, since.unwrap_or(i64::MIN)])?;
+        let mut breakdown = SpendBreakdown::default();
+        while let Some(row) = rows.next()? {
+            let provider: String = row.get(0)?;
+            let model: String = row.get(1)?;
+            let total = Spend {
+                usd: Usd {
+                    micros: to_u64(row.get::<_, i64>(3)?),
+                },
+                tokens: to_u64(row.get::<_, i64>(2)?),
+            };
+            let windowed = Spend {
+                usd: Usd {
+                    micros: to_u64(row.get::<_, i64>(5)?),
+                },
+                tokens: to_u64(row.get::<_, i64>(4)?),
+            };
+            breakdown.total.tokens = breakdown.total.tokens.saturating_add(total.tokens);
+            breakdown.total.usd.micros = breakdown.total.usd.micros.saturating_add(total.usd.micros);
+            breakdown.windowed.tokens = breakdown.windowed.tokens.saturating_add(windowed.tokens);
+            breakdown.windowed.usd.micros =
+                breakdown.windowed.usd.micros.saturating_add(windowed.usd.micros);
+            breakdown.targets.push(TargetSpendRow {
+                provider,
+                model,
+                spend: TargetSpend { total, windowed },
+            });
+        }
+        Ok(breakdown)
+    }
+
     /// Decides whether a key may spend `projected` on a request that will use
     /// `projected_tokens`.
     ///
@@ -730,13 +863,39 @@ impl Ledger {
         projected: Cost,
         projected_tokens: u32,
     ) -> Result<Verdict, TokenError> {
+        let spend = self.spend(key_id)?;
+        self.admit_against(key_id, cap, &spend, projected, projected_tokens)
+    }
+
+    /// The cap check against a spend figure the caller already holds.
+    ///
+    /// The same comparison [`Ledger::admit_with`] makes, with the spend
+    /// supplied instead of read. A caller that needs the spend *and* the
+    /// per-target split reads them together (one grouped query) and passes the
+    /// total here, so the two halves of a budget are evaluated against the
+    /// same view of the table rather than two queries that can disagree.
+    ///
+    /// The windowed case is the reason this exists: the caller measures the
+    /// spend over a window, and the total it holds is the windowed one.
+    ///
+    /// # Errors
+    ///
+    /// Never fails: there is no I/O here. The `Result` is kept so the two
+    /// entry points have the same shape.
+    pub fn admit_against(
+        &self,
+        _key_id: &str,
+        cap: &Cap,
+        spend: &Spend,
+        projected: Cost,
+        projected_tokens: u32,
+    ) -> Result<Verdict, TokenError> {
         if cap.refuse_unpriced && !projected.priced {
             return Ok(Verdict::Deny(DenyReason::Unpriced));
         }
         if cap.usd_micros.is_none() && cap.tokens.is_none() {
             return Ok(Verdict::Allow);
         }
-        let spend = self.spend(key_id)?;
         let pending_usd = to_u64(i64::try_from(projected.usd.micros).unwrap_or(i64::MAX));
         if let Some(limit) = cap.usd_micros {
             let spent = spend.usd.micros.saturating_add(pending_usd);
@@ -998,7 +1157,6 @@ mod tests {
         t.set_flat_rate("claude");
         t
     }
-
     fn priced_table() -> PricingTable {
         let mut t = PricingTable::default();
         t.set(
@@ -1491,6 +1649,114 @@ mod tests {
         assert_eq!(
             (cap.usd_micros, cap.tokens, cap.refuse_unpriced),
             (Some(5_000), Some(900), false)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_breakdown_splits_a_keys_spend_across_its_targets() {
+        // The property the per-target arm rests on: the sum over the targets
+        // equals the key's whole spend, and each target carries its own share.
+        // A breakdown whose parts did not add up would let a budget deny a
+        // request on a spend that never happened.
+        let ledger = Ledger::open_in_memory().expect("open");
+        ledger
+            .record(&entry("k1", "p", "m", 100))
+            .expect("record");
+        ledger
+            .record(&entry("k1", "p", "m", 50))
+            .expect("record");
+        ledger
+            .record(&entry("k1", "q", "m2", 25))
+            .expect("record");
+        ledger
+            .record(&entry("k2", "p", "m", 999))
+            .expect("record");
+        let breakdown = ledger.spend_breakdown("k1", None).expect("breakdown");
+        assert_eq!(breakdown.total.tokens, 175);
+        assert_eq!(breakdown.target("p", "m").total.tokens, 150);
+        assert_eq!(breakdown.target("q", "m2").total.tokens, 25);
+        assert_eq!(
+            breakdown.target("p", "m").total.tokens
+                + breakdown.target("q", "m2").total.tokens,
+            breakdown.total.tokens,
+            "the parts add up to the whole"
+        );
+        assert_eq!(
+            breakdown.target("q", "m2").total.tokens,
+            25,
+            "another key's spend is not counted against this one"
+        );
+    }
+
+    #[test]
+    fn a_target_that_never_served_reports_zero() {
+        // A target with no spend is a target the budget must NOT refuse, so
+        // the lookup has to answer zero rather than "unknown".
+        let ledger = Ledger::open_in_memory().expect("open");
+        ledger
+            .record(&entry("k1", "p", "m", 100))
+            .expect("record");
+        let breakdown = ledger.spend_breakdown("k1", None).expect("breakdown");
+        assert_eq!(breakdown.target("q", "m2").total.tokens, 0);
+    }
+
+    #[test]
+    fn a_window_excludes_spend_recorded_before_it() {
+        // The window is what makes a ceiling recoverable: a row older than the
+        // window does not count against it, because the ledger is append-only
+        // and the spend can never be un-spent.
+        let ledger = Ledger::open_in_memory().expect("open");
+        ledger
+            .record(&Entry {
+                created_at: 1_000,
+                ..entry("k1", "p", "m", 100)
+            })
+            .expect("record");
+        ledger
+            .record(&Entry {
+                created_at: 9_000,
+                ..entry("k1", "p", "m", 10)
+            })
+            .expect("record");
+        let breakdown = ledger
+            .spend_breakdown("k1", Some(5_000))
+            .expect("breakdown");
+        assert_eq!(breakdown.total.tokens, 110, "the total is every row");
+        assert_eq!(breakdown.windowed.tokens, 10, "the window is the recent one");
+        assert_eq!(breakdown.target("p", "m").windowed.tokens, 10);
+        assert_eq!(
+            breakdown.target("p", "m").total.tokens, 110,
+            "the cumulative figure is unaffected by the window"
+        );
+    }
+
+    #[test]
+    fn an_existing_ledger_gains_the_covering_index() {
+        // The index is what makes the grouped query cheap, and an existing
+        // ledger file has to get it on open — the same property the column
+        // migrations carry.
+        let path = std::env::temp_dir().join("ar-tokens-index.sqlite");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE usage (id INTEGER PRIMARY KEY AUTOINCREMENT, key_id TEXT NOT NULL,
+                 provider TEXT NOT NULL, model TEXT NOT NULL, prompt_tokens INTEGER NOT NULL,
+                 completion_tokens INTEGER NOT NULL, total_tokens INTEGER NOT NULL,
+                 cost_micros INTEGER NOT NULL, priced INTEGER NOT NULL, created_at INTEGER NOT NULL);",
+            )
+            .expect("seed");
+        }
+        let _ledger = Ledger::open(&path).expect("reopen");
+        let conn = Connection::open(&path).expect("reopen");
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='usage_by_target'")
+            .expect("prepare");
+        let mut rows = stmt.query([]).expect("query");
+        assert!(
+            rows.next().expect("a row").is_some(),
+            "the covering index was not created on an existing ledger"
         );
         let _ = std::fs::remove_file(&path);
     }

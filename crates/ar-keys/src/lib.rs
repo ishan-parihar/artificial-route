@@ -20,7 +20,7 @@
 //! # #[tokio::main(flavor = "current_thread")]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! use ar_keys::{
-//!     Admission, Issue, KeyMeta, Lane, LaneSpec, MasterKey, Revocation, Scope, ScopeSet, Secret,
+//!     Admission, Issue, KeyMeta, Lane, LaneSpec, MasterKey, Revocations, Scope, ScopeSet, Secret,
 //!     Tokens, encrypt, verify,
 //! };
 //!

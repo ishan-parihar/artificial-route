@@ -94,6 +94,21 @@ fn arms(row: &Limit, depth: usize, out: &mut Vec<String>) {
             serde_json::Value::from(model.as_str())
         ));
     }
+    // The per-target ceilings, one `target: ceiling` line each. The target is
+    // quoted for the same reason `model` is: a target is a path-like string
+    // with slashes and colons in it, and a bare scalar would not survive.
+    if !row.model_tokens.is_empty() {
+        out.push(format!("{pad}model_tokens:"));
+        for (target, ceiling) in &row.model_tokens {
+            out.push(format!(
+                "{pad}  {}: {ceiling}",
+                serde_json::Value::from(target.as_str())
+            ));
+        }
+    }
+    if let Some(window) = &row.spend_window {
+        out.push(format!("{pad}spend_window: {window}"));
+    }
 }
 
 #[cfg(test)]
@@ -127,5 +142,39 @@ mod tests {
         );
         let cfg = ar_config::Config::parse(&render(&limits), |_| Ok(None)).expect("parses");
         assert_eq!(cfg.limits, limits);
+    }
+
+    #[test]
+    fn render_should_round_trip_the_per_target_ceilings() {
+        let mut limits = Limits::default();
+        let mut model_tokens = std::collections::BTreeMap::new();
+        model_tokens.insert("nvidia/z-ai/glm-5.3".to_owned(), 500_000_000);
+        model_tokens.insert("kilocode/minimax/minimax-m3.1-flash:free".to_owned(), 1_000_000_000);
+        limits.keys.insert(
+            "k".to_owned(),
+            Limit {
+                tokens: Some(5),
+                model_tokens,
+                spend_window: Some("24h".to_owned()),
+                ..Limit::default()
+            },
+        );
+        let cfg = ar_config::Config::parse(&render(&limits), |_| Ok(None)).expect("parses");
+        assert_eq!(cfg.limits, limits);
+    }
+
+    #[test]
+    fn render_should_quote_a_target_that_looks_like_something_else() {
+        let mut limits = Limits::default();
+        let mut model_tokens = std::collections::BTreeMap::new();
+        model_tokens.insert("a: b".to_owned(), 5);
+        limits.keys.insert(
+            "k".to_owned(),
+            Limit {
+                model_tokens,
+                ..Limit::default()
+            },
+        );
+        assert!(render(&limits).ends_with("      \"a: b\": 5\n"));
     }
 }

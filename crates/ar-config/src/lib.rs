@@ -100,6 +100,14 @@ pub enum ConfigError {
         /// Which arm carried the zero.
         field: &'static str,
     },
+    /// The per-target window is not a duration the engine can read.
+    #[error("limits {key:?} spend_window {value:?} is not a window")]
+    BadLimitWindow {
+        /// The key the row governs, or "default".
+        key: String,
+        /// The window as written.
+        value: String,
+    },
     /// The filesystem watcher could not be installed.
     #[error("cannot watch {path}: {cause}")]
     Watch {
@@ -1141,6 +1149,22 @@ impl Limits {
         self.keys.get(key_id).unwrap_or(&self.default)
     }
 
+    /// The row that governs one key, with no scope filter.
+    ///
+    /// [`Limits::for_request`] drops a row whose `model:` scope does not match
+    /// the request. The **per-target** arms are scoped by their own keys —
+    /// each entry names the `provider/model` it governs — so a row that
+    /// carries them must not be dropped for a scope mismatch: the target in
+    /// the map is the scope, and the `model:` scope is about the *combo* the
+    /// client asked for, which is a different axis.
+    ///
+    /// The key's own row wins over the default row, exactly as
+    /// [`Limits::for_key`] does.
+    #[must_use]
+    pub fn row_for(&self, key_id: &str) -> &Limit {
+        self.keys.get(key_id).unwrap_or(&self.default)
+    }
+
     /// [`Limits::for_key`] for a request that asked for `asked`: a key row or
     /// default scoped to a different model does not apply, and the request
     /// falls through to the next row (key row, then `default`, then nothing).
@@ -1184,6 +1208,50 @@ pub struct Limit {
     /// body (and so the model) is parsed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Per-target token ceilings, keyed by `provider/model`.
+    ///
+    /// The other half of what `model` does not do: `model` scopes *when* a row
+    /// applies, and this scopes *what* it counts. A target named here is
+    /// measured against the spend recorded for **that target alone** — the
+    /// ledger's `provider`/`model` columns, which name the model that served.
+    ///
+    /// Without this arm a ceiling is always key-wide, so one model that burns a
+    /// budget exhausts it for every other model the key can reach, and the
+    /// refusal is collateral damage rather than a fact about the model that
+    /// spent. A target with no entry here is unchanged: it falls under the
+    /// key-wide `tokens` arm, counted over the whole key.
+    ///
+    /// The key is spelled `provider/model` — the same spelling a combo target
+    /// uses, so the operator reads one vocabulary everywhere. The model half may
+    /// itself contain `/` (`kilocode/minimax/minimax-m3.1-flash:free`), so the
+    /// provider is the **first** segment.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_tokens: BTreeMap<String, u64>,
+    /// The window the spend arms are measured over, as `24h`.
+    ///
+    /// `None` — the default — measures them cumulatively, against every token
+    /// the key has ever spent. A window makes them **rates** rather than
+    /// totals: the ceiling applies to the spend inside the window, so a key
+    /// that exceeded it yesterday is inside its budget again today.
+    ///
+    /// It covers BOTH spend arms — the key-wide `tokens` and the per-target
+    /// `model_tokens` — because a window on only one of them is a trap: the
+    /// other stays cumulative against an append-only ledger, so it is blown
+    /// forever and the window never rescues the key.
+    ///
+    /// It is read from the key's **own** row (the `keys:` entry, else
+    /// `default`), and the same window measures both arms — so the two can
+    /// never disagree about which spend is in force.
+    ///
+    /// Rolling, not calendar: the window is the last N hours of recorded spend,
+    /// not the current hour bucket. A calendar window needs a reset job that
+    /// runs while the proxy is up, and a budget that resets only when the proxy
+    /// happens to be running is not a budget.
+    ///
+    /// Off by default: every config written before this arm existed is
+    /// cumulative, and this arm is additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend_window: Option<String>,
 }
 
 /// The limit of a key nothing applies to. Static so `for_request` can hand out
@@ -1194,6 +1262,8 @@ static NO_LIMIT: Limit = Limit {
     tokens: None,
     refuse_unpriced: false,
     model: None,
+    model_tokens: BTreeMap::new(),
+    spend_window: None,
 };
 
 impl Limit {
@@ -1210,7 +1280,43 @@ impl Limit {
             && self.usd_micros.is_none()
             && self.tokens.is_none()
             && !self.refuse_unpriced
+            && self.model_tokens.is_empty()
     }
+
+    /// The window the spend arms are measured over, if the row names one and
+    /// it parses.
+    ///
+    /// `None` is the cumulative case, which is also the case for a row that
+    /// names an unparseable window — the parse is refused at load, so a row
+    /// that reached this point with a bad window is one the config accepted.
+    #[must_use]
+    pub fn spend_window(&self) -> Option<Duration> {
+        self.spend_window.as_deref().and_then(parse_window)
+    }
+}
+
+/// A window duration, in seconds.
+///
+/// The config spells it `24h`, `30m`, `90s`, `7d`; a bare number is seconds.
+/// The shorthand is the operator's, not the engine's: a budget that says
+/// `86400` has to be divided by hand to be read.
+#[must_use]
+pub fn parse_window(raw: &str) -> Option<Duration> {
+    let raw = raw.trim();
+    let (digits, factor) = match raw.as_bytes().last()? {
+        b's' => (&raw[..raw.len() - 1], 1_u64),
+        b'm' => (&raw[..raw.len() - 1], 60),
+        b'h' => (&raw[..raw.len() - 1], 3_600),
+        b'd' => (&raw[..raw.len() - 1], 86_400),
+        _ => (raw, 1),
+    };
+    let n: u64 = digits.trim().parse().ok()?;
+    // A zero window would make every request over budget, which reads as
+    // "never" to nobody; a window is a length, and it has to be positive.
+    if n == 0 {
+        return None;
+    }
+    Some(Duration::from_secs(n.checked_mul(factor)?))
 }
 
 impl Config {
@@ -1366,6 +1472,31 @@ impl Config {
                 if zero {
                     return Err(ConfigError::ZeroLimit { key: name, field });
                 }
+            }
+            // A per-target ceiling of zero reads as "unlimited" to the engine
+            // and as "that model may never be used" to the operator, which is
+            // the same ambiguity every other arm refuses at parse.
+            for cap in limit.model_tokens.values() {
+                if *cap == 0 {
+                    return Err(ConfigError::ZeroLimit {
+                        key: name,
+                        field: "model_tokens",
+                    });
+                }
+                // A ceiling for a target nothing serves is a ceiling that never
+                // applies, so the operator believes they capped a model that is
+                // in fact uncapped. The check needs the **resolved** target —
+                // the provider and the provider-local model the chain will
+                // actually ask for — and only the registry knows that, so it
+                // belongs to `ar-server`'s load, not to this parse.
+            }
+            if let Some(window) = &limit.spend_window
+                && parse_window(window).is_none()
+            {
+                return Err(ConfigError::BadLimitWindow {
+                    key: name,
+                    value: window.clone(),
+                });
             }
         }
         for s in &self.oauth {
@@ -1839,6 +1970,73 @@ combos:
         let yaml = "limits:\n  default:\n    rpm: 0\n";
         let err = Config::parse(yaml, stub_lookup).unwrap_err();
         assert!(matches!(err, ConfigError::ZeroLimit { .. }), "got: {err:?}");
+    }
+
+    #[test]
+    fn a_zero_per_target_ceiling_is_refused_at_parse() {
+        // The same ambiguity, one arm down: `0` reads as "unlimited" to the
+        // engine and as "that model may never be used" to the operator.
+        let yaml = "limits:\n  default:\n    model_tokens:\n      \"p/m\": 0\n";
+        let err = Config::parse(yaml, stub_lookup).unwrap_err();
+        assert!(matches!(err, ConfigError::ZeroLimit { .. }), "got: {err:?}");
+    }
+
+    #[test]
+    fn a_per_target_ceiling_parses_and_reads_back() {
+        let yaml = "limits:\n  default:\n    model_tokens:\n      \"p/m\": 1000\n      \"q/m2\": 20\n";
+        let cfg = Config::parse(yaml, stub_lookup).unwrap();
+        assert_eq!(cfg.limits.default.model_tokens.get("p/m"), Some(&1_000));
+        assert_eq!(cfg.limits.default.model_tokens.get("q/m2"), Some(&20));
+        assert!(
+            !cfg.limits.default.is_empty(),
+            "a row with only per-target ceilings is not empty"
+        );
+    }
+
+    #[test]
+    fn a_spend_window_parses_into_a_duration() {
+        let yaml = "limits:\n  default:\n    spend_window: 24h\n";
+        let cfg = Config::parse(yaml, stub_lookup).unwrap();
+        assert_eq!(
+            cfg.limits.default.spend_window(),
+            Some(Duration::from_secs(24 * 3_600))
+        );
+    }
+
+    #[test]
+    fn an_unreadable_spend_window_is_refused_at_parse() {
+        // A window the engine cannot read would silently mean "cumulative",
+        // and the operator would believe they had a rate ceiling.
+        let yaml = "limits:\n  default:\n    spend_window: soon\n";
+        let err = Config::parse(yaml, stub_lookup).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::BadLimitWindow { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_zero_spend_window_is_refused_at_parse() {
+        // A zero-length window would make every request over budget, which
+        // reads as "never" to nobody.
+        let yaml = "limits:\n  default:\n    spend_window: 0h\n";
+        let err = Config::parse(yaml, stub_lookup).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::BadLimitWindow { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_window_reads_every_shorthand() {
+        assert_eq!(parse_window("30m"), Some(Duration::from_secs(1_800)));
+        assert_eq!(parse_window("7d"), Some(Duration::from_secs(604_800)));
+        assert_eq!(parse_window("90s"), Some(Duration::from_secs(90)));
+        assert_eq!(
+            parse_window("3600"),
+            Some(Duration::from_secs(3_600)),
+            "a bare number is seconds"
+        );
     }
 
     #[test]

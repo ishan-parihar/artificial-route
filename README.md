@@ -39,7 +39,7 @@ Full flag table, service details and `--uninstall` are further down under [Insta
 ## Features
 
 - **21 routing strategies + `auto/*`** — priority, least-used, quota-weighted/fair, cost-optimized, expiry-first, reset-aware, fusion, pipeline… with `simulate`/`explain` in the library. A combo's `strategy:` reaches the pick since 0.1.12 — it was silently shadowed by the global default before. Bare `auto` maps to `least-used`; the 8-variant auto factory engages for literal `auto/*` names - **276 providers, 1559 models** compiled in — the same provider set as OmniRoute's registry, regenerated from it by `aroute import --from omniroute` - **6 wire dialects** — OpenAI, Anthropic, OpenAI-Responses, Gemini, Ollama inbound, OpenAI render; 18 further pairs named loudly instead of half-ported - **3 compression engines** (lite, rtk, caveman) with honor-and-echo semantics, per-combo in `config.yaml` and per-request via header, on an intensity dial (`rtk` minimal/standard/aggressive, `caveman` lite/full/ultra) rather than a dozen half-wired engine ids
-- **OAuth dispatch** — codex, cline, claude, gemini-cli, cursor and grok-cli: token injection, refresh on expiry, one rotation retry on 401, per-connection single-flight so a concurrent burst cannot trip `refresh_token_reused`. Two login mechanisms, both with every endpoint operator-supplied: PKCE browser redirect, and RFC 8628 **device flow** for providers that publish no redirect endpoint - **One terminal-status list** — 6 `(status, reason)` rows plus 1 carve-out-only row, generated into the store's CHECK clause; Cursor's `expired` and Claude's transient `invalid_grant` are carve-outs toward retry, grok-cli's `invalid_client` is a carve-out toward terminal, and a transient can never retire an account — the one remaining intentional divergence from OmniRoute's taxonomy is first-sighting timing on `(401, token_revoked)`: we retire it on the first sighting, OmniRoute on the third attempt - **Quota-aware failover** — per-key backoff, `Retry-After` wins, throttle anywhere outranks later transport failure. When every target in the chain is cooling before dispatch, the answer is a `429` with the soonest recovery window in `Retry-After` — never a bare 503 a client would read as "gateway broken" and retry into the same cooling chain. Since 0.1.13 the verdict also reads the body: a non-streaming 2xx that carries an `error` object fails over with its code instead of reaching the client as a 200, a fully auth-locked key set is refused without paying the round trip, and the Cline gateway's `{"success":…,"data":…}` reply skin is stripped (its usage is counted) rather than relayed - **Policy & gate** — a `limits:` block (per-key rpm + cumulative dollar/token ceilings + `refuse_unpriced`) enforced at the edge: `429` with `Retry-After` before any body work, `402` with the denying arm in `x-ar-deny-reason` before dispatch, spend checked against the same usage ledger the response path records into; a bearer gate armed by `aroute keys arm-gate` (master in the encrypted store, 30-day signed client tokens, `keys mint` for more, `aroute doctor` reports armed/unarmed); `aroute limits` views and edits the block, and `aroute sync` carries the dashboard's per-key rpm into it
+- **OAuth dispatch** — codex, cline, claude, gemini-cli, cursor and grok-cli: token injection, refresh on expiry, one rotation retry on 401, per-connection single-flight so a concurrent burst cannot trip `refresh_token_reused`. Two login mechanisms, both with every endpoint operator-supplied: PKCE browser redirect, and RFC 8628 **device flow** for providers that publish no redirect endpoint - **One terminal-status list** — 6 `(status, reason)` rows plus 1 carve-out-only row, generated into the store's CHECK clause; Cursor's `expired` and Claude's transient `invalid_grant` are carve-outs toward retry, grok-cli's `invalid_client` is a carve-out toward terminal, and a transient can never retire an account — the one remaining intentional divergence from OmniRoute's taxonomy is first-sighting timing on `(401, token_revoked)`: we retire it on the first sighting, OmniRoute on the third attempt - **Quota-aware failover** — per-key backoff, `Retry-After` wins, throttle anywhere outranks later transport failure. When every target in the chain is cooling before dispatch, the answer is a `429` with the soonest recovery window in `Retry-After` — never a bare 503 a client would read as "gateway broken" and retry into the same cooling chain. Since 0.1.13 the verdict also reads the body: a non-streaming 2xx that carries an `error` object fails over with its code instead of reaching the client as a 200, a fully auth-locked key set is refused without paying the round trip, and the Cline gateway's `{"success":…,"data":…}` reply skin is stripped (its usage is counted) rather than relayed - **Policy & gate** — a `limits:` block (per-key rpm + cumulative dollar/token ceilings + `refuse_unpriced`) enforced at the edge: `429` with `Retry-After` before any body work, `402` with the denying arm in `x-ar-deny-reason` before dispatch, spend checked against the same usage ledger the response path records into; **per-model ceilings** (`model_tokens:`) measured against that model's own spend, so a model that burns its budget fails over to a sibling instead of taking the key down with it, and an optional rolling `spend_window` makes the ceilings rates rather than one-way totals; a bearer gate armed by `aroute keys arm-gate` (master in the encrypted store, 30-day signed client tokens, `keys mint` for more, `aroute doctor` reports armed/unarmed); `aroute limits` views and edits the block, and `aroute sync` carries the dashboard's per-key rpm into it
 - **Built-in control page** — `/ui` on the proxy's own port: edit combos, providers and per-key limits, mint client keys, read the usage and failure log by date range, and try a combo in a playground. Vanilla JS embedded in the binary, no build step, no extra process ([details](#control-page-ui)) - **Agent-native CLI** — TOON output, `--fields` narrowing, stdout data / stderr diagnostics, exit 0/1/2, fail-loud flags - **Hot-reload config** — `config.yaml` watched live; secrets stay in `$VAR`, never in the file
 
 ## Benchmarks, parity and open gaps
@@ -186,7 +186,35 @@ limits:
     ci-runner: { tokens: 2000000, model: cheap }   # capped only when it asks for `cheap`
 ```
 
-`aroute limits` prints the block as one row per key, `set` merges arms into a row (`--key` names a client key; the `default` row without it), and `clear` removes a row or the block. `aroute sync` updates each dashboard key's `rpm` — `api_keys.max_requests_per_minute`, the one dashboard column that maps 1:1 — and leaves every other arm as written: the dashboard's daily/weekly dollar and token windows are a different shape from these cumulative arms and are deliberately not carried.
+**A per-model ceiling** is the other half of that, and it is the arm that
+scopes *what* a ceiling counts. `model_tokens:` names `provider/model` targets
+and their own ceilings, measured against **that model's** spend rather than
+the key's whole history. A model that has spent its own budget is dropped
+from the chain and the request fails over to a sibling that has budget left —
+so one model burning a budget is a failover, not an outage for every other
+model the key can reach. Only a chain with nothing left is refused, and the
+`402` names the models (`x-ar-deny-reason: model_token_cap`).
+
+```yaml
+limits:
+  keys:
+    prod-deploy:
+      tokens: 5000000000                          # the key's whole ceiling
+      model_tokens:                               # each model's own ceiling
+        "kilocode/minimax/minimax-m3.1-flash:free": 1000000000
+        "nvidia/z-ai/glm-5.3": 500000000
+```
+
+The ceilings are **cumulative** by default, which against an append-only ledger
+is a one-way door: a key that has spent its budget is refused until the config
+is edited, because the spend can never be un-spent. `spend_window: 24h` makes
+them **rates** instead — the spend inside the last 24 hours counts and the
+rest falls out of the window, so the key is inside its budget again once the
+old spend ages out. It covers both spend arms, so the two can never disagree
+about which spend is in force. The window is rolling, not a calendar bucket,
+and nothing runs on a timer: the ceiling is evaluated per request.
+
+`aroute limits` prints the block as one row per key, `set` merges arms into a row (`--key` names a client key; the `default` row without it), and `clear` removes a row or the block. `aroute limits set --model-tokens provider/model=N` arms a per-model ceiling and `--spend-window 24h` sets the window; a target no combo routes to is refused at write time, so a typo cannot arm a ceiling that never applies. `aroute sync` updates each dashboard key's `rpm` — `api_keys.max_requests_per_minute`, the one dashboard column that maps 1:1 — and leaves every other arm as written: the dashboard's daily/weekly dollar and token windows are a different shape from these cumulative arms and are deliberately not carried.
 
 ### Control page (/ui)
 

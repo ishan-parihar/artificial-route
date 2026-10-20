@@ -760,35 +760,104 @@ async fn handle_chat_inner(
     // request costs the client nothing. Priced from the chain's first target
     // against the same rows the response path bills from, so the estimate and
     // the eventual bill agree to the row.
-    if let (Some(ledger), Some(target)) = (state.ledger.as_ref(), plan.chain.first()) {
-        let projection = crate::policy::Projection {
-            asked: canonical.model.as_ref(),
-            provider: target.provider.as_str(),
-            model: &target.model,
-            tokens_in: ar_tokens::count_text(&String::from_utf8_lossy(&canonical.body)),
-            tokens_out: declared_output_ceiling(&canonical.body),
-            prices: &state.config.prices,
-        };
-        let verdict = {
+    //
+    // Both arms read the ledger ONCE. The key-wide ceiling is the total and
+    // the per-target ceiling is one row of the same split, so one grouped
+    // query answers both — and the per-target arm needs the split for EVERY
+    // target in the chain, not just the first, because a model that has spent
+    // its own budget must hand the request to a sibling rather than take the
+    // whole request down with it.
+    let mut plan = plan;
+    if let Some(ledger) = state.ledger.as_ref() {
+        let window = state.policy.spend_window(policy_key);
+        let since = window.map(|w| epoch_now().saturating_sub(w.as_secs() as i64));
+        let breakdown = {
             // Poisoned is the record path's convention too: a ledger that
             // panicked mid-write is a bug to surface, not a ceiling to guess.
             let guard = ledger
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.policy.spend_verdict(policy_key, &guard, &projection)
+            guard.spend_breakdown(policy_key, since)
         };
-        if let ar_tokens::Verdict::Deny(reason) = verdict {
+        let breakdown = match breakdown {
+            Ok(breakdown) => breakdown,
+            Err(e) => {
+                // A ledger that cannot be read cannot evaluate a ceiling, and a
+                // cap that fails open is not a cap.
+                tracing::warn!(error = %e, "spend ledger could not be read");
+                let mut resp = error_because(
+                    StatusCode::PAYMENT_REQUIRED,
+                    "payment_required",
+                    "unauditable",
+                    "the spend ledger could not be read, so this key's ceilings cannot be checked",
+                );
+                stamp(&mut resp, DENY_HEADER, "unauditable");
+                return resp.with_guard(guard_verdict);
+            }
+        };
+
+        // The key-wide arm. The spend compared is the windowed figure when the
+        // row names a window, and the cumulative figure otherwise — the same
+        // window the per-target arm uses, so the two cannot disagree about
+        // which spend is in force.
+        //
+        // The comparison itself is `ar-tokens`' own, so the refusal the client
+        // sees and the one the store's cap produces are the same words.
+        if let Some(cap) = state.policy.key_cap(policy_key) {
+            let spend = if window.is_some() {
+                breakdown.windowed
+            } else {
+                breakdown.total
+            };
+            let projection = crate::policy::Projection {
+                provider: plan.chain.first().map_or("", |t| t.provider.as_str()),
+                model: plan.chain.first().map_or("", |t| t.model.as_ref()),
+                tokens_in: ar_tokens::count_text(&String::from_utf8_lossy(&canonical.body)),
+                tokens_out: declared_output_ceiling(&canonical.body),
+                prices: &state.config.prices,
+            };
+            let verdict = {
+                let guard = ledger
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.admit_against(
+                    policy_key,
+                    &cap,
+                    &spend,
+                    crate::policy::projected_cost(&projection),
+                    projection.tokens_in.saturating_add(projection.tokens_out),
+                )
+            };
+            if let Ok(ar_tokens::Verdict::Deny(reason)) = verdict {
+                let mut resp = error_because(
+                    reason.status(),
+                    "payment_required",
+                    reason.code(),
+                    &reason.to_string(),
+                );
+                // The arm that denied, never the amounts: the operator knows
+                // their own numbers, and a header log does not need them.
+                stamp(&mut resp, DENY_HEADER, reason.code());
+                return resp.with_guard(guard_verdict);
+            }
+        }
+
+        // The per-target arm: a target that has reached its own ceiling is
+        // dropped from the chain, and the request continues on a sibling that
+        // has budget left. Only a chain with nothing left is refused.
+        let (kept, refused) =
+            filter_by_target_budget(&state.policy, policy_key, &plan.chain, &breakdown);
+        if !refused.is_empty() && kept.is_empty() {
             let mut resp = error_because(
-                reason.status(),
+                StatusCode::PAYMENT_REQUIRED,
                 "payment_required",
-                reason.code(),
-                &reason.to_string(),
+                "model_token_cap",
+                &target_cap_message(&refused),
             );
-            // The arm that denied, never the amounts: the operator knows
-            // their own numbers, and a header log does not need them.
-            stamp(&mut resp, DENY_HEADER, reason.code());
+            stamp(&mut resp, DENY_HEADER, "model_token_cap");
             return resp.with_guard(guard_verdict);
         }
+        plan.chain = kept;
     }
 
     // Started here so the latency the response reports is the provider's time and
@@ -2730,6 +2799,72 @@ fn target_of(c: &Candidate) -> ChainTarget {
     ChainTarget::new(c.provider.clone(), c.model.clone())
 }
 
+/// A target the per-target budget refused.
+///
+/// Only the name is carried: the refusal message names the models and never
+/// the amounts, so the ceilings and the spend would be dead state.
+#[derive(Debug, Clone)]
+struct RefusedTarget {
+    /// The `provider/model` that was refused.
+    target: String,
+}
+
+/// Splits the chain into the targets that may serve and the ones that may not.
+///
+/// A target with no `model_tokens:` entry is always kept: the per-target arm
+/// constrains only the targets it names, and the key-wide arm above governs
+/// everything else.
+///
+/// A target with an entry is kept while its spend is under its own ceiling,
+/// and dropped once it is not. The chain therefore *fails over* rather than
+/// dying: a model that has spent its budget hands the request to a sibling
+/// that has not, which is the whole point of naming a budget per model.
+///
+/// The spend compared is the windowed figure when the key's row names a
+/// window, and the cumulative figure otherwise — the same window the key-wide
+/// arm uses, so the two cannot disagree about which spend is in force.
+fn filter_by_target_budget(
+    policy: &crate::policy::Policy,
+    key_id: &str,
+    chain: &[ChainTarget],
+    breakdown: &ar_tokens::SpendBreakdown,
+) -> (Vec<ChainTarget>, Vec<RefusedTarget>) {
+    let windowed = policy.spend_window(key_id).is_some();
+    let mut kept = Vec::with_capacity(chain.len());
+    let mut refused = Vec::new();
+    for target in chain {
+        let name = format!("{}/{}", target.provider.as_str(), target.model);
+        let Some(cap) = policy.target_cap(key_id, &name) else {
+            kept.push(target.clone());
+            continue;
+        };
+        let spend = breakdown.target(target.provider.as_str(), target.model.as_ref());
+        let spent = if windowed {
+            spend.windowed.tokens
+        } else {
+            spend.total.tokens
+        };
+        if spent >= cap {
+            refused.push(RefusedTarget { target: name });
+        } else {
+            kept.push(target.clone());
+        }
+    }
+    (kept, refused)
+}
+
+/// The refusal message for a chain whose every target is over its own budget.
+///
+/// Names the models, never the amounts: the operator knows their own numbers,
+/// and a header log does not need them.
+fn target_cap_message(refused: &[RefusedTarget]) -> String {
+    let names: Vec<&str> = refused.iter().map(|r| r.target.as_str()).collect();
+    format!(
+        "every model this key may use has reached its own token ceiling: {}",
+        names.join(", ")
+    )
+}
+
 /// Resolves an `auto/*` alias into a scored chain, or `None` for a concrete name.
 ///
 /// The expected entry point is
@@ -3971,8 +4106,8 @@ mod tests {
         PROVIDER_HEADER, RESPONSE_COST_HEADER, SAVINGS_TOKENS_HEADER, Stages, TOKENS_IN_HEADER,
         TOKENS_OUT_HEADER, TOKENS_PER_SECOND_HEADER, USAGE_FRAME_CAP, UsageTee, VERSION_HEADER,
         accept_forces_stream, build_chain, card_json, completion_seen, declares_stream, decorate,
-        error, error_because, kind_for, model, models_head, not_found, outcome_label, require_json,
-        resolve, unknown_model, usage_from_frames,
+        epoch_now, error, error_because, kind_for, model, models_head, not_found, outcome_label,
+        require_json, resolve, unknown_model, usage_from_frames,
     };
     use super::{Continuation, SentText, resume_body, resumed};
     use crate::app::{AppState, Components};
@@ -6864,6 +6999,330 @@ mod tests {
             .get(DENY_HEADER)
             .and_then(|v| v.to_str().ok());
         assert_eq!(deny, Some("token_cap"), "the arm, not the amounts");
+    }
+
+    // --- the per-target budget arm ----------------------------------------
+
+    /// A two-target server: provider `p` serving model `m`, and provider `q`
+    /// serving model `m2`, in one combo `m`.
+    ///
+    /// Two targets because the whole point of the arm is that a target with no
+    /// budget left hands the request to a **sibling**, and one target cannot
+    /// show a handover.
+    fn two_target_config() -> ServerConfig {
+        let mut config = ServerConfig::single(
+            0,
+            Strategy::Priority,
+            vec![
+                crate::exec::ProviderConfig::new(
+                    ProviderId::new("p"),
+                    "http://127.0.0.1:1/v1",
+                    "k",
+                )
+                .with_model("m"),
+                crate::exec::ProviderConfig::new(
+                    ProviderId::new("q"),
+                    "http://127.0.0.1:1/v1",
+                    "k",
+                )
+                .with_model("m2"),
+            ],
+        );
+        config.combos = vec![crate::config::RouteCombo::new(
+            "m",
+            Strategy::Priority,
+            vec![
+                ComboTarget::new(ProviderId::new("p"), "m"),
+                ComboTarget::new(ProviderId::new("q"), "m2"),
+            ],
+        )];
+        config
+    }
+
+    /// A two-target server whose `limits:` block is `limits`, with an
+    /// in-memory ledger the spend arms read — and the ledger itself, so a
+    /// test can seed spend before the request.
+    fn limited_two_target(
+        limits: &str,
+        exec: Arc<dyn ArExec>,
+    ) -> (AppState, Arc<Mutex<ar_tokens::Ledger>>) {
+        let mut config = two_target_config();
+        config.limits = ar_config::Config::parse(limits, |_| Ok(None))
+            .expect("test limits parse")
+            .limits;
+        let ledger = Arc::new(Mutex::new(
+            ar_tokens::Ledger::open_in_memory().expect("in-memory ledger"),
+        ));
+        let state = Components {
+            exec,
+            ledger: Some(ledger.clone()),
+            ..Components::unconfigured(config)
+        }
+        .into_state();
+        (state, ledger)
+    }
+
+    /// Records what each dispatch was asked for, so a handover is observable.
+    ///
+    /// The list is shared with the test rather than owned by the executor: the
+    /// executor lives inside the server's state, and the test needs to read
+    /// what it saw.
+    struct RecordingProviders {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RecordingProviders {
+        fn new() -> (Arc<Self>, Arc<Mutex<Vec<String>>>) {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            (
+                Arc::new(Self { seen: seen.clone() }),
+                seen,
+            )
+        }
+    }
+
+    impl ArExec for RecordingProviders {
+        fn post_chat<'a>(
+            &'a self,
+            provider: &'a ProviderId,
+            canonical: &'a CanonicalRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<Upstream, ExecError>> + Send + 'a>> {
+            self.seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(format!("{}/{}", provider.as_str(), canonical.model));
+            Box::pin(async move {
+                Ok(Upstream::success(Box::pin(futures::stream::iter(vec![
+                    Bytes::from_static(
+                        br#"{"choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+                    ),
+                ]))))
+            })
+        }
+
+        fn post_media<'a>(
+            &'a self,
+            _provider: &'a ProviderId,
+            _model: Option<&'a str>,
+            _endpoint: &'a str,
+            _content_type: &'a str,
+            _body: &'a [u8],
+        ) -> Pin<Box<dyn Future<Output = Result<MediaReply, ExecError>> + Send + 'a>> {
+            Box::pin(async move { Err(ExecError::Transport("no media dispatch in this fixture".to_owned())) })
+        }
+    }
+
+    /// Seeds one target's spend, so a test can start from a key that has
+    /// already spent against one model and not another.
+    fn seed_spend(ledger: &Arc<Mutex<ar_tokens::Ledger>>, provider: &str, model: &str, tokens: u32) {
+        ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(&ar_tokens::Entry {
+                key_id: "anonymous",
+                provider,
+                model,
+                combo: "m",
+                usage: ar_tokens::NormalizedUsage::new(tokens, 0),
+                cost: ar_tokens::Cost::UNPRICED,
+                created_at: 1_700_000_000,
+            })
+            .expect("seed the spend");
+    }
+
+    #[tokio::test]
+    async fn a_target_over_its_own_budget_hands_the_request_to_a_sibling() {
+        // The point of the arm: one model spending its own budget must not take
+        // the whole request down when a sibling in the same chain has budget
+        // left. Before this, the 402 arm ran against the chain's FIRST target
+        // only, so the request died instead of failing over.
+        let (exec, seen) = RecordingProviders::new();
+        let (state, ledger) = limited_two_target(
+            "limits:\n  default:\n    model_tokens:\n      \"p/m\": 1\n",
+            exec,
+        );
+        // The first target has spent its own budget; the second has spent
+        // nothing. The key-wide arm is unarmed, so only the per-target arm can
+        // refuse.
+        seed_spend(&ledger, "p", "m", 10);
+        let router = crate::app::app(state);
+        let resp = drive(
+            &router,
+            chat("{\"model\":\"m\",\"messages\":[],\"max_tokens\":50}", &[]),
+        )
+        .await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::PAYMENT_REQUIRED,
+            "the sibling still has budget, so the request is served"
+        );
+        let seen = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            seen.first().map(String::as_str),
+            Some("q/m2"),
+            "the over-budget target was dispatched to anyway: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chain_with_no_budget_left_is_refused_and_names_the_models() {
+        // The other half: when every target is over its own budget, the
+        // request is refused — and the refusal names the models, because
+        // "your key is out of money" is not what happened and would send an
+        // operator to the wrong place.
+        let (exec, seen) = RecordingProviders::new();
+        let (state, ledger) = limited_two_target(
+            "limits:\n  default:\n    model_tokens:\n      \"p/m\": 1\n      \"q/m2\": 1\n",
+            exec,
+        );
+        seed_spend(&ledger, "p", "m", 10);
+        seed_spend(&ledger, "q", "m2", 10);
+        let router = crate::app::app(state);
+        let resp = drive(
+            &router,
+            chat("{\"model\":\"m\",\"messages\":[],\"max_tokens\":50}", &[]),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(
+            resp.headers()
+                .get(DENY_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("model_token_cap"),
+            "the arm, not the amounts"
+        );
+        let body = body_of(resp).await;
+        assert_eq!(body["error"]["reason"], "model_token_cap");
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("p/m"), "the message names the models: {message}");
+        assert!(message.contains("q/m2"), "the message names the models: {message}");
+        let seen = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            seen.is_empty(),
+            "an over-budget chain dispatched anyway: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_target_with_no_budget_of_its_own_still_counts_against_the_key() {
+        // The old behaviour, preserved: a target with no `model_tokens` entry
+        // falls under the key-wide ceiling, counted over the whole key. The
+        // per-target arm constrains only the targets it names.
+        let router = crate::app::app(limited("limits:\n  default:\n    tokens: 1\n"));
+        let resp = drive(
+            &router,
+            chat("{\"model\":\"m\",\"messages\":[],\"max_tokens\":50}", &[]),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(body_of(resp).await["error"]["reason"], "token_cap");
+    }
+
+    #[tokio::test]
+    async fn a_key_over_its_own_ceiling_is_refused_even_for_a_target_with_its_own() {
+        // The key-wide arm is an ADDITIONAL constraint, not a replacement: a
+        // key whose total spend is past its ceiling is refused whatever the
+        // target's own budget says.
+        let (exec, seen) = RecordingProviders::new();
+        let (state, ledger) = limited_two_target(
+            "limits:\n  default:\n    tokens: 100\n    model_tokens:\n      \"p/m\": 1000000\n",
+            exec,
+        );
+        // The key-wide ceiling is 100 and the request projects under it, so the
+        // only thing that can deny it is the key's own total spend.
+        seed_spend(&ledger, "p", "m", 100);
+        let router = crate::app::app(state);
+        let resp = drive(
+            &router,
+            chat("{\"model\":\"m\",\"messages\":[],\"max_tokens\":50}", &[]),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(body_of(resp).await["error"]["reason"], "token_cap");
+        let seen = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(seen.is_empty(), "dispatched past the key ceiling: {seen:?}");
+    }
+
+    #[tokio::test]
+    async fn a_window_keeps_spend_outside_it_from_counting() {
+        // The arm that makes a ceiling recoverable. Without a window, a key
+        // that has spent its budget is refused FOREVER — the ledger is
+        // append-only, so the spend can never be un-spent and the only remedy
+        // is editing the config by hand.
+        //
+        // With a window, the spend inside the window counts and the spend
+        // outside it does not. This seeds a row two days old against a 24-hour
+        // window: the row is outside the window, so the key is inside its
+        // budget again and the request is served.
+        let (exec, seen) = RecordingProviders::new();
+        let (state, ledger) = limited_two_target(
+            "limits:\n  default:\n    tokens: 100\n    spend_window: 24h\n",
+            exec,
+        );
+        // Two days ago, well outside a 24-hour window. The ceiling is 100
+        // tokens and the request projects well under that, so the only thing
+        // that could deny it is the historical spend.
+        ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(&ar_tokens::Entry {
+                key_id: "anonymous",
+                provider: "p",
+                model: "m",
+                combo: "m",
+                usage: ar_tokens::NormalizedUsage::new(100, 0),
+                cost: ar_tokens::Cost::UNPRICED,
+                created_at: epoch_now() - 2 * 86_400,
+            })
+            .expect("seed the spend");
+        let router = crate::app::app(state);
+        let resp = drive(
+            &router,
+            chat("{\"model\":\"m\",\"messages\":[],\"max_tokens\":50}", &[]),
+        )
+        .await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::PAYMENT_REQUIRED,
+            "spend outside the window does not count against it"
+        );
+        let seen = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(seen.first().map(String::as_str), Some("p/m"));
+    }
+
+    #[tokio::test]
+    async fn a_window_counts_spend_inside_it() {
+        // The other half of the window: a row inside the window still counts,
+        // so the window is a window and not a switch that disables the ceiling.
+        let (exec, seen) = RecordingProviders::new();
+        let (state, ledger) = limited_two_target(
+            "limits:\n  default:\n    tokens: 100\n    spend_window: 24h\n",
+            exec,
+        );
+        // A minute ago: inside the window, so this spend counts against it.
+        ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(&ar_tokens::Entry {
+                key_id: "anonymous",
+                provider: "p",
+                model: "m",
+                combo: "m",
+                usage: ar_tokens::NormalizedUsage::new(100, 0),
+                cost: ar_tokens::Cost::UNPRICED,
+                created_at: epoch_now() - 60,
+            })
+            .expect("seed the spend");
+        let router = crate::app::app(state);
+        let resp = drive(
+            &router,
+            chat("{\"model\":\"m\",\"messages\":[],\"max_tokens\":50}", &[]),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(body_of(resp).await["error"]["reason"], "token_cap");
+        let seen = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(seen.is_empty(), "dispatched past the ceiling: {seen:?}");
     }
 
     #[test]

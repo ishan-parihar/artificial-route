@@ -447,6 +447,30 @@ pub struct SetLimitsArgs {
     /// totals the key's whole spend (docs/23 G3).
     #[arg(long)]
     pub model: Option<String>,
+    /// A per-target token ceiling, as `provider/model=N`.
+    ///
+    /// The target's OWN spend against this key, not the key's whole spend —
+    /// which is what `tokens` measures. A model that burns its budget is
+    /// dropped from the chain and the request fails over to a sibling that
+    /// has budget left; only a chain with nothing left is refused.
+    ///
+    /// Repeatable: pass it once per target. The target must be one a combo
+    /// routes to, checked at write time so a typo cannot arm a ceiling that
+    /// never applies.
+    #[arg(long = "model-tokens", value_name = "TARGET=CEILING")]
+    pub model_tokens: Vec<String>,
+    /// The window the spend arms are measured over, as `24h`.
+    ///
+    /// Off by default, which means the arms are cumulative: a key that has
+    /// spent its budget is refused until the config is edited, because the
+    /// ledger is append-only and the spend can never be un-spent. A window
+    /// makes them rates — the spend inside the last N hours counts, and the
+    /// key is inside its budget again once the old spend falls out of it.
+    ///
+    /// Covers both spend arms: the key-wide `tokens` and the per-target
+    /// `model_tokens`.
+    #[arg(long, value_name = "WINDOW")]
+    pub spend_window: Option<String>,
 }
 
 /// Options for `aroute limits clear`.

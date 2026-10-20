@@ -45,13 +45,15 @@ const COMBO_COLUMNS: [&str; 5] = ["id", "provider", "status", "strategy", "targe
 const SYNC_COLUMNS: [&str; 5] = ["id", "provider", "status", "strategy", "targets"];
 /// Columns of an `aroute limits` row. `key` leads but is not `id`: the
 /// `default` row is a row like any other here, and the column names it.
-const LIMIT_COLUMNS: [&str; 6] = [
+const LIMIT_COLUMNS: [&str; 8] = [
     "key",
     "rpm",
     "usd_micros",
     "tokens",
     "refuse_unpriced",
     "model",
+    "model_tokens",
+    "spend_window",
 ];
 /// Columns of a `doctor` finding.
 const CHECK_COLUMNS: [&str; 3] = ["check", "status", "detail"];
@@ -630,6 +632,17 @@ pub fn limits_view(cli: &Cli) -> anyhow::Result<()> {
                 opt_cell(row.tokens),
                 row.refuse_unpriced.to_string(),
                 opt_cell(row.model.as_deref()),
+                // The per-target ceilings, one cell: a row can name several, and
+                // one column per target would make the table's width depend on
+                // the config.
+                opt_cell(Some(
+                    row.model_tokens
+                        .iter()
+                        .map(|(target, ceiling)| format!("{target}={ceiling}"))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                )),
+                opt_cell(row.spend_window.as_deref()),
             ]
         })
         .collect();
@@ -706,10 +719,12 @@ pub fn limits_set(cli: &Cli, args: &SetLimitsArgs) -> anyhow::Result<()> {
         && args.tokens.is_none()
         && args.refuse_unpriced.is_none()
         && args.model.is_none()
+        && args.model_tokens.is_empty()
+        && args.spend_window.is_none()
     {
         return Err(fail(
             "no arm given",
-            "pass at least one of --rpm, --usd-micros, --tokens, --refuse-unpriced, --model",
+            "pass at least one of --rpm, --usd-micros, --tokens, --refuse-unpriced, --model, --model-tokens, --spend-window",
         ));
     }
     let doc = read_config_text(cli)?;
@@ -720,6 +735,28 @@ pub fn limits_set(cli: &Cli, args: &SetLimitsArgs) -> anyhow::Result<()> {
         Some(raw) => Some(limit_scope(raw, &cfg.combos).map_err(|(m, h)| fail(m, h))?),
         None => None,
     };
+    // The per-target ceilings, parsed and checked against the config's own
+    // combos: a ceiling for a target nothing routes to is a ceiling that never
+    // applies.
+    let mut model_tokens = Vec::new();
+    for raw in &args.model_tokens {
+        let parsed = parse_model_tokens(raw).map_err(|(m, h)| fail(m, h))?;
+        if !routable_target(&parsed.target, &cfg) {
+            return Err(fail(
+                format!("no combo routes to {:?}", parsed.target),
+                "name a target a combo routes to, e.g. nvidia/z-ai/glm-5.3",
+            ));
+        }
+        model_tokens.push(parsed);
+    }
+    if let Some(window) = &args.spend_window
+        && ar_config::parse_window(window).is_none()
+    {
+        return Err(fail(
+            format!("--spend-window {window:?} is not a window"),
+            "a window is a length: 30m, 24h, 7d, or a whole number of seconds",
+        ));
+    }
     let label = args.key.clone().unwrap_or_else(|| "default".to_owned());
     // The merge is per arm: a named arm is set, an arm not passed stays as it
     // was — `set --rpm` must not quietly drop a ceiling the row already
@@ -737,6 +774,14 @@ pub fn limits_set(cli: &Cli, args: &SetLimitsArgs) -> anyhow::Result<()> {
     if let Some(scope) = scope {
         row.model = scope;
     }
+    // The per-target ceilings merge the same way: a named target is set, a
+    // target not named keeps what the row already carried.
+    for entry in &model_tokens {
+        row.model_tokens.insert(entry.target.clone(), entry.ceiling);
+    }
+    if let Some(window) = &args.spend_window {
+        row.spend_window = Some(window.clone());
+    }
     // A scope alone limits nothing, so a row with only a scope is empty.
     if row.is_empty() {
         return Err(fail(
@@ -748,16 +793,83 @@ pub fn limits_set(cli: &Cli, args: &SetLimitsArgs) -> anyhow::Result<()> {
         opt_cell(row.rpm),
         opt_cell(row.usd_micros),
         opt_cell(row.tokens),
-        row.refuse_unpriced,
+        row.refuse_unpriced.to_string(),
         opt_cell(row.model.as_deref()),
+        opt_cell(row.spend_window.as_deref()),
     );
+    let targets: Vec<String> = row
+        .model_tokens
+        .iter()
+        .map(|(target, ceiling)| format!("{target}={ceiling}"))
+        .collect();
     let next = splice_section(&doc, "limits", &import::limits::render(&cfg.limits));
     write_file(&cli.config, &next)?;
     println!(
-        "limits: {label} — rpm={} usd_micros={} tokens={} refuse_unpriced={} model={}",
-        summary.0, summary.1, summary.2, summary.3, summary.4
+        "limits: {label} — rpm={} usd_micros={} tokens={} refuse_unpriced={} model={} spend_window={} model_tokens={}",
+        summary.0, summary.1, summary.2, summary.3, summary.4, summary.5,
+        if targets.is_empty() { "-".to_owned() } else { targets.join(",") }
     );
     Ok(())
+}
+
+/// One `--model-tokens TARGET=CEILING` pair, parsed.
+struct ModelTokens {
+    /// The `provider/model` the ceiling governs.
+    target: String,
+    /// The ceiling, in tokens.
+    ceiling: u64,
+}
+
+/// Parses a `--model-tokens TARGET=CEILING` value.
+///
+/// The split is on the **last** `=`, because a model name never contains one
+/// and the forgiving choice costs nothing.
+fn parse_model_tokens(raw: &str) -> Result<ModelTokens, (String, &'static str)> {
+    let Some((target, ceiling)) = raw.rsplit_once('=') else {
+        return Err((
+            format!("--model-tokens {raw:?} is not TARGET=CEILING"),
+            "name the target and its ceiling, e.g. --model-tokens nvidia/z-ai/glm-5.3=500000000",
+        ));
+    };
+    let target = target.trim();
+    if target.is_empty() {
+        return Err((
+            "--model-tokens names no target".to_owned(),
+            "name the target, e.g. --model-tokens nvidia/z-ai/glm-5.3=500000000",
+        ));
+    }
+    let ceiling: u64 = ceiling.trim().parse().map_err(|_| {
+        (
+            format!("--model-tokens ceiling {ceiling:?} is not a number"),
+            "the ceiling is a whole number of tokens",
+        )
+    })?;
+    if ceiling == 0 {
+        return Err((
+            "--model-tokens 0 is refused".to_owned(),
+            "0 means \"never\" to an operator and \"unlimited\" to the engine; omit the arm to leave it unlimited",
+        ));
+    }
+    Ok(ModelTokens {
+        target: target.to_owned(),
+        ceiling,
+    })
+}
+
+/// Whether any combo routes to `target`.
+///
+/// The check is against the config's own targets, so a typo cannot arm a
+/// ceiling that never applies. A target with no `/` is a bare provider, which
+/// the server resolves to that provider's first model — so the check accepts
+/// it too, because the server's resolution is the authority and it refuses
+/// the whole config at load if the target does not exist.
+fn routable_target(target: &str, cfg: &ar_config::Config) -> bool {
+    cfg.combos.iter().any(|c| {
+        c.targets
+            .iter()
+            .chain(c.pool.iter())
+            .any(|t| t == target || t.split_once('/').is_none_or(|(p, _)| p == target))
+    })
 }
 
 /// `aroute limits clear` — remove one key's row (`--key`), or the whole block.
@@ -3613,7 +3725,7 @@ mod tests {
         let config = dir.join("config.yaml");
         std::fs::write(
             &config,
-            "keys:\n  local: dummy\ncombos:\n  - id: c\n    strategy: priority\n    targets:\n      - openai/gpt-5.4\n",
+            "keys:\n  local: dummy\ncombos:\n  - id: c\n    strategy: priority\n    targets:\n      - openai/gpt-5.4\n      - openai/gpt-5.4-mini\n",
         )
         .unwrap();
         Cli {
@@ -3635,6 +3747,8 @@ mod tests {
                 tokens: Some(1000),
                 refuse_unpriced: None,
                 model: None,
+                model_tokens: Vec::new(),
+                spend_window: None,
             },
         )
         .unwrap();
@@ -3656,6 +3770,8 @@ mod tests {
                 tokens: None,
                 refuse_unpriced: Some(true),
                 model: None,
+                model_tokens: Vec::new(),
+                spend_window: None,
             },
         )
         .unwrap();
@@ -3676,6 +3792,8 @@ mod tests {
                 tokens: None,
                 refuse_unpriced: None,
                 model: None,
+                model_tokens: Vec::new(),
+                spend_window: None,
             },
         )
         .unwrap();
@@ -3694,6 +3812,8 @@ mod tests {
             tokens: None,
             refuse_unpriced: None,
             model: model.map(str::to_owned),
+            model_tokens: Vec::new(),
+            spend_window: None,
         };
         limits_set(&cli, &set(Some(60), Some("c"))).unwrap();
         assert_eq!(
@@ -3733,6 +3853,8 @@ mod tests {
             tokens: None,
             refuse_unpriced: None,
             model: Some("c".to_owned()),
+            model_tokens: Vec::new(),
+            spend_window: None,
         };
         assert!(
             limits_set(&cli, &scope_only).is_err(),
@@ -3755,6 +3877,8 @@ mod tests {
                 tokens: None,
                 refuse_unpriced: None,
                 model: None,
+                model_tokens: Vec::new(),
+                spend_window: None,
             },
         );
         assert!(
@@ -3770,11 +3894,113 @@ mod tests {
                 tokens: None,
                 refuse_unpriced: None,
                 model: None,
+                model_tokens: Vec::new(),
+                spend_window: None,
             },
         );
         assert!(empty.is_err(), "nothing to set");
         // Neither refusal wrote anything.
         assert!(load(&cli).unwrap().limits.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn limits_set_writes_a_per_target_ceiling_and_a_window() {
+        let dir = tmpdir("limits-model-tokens");
+        let cli = limits_cli(&dir);
+        limits_set(
+            &cli,
+            &SetLimitsArgs {
+                key: Some("prod".to_owned()),
+                rpm: None,
+                usd_micros: None,
+                tokens: Some(5_000_000_000),
+                refuse_unpriced: None,
+                model: None,
+                model_tokens: vec!["openai/gpt-5.4=500000000".to_owned()],
+                spend_window: Some("24h".to_owned()),
+            },
+        )
+        .unwrap();
+        let row = &load(&cli).unwrap().limits.keys["prod"];
+        assert_eq!(
+            row.model_tokens.get("openai/gpt-5.4"),
+            Some(&500_000_000)
+        );
+        assert_eq!(row.spend_window.as_deref(), Some("24h"));
+        assert_eq!(
+            row.tokens,
+            Some(5_000_000_000),
+            "the key-wide arm survived the per-target one"
+        );
+        // The second set names a DIFFERENT target, and the first must survive
+        // it — a per-target merge is per target, not per row.
+        limits_set(
+            &cli,
+            &SetLimitsArgs {
+                key: Some("prod".to_owned()),
+                rpm: None,
+                usd_micros: None,
+                tokens: None,
+                refuse_unpriced: None,
+                model: None,
+                model_tokens: vec!["openai/gpt-5.4-mini=1000000".to_owned()],
+                spend_window: None,
+            },
+        )
+        .unwrap();
+        let row = &load(&cli).unwrap().limits.keys["prod"];
+        assert_eq!(row.model_tokens.len(), 2, "both targets are carried");
+        assert_eq!(row.spend_window.as_deref(), Some("24h"), "the window survived");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn limits_set_refuses_a_per_target_ceiling_that_names_no_target() {
+        let dir = tmpdir("limits-model-tokens-bad");
+        let cli = limits_cli(&dir);
+        let err = limits_set(
+            &cli,
+            &SetLimitsArgs {
+                key: Some("prod".to_owned()),
+                rpm: None,
+                usd_micros: None,
+                tokens: None,
+                refuse_unpriced: None,
+                model: None,
+                model_tokens: vec!["nvidia/nope-not-a-model=100".to_owned()],
+                spend_window: None,
+            },
+        );
+        assert!(
+            err.is_err(),
+            "a ceiling for a target nothing routes to is a ceiling that never applies"
+        );
+        assert!(load(&cli).unwrap().limits.keys.is_empty(), "nothing was written");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn limits_set_refuses_a_malformed_per_target_ceiling() {
+        let dir = tmpdir("limits-model-tokens-malformed");
+        let cli = limits_cli(&dir);
+        for bad in ["no-equals-sign", "openai/gpt-5.4=notanumber", "=100"] {
+            let err = limits_set(
+                &cli,
+                &SetLimitsArgs {
+                    key: Some("prod".to_owned()),
+                    rpm: None,
+                    usd_micros: None,
+                    tokens: None,
+                    refuse_unpriced: None,
+                    model: None,
+                    model_tokens: vec![bad.to_owned()],
+                    spend_window: None,
+                },
+            );
+            assert!(err.is_err(), "{bad:?} was accepted");
+        }
+        assert!(load(&cli).unwrap().limits.keys.is_empty(), "nothing was written");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3791,6 +4017,8 @@ mod tests {
                 tokens: None,
                 refuse_unpriced: None,
                 model: None,
+                model_tokens: Vec::new(),
+                spend_window: None,
             },
         )
         .unwrap();
@@ -3803,6 +4031,8 @@ mod tests {
                 tokens: None,
                 refuse_unpriced: None,
                 model: None,
+                model_tokens: Vec::new(),
+                spend_window: None,
             },
         )
         .unwrap();

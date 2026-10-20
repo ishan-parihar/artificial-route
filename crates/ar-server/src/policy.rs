@@ -14,9 +14,11 @@
 //! `limits:` gets [`Policy::disabled`], which answers everything without
 //! touching a lock.
 
+use std::time::Duration;
+
 use ar_config::Limits;
 use ar_limit::{Limiter, Spec};
-use ar_tokens::{Cap, Cost, Ledger, PricingTable, Verdict, cost_micros};
+use ar_tokens::{Cap, Cost, PricingTable, cost_micros};
 
 /// The enforcer, built once from the config block.
 pub struct Policy {
@@ -85,17 +87,21 @@ impl Policy {
         bucket.1.check(key_id).err()
     }
 
-    /// The 402 arm's cap: the ceiling this key's row names, if it arms anything.
+    /// The key-wide cap this key's row names, if it arms anything.
     ///
-    /// `None` means *no ceiling*, which the caller reports as "nothing to do"
-    /// rather than as an error — a row that limits only requests per minute is
-    /// a perfectly reasonable row.
+    /// `None` when the row arms no spend ceiling, which is the state every
+    /// config written before the block existed.
+    ///
+    /// Read from the **unscoped** row, for the same reason the per-target arm
+    /// is: the window that measures both arms comes from the key's own row,
+    /// and a row whose `model:` scope names another combo must not lose its
+    /// ceiling over that.
     #[must_use]
-    pub fn cap(&self, key_id: &str, asked: &str) -> Option<Cap> {
+    pub fn key_cap(&self, key_id: &str) -> Option<Cap> {
         if !self.armed {
             return None;
         }
-        let limit = self.limits.for_request(key_id, asked);
+        let limit = self.limits.row_for(key_id);
         if limit.usd_micros.is_none() && limit.tokens.is_none() && !limit.refuse_unpriced {
             return None;
         }
@@ -107,29 +113,33 @@ impl Policy {
         })
     }
 
-    /// The 402 arm end-to-end: project the request, check it against the
-    /// ledger's spend for this key, verdict.
+    /// The per-target ceiling this key's row names for `provider/model`, if it
+    /// names one.
     ///
-    /// Spend the ledger cannot read denies. The caller asked for a ceiling,
-    /// and when the ceiling cannot be evaluated the honest answer is not to
-    /// serve — a cap that fails open on a disk error is not a cap.
-    pub fn spend_verdict(
-        &self,
-        key_id: &str,
-        ledger: &Ledger,
-        projection: &Projection<'_>,
-    ) -> Verdict {
-        let Some(cap) = self.cap(key_id, projection.asked) else {
-            return Verdict::Allow;
-        };
-        let projected = project_cost(projection);
-        // The ledger records a response's tokens both ways, so the projection
-        // counts both too — an input-only figure is a ceiling that
-        // systematically under-counts what the bill will add.
-        let projected_tokens = projection.tokens_in.saturating_add(projection.tokens_out);
-        ledger
-            .admit_with(key_id, &cap, projected, projected_tokens)
-            .unwrap_or(Verdict::Deny(ar_tokens::DenyReason::Unauditable))
+    /// The key is spelled `provider/model`, the same spelling a combo target
+    /// uses. The model half may itself contain `/`, so the provider is the
+    /// **first** segment and the rest is the model.
+    ///
+    /// Read from the **unscoped** row: each entry names the target it governs,
+    /// so the map's own keys are the scope. A row whose `model:` scope names
+    /// a different combo still governs the targets it names — otherwise a
+    /// scoped row would silently lose its per-target ceilings.
+    #[must_use]
+    pub fn target_cap(&self, key_id: &str, target: &str) -> Option<u64> {
+        self.limits
+            .row_for(key_id)
+            .model_tokens
+            .get(target)
+            .copied()
+    }
+
+    /// The window this key's spend arms are measured over.
+    ///
+    /// `None` is the cumulative case, which is also the case for every config
+    /// written before the arm existed.
+    #[must_use]
+    pub fn spend_window(&self, key_id: &str) -> Option<Duration> {
+        self.limits.row_for(key_id).spend_window()
     }
 }
 
@@ -141,7 +151,7 @@ impl Policy {
 /// returns. A model with no row is [`Cost::UNPRICED`]: what `refuse_unpriced`
 /// denies, and what the spend arms price at zero.
 #[must_use]
-fn project_cost(projection: &Projection<'_>) -> Cost {
+pub fn projected_cost(projection: &Projection<'_>) -> Cost {
     let Some(row) = projection.prices.get(projection.provider, projection.model) else {
         return Cost::UNPRICED;
     };
@@ -158,9 +168,6 @@ fn project_cost(projection: &Projection<'_>) -> Cost {
 /// The request as the projection needs it: the target that will serve it, its
 /// counted tokens, and the table that prices it.
 pub struct Projection<'a> {
-    /// The model the client asked for (a combo id), which a scoped `limits:`
-    /// row is matched against.
-    pub(crate) asked: &'a str,
     /// The provider the chain's first target names.
     pub(crate) provider: &'a str,
     /// The model that target serves — its own spelling, not the alias the
@@ -201,7 +208,7 @@ mod tests {
     fn disabled_answers_nothing_limited() {
         let p = Policy::disabled();
         assert!(p.rate_wait("anyone").is_none());
-        assert!(p.cap("anyone", "m").is_none());
+        assert!(p.key_cap("anyone").is_none());
     }
 
     #[test]
@@ -233,7 +240,7 @@ mod tests {
     fn a_response_only_row_arms_no_cap() {
         let p = Policy::from_limits(&limits_yaml("limits:\n  default:\n    rpm: 3\n"), true);
         assert!(
-            p.cap("k", "m").is_none(),
+            p.key_cap("k").is_none(),
             "rpm alone is not a spend ceiling"
         );
     }
@@ -243,14 +250,13 @@ mod tests {
         let p = Policy::from_limits(&Limits::default(), true);
         let prices = prices_with(2_000_000); // $2 per MTok
         let projection = Projection {
-            asked: "m",
             provider: "provider",
             model: "model",
             tokens_in: 500_000,
             tokens_out: 10_000,
             prices: &prices,
         };
-        let cost = project_cost(&projection);
+        let cost = projected_cost(&projection);
         assert!(cost.priced);
         // 0.5 MTok in + 0.01 MTok out, both at $2/MTok.
         assert_eq!(cost.usd.micros, 1_000_000 + 20_000);
@@ -261,33 +267,27 @@ mod tests {
     fn an_unpriced_model_projects_unpriced() {
         let prices = PricingTable::default();
         let projection = Projection {
-            asked: "m",
             provider: "provider",
             model: "no-row",
             tokens_in: 10,
             tokens_out: 0,
             prices: &prices,
         };
-        let cost = project_cost(&projection);
+        let cost = projected_cost(&projection);
         assert!(!cost.priced);
     }
 
     #[test]
-    fn a_scoped_cap_is_none_when_another_model_is_asked() {
+    fn a_scoped_row_still_arms_its_own_ceiling() {
+        // The scope names the COMBO the row applies to, not the arm's reach:
+        // the row's own ceiling governs the key it names, and the scope only
+        // decides which requests it is consulted for. A scope must not silently
+        // disarm the row.
         let p = Policy::from_limits(
             &limits_yaml("limits:\n  keys:\n    k:\n      tokens: 100\n      model: jev\n"),
             true,
         );
-        assert!(p.cap("k", "other").is_none());
-    }
-
-    #[test]
-    fn a_scoped_cap_arms_when_its_model_is_asked() {
-        let p = Policy::from_limits(
-            &limits_yaml("limits:\n  keys:\n    k:\n      tokens: 100\n      model: jev\n"),
-            true,
-        );
-        assert_eq!(p.cap("k", "jev").and_then(|c| c.tokens), Some(100));
+        assert_eq!(p.key_cap("k").and_then(|c| c.tokens), Some(100));
     }
 
     #[test]
@@ -296,16 +296,16 @@ mod tests {
             &limits_yaml("limits:\n  default:\n    refuse_unpriced: true\n"),
             true,
         );
-        assert!(p.cap("k", "m").is_some());
-        assert!(p.cap("k", "m").unwrap().refuse_unpriced);
+        assert!(p.key_cap("k").is_some());
+        assert!(p.key_cap("k").unwrap().refuse_unpriced);
     }
 
     #[test]
     fn a_cap_without_a_ledger_is_not_a_cap() {
         let p = Policy::from_limits(&limits_yaml("limits:\n  default:\n    tokens: 10\n"), true);
-        assert!(p.cap("k", "m").is_some(), "armed with a ledger behind it");
+        assert!(p.key_cap("k").is_some(), "armed with a ledger behind it");
         let p = Policy::from_limits(&limits_yaml("limits:\n  default:\n    tokens: 10\n"), false);
-        assert!(p.cap("k", "m").is_none());
+        assert!(p.key_cap("k").is_none());
     }
 
     #[test]
@@ -316,10 +316,69 @@ mod tests {
             ),
             true,
         );
-        let cap = p.cap("k", "m").expect("armed");
+        let cap = p.key_cap("k").expect("armed");
         assert_eq!(cap.usd_micros, Some(7));
         assert_eq!(cap.tokens, Some(9));
         assert!(cap.refuse_unpriced);
+    }
+
+    #[test]
+    fn a_per_target_ceiling_is_read_by_its_target_name() {
+        let p = Policy::from_limits(
+            &limits_yaml(
+                "limits:\n  keys:\n    k:\n      model_tokens:\n        \"nvidia/z-ai/glm-5.3\": 500\n",
+            ),
+            true,
+        );
+        assert_eq!(
+            p.target_cap("k", "nvidia/z-ai/glm-5.3"),
+            Some(500),
+            "the named target is governed"
+        );
+        assert_eq!(
+            p.target_cap("k", "nvidia/other"),
+            None,
+            "a target the row does not name is not governed by it"
+        );
+    }
+
+    #[test]
+    fn a_per_target_ceiling_survives_a_row_scoped_to_another_combo() {
+        // The scope names the combo the row applies to; each entry in
+        // `model_tokens` names the target it governs. Dropping the row for a
+        // scope mismatch would silently lose the per-target ceilings.
+        let p = Policy::from_limits(
+            &limits_yaml(
+                "limits:\n  keys:\n    k:\n      model: jev\n      model_tokens:\n        \"nvidia/z-ai/glm-5.3\": 500\n",
+            ),
+            true,
+        );
+        assert_eq!(p.target_cap("k", "nvidia/z-ai/glm-5.3"), Some(500));
+    }
+
+    #[test]
+    fn the_window_is_read_from_the_keys_own_row() {
+        // One window per key, and it measures BOTH spend arms, so the two can
+        // never disagree about which spend is in force.
+        let p = Policy::from_limits(
+            &limits_yaml("limits:\n  keys:\n    k:\n      spend_window: 24h\n"),
+            true,
+        );
+        assert_eq!(p.spend_window("k"), Some(Duration::from_secs(24 * 3_600)));
+        assert_eq!(
+            p.spend_window("other"),
+            None,
+            "a key without a row inherits the DEFAULT row, and that row names no window"
+        );
+    }
+
+    #[test]
+    fn a_row_without_a_window_measures_cumulatively() {
+        let p = Policy::from_limits(
+            &limits_yaml("limits:\n  keys:\n    k:\n      tokens: 10\n"),
+            true,
+        );
+        assert_eq!(p.spend_window("k"), None);
     }
 
     #[test]

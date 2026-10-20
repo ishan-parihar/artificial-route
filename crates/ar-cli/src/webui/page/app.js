@@ -742,12 +742,13 @@ function paneKeys(root, st) {
     H("section", { class: "block" },
       H("div", { class: "block-head" },
         H("h2", { text: "Limits" }),
-        H("span", { class: "hint", text: "Per-key ceilings in `limits:`, enforced at the edge. Blank an arm to clear it; all-clear removes the row. A combo scope limits the spend arms to requests for that combo." })),
+        H("span", { class: "hint", text: "Per-key ceilings in `limits:`, enforced at the edge. Blank an arm to clear it; all-clear removes the row. A combo scope limits the spend arms to requests for that combo. A per-model cap (`target=cap`) is measured against THAT model's spend, so a model that burns its budget fails over to a sibling instead of taking the key down with it. A window (`24h`) makes the caps a rate rather than a total." })),
       H("div", { class: "block-body" },
         H("div", { class: "table-wrap" }, H("table", null,
           H("thead", null, H("tr", null,
             H("th", { text: "Key" }), H("th", { text: "rpm" }), H("th", { text: "$ cap" }),
-            H("th", { text: "token cap" }), H("th", { text: "unpriced" }), H("th", { text: "scope" }), H("th", { text: "Spend, all time" }),
+            H("th", { text: "token cap" }), H("th", { text: "unpriced" }), H("th", { text: "scope" }),
+            H("th", { text: "per-model caps" }), H("th", { text: "window" }), H("th", { text: "Spend, all time" }),
             H("th", { text: "Set ceilings" }))),
           H("tbody", { id: "key-rows" }))))));
   renderKeys(st);
@@ -778,7 +779,7 @@ function renderKeys(st) {
   body.textContent = "";
   const names = Object.keys(rows);
   if (!names.length) {
-    body.append(H("tr", null, H("td", { colspan: "8", class: "varname",
+    body.append(H("tr", null, H("td", { colspan: "10", class: "varname",
       text: "No limits rows yet. Mint a key to start." })));
   }
   for (const name of names) {
@@ -798,6 +799,13 @@ function renderKeys(st) {
     unpriced.checked = !!cap.refuse_unpriced;
     const scope = H("input", { "aria-label": "combo scope for " + name, placeholder: "all combos", spellcheck: "false", autocomplete: "off", style: "width:110px" });
     scope.value = cap.model || "";
+    // The per-target ceilings, in ONE field: `target=ceiling` pairs separated
+    // by commas. A field per target would make the row's width depend on the
+    // config, and the map IS the scope — the target names the model it caps.
+    const modelTokens = H("input", { "aria-label": "per-model token caps for " + name, placeholder: "target=cap,target=cap", spellcheck: "false", autocomplete: "off", style: "width:220px" });
+    modelTokens.value = Object.entries(cap.model_tokens || {}).map(([t, c]) => t + "=" + c).join(",");
+    const windowInput = H("input", { "aria-label": "spend window for " + name, placeholder: "24h", spellcheck: "false", autocomplete: "off", style: "width:70px" });
+    windowInput.value = cap.spend_window || "";
     body.append(H("tr", null,
       H("td", { text: name }),
       H("td", { class: "num", text: cap.rpm == null ? "unset" : String(cap.rpm) }),
@@ -805,17 +813,30 @@ function renderKeys(st) {
       H("td", { class: "num", text: cap.tokens == null ? "unset" : String(cap.tokens) }),
       H("td", { class: "num", text: cap.refuse_unpriced ? "refuse" : "allow" }),
       H("td", { class: "varname", text: cap.model || "all" }),
+      H("td", { class: "varname", text: Object.keys(cap.model_tokens || {}).length ? Object.keys(cap.model_tokens).length + " capped" : "none" }),
+      H("td", { class: "varname", text: cap.spend_window || "all time" }),
       H("td", { class: "num", text: "$" + spend.toFixed(6) }),
       H("td", null, H("form", { class: "row-form", onsubmit: async (e) => {
         e.preventDefault();
         const send = (input) => input.type === "checkbox" ? input.checked : (input.value === "" ? null : Number(input.value));
+        // The per-target field is parsed here so the server gets a map, and a
+        // malformed pair is refused before anything is sent.
+        let caps = {};
+        for (const pair of modelTokens.value.split(",").map((s) => s.trim()).filter(Boolean)) {
+          const at = pair.lastIndexOf("=");
+          if (at < 1) { showError("keys-error", new Error("per-model cap " + JSON.stringify(pair) + " is not target=cap")); return; }
+          const ceiling = Number(pair.slice(at + 1));
+          if (!Number.isFinite(ceiling) || ceiling <= 0) { showError("keys-error", new Error("per-model cap " + JSON.stringify(pair) + " is not a positive number")); return; }
+          caps[pair.slice(0, at).trim()] = ceiling;
+        }
         try {
           await api("/ui/api/limits", { key: name,
             rpm: send(rpmInput), usd_micros: send(usdInput), tokens: send(tokensInput),
-            refuse_unpriced: send(unpriced), model: scope.value.trim() || null });
+            refuse_unpriced: send(unpriced), model: scope.value.trim() || null,
+            model_tokens: caps, spend_window: windowInput.value.trim() || null });
           await refresh();
         } catch (err) { showError("keys-error", err); }
-      } }, rpmInput, usdInput, tokensInput, unpriced, scope, H("button", { class: "btn small", type: "submit", text: "Set" })))));
+      } }, rpmInput, usdInput, tokensInput, unpriced, scope, modelTokens, windowInput, H("button", { class: "btn small", type: "submit", text: "Set" })))));
   }
 }
 
