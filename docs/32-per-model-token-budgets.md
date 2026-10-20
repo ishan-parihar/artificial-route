@@ -1,11 +1,19 @@
 # 32 — Per-model token budgets: a ceiling that names the model it stopped
 
-Status: **built, 2026-10-20.** Owner: this doc, for the *shape* of the feature.
+Status: **built, 2026-10-20. NOT ARMED.** The engine carries the arms; the
+operator ruled on 2026-10-20 that the deployed system should hold **no**
+budgets, so the VPS config carries no `limits:` block and the arms are inert.
+See [`docs/34-spend-cap-audit.md`](34-spend-cap-audit.md) for the audit and
+for why the block was there in the first place.
+Owner: this doc, for the *shape* of the feature.
 Companions: [`docs/28-gap-ledger.md`](28-gap-ledger.md) (the state of every open
 item), [`docs/15-policy-security-layer.md`](15-policy-security-layer.md) (the
 policy layer's decision record),
 [`docs/33-vps-limits-config.md`](33-vps-limits-config.md) (the ceilings the VPS
-actually runs, and the measurements they came from), `TODO.md` (the register).
+ran, and the measurements they came from — superseded by the audit),
+[`docs/34-spend-cap-audit.md`](34-spend-cap-audit.md) (the cap surfaces, the
+audit, and the finding that the block was an audit fixture),
+`TODO.md` (the register).
 
 ---
 
