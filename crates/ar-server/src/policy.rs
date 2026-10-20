@@ -133,6 +133,15 @@ impl Policy {
             .copied()
     }
 
+    /// Whether this key's row names any per-target ceiling.
+    ///
+    /// The arm is opt-in, so a caller that has no per-target ceiling must not
+    /// pay to read the ledger on its behalf.
+    #[must_use]
+    pub fn has_target_caps(&self, key_id: &str) -> bool {
+        !self.limits.row_for(key_id).model_tokens.is_empty()
+    }
+
     /// The window this key's spend arms are measured over.
     ///
     /// `None` is the cumulative case, which is also the case for every config
