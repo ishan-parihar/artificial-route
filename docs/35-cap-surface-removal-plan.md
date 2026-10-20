@@ -26,6 +26,20 @@ would re-create on a host that has one),
 
 ---
 
+## Contents
+
+- [0. The release path, stated once](#0-the-release-path-stated-once)
+- [1. The problem, stated precisely](#1-the-problem-stated-precisely)
+- [2. What the engine actually enforces](#2-what-the-engine-actually-enforces)
+- [3. What stays and what goes](#3-what-stays-and-what-goes)
+- [4. The options](#4-the-options)
+- [5. The recommended sequence — discrete shippable steps](#5-the-recommended-sequence--discrete-shippable-steps)
+- [6. What the sequence does to the five write paths](#6-what-the-sequence-does-to-the-five-write-paths)
+- [7. Open decisions for the operator](#7-open-decisions-for-the-operator)
+- [8. The test plan](#8-the-test-plan)
+- [9. Open items carried from the recon](#9-open-items-carried-from-the-recon)
+- [10. Acceptance for this plan](#10-acceptance-for-this-plan)
+
 ## 0. The release path, stated once
 
 Every change below ships as a **GitHub release**, never as a copied binary.

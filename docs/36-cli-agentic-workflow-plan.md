@@ -34,6 +34,18 @@ page, this document does not edit it).
 
 ---
 
+## Contents
+
+- [0. The goal, restated as a testable contract](#0-the-goal-restated-as-a-testable-contract)
+- [1. The inventory: every command, and what it can reach](#1-the-inventory-every-command-and-what-it-can-reach)
+- [2. The findings, severity-ranked](#2-the-findings-severity-ranked)
+- [3. Where the code has drifted from `docs/06-axi-mcp.md`](#3-where-the-code-has-drifted-from-docs06-axi-mcpmd)
+- [4. The plan of record](#4-the-plan-of-record)
+- [5. The open operator decisions](#5-the-open-operator-decisions)
+- [6. The test plan](#6-the-test-plan)
+- [7. Open items carried from the recon](#7-open-items-carried-from-the-recon)
+- [8. The single change to make first](#8-the-single-change-to-make-first)
+
 ## 0. The goal, restated as a testable contract
 
 The operator's sentence is a capability claim about the CLI as an **agent

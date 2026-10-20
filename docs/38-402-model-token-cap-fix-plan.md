@@ -198,6 +198,19 @@ three of them under budget — was never refused by it. All verified against the
 `policy.rs:85`, `row_for` at `:104`/`:130`/`:142`/`:151`). Recorded in `docs/35` §2.2 and
 Ask **Q16** Gap 1, still open.
 
+**But it did not cause this incident, and the distinction is worth stating.** The `model:`
+scope is the row-level scope ("this row governs requests for combo X"); the `model_tokens:`
+map is a *different* axis ("this target has its own ceiling"), and the code says so
+deliberately — `ar-config/src/lib.rs:1152-1159` and the policy test
+`a_per_target_ceiling_survives_a_row_scoped_to_another_combo` (`policy.rs:352`) both say a
+scope mismatch must not drop a row that carries per-target ceilings. **Measured: neither
+version of the live config carried a `model:` scope at all** — the 13:06 block was
+`tokens: 5000000000` with no scope, and the guard's version was
+`tokens: 6000000000` + `spend_window: 24h` + four `model_tokens` rows, also with no scope.
+So there was no scope to mis-apply, and CAP-01 is a **real defect in a different scenario**
+(a scoped row governing requests it should not), not a contributing cause here. The
+incident's mechanism is §0's, and it does not need CAP-01 to explain it.
+
 ### 2.2 A chain whose every target is capped is refused with no fallback
 
 `filter_by_target_budget` (`routes.rs:2842-2870`) drops each target whose own ceiling is

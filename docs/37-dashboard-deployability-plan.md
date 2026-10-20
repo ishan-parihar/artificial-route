@@ -26,6 +26,19 @@ fact carries its chunk name. Anything not directly observed is marked
 
 ---
 
+## Contents
+
+- [1. The question, and the answer in one line](#1-the-question-and-the-answer-in-one-line)
+- [2. The two UIs, honestly](#2-the-two-uis-honestly)
+- [3. The three hard blockers](#3-the-three-hard-blockers)
+- [4. Resolving B1: how a 1.6 GiB artifact becomes a release asset](#4-resolving-b1-how-a-16-gib-artifact-becomes-a-release-asset)
+- [5. The serving options (recon's ranking, intact)](#5-the-serving-options-recons-ranking-intact)
+- [6. The security control set — what must be TRUE before the dashboard is reachable from the aroute hostname](#6-the-security-control-set--what-must-be-true-before-the-dashboard-is-reachable-from-the-aroute-hostname)
+- [7. Open items — the first one decides the whole plan](#7-open-items--the-first-one-decides-the-whole-plan)
+- [8. The two-panels decision — decisive position](#8-the-two-panels-decision--decisive-position)
+- [9. Test and verification plan](#9-test-and-verification-plan)
+- [10. Summary of the recommendation](#10-summary-of-the-recommendation)
+
 ## 1. The question, and the answer in one line
 
 The operator's stated goal (2026-10-20): *"the lack of a web-dashboard surface
