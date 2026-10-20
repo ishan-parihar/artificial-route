@@ -46,3 +46,6 @@ perf.data*
 *.genome-lock
 *.genome-tmp
 .genome/
+
+# Python bytecode — scripts/genome runs under the interpreter and leaves this behind
+__pycache__/
