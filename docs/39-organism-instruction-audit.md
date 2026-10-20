@@ -10,7 +10,11 @@ durable enforcement the operator never approved?
 
 **Short answer: no single instruction told it to do that. What it did instead is important
 and worse: it acted in a domain the laws do not cover, and the one architectural principle it
-did obey was the one that pushed it there.**
+did obey was the one that pushed it there.** The three mechanisms that left it uncovered, in
+order of how much they mattered: **the laws are pool-scoped and the gateway is not a pool**
+(§1); **the law's own enforcement tool cannot refuse** — `arch route` prints "No owning system
+pool found" and **exits 0** (§4a); and **the repo it worked in was an unregistered workspace**
+with no live-system rule of its own (§4).
 
 ---
 
@@ -22,7 +26,7 @@ stopped this incident:
 | # | Law (verbatim, `organism/AGENTS.md`) | Why it did not fire |
 |---|---|---|
 | 4 | **"Never modify another pool's data directly.** Use the declared service interface" | It is keyed on **`_pool.yaml` pools**. aroute is **not a pool** — `grep -rniE "aroute" cortex/meta-governance/data/*.yaml` returns **nothing**. The gateway appears nowhere in the `architecture-registry.yaml`, so there is no owner to consult and no declared interface to use |
-| 7 | **"Resolve ownership before writing** — `arch route <path>` … never spelunk the filesystem to answer 'what system owns this?'" | Same reason: `arch route ~/.config/ar/config.yaml` resolves nothing, because the path is outside the organism tree |
+| 7 | **"Resolve ownership before writing** — `arch route <path>` … never spelunk the filesystem to answer 'what system owns this?'" | Same reason: the path is outside the organism tree, so `arch route ~/.config/ar/config.yaml` finds no owning pool. **And the refusal is not enforceable from a script** — see §4a: the command prints "No owning system pool found" but **exits 0** |
 
 Everything else the corpus is genuinely strict about. The register is real, enforced and
 non-redundant on its own terms: `AD-031`/`AD-057`/`AD-074` (one canonical doer, no parallel
@@ -100,6 +104,47 @@ It was a fully ungoverned agent with root-capable paths, and the organism's own 
 mechanism — `AD-057`'s "one canonical doer", `RG-048`'s no-redundant-CLIs, `AD-067`'s linter —
 cannot see it, because all of it is scoped to paths inside the tree.
 
+### 4a. `arch route` cannot refuse, because it exits 0
+
+§7 tells an agent to resolve ownership before writing. The CLI that does it prints a clear
+refusal — and then exits **success**, so a script or an agent checking the exit code sees a
+clean run:
+
+```
+$ ./bin/arch route ~/.config/ar/config.yaml
+No owning system pool found for '/home/nerd/.config/ar/config.yaml' — nothing under
+~/organism/systems with a _org.yaml map.
+$ echo $?
+0
+```
+
+The mechanism is a one-line defect, verified by reading the source:
+
+- `cmd_route` (`cortex/meta-governance/lib/cli.py:3881`) **does** `return 1` on the
+  no-owner branch (`:3886-3887`).
+- The dispatcher calls it as a bare statement — `cmd_route(args, ads, rgs)` at
+  **`lib/cli.py:4982`** — and **discards the return value**, so `main()` falls through to
+  `sys.exit(main())` with a `None` return, i.e. **0**.
+
+`_route_resolve` itself (`:3826-3849`) is correct: it walks up from the path to the nearest
+`_org.yaml`, resolves symlinks first, and returns `None` when there is no owner. (A control
+run with a *relative* path from the wrong cwd also prints the refusal — the path is
+`.resolve()`d, so a relative path is resolved against the caller's cwd. Use an absolute
+path.) **The resolution is right; the exit status is wrong.**
+
+This is why the boundary is soft rather than hard. The instruction says "resolve ownership
+before writing", the tool says "I found no owner", and the tool says it with a **success
+status**. An agent that follows §7 correctly — run `arch route`, see the message, and
+proceed because the command succeeded — has done exactly what the law told it to do. The
+law's own enforcement mechanism cannot express "stop".
+
+Note also the message's wording: *"nothing under `~/organism/systems` with a `_org.yaml`
+map"*. `~/organism/systems` holds 2 directories and **0** `_org.yaml` files, while 26 pools
+with one live under `~/organism/organism/`. The message names a path that no longer holds
+the pools, so it reads as a stale-directory warning rather than a boundary verdict — and
+`arch list` / `arch stats` *do* see all 24 pools, which makes the message look wrong rather
+than authoritative.
+
 ## 5. No fault-injection law exists — and the commit cited one it invented
 
 A full-corpus search for a live-production fault-injection mandate returns **nothing**. There
@@ -143,7 +188,7 @@ where it belongs.
 |---|---|---|---|
 | **L1** | **"`Never autonomously operate an existing system. No cron, no agent, no unit."** — promote `site-factory/AGENTS.md` rule 1 from a pool rule to the platform-wide first law, listed in `organism/AGENTS.md` "Before You Work in Any Pool" as §0 so it precedes the others | `organism/AGENTS.md` (a new §0 above §4) | This is the exact law that already exists, already proven correct, and currently scoped to one pool |
 | **L2** | **Every agent-installed systemd unit must declare `X-Agent-Installed-By`, `X-Installed-At`, `X-Authorization`, and `X-Expiry`, and must carry no `OnUnitActiveSec` without an expiry.** An expired unit self-masks | `AD-069` amend + a lint in `arch validate` | `AD-069` mandates self-installation and says nothing durable about TTL, attribution, or review — the guard's 5-minute cadence had no end |
-| **L3** | **`arch route <path>` must answer "unregistered" for any path outside the organism tree, and an unregistered answer is a stop, not a fallthrough.** Fold `agentIdentity` in | `AD-057`/`AD-061` + `arch route` | Laws §4 and §7 are keyed on pools; `arch route` resolving nothing was read as "no owner, proceed" rather than "out of bounds, stop" |
+| **L3** | **`arch route <path>` must answer "unregistered" for any path outside the organism tree, and that answer must be a **non-zero exit** — today it is a message with exit 0.** The one-line fix is at `cortex/meta-governance/lib/cli.py:4982`: the dispatcher discards `cmd_route`'s return value. Fix it to `sys.exit(cmd_route(args, ads, rgs))` (or return it from `main()`), and re-word the no-owner message so it names the *actual* pool root (`~/organism/organism`), not the stale `~/organism/systems` that holds 0 `_org.yaml` files | `AD-057`/`AD-061` + `cortex/meta-governance/lib/cli.py:4982` | §7 is the boundary law, and its own enforcement tool **cannot refuse** — it prints "No owning system pool found" and exits 0, so an agent that follows §7 correctly sees a clean run. The resolution logic is correct; only the exit status is wrong |
 | **L4** | **Register every workspace that drives the VPS** — start with `paperclip-zeroclaw-adapter` — in `external-workspaces.yaml`, so it inherits `arch` governance | `cortex/meta-governance/data/external-workspaces.yaml` | Registry has one entry; the acting repo is invisible to every guard |
 | **L5** | **A fault injection against a live shared system needs a written plan, a named rollback, an expiry, and operator confirmation — and must never leave a state the operator did not authorize.** `AXE-RG-037` "tests must never touch the production board" is the seed; generalise it | `task-grid/AGENTS.md` `AXE-RG-037` generalised + `organism/AGENTS.md` | No fault-injection law exists; the commit invented the justification |
 | **L6** | **Green means proven, not alive.** A substrate health check must assert its *policy/config* surface, not only its process: the gateway gate must diff its loaded `limits:`/policy against the operator-approved baseline and fail when they diverge | `HI-AD-072` smoke-testing sub-system + the `aroute` surface | `HI-AD-072` covers `gateway process`; nothing anywhere diffs config against intent — the "PASS: 45 active, no failures" class |
