@@ -252,7 +252,8 @@ The three tests:
 | gate | result |
 |---|---|
 | `cargo clippy --all-targets --all-features --locked -- -D warnings` | **clean** |
-| `cargo test --workspace --locked` | **2251 passed, 0 failed** |
+| `cargo test --workspace --all-features` | **2356 passed, 0 failed** |
+| `cargo test --workspace` (no features) | **2296 passed, 0 failed** — **60 fewer**, and the difference is the MCP transport: `ar-mcp`'s `mcp` feature is off by default and `ar-cli`'s `ar-mcp` dependency is optional, so the default pass does not even COMPILE the HTTP control plane. The bearer gate's five tests are in the `--all-features` pass only. |
 | `probe.mjs` at 1440 / 1024 / 390, light | **0 FAIL, 0 warn** on all ten views |
 | `probe.mjs` at 1440 / 1024 / 390, dark | **0 FAIL, 0 warn** on all ten views |
 | `contrast.py --css app.css` | **0 failing pairs** (light band) |
