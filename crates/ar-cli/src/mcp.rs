@@ -83,6 +83,17 @@ pub async fn run(cli: &Cli, args: &McpArgs) -> anyhow::Result<()> {
                     "the HTTP address could not be bound; pick a free loopback port",
                 )
             })?;
+            // The bearer gate, resolved HERE, in the one place that already
+            // holds the credential store and the env master.
+            //
+            // The control plane must never be weaker than `/v1`, and the way to
+            // guarantee that is to resolve the **same** effective master by the
+            // **same** precedence: the store's gate row if it decrypts, else
+            // `AR_HTTP_MASTER_KEY`, else no gate. A third resolver in
+            // `ar-mcp` would be a gate that could disagree with the other two
+            // about which master is in force.
+            let mut built = built;
+            built.bearer = bearer_gate(cli);
             ar_mcp::serve_http(built, listener).await
         }
         None => ar_mcp::serve_stdio(built).await,
@@ -93,6 +104,113 @@ pub async fn run(cli: &Cli, args: &McpArgs) -> anyhow::Result<()> {
             "the MCP host closed the connection; nothing to retry from here",
         )
     })
+}
+
+/// The bearer gate for the MCP HTTP transport, or `None` when there is no gate
+/// anywhere on this host.
+///
+/// The **same** resolution `/v1` uses, in the **same** order:
+///
+/// 1. the credential store's gate row, if it decrypts;
+/// 2. otherwise `AR_HTTP_MASTER_KEY`;
+/// 3. otherwise no gate.
+///
+/// The revocation list is the **same** list the server's gate consults, so a
+/// token revoked for the proxy is revoked for the control plane too. Two lists
+/// would be two answers about the same token.
+///
+/// `None` is a supported configuration: the loopback install, where the
+/// socket's bind is the trust boundary. The transport then serves as it always
+/// did, and the bearer is defence in depth where a gate does exist.
+fn bearer_gate(cli: &Cli) -> Option<ar_mcp::transport::BearerGate> {
+    let master = effective_master(cli)?;
+    // The length check `/v1` does and this path must do too:
+    // `MasterKey::new` only derives the AEAD key, and the enforcement lives in
+    // `Secret::from_slice` — which `AuthGate::new` calls. Without it, a
+    // malformed master would build a signing engine that never verifies
+    // anything, silently.
+    let master = match ar_keys::Secret::from_slice(master.as_bytes()) {
+        Ok(master) => master,
+        Err(e) => {
+            // The same sentence `ar-server`'s `build_gate` prints, so an
+            // operator reading the logs sees one answer and not two. The gate
+            // is OFF and the process still serves — the same trade `serve`
+            // makes — but it says so, loudly, and names the reason.
+            eprintln!("ar: bearer gate DISABLED — the master key was rejected ({e})");
+            return None;
+        }
+    };
+    // A fresh salt: it only ever feeds the AEAD key. The SIGNING key is the
+    // master bytes themselves (`MasterKey::signing_key` returns `&self.master`),
+    // so this engine verifies exactly the tokens the server's own gate
+    // verifies — and the salt does NOT have to match the server's.
+    let tokens = match ar_keys::MasterKey::new(master, ar_keys::KeyMeta::generate()) {
+        Ok(key) => ar_keys::Tokens::new(&key),
+        Err(e) => {
+            eprintln!("ar: bearer gate DISABLED — the master key was rejected ({e})");
+            return None;
+        }
+    };
+    Some(ar_mcp::transport::BearerGate {
+        tokens: std::sync::Arc::new(tokens),
+        revocations: revocations(cli),
+    })
+}
+
+/// The effective master for the control plane's gate.
+///
+/// The store's gate row if it decrypts, else `AR_HTTP_MASTER_KEY`, else
+/// `None` — the same precedence `ar-server`'s own gate uses, so the control
+/// plane and the data plane cannot disagree about which master is in force.
+///
+/// A row that is present but will not decrypt is an **emergency**, and it is
+/// reported: a missing row is normal (the env master is then in force), and
+/// the two are not the same fact.
+fn effective_master(cli: &Cli) -> Option<ar_keys::Secret> {
+    if let Some(store) = commands::credential_store(cli) {
+        match commands::gate_master(&store) {
+            Ok(Some(master)) => return Some(master),
+            Ok(None) => {}
+            Err(e) => {
+                // The same sentence `serve` prints, so one log answers for
+                // both planes.
+                eprintln!("ar: gate row present but unreadable — serving ungated: {e}");
+            }
+        }
+    }
+    ar_server::config::http_master_key_from_env()
+}
+
+/// The revocation list, in the credential store's own file.
+///
+/// Resolved through the **same probe** `serve` uses, so `aroute mcp` and
+/// `aroute serve` cannot disagree about whether the store is usable — which
+/// is the stated reason [`commands::StoreProbe`] exists. The probe does not
+/// open the file when it is absent, so the revocation table never CREATES a
+/// store on a host that has none.
+///
+/// A store that exists but will not open still yields a table, because the
+/// table needs no master: the credential rows may be undecryptable and the
+/// revocation rows are not.
+fn revocations(cli: &Cli) -> Option<std::sync::Arc<ar_keys::Revocations>> {
+    let path = match commands::store_probe(&cli.config) {
+        commands::StoreProbe::Absent(_) => return None,
+        commands::StoreProbe::Open { path, .. }
+        | commands::StoreProbe::Live { path, .. }
+        | commands::StoreProbe::Unreadable { path, .. } => path,
+    };
+    match ar_keys::Revocations::open(&path, ar_keys::DEFAULT_CAP) {
+        Ok(list) => Some(std::sync::Arc::new(list)),
+        Err(e) => {
+            // The same sentence `serve` prints. A silent failure on a security
+            // control is worse than a loud one: the operator would believe
+            // revocation works, and it does not.
+            eprintln!(
+                "ar: revocation table not available — revoked tokens stay valid until they expire: {e}"
+            );
+            None
+        }
+    }
 }
 
 /// Prints the catalog as TOON, then the two things a caller does next.
@@ -203,6 +321,10 @@ fn build(cli: &Cli, cfg: &Config, scope: Scope) -> Result<Host, anyhow::Error> {
     })?;
 
     Ok(Host {
+        // The bearer gate, set by the caller for the HTTP transport. The
+        // stdio transport carries none: the pipe is the trust boundary, and a
+        // bearer there would be a credential the client cannot present.
+        bearer: None,
         combos,
         admission,
         ledger_path: dir.join(LEDGER_FILE),

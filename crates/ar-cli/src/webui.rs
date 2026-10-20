@@ -1796,7 +1796,15 @@ async fn provider_key(
             "check permissions on the env file",
         );
     }
-    if next != doc
+    // The env file is written FIRST, because that is what publishes the
+    // credential. So a config that does not change is not "nothing was
+    // written" here: the env file was. The response says so, and the note
+    // names the CONFIG rather than claiming nothing happened.
+    //
+    // The comparison is semantic (F8): the renderer emits block-style lists
+    // where a hand-written file uses flow-style, so a byte comparison would
+    // re-render the file on every paste of the same credential.
+    if !means_the_same(&doc, &next)
         && let Err(e) = commands::write_file(&ctx.config, &next)
     {
         return bad_request(
@@ -1804,7 +1812,13 @@ async fn provider_key(
             "the env value was set; fix the config write and retry",
         );
     }
-    Json(json!({ "ok": true, "var": var, "pending_restart": true })).into_response()
+    Json(json!({
+        "ok": true,
+        "var": var,
+        "pending_restart": true,
+        "note": "the credential was written to the env file",
+    }))
+    .into_response()
 }
 
 /// Upserts one `NAME=value` in the env file, 0600, preserving every other
@@ -2219,8 +2233,16 @@ async fn provider_custom(
         };
     }
     if means_the_same(&doc, &next) {
-        return Json(json!({ "ok": true, "pending_restart": false, "note": "identical" }))
-            .into_response();
+        // The CONFIG is unchanged. The env file may not be: the credential is
+        // written there first, because that is what publishes it. So "identical"
+        // would be a lie about the write path as a whole, and the note names
+        // the config and says what else happened.
+        let note = if key.is_empty() {
+            "identical"
+        } else {
+            "the config is unchanged; the credential was written to the env file"
+        };
+        return Json(json!({ "ok": true, "pending_restart": false, "note": note })).into_response();
     }
     if let Err(e) = commands::write_file(&ctx.config, &next) {
         return bad_request(
@@ -2827,7 +2849,7 @@ mod http_tests {
     }
 
     #[tokio::test]
-    async fn an_unmodelled_yaml_key_should_not_compare_equal() {
+    async fn an_unmodelled_yaml_key_is_not_compared() {
         // The limit on the "semantic" claim, stated as a test so it cannot
         // drift: `Config` does not deny unknown fields, so a YAML key the
         // struct does not model is dropped from both parses and is NOT

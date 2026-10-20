@@ -258,10 +258,10 @@ while the other half is still good.
 
 ## Phase 3 — The remaining code gaps (agent, in this order)
 
-**3.1 — A8: the panel's gate is resolved once at boot.** *(agent)* `GateState` is built
+**3.1 — A8: the panel's gate was resolved once at boot.** *(agent, LANDED 2026-10-20)* `GateState` was built
 in `serve` and held in an `Arc` for the process's life, so arming the gate
-while the proxy runs does not turn the panel's gate on, and breaking the
-master does not turn it `Broken`. — **LANDED 2026-10-20.**
+while the proxy ran did not turn the panel's gate on, and breaking the
+master did not turn it `Broken`.
 
 - The **safe** direction is already the one in place: a panel that stays
   unarmed for the life of the process is safer than a gate that turns itself
@@ -316,11 +316,10 @@ CSS-driven font requests are refused while a script's silence is admitted.
 - **Blocked on B1's ruling** (should `/ui` be public at all?). If the answer is
   "never public", A5's general form is moot and only the panel's copy matters.
 
-**3.3 — F8: a "no-op" write still rewrites the file.** *(agent)* `POST /ui/api/combos` is
+**3.3 — F8: a "no-op" write still rewrote the file.** *(agent, LANDED 2026-10-20)* The combos write endpoint is
 a whole-section replace and the YAML renderer emits block-style lists where the
 hand-written file used flow-style, so posting the config's own combo list
-changed 39 lines and the `identical` short-circuit (`webui.rs:1253` and three
-siblings) never fired. — **LANDED 2026-10-20.**
+changed 39 lines and the `identical` short-circuit never fired.
 
 - The fix is a **semantic comparison before the write**: parse both documents
   and compare the parsed `Config`, rather than comparing the rendered bytes.
@@ -359,16 +358,43 @@ one `http-gate` row each, different envelopes: `~/.config/ar/credentials.db`
   `ar.env`, and setting `AR_CRED_STORE` in the same edit means the store is
   unambiguous from the moment the new master lands.
 
-**3.5 — A6: the MCP HTTP transport has no bearer gate.** *(agent)* `aroute mcp --http`
-serves StreamableHTTP at `/mcp`, refuses a routable listener
-(`crates/ar-mcp/src/transport.rs:885`), and relies on rmcp's loopback
-`Host` allow-list. The loopback bind and the scope guard are the only controls.
+**3.5 — A6: the MCP HTTP transport had no bearer gate.** *(agent, LANDED 2026-10-20)* `aroute mcp --http`
+served StreamableHTTP at `/mcp`, refused a routable listener
+(`crates/ar-mcp/src/transport.rs:885`), and relied on rmcp's loopback
+`Host` allow-list. The loopback bind and the scope guard were the only controls.
 
 - Lower exposure than A1 (stdio is the default), but it is the same law
   (RG-001): a route that changes state needs a credential.
-- The fix is the same shape as the panel's: a bearer check on the HTTP
-  transport, using the **same** `Tokens` engine the rest of the system uses, so
-  one master governs all three surfaces.
+- **The scope is `execute:completions`** — the same scope `/v1` requires. The
+  MCP control plane **spends** (`ar_route_request` puts a request on the
+  wire), so it is the same act, and one token works on both planes. A separate
+  scope would mean a token minted for chat does not work here.
+- **The check is an axum middleware in front of rmcp**, so an unauthenticated
+  request is refused with a **401** and a `WWW-Authenticate: Bearer` header,
+  and the body is **not** an MCP response.
+- **The master is resolved ONCE, in `ar-cli`**, by the server's own precedence
+  (the store's gate row if it decrypts, else `AR_HTTP_MASTER_KEY`), and handed
+  in. A third resolver in `ar-mcp` would be a gate that could disagree with the
+  other two about which master is in force.
+- **The engine's salt does NOT have to match the server's**: the SIGNING key is
+  the master bytes themselves (`MasterKey::signing_key` returns `&self.master`).
+  A test mints with a **different** engine built the same way, to pin that.
+- **The revocation list is the same file** the server's gate consults, so a
+  token revoked for the proxy is revoked for the control plane.
+- **The listener is NOT widened.** The loopback refusal stands, because
+  whether the control plane should be reachable off-box is an operator
+  decision that has not been made (B1/Q7 is still open for `/ui`, and this is
+  the same question one layer down).
+- **An ungated host still serves** — the loopback install, where the socket's
+  bind is the trust boundary. The gate is off with a **loud** message when the
+  master is rejected, never silently.
+- **CI NOTE: the MCP tests are NOT in `cargo test --workspace`.** `ar-mcp`'s
+  `mcp` feature is off by default and `ar-cli`'s `ar-mcp` dependency is
+  `optional = true`, so the transport is not even compiled by the default
+  workspace pass. The MCP tests must be run with `--features mcp` explicitly.
+  Without that sentence, a reader who runs the default pass, sees green, and
+  concludes "the MCP gate is tested" would be wrong — and the 401 path is
+  exactly the kind of thing that silently stops being tested.
 
 **3.6 — D3: the Responses `function_call` item and four renderers.** *(agent)*
 Tool declarations, `tool_choice` and tool history already cross every dialect

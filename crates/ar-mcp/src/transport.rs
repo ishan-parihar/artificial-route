@@ -55,6 +55,7 @@ use ar_exec::{
 use ar_keys::Admission;
 use ar_route::{AutoCandidate, AutoCombo, AutoSelector, AutoVariant, Candidate, Strategy};
 use ar_tokens::Ledger;
+use axum::response::IntoResponse;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorCode, ErrorData,
     Implementation, JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
@@ -141,6 +142,79 @@ pub struct Host {
     pub audit: Audit,
     /// The key id the audit row attributes the call to. Never a secret.
     pub key_id: String,
+    /// The bearer gate for the HTTP transport, when one is configured.
+    ///
+    /// `None` means the HTTP transport is **not** served at all — the stdio
+    /// transport is the default and carries no bearer, because the pipe it
+    /// runs on is the trust boundary. The HTTP transport is different: it is a
+    /// socket, and a socket has a browser and other local users on the other
+    /// end of it.
+    ///
+    /// The engine is the **same** one `/v1` verifies against, and the
+    /// revocation list is the **same** `Arc`, so a token revoked for the proxy
+    /// is revoked for the control plane. A second gate that consulted a
+    /// second list would be a gate that disagreed with the data plane about
+    /// the same token.
+    pub bearer: Option<BearerGate>,
+}
+
+/// The HTTP transport's bearer gate.
+///
+/// One engine, one revocation list, one answer — the same objects `/v1`'s
+/// gate holds. The MCP plane **spends**: `ar_route_request` puts a request on
+/// the wire, so it is the same act as a completion and it carries the same
+/// scope requirement. A separate scope would mean a token minted for chat
+/// does not work here, and one minted here does not work there, for no gain.
+#[derive(Clone)]
+pub struct BearerGate {
+    /// The token engine.
+    pub tokens: Arc<ar_keys::Tokens>,
+    /// The revocation list, shared with `/v1`.
+    pub revocations: Option<Arc<ar_keys::Revocations>>,
+}
+
+impl BearerGate {
+    /// Verifies a bearer token, and names the key it spends against.
+    ///
+    /// # Errors
+    ///
+    /// A client-safe sentence. `ar-keys`' own `Display` for a bad signature, an
+    /// expiry, a revoked `jti` or a missing scope names which, and none of
+    /// them echoes the token.
+    pub fn verify(&self, token: &str) -> Result<String, String> {
+        let verified = self
+            .tokens
+            .verify(
+                token,
+                ar_keys::Scope::ExecuteCompletions,
+                self.revocations.as_deref(),
+            )
+            .map_err(|e| reason(&e))?;
+        Ok(verified.key_id)
+    }
+}
+
+/// Turns an `ar-keys` failure into a client-safe sentence.
+///
+/// The same mapping `/v1`'s gate uses, for the same reason: the control
+/// plane and the data plane must tell a client the same thing about the same
+/// token.
+fn reason(e: &ar_keys::KeyError) -> String {
+    match e {
+        ar_keys::KeyError::Expired => "this token has expired".to_owned(),
+        ar_keys::KeyError::Revoked { .. } => "this token has been revoked".to_owned(),
+        ar_keys::KeyError::ScopeDenied { needed, .. } => {
+            format!("this token lacks the {needed} scope")
+        }
+        // Everything else is a signature or shape problem, and distinguishing
+        // them for a caller who presented a bad token only helps them guess.
+        //
+        // This arm is LOAD-BEARING: a revocation table that cannot be read
+        // (a sqlite failure) lands here too, and lands here as a 401 rather
+        // than a 500. That is the right direction — a gate that cannot check
+        // must not admit.
+        _ => "this token is not valid".to_owned(),
+    }
 }
 
 impl Host {
@@ -887,7 +961,13 @@ pub async fn serve_http(host: Host, listener: tokio::net::TcpListener) -> Result
             "refusing to serve the control plane on {addr}: the HTTP transport is loopback only"
         )));
     }
-    let app = axum::Router::new().nest_service("/mcp", http_service(host));
+    let bearer = host.bearer.clone();
+    let app = axum::Router::new()
+        .nest_service("/mcp", http_service(host))
+        .layer(axum::middleware::from_fn(move |req, next| {
+            let bearer = bearer.clone();
+            async move { bearer_guard(bearer.as_ref(), req, next).await }
+        }));
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             // A failed signal read means no shutdown trigger; the server then runs
@@ -896,6 +976,80 @@ pub async fn serve_http(host: Host, listener: tokio::net::TcpListener) -> Result
         })
         .await
         .map_err(|e| Error::Transport(e.to_string()))
+}
+
+/// The bearer check, in front of the MCP service.
+///
+/// A middleware layer, so an unauthenticated request is refused **before**
+/// rmcp ever sees it — and with a 401 that is not an MCP response, because the
+/// client asked for a tool and got nothing.
+///
+/// The gate is the **same** one `/v1` uses: the same engine, the same scope,
+/// and the same revocation list. A token revoked for the proxy is revoked for
+/// the control plane, and a token that only carries `read:*` is refused here
+/// for the same reason `/v1` refuses it — the MCP plane spends.
+///
+/// `None` means no gate is configured, and the transport serves as it always
+/// did. That is the loopback install, and it is not a hole: the socket's
+/// loopback bind is the trust boundary there, exactly as it is for `/v1` on
+/// the same build. The bearer is **defence in depth** for the loopback case
+/// — a browser on the same host, a DNS-rebinding page, another local user.
+///
+/// The listener is **not** widened: the loopback refusal above stands, because
+/// whether the control plane should be reachable from off-box is an operator
+/// decision that has not been made.
+async fn bearer_guard(
+    gate: Option<&BearerGate>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let Some(gate) = gate else {
+        return next.run(req).await;
+    };
+    let Some(token) = bearer_token(req.headers()) else {
+        return unauthorized("this control plane needs a credential; mint one with `aroute keys mint`");
+    };
+    if let Err(reason) = gate.verify(token) {
+        return unauthorized(&reason);
+    }
+    next.run(req).await
+}
+
+/// The bearer a request presents, if any.
+fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    let raw = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
+    raw.strip_prefix("Bearer ")
+        .or_else(|| raw.strip_prefix("bearer "))
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+}
+
+/// The 401 the gate answers with.
+///
+/// `WWW-Authenticate: Bearer` is what tells a client this is an
+/// authentication problem rather than a transport one, and `no-store` keeps a
+/// refusal the browser may keep from also keeping a success.
+fn unauthorized(reason: &str) -> axum::response::Response {
+    // The body is built by `serde_json`, so the escaping is the library's job
+    // and a reason containing a quote cannot break the JSON.
+    let body = serde_json::json!({
+        "error": {
+            "type": "invalid_request_error",
+            "code": "credential_rejected",
+            "message": reason,
+        }
+    })
+    .to_string();
+    (
+        axum::http::StatusCode::UNAUTHORIZED,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/json"),
+            (axum::http::header::WWW_AUTHENTICATE, "Bearer"),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 /// The StreamableHTTP service over the catalog, with a fresh session per client.
@@ -973,6 +1127,9 @@ mod tests {
             scope: Scope::ALL,
             audit: crate::Audit::open(&scratch(name, "audit.redb")).expect("audit"),
             key_id: "k1".to_owned(),
+            // No bearer: the loopback install, where the socket's bind is the
+            // trust boundary. The gated case is covered by its own test.
+            bearer: None,
         }
     }
 
@@ -1394,5 +1551,189 @@ mod tests {
 
         let reply = String::from_utf8_lossy(&reply);
         assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    }
+
+    // ── the bearer gate ──────────────────────────────────────────────────
+
+    /// A gated host, and the engine that gates it.
+    ///
+    /// The engine is built from the master bytes with a **fresh salt**, and the
+    /// tokens it issues are minted by a **different** engine built the same
+    /// way. That is the property that matters: the SIGNING key is the master
+    /// bytes themselves (`MasterKey::signing_key` returns `&self.master`), so
+    /// the salt does not have to match — and a test that minted and verified
+    /// with the SAME engine would not notice if that ever stopped being true.
+    fn gated_host(name: &str, scopes: ar_keys::ScopeSet) -> (Host, String) {
+        let master = ar_keys::Secret::generate();
+        let engine = ar_keys::Tokens::new(
+            &ar_keys::MasterKey::new(master.to_owned_secret(), ar_keys::KeyMeta::generate())
+                .expect("master"),
+        );
+        // Minted by a DIFFERENT engine, built the same way from the same bytes.
+        let minter = ar_keys::Tokens::new(
+            &ar_keys::MasterKey::new(master.to_owned_secret(), ar_keys::KeyMeta::generate())
+                .expect("master"),
+        );
+        let token = minter
+            .issue(ar_keys::Issue {
+                key_id: "k1",
+                scopes,
+                device_id: None,
+                ttl: None,
+            })
+            .expect("issue")
+            .access;
+        let mut host = host(name);
+        host.bearer = Some(super::BearerGate {
+            tokens: Arc::new(engine),
+            revocations: None,
+        });
+        (host, token)
+    }
+
+    /// One `POST /mcp` against a served control plane, with an optional
+    /// bearer. Returns the status line and the body.
+    async fn post_mcp(
+        host: Host,
+        bearer: Option<&str>,
+    ) -> (String, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral loopback port");
+        let addr = listener.local_addr().expect("bound address");
+        let server = tokio::spawn(super::serve_http(host, listener));
+
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#;
+        let auth = match bearer {
+            Some(token) => format!("Authorization: Bearer {token}\r\n"),
+            None => String::new(),
+        };
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth}Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect to the server");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("send the request");
+        let mut reply = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stream.read_to_end(&mut reply),
+        )
+        .await
+        .expect("the server answers within 10s")
+        .expect("read the reply");
+        server.abort();
+
+        let reply = String::from_utf8_lossy(&reply).to_string();
+        let (status, body) = reply
+            .split_once("\r\n\r\n")
+            .map_or((reply.clone(), String::new()), |(head, body)| {
+                (head.to_owned(), body.to_owned())
+            });
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn a_gated_control_plane_should_refuse_a_request_with_no_bearer() {
+        // The refusal is a 401 with `WWW-Authenticate`, and the body is NOT an
+        // MCP response: the client asked for a tool and got nothing.
+        let (host, _) = gated_host("http-bearer-none", ar_keys::ScopeSet::all());
+        let (status, body) = post_mcp(host, None).await;
+        assert!(status.contains("401"), "{status}");
+        assert!(
+            status.to_lowercase().contains("www-authenticate: bearer"),
+            "the 401 must say what kind of credential is wanted: {status}"
+        );
+        assert!(
+            !body.contains("jsonrpc"),
+            "the refusal must not look like an MCP response: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gated_control_plane_should_admit_a_valid_bearer() {
+        // The token is minted by a DIFFERENT engine built from the same master
+        // bytes, so this also proves that the salt does not affect signing —
+        // the property the whole shared-engine design rests on.
+        let (host, token) = gated_host("http-bearer-valid", ar_keys::ScopeSet::all());
+        let (status, _) = post_mcp(host, Some(&token)).await;
+        assert!(status.contains("200"), "{status}");
+    }
+
+    #[tokio::test]
+    async fn a_gated_control_plane_should_refuse_a_read_only_token() {
+        // The MCP plane SPENDS — `ar_route_request` puts a request on the
+        // wire — so a `read:*` token is refused, exactly as `/v1` refuses it.
+        let (host, token) = gated_host(
+            "http-bearer-read-only",
+            ar_keys::ScopeSet::of([ar_keys::Scope::ReadAll]),
+        );
+        let (status, body) = post_mcp(host, Some(&token)).await;
+        assert!(status.contains("401"), "{status}");
+        assert!(
+            body.contains("scope"),
+            "the refusal must name the scope, so the operator knows what to mint: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gated_control_plane_should_refuse_a_revoked_token() {
+        // The shared revocation list: a token revoked for the proxy is revoked
+        // for the control plane too. Two lists would be two answers about the
+        // same token.
+        let dir = std::env::temp_dir().join(format!("ar-mcp-revoke-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let list = ar_keys::Revocations::open(&dir.join("credentials.db"), 64).expect("the list opens");
+
+        let master = ar_keys::Secret::generate();
+        let engine = ar_keys::Tokens::new(
+            &ar_keys::MasterKey::new(master.to_owned_secret(), ar_keys::KeyMeta::generate())
+                .expect("master"),
+        );
+        let minter = ar_keys::Tokens::new(
+            &ar_keys::MasterKey::new(master.to_owned_secret(), ar_keys::KeyMeta::generate())
+                .expect("master"),
+        );
+        let issued = minter
+            .issue(ar_keys::Issue {
+                key_id: "k1",
+                scopes: ar_keys::ScopeSet::all(),
+                device_id: None,
+                ttl: None,
+            })
+            .expect("issue");
+        list.revoke(&issued.session_id, issued.expires_at)
+            .expect("the revoke lands");
+
+        let mut host = host("http-bearer-revoked");
+        host.bearer = Some(super::BearerGate {
+            tokens: Arc::new(engine),
+            revocations: Some(Arc::new(list)),
+        });
+
+        let (status, body) = post_mcp(host, Some(&issued.access)).await;
+        assert!(status.contains("401"), "{status}");
+        assert!(
+            body.contains("revoked"),
+            "the refusal must say the token was revoked, not that it was invalid: {body}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_ungated_control_plane_should_still_answer() {
+        // The loopback install: no gate configured, and the transport serves as
+        // it always did. This is what keeps the default install working.
+        let (status, _) = post_mcp(host("http-bearer-ungated"), None).await;
+        assert!(status.contains("200"), "{status}");
     }
 }
