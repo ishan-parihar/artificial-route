@@ -1,6 +1,8 @@
 # Artificial Route
 
-**One OpenAI-compatible endpoint over 276 providers — a static binary that idles at ~28 MiB serving the full catalog.** [![release](https://img.shields.io/github/v/release/ishan-parihar/artificial-route)](https://github.com/ishan-parihar/artificial-route/releases) [![license](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE) [![musl](https://img.shields.io/badge/binary-static--musl-lightgrey)](https://github.com/ishan-parihar/artificial-route/releases) ![tests](https://img.shields.io/badge/tests-2021_passing-brightgreen) A minimal-RAM Rust port of the [OmniRoute](https://github.com/ishan-parihar/OmniRoute) gateway core: same combos, strategies and dialects, none of the desktop. File YAML in, SSE out — no runtime dependencies. A small built-in control page at [`/ui`](#control-page-ui) edits the same YAML; the full OmniRoute dashboard is an optional extra.
+[![release](https://img.shields.io/github/v/release/ishan-parihar/artificial-route)](https://github.com/ishan-parihar/artificial-route/releases) [![license](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE) [![musl](https://img.shields.io/badge/binary-static--musl-lightgrey)](https://github.com/ishan-parihar/artificial-route/releases) ![tests](https://img.shields.io/badge/tests-2298_passing-brightgreen)
+
+**One OpenAI-compatible endpoint over 276 providers — a static binary that idles at ~28 MiB serving the full catalog.** A minimal-RAM Rust port of the OmniRoute gateway core: same combos, strategies and dialects, none of the desktop. File YAML in, SSE out — no runtime dependencies. A small built-in control page at `/ui` edits the same YAML; the full OmniRoute dashboard is an optional extra.
 
 Every document in `docs/` is listed with the question it answers in [docs/PAGE-INDEX.md](docs/PAGE-INDEX.md).
 
@@ -85,7 +87,7 @@ Nothing is claimed that is not checked: a failed start is reported as such, and 
 
 ## Running it
 
-The dashboard is a vendored, rebranded build of the OmniRoute front end: `aroute dashboard` starts the compiled UI as a supervised Node child, resolving the dist from `--path`, `$AR_DASHBOARD_DIR`, beside the binary, or the `--with-dashboard` install location (`~/.config/ar/dashboard`) — no flags needed after an install. `dashboard/rebrand-dist.sh` is the one-step rebuild path (pull upstream → `npm ci` → build → rebrand); refresh an installed dist by re-running the installer with `--with-dashboard`. Detail lives in [docs/14-web-ui-port-plan.md](docs/14-web-ui-port-plan.md).
+The dashboard is a vendored, rebranded build of the [OmniRoute](https://github.com/ishan-parihar/OmniRoute) front end: `aroute dashboard` starts the compiled UI as a supervised Node child, resolving the dist from `--path`, `$AR_DASHBOARD_DIR`, beside the binary, or the `--with-dashboard` install location (`~/.config/ar/dashboard`) — no flags needed after an install. `dashboard/rebrand-dist.sh` is the one-step rebuild path (pull upstream → `npm ci` → build → rebrand); refresh an installed dist by re-running the installer with `--with-dashboard`. Detail lives in [docs/14-web-ui-port-plan.md](docs/14-web-ui-port-plan.md).
 
 The install already puts `aroute` on a systemd unit, so on a box with systemd the proxy is already running — `curl -s localhost:20128/healthz` answers before you type anything. The commands above are for the no-systemd case, or for running a second instance in the foreground. One-shot without a server at all:
 `aroute run -m cheap -p 'hello'`.
