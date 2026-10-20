@@ -1,5 +1,9 @@
 # The VPS config change, and why each number is that number
 
+**Status: deployed and verified, 2026-10-20.** Owner: this doc, for the
+*configuration* the VPS runs. The design and the engine behind it are
+[`docs/32-per-model-token-budgets.md`](32-per-model-token-budgets.md).
+
 Measured 2026-10-20 from `~/.config/ar/usage.sqlite` on `racknerd`, the
 `racknerd-harness` key, all time:
 
@@ -93,3 +97,46 @@ minimax at 4.84 B against its own 5 B ceiling — also under. So the key
 
 Step 5 is the one that proves the new behaviour rather than the old: a 402
 there would mean the failover did not happen.
+
+## What happened (the record)
+
+**Deployed 2026-10-20, 13:44 IST.** `aroute` **v0.1.20** installed from the
+release asset (never a local build — ledger C1), the binary verified
+`static-pie linked`, the service restarted, and the config written by
+`aroute limits set`.
+
+| # | check | result |
+|---|---|---|
+| 1 | `aroute --version` on the VPS | `aroute 0.1.20` |
+| 2 | `file -b ~/.local/bin/aroute` | `ELF 64-bit LSB pie executable, … static-pie linked` |
+| 3 | `systemctl --user is-active aroute` | `active` |
+| 4 | `curl /healthz` | `200` |
+| 5 | the `limits:` block in the file | the four `model_tokens` entries and `spend_window: 24h`, exactly as above |
+| 6 | a real `POST /v1/chat/completions` on `glm-5.3` | **200**, `x-ar-decision: …;provider=nvidia;model=z-ai/glm-5.3` |
+| 7 | the same through the **public** endpoint | **200**, same decision header |
+| 8 | the **failover probe** | `model_tokens["nvidia/z-ai/glm-5.3"]` set to `1` (the current spend is already past it) → the request was **served by `minimax`**, not refused: `x-ar-decision: …;provider=kilocode;model=minimax/minimax-m3.1-flash:free` |
+| 9 | the ceiling restored to `500000000` and the service restarted | the config reads back as above |
+| 10 | 402s in the failure log | **8 in the 10 minutes before** the fix, **0 after**; 27 successful requests through the key since |
+
+**Step 8 is the one that matters.** A 402 there would have meant the failover
+did not happen, and the fix would have been "the key serves again" rather
+than "a model that spends its budget hands the request to a sibling".
+
+### The incident, closed
+
+The key was refused for every request because its lifetime spend had passed
+a lifetime ceiling. It now serves, and the ceilings are **daily rates**: the
+key-wide `6 B` and minimax's own `5 B` are measured over a rolling 24 h
+window, so the key is inside its budget again once the old spend ages out,
+and the next day's burn is bounded rather than merely observed.
+
+### A note on the panel
+
+The deployed binary also carries the `/ui` gate (v0.1.19 and later). Measured
+on the public endpoint after the install: an anonymous
+`POST /ui/api/keys/mint` returns **401** `credential_rejected`, where the
+2026-10-19 build returned **200** and a spendable token. The cloudflared
+ingress rule (the `/ui` → 404 block) is still **not** applied — the tunnel
+process has not been restarted since the rule was written — so the panel is
+reachable but **credentialed**, not closed at the tunnel. The operator's
+`sudo systemctl restart cloudflared` still closes it at the tunnel.
