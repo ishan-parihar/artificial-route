@@ -64,8 +64,10 @@ still degrades to `context-relay`. The signal needs the cache layer to publish t
 prefix length it already computes — a change to `ar-cache`, not to the router.
 
 **Not yet deployed.** The routing work is committed on `main` but the VPS still runs
-`v0.1.17`; it ships with the next release (register `OPS-01` — 14 commits were already
-unreleased before this, so the release carries both). The live smoke that proved the
+`v0.1.17`; it ships with the next release (register `OPS-01` — **39 commits** are
+unreleased as of 2026-10-20, measured with `git rev-list --count v0.1.17..HEAD`, so
+the release carries the routing work, the provider-discovery work and the whole `/ui`
+pass). The live smoke that proved the
 fixes ran against a **scratch instance** over the operator's own config and keys, not
 against the deployed proxy.
 

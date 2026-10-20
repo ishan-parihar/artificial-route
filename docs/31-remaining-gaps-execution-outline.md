@@ -20,9 +20,10 @@ Dated-frozen: published `2026-10-20`. A plan that changes is a new plan.
 ## The shape of the remaining work
 
 There are **nine** open items. They are not nine pieces of work of the same
-size, and treating them as one queue is what produced the two-month-old
-unreleased commits. They fall into four shapes, and the shape dictates who acts
-and in what order:
+size, and treating them as one queue is what produced a release that sat
+**23 hours** behind `main` (the `v0.1.17` tag is 2026-10-19 07:16; the repo
+itself is three weeks old, not months). They fall into four shapes, and the
+shape dictates who acts and in what order:
 
 | shape | rows | who | blocking? |
 |---|---|---|---|
@@ -30,6 +31,31 @@ and in what order:
 | **Code — a defined change, no ruling needed** | A7, A8, A5, F8, UI-08 | agent | no, but A7 is the lever for A2 |
 | **Decide — needs the operator's ruling first** | B1, B3, B5, B2 | operator | B1 blocks A5 and B5 |
 | **Probe — needs evidence, not code** | E1, E2, C3, C4, D2 | agent, after a release | waits on the release |
+
+**Every item below says who owns it.** "agent" means an agent can execute it
+end to end from the repo. "operator" means it needs a hand on the VPS, a
+credential, or a ruling — an agent can prepare it but not finish it. "blocked"
+means the item is real and named but cannot start; the text says on what.
+
+### The ordering constraints that are not obvious
+
+Four of these are **orders, not tasks**, and a flat list of the same items
+would get them executed wrongly:
+
+1. **A1 → A2 is an order, not two tasks.** Restarting the tunnel closes the
+   **door**; rotating the master kills the **keys already handed out**.
+   Rotating first leaves a window where the door is still open, so a fresh
+   30-day token can still be minted — and the rotation then kills it too,
+   having rotated for nothing. Restart first, then rotate.
+2. **A7, A8 and A6 are carried by the release (C1), not done before it.**
+   They are code in the same binary as the panel's gate, so they cannot ship
+   ahead of it. Phase 1 (the release) therefore comes **before** Phase 2 and
+   Phase 3's server-side work — but **after** Phase 0, because Phase 0 needs no
+   release and the exposure is live now.
+3. **A8 depends on A7's mechanism.** Both need a per-request store read. Doing
+   A7 first means that read is already built, opened once and shared.
+4. **A5's general form depends on B1's ruling.** If `/ui` is never public, the
+   general `loopback_only` change is moot and only the panel's copy matters.
 
 **The one thing that is true today and was not true yesterday:** the exposure is
 **live and it is not a code problem**. Measured 2026-10-20 against
@@ -50,7 +76,9 @@ problem is that it is **not running**.
 ## Phase 0 — Close the exposure (operator, minutes, do this first)
 
 This phase is **operations, not code**, and it does not need a release. It is
-the whole of the difference between an open panel and a closed one.
+the whole of the difference between an open panel and a closed one. Every step
+is the **operator's** — an agent can run the checks but the restart and the
+rotation need the VPS.
 
 | step | command | acceptance |
 |---|---|---|
@@ -81,8 +109,15 @@ tokens minted before the rotation answer **401**.
 
 ## Phase 1 — Ship what is already written (agent, then operator)
 
-The panel work is **committed and unpushed**. Seven commits sit on `main` ahead
-of the `v0.1.17` tag, and the release path is written down and tested:
+The panel work is **committed and unpushed**. The release scope is **39
+commits** ahead of the `v0.1.17` tag (`git rev-list --count v0.1.17..HEAD`;
+the tag is annotated, so it resolves to the commit `5045a3b` `chore(release):
+v0.1.17`, not to the tag object's own hash), of which **8** are not yet pushed
+to `origin/main`. That number is the release's blast radius, not this
+session's: the unreleased range starts at `0bbaa22` (the installer and the
+default config) and includes the provider-discovery work, not only the panel.
+**Steps 1.1-1.4 are the agent's; 1.5-1.7 are the operator's**, because the
+release publishes an artefact and the install touches the VPS.
 
 | step | action | gate |
 |---|---|---|
@@ -93,7 +128,6 @@ of the `v0.1.17` tag, and the release path is written down and tested:
 | **1.5** | `.github/workflows/release.yml` builds and publishes | the musl asset is on the release |
 | **1.6** | install on the VPS from the **release asset** | `aroute --version` reports `0.1.18` |
 | **1.7** | re-verify the panel | the public `/ui` now needs a token: an unauthenticated `/ui/api/state` → **401** |
-
 **Never scp a locally built binary** (ledger C1). The local release build
 links glibc 2.39 and the VPS has glibc 2.36; the 2026-10-19 incident came from
 doing exactly that. `docs/RUNBOOK.md` has the install recipe, including the
@@ -112,7 +146,7 @@ is good for its whole lifetime and the only remedy is rotating the master,
 which invalidates every legitimate token at once. The machinery is already
 built and tested — it is simply not reachable.
 
-**2.1 — the CLI subcommand.** `aroute keys revoke <token>` writes the token's
+**2.1 — the CLI subcommand.** *(agent)* `aroute keys revoke <token>` writes the token's
 `jti` into the revocation store.
 
 - The store is `Revocation::open(path, cap)` (`crates/ar-keys/src/revoke.rs:49`),
@@ -128,7 +162,7 @@ built and tested — it is simply not reachable.
   store's path is `commands::store_path` (`crates/ar-cli/src/commands.rs:113`),
   which honours `$AR_CRED_STORE` and otherwise resolves beside the config.
 
-**2.2 — the server consults it.** Both gates must, **together**:
+**2.2 — the server consults it.** *(agent)* Both gates must, **together**:
 
 - `/v1`: `AuthGate::verify` (`crates/ar-server/src/keys.rs:253`) calls
   `introspect` and never checks the list. It must call
@@ -145,7 +179,7 @@ of every `/v1` request. **Measure it before shipping**: the release already has
 a bench harness (ledger C3's `scripts/soak.sh`), and the gate's own cost is
 the number that decides whether the lookup is acceptable.
 
-**2.3 — the panel's mint default.** `--ttl-days 30` is the current default and
+**2.3 — the panel's mint default.** *(agent)* `--ttl-days 30` is the current default and
 `--ttl-days 0` mints a token that **never expires**. A panel that mints
 30-day credentials by default is a panel that hands out long-lived secrets to
 whoever reaches it. The panel's mint should default to the **CLI's shortest
@@ -159,7 +193,7 @@ the panel's mint default is shorter and says so.
 
 ## Phase 3 — The remaining code gaps (agent, in this order)
 
-**3.1 — A8: the panel's gate is resolved once at boot.** `GateState` is built
+**3.1 — A8: the panel's gate is resolved once at boot.** *(agent)* `GateState` is built
 in `serve` and held in an `Arc` for the process's life, so arming the gate
 while the proxy runs does not turn the panel's gate on, and breaking the
 master does not turn it `Broken`.
@@ -175,7 +209,7 @@ master does not turn it `Broken`.
 - **Do it after 2.2**, not before. Doing 2.2 first means the per-request store
   read is already built and paid for.
 
-**3.2 — A5: `loopback_only` refuses what a browser sends.** The rule refuses a
+**3.2 — A5: `loopback_only` refuses what a browser sends.** *(agent, after B1)* The rule refuses a
 request whose `Host` **or** `Origin` names a non-loopback authority
 (`crates/ar-server/src/app.rs:680-701`). The tunnel rewrites `Host` to
 loopback but forwards `Origin`, so a browser's cross-origin `fetch()` and its
@@ -192,7 +226,7 @@ CSS-driven font requests are refused while a script's silence is admitted.
 - **Blocked on B1's ruling** (should `/ui` be public at all?). If the answer is
   "never public", A5's general form is moot and only the panel's copy matters.
 
-**3.3 — F8: a "no-op" write still rewrites the file.** `POST /ui/api/combos` is
+**3.3 — F8: a "no-op" write still rewrites the file.** *(agent)* `POST /ui/api/combos` is
 a whole-section replace and the YAML renderer emits block-style lists where the
 hand-written file used flow-style, so posting the config's own combo list
 changed 39 lines and the `identical` short-circuit (`webui.rs:1253` and three
@@ -208,7 +242,7 @@ siblings) never fired.
   `PartialEq` but **not** `Eq` — so the comparison is `==` on `PartialEq`, and
   no `Hash` is needed.
 
-**3.4 — UI-08: rule the canonical credential store on the VPS.** Two stores,
+**3.4 — UI-08: rule the canonical credential store on the VPS.** *(operator, folded into Phase 0.6)* Two stores,
 one `http-gate` row each, different envelopes: `~/.config/ar/credentials.db`
 (what `serve` opens, because `store_path` resolves beside the config) and
 `~/credentials.db` (what a shell whose CWD is `$HOME` opens).
@@ -222,7 +256,7 @@ one `http-gate` row each, different envelopes: `~/.config/ar/credentials.db`
   `ar.env`, and setting `AR_CRED_STORE` in the same edit means the store is
   unambiguous from the moment the new master lands.
 
-**3.5 — A6: the MCP HTTP transport has no bearer gate.** `aroute mcp --http`
+**3.5 — A6: the MCP HTTP transport has no bearer gate.** *(agent)* `aroute mcp --http`
 serves StreamableHTTP at `/mcp`, refuses a routable listener
 (`crates/ar-mcp/src/transport.rs:885`), and relies on rmcp's loopback
 `Host` allow-list. The loopback bind and the scope guard are the only controls.
@@ -233,10 +267,29 @@ serves StreamableHTTP at `/mcp`, refuses a routable listener
   transport, using the **same** `Tokens` engine the rest of the system uses, so
   one master governs all three surfaces.
 
+**3.6 — D3: the Responses `function_call` item and four renderers.** *(agent)*
+Tool declarations, `tool_choice` and tool history already cross every dialect
+that has them. Two pieces remain: the inbound **Responses `function_call`
+item** is refused (`UnsupportedPart`, a 400 for the whole request), and the
+**Ollama, cursor, clova and kiro** renderers emit neither declarations nor
+calls.
+
+- The code is in `crates/ar-translate/src/translate.rs`, and it is the same
+  shape as the work that already landed: a canonical `ToolCall` in the middle
+  and a per-dialect renderer at the edge.
+- The inbound `function_call` is the **request** side, so it is the harder
+  half: the canonical form has to be produced from a Responses item that the
+  other dialects never send.
+- This is the one Phase 3 item that is **not** a gate or a control. It is
+  ordinary feature work, and it is scheduled here only because the ledger
+  keeps it open. If Phase 0-3.5 is done and this is not, the panel work is
+  still complete — this row is a separate feature, not part of the exposure.
+
 **Phase 3 gate:** the panel's gate is live (armed or broken, seen per request);
 `loopback_only` ignores `Origin` when `Host` is loopback; a no-op write leaves
 the file byte-identical; one credential store exists and `AR_CRED_STORE` names
-it; `/mcp` needs a bearer.
+it; `/mcp` needs a bearer; a Responses `function_call` item is accepted rather
+than refused.
 
 ---
 
@@ -283,6 +336,9 @@ discussed in the phases above because other work depends on them, and are
 listed in Phase 6 with the rest so nothing is left implicit. **Eleven** are
 named only here, each with why it is not scheduled. A row that is silently
 absent is the failure mode this doc exists to prevent.
+
+**Three rows are "partly built" rather than open** — A4, D3 and D4 — and all
+three are named above: A4 in Phase 3.4, D3 in Phase 3.6, D4 in Phase 6.1.
 
 ### 6.1 — Provider-dependent: no credential, no work
 

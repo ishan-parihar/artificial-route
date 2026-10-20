@@ -100,11 +100,16 @@ paint stripped from the URL); U2's four states, persistent errors, and the
 write that re-reads; U3's four new views; U4's settings pane over the
 yaml-backed sections; U5's craft pass.
 
-**Still the operator's:** U0's `AR-2` (the cloudflared ingress 404) — staged
-on the VPS, needs a **root** `systemctl restart cloudflared`. Until it runs,
-the public `/ui` is **gated** rather than **open**, which is a different
-thing and a smaller one. `UI-08` (which credential store is canonical) is
-also the operator's ruling.
+**Still the operator's:** U0's `AR-2` (the cloudflared ingress 404) — the
+rule is **written and validated** on the VPS (`ingress validate` → OK), but
+inert, because the `cloudflared` process started before the edit and reads its
+ingress rules at startup. It needs a **root** `systemctl restart cloudflared`.
+**Until it runs, the deployed panel is ungated, not "gated rather than open"**:
+the VPS runs the pre-fix build, and an anonymous mint was measured live on
+2026-10-20 returning a spendable token. The operator's steps, in order, are
+in `docs/31` Phase 0 — restart the tunnel, then rotate the master (the
+restart closes the door; the rotation kills the keys already handed out).
+`UI-08` (which credential store is canonical) is also the operator's ruling.
 
 **The gates, as measured:** clippy clean; **2251** workspace tests green;
 **20** probe runs (ten views x two bands x three widths) at **0 FAIL, 0
