@@ -3,7 +3,9 @@
 Status: **built, 2026-10-20.** Owner: this doc, for the *shape* of the feature.
 Companions: [`docs/28-gap-ledger.md`](28-gap-ledger.md) (the state of every open
 item), [`docs/15-policy-security-layer.md`](15-policy-security-layer.md) (the
-policy layer's decision record), `TODO.md` (the register).
+policy layer's decision record),
+[`docs/33-vps-limits-config.md`](33-vps-limits-config.md) (the ceilings the VPS
+actually runs, and the measurements they came from), `TODO.md` (the register).
 
 ---
 
