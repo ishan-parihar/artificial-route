@@ -45,39 +45,9 @@ pub const OBS_DIR_VAR: &str = "AR_OBS_DIR";
 /// cannot be opened" are different problems, and collapsing them into
 /// "unarmed" would silently reopen the panel on a box whose operator
 /// believes it is closed.
-/// The panel's gate state, and the revocation list it consults.
 ///
-/// One `Arc` for the whole process. The panel's gate and `/v1`'s gate must
-/// consult the **same** list: a token revoked through the panel has to be
-/// dead on `/v1` too, and two handles on the same file would be two sqlite
-/// connections with two independent read snapshots — able to disagree about a
-/// just-revoked `jti` for the length of a transaction.
-fn gate_state(cli: &Cli, revocations: Option<&Arc<ar_keys::Revocations>>) -> webui::auth::GateState {
-    let Some(store) = commands::credential_store(cli) else {
-        return webui::auth::GateState::Unarmed;
-    };
-    match commands::gate_master(&store) {
-        Ok(None) => webui::auth::GateState::Unarmed,
-        Ok(Some(master)) => {
-            // The token engine needs a `MasterKey`, and the master bytes are
-            // what it signs with (`MasterKey::signing_key` returns the master
-            // itself), so this is the same key the server's `/v1` gate
-            // verifies against.
-            match ar_keys::MasterKey::new(
-                master.to_owned_secret(),
-                ar_keys::KeyMeta::generate(),
-            ) {
-                Ok(master) => webui::auth::GateState::Armed(
-                    ar_keys::Tokens::new(&master),
-                    revocations.cloned(),
-                ),
-                Err(e) => webui::auth::GateState::Broken(e.to_string()),
-            }
-        }
-        Err(e) => webui::auth::GateState::Broken(e.to_string()),
-    }
-}
-
+/// The live gate that implements this is [`webui::livegate::LiveGate`].
+///
 /// Builds the server components from File-mode config.
 ///
 /// `want = None` serves every configured combo; the listener resolves the
@@ -294,13 +264,10 @@ pub async fn serve(cli: &Cli, args: &ServeArgs) -> anyhow::Result<()> {
     // sqlite connection — `components` keeps its own, and sqlite takes
     // concurrent readers.
     //
-    // The gate is resolved ONCE, into a `GateState`, and that value is the
-    // only thing the panel reads its armed-badge from. The old shape computed
-    // the badge from a separate `gate_master` call and the gate from another,
-    // and the two could disagree — a store that opened for one and not the
-    // other produced a badge saying "unarmed" on a panel that was refusing
-    // every request, which is the exact confusion this panel exists to
-    // remove.
+    // The gate is resolved **per request** (A8), and both the badge and the
+    // guard read that one value — the old shape computed the badge from a
+    // separate `gate_master` call and the gate from another, and the two could
+    // disagree, which is the exact confusion this panel exists to remove.
     let mut ui_ctx = webui::Ctx::new(
         cli.config.clone(),
         built.ledger.clone(),
@@ -313,7 +280,23 @@ pub async fn serve(cli: &Cli, args: &ServeArgs) -> anyhow::Result<()> {
     // ungated", so the operator believes the gate is on while it is not. The
     // panel's answer to that is what `GateState::Broken` is for — reads
     // degrade, writes refuse.
-    ui_ctx.set_gate(gate_state(cli, revocations.as_ref()));
+    //
+    // The LIVE gate resolves the same state **per request**: arming the gate
+    // while the proxy runs turns the panel's gate on, and breaking the master
+    // turns it `Broken`. The master is re-derived only when the gate row's
+    // ciphertext changes, so the cost of a request that changes nothing is
+    // one sqlite point read.
+    //
+    // The env master is the **server's own resolved** one —
+    // `built.config.http_master_key` — not a second read of the variable.
+    // The server's decoder owns the encoding rules, and a second decoder that
+    // disagreed with it would be a gate that works on one surface and not the
+    // other. An environment variable cannot change under a running process,
+    // so it is captured once.
+    let env_master = built.config.http_master_key.as_ref().map(|s| s.to_owned_secret());
+    if let Some(live) = ui_ctx.live_gate(revocations.clone(), env_master) {
+        ui_ctx.set_live_gate(live);
+    }
 
     let server = ar_server::server(built);
     let count = server.state.config.providers.len();

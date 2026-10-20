@@ -29,6 +29,7 @@
 //! the restart command until `ConfigHandle::watch` is attached (docs/16 P2).
 
 pub mod auth;
+mod livegate;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -94,16 +95,27 @@ pub struct Ctx {
     ledger: Option<Arc<Mutex<ar_tokens::Ledger>>>,
     /// The encrypted credential store behind the gate. rusqlite connections
     /// are `Send` but not `Sync`, so the one connection rides a mutex.
-    store: Option<Mutex<ar_keys::CredentialStore>>,
-    /// The panel's own gate, resolved at boot. `Unarmed` on a box that never
-    /// armed one, `Armed` when the row decrypts, `Broken` when it does not —
-    /// and `Broken` is the arm that refuses writes.
+    /// The credential store, when the host has one.
     ///
-    /// The **only** source of the panel's armed-badge: the badge used to be
-    /// computed from a second `gate_master` call, and two calls could
-    /// disagree — a badge saying "unarmed" on a panel that was refusing every
-    /// request. One value, one source, no way to disagree.
+    /// An `Arc` because the **request path** reads it: the live gate reads
+    /// the gate row's envelope on every API call, and the mint handler and
+    /// the health view read it too. One connection and one lock, shared —
+    /// two connections would be two read snapshots that could disagree about
+    /// a just-written gate row.
+    store: Option<Arc<Mutex<ar_keys::CredentialStore>>>,
+    /// The **pinned** gate state.
+    ///
+    /// The live gate ([`Ctx::live_gate`]) is what the shipped path uses; this
+    /// is the fallback for a host with neither a store nor an env master, and
+    /// the handle a test uses to hold a gate still.
+    ///
+    /// It is **not** the panel's only source of the armed-badge any more —
+    /// the live gate is — and keeping the two apart is what stops a badge and
+    /// a guard from disagreeing.
     gate: Arc<auth::GateState>,
+    /// The live gate: resolved per request, re-derived only when the gate
+    /// row's ciphertext changes.
+    live_gate: Option<Arc<livegate::LiveGate>>,
     /// The server's live resilience table, so the resilience view reports the
     /// resolver's actual state rather than a guess read from the config.
     resilience: Arc<Resilience>,
@@ -154,8 +166,9 @@ impl Ctx {
             env,
             boot_text,
             ledger,
-            store: store.map(Mutex::new),
+            store: store.map(|s| Arc::new(Mutex::new(s))),
             gate: Arc::new(auth::GateState::Unarmed),
+            live_gate: None,
             resilience: Arc::new(Resilience::new()),
             providers: Vec::new(),
             settings: ServerSettings::default(),
@@ -168,21 +181,41 @@ impl Ctx {
     /// there is no second copy of the fact to fall out of step.
     #[must_use]
     pub fn gate_armed(&self) -> bool {
-        self.gate.is_armed()
+        self.gate().is_armed()
     }
 
     /// The gate's state, as the page names it: the label and the badge class.
     #[must_use]
     pub fn gate_badge(&self) -> (&'static str, &'static str) {
-        auth::gate_badge(&self.gate)
+        auth::gate_badge(&self.gate())
     }
 
     /// The reason the gate is broken, when it is.
     #[must_use]
-    pub fn gate_broken_reason(&self) -> Option<&str> {
-        match self.gate.as_ref() {
+    pub fn gate_broken_reason(&self) -> Option<String> {
+        match self.gate() {
             auth::GateState::Broken(reason) => Some(reason),
             _ => None,
+        }
+    }
+
+    /// The gate's state, resolved **now**.
+    ///
+    /// A8: the state used to be resolved once at boot, so a gate armed or
+    /// broken after boot was not seen. It is resolved per call now, and the
+    /// cost is one sqlite point read: the master is re-derived only when the
+    /// gate row's ciphertext has actually changed.
+    ///
+    /// The badge and the guard both go through this, so they cannot disagree —
+    /// which was the defect the old shape had.
+    ///
+    /// The fallback is the **pinned** state, which is what a test uses to hold
+    /// a gate still. The live gate covers every shipped case: a store host
+    /// and an env-only host both build one.
+    pub fn gate(&self) -> auth::GateState {
+        match &self.live_gate {
+            Some(live) => live.resolve(),
+            None => self.gate.as_ref().clone(),
         }
     }
 
@@ -209,20 +242,77 @@ impl Ctx {
         self.settings = settings;
     }
 
-    /// The panel's gate state, set once the credential store has been read.
+    /// Pins the gate state.
     ///
-    /// Three arms, and the arm is decided by *decrypting* the gate row rather
-    /// than by finding its name: a row that will not open is a broken gate,
-    /// and a broken gate refuses writes.
+    /// The **live** gate ([`Self::live_gate`]) is what the shipped path uses;
+    /// this is the fallback for a host with neither a store nor an env master,
+    /// and the handle a test uses to hold a gate still. It is **not** the
+    /// panel's only source of the armed-badge any more — the live gate is —
+    /// and keeping the two apart is what stops a badge and a guard from
+    /// disagreeing.
+    ///
+    /// ponytail: `#[cfg(test)]` on the method would be a lie — the fallback is
+    /// also the no-store-and-no-env path, which is a shipped configuration.
+    /// The *production* caller does not set it, so the warning is about the
+    /// method being reachable only from the test fixture, which is exactly
+    /// what it is for.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the test fixture pins the gate"))]
     pub fn set_gate(&mut self, gate: auth::GateState) {
         self.gate = Arc::new(gate);
+    }
+
+    /// Arms the **live** gate: the state is resolved per request, and the
+    /// master is re-derived only when the gate row's ciphertext changes.
+    ///
+    /// This is the fix for A8. The boot-time [`Self::set_gate`] remains for
+    /// the tests that want a fixed state, and for the case where there is no
+    /// store at all.
+    pub fn set_live_gate(&mut self, live: Arc<livegate::LiveGate>) {
+        self.live_gate = Some(live);
+    }
+
+    /// The live gate, built over the store this context already holds.
+    ///
+    /// The live gate is built **whether or not there is a store**: the store
+    /// is where the gate row lives, and the env master is the fallback when
+    /// the row is absent or unreadable. A host with no store but with
+    /// `AR_HTTP_MASTER_KEY` has a working gate on `/v1`, and the panel must
+    /// agree — so it gets a live gate with no store and the env master.
+    ///
+    /// The store is **shared**, not opened twice: the panel's gate and the
+    /// revocation table live in the same file, and two connections would be
+    /// two read snapshots that could disagree.
+    ///
+    /// `env_master` is the **server's own resolved** master — the same bytes
+    /// `/v1`'s gate verifies against, read through the server's decoder. It
+    /// is the fallback when the store's gate row is absent or unreadable,
+    /// which is what keeps the two surfaces from disagreeing.
+    #[must_use]
+    pub fn live_gate(
+        &self,
+        revocations: Option<Arc<ar_keys::Revocations>>,
+        env_master: Option<ar_keys::Secret>,
+    ) -> Option<Arc<livegate::LiveGate>> {
+        // No store and no env master means there is no gate anywhere, and the
+        // boot-time resolution is the whole story.
+        if self.store.is_none() && env_master.is_none() {
+            return None;
+        }
+        Some(Arc::new(livegate::LiveGate::new(
+            self.store.clone(),
+            env_master,
+            revocations,
+        )))
     }
 }
 
 /// The `/ui` routes on top of the proxy's router. `app()` has already
 /// applied its own state, so the merge is a plain stateless join.
 pub fn mount(proxy: Router, ctx: Ctx) -> Router {
-    let gate = Arc::clone(&ctx.gate);
+    // ONE `Arc<Ctx>`, shared by the router's state and the guard's layer.
+    // Two `Ctx` values would mean two store connections and two live gates,
+    // and the two could disagree about which tokens are revoked.
+    let ctx = Arc::new(ctx);
     let ui = Router::new()
         .route("/ui", get(page))
         // Trailing-slash entries redirect instead of falling through to the
@@ -247,7 +337,7 @@ pub fn mount(proxy: Router, ctx: Ctx) -> Router {
         .route("/ui/api/provider-remove", post(provider_remove))
         .route("/ui/api/keys/mint", post(mint_key))
         .route("/ui/api/limits", post(set_limits))
-        .with_state(Arc::new(ctx));
+        .with_state(Arc::clone(&ctx));
     // One guard for the whole panel, and it is NOT the proxy's `loopback_only`.
     //
     // `loopback_only` refuses a request whose `Origin` names a non-loopback
@@ -269,10 +359,13 @@ pub fn mount(proxy: Router, ctx: Ctx) -> Router {
     // The static assets carry no data, so they get the `Host` check and
     // nothing else — refusing a font because a browser attached an `Origin`
     // to it protects nothing and costs the panel its typography.
-    ui.layer(axum::middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
-        let gate = Arc::clone(&gate);
-        async move { ui_guard(&gate, req, next).await }
-    }))
+    // The guard needs the panel's context, because the gate is resolved per
+    // request (A8). The context lives in the router's state, so the guard is
+    // a `from_fn_with_state` layer rather than a captured `Arc`.
+    ui.layer(axum::middleware::from_fn_with_state(
+        Arc::clone(&ctx),
+        ui_guard,
+    ))
         .merge(proxy)
 }
 
@@ -304,7 +397,7 @@ pub fn mount(proxy: Router, ctx: Ctx) -> Router {
 /// non-browser client (which sends no `Origin` at all). Now it fires only
 /// where there is no credential to check instead.
 async fn ui_guard(
-    gate: &auth::GateState,
+    State(ctx): State<Arc<Ctx>>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
@@ -322,6 +415,11 @@ async fn ui_guard(
             .into_response();
     }
     if req.uri().path().starts_with("/ui/api/") {
+        // The gate is resolved NOW, not at boot (A8). Arming the gate while
+        // the proxy runs turns the panel's gate on; breaking the master turns
+        // it `Broken`. The cost is one sqlite point read: the master is
+        // re-derived only when the gate row's ciphertext has changed.
+        let gate = ctx.gate();
         // Two rules, and which one applies is decided by the gate's ARM, not
         // by the outcome of the credential check. `auth::check` short-circuits
         // to `Ok` for an unarmed panel (there is no token to ask for there),
@@ -331,7 +429,7 @@ async fn ui_guard(
             // Armed: the credential is the control. A valid token stands in
             // for the CSRF check — a cross-origin page cannot attach a token
             // it cannot read — so no `Origin` rule applies here.
-            if let Err(reason) = auth::check(req.headers(), gate) {
+            if let Err(reason) = auth::check(req.headers(), &gate) {
                 return unauthorized(reason);
             }
         } else if !origin_is_absent_or_loopback(req.headers()) {
@@ -1736,7 +1834,8 @@ async fn mint_key(
     let Some(store) = ctx.store.as_ref() else {
         return conflict(
             "no credential store".into(),
-            "the store lives beside the config; check `aroute doctor`",
+            "the gate master lives in the credential store; run `aroute keys arm-gate` to \
+             create it. (An env-armed gate has no store to mint from.)",
         );
     };
     let guard = store
@@ -2362,6 +2461,179 @@ mod http_tests {
     }
 
     /// The same, with an explicit gate state.
+    /// A live gate over a real store in a temp dir, and the pieces to drive it.
+    ///
+    /// The store is opened with a **fast** master derivation: the production
+    /// one is argon2id at 19 MiB and ~40 ms, and a test that re-derives would
+    /// spend that on every case.
+    fn live_gate_fixture(tag: &str) -> (Arc<livegate::LiveGate>, PathBuf, ar_keys::Secret) {
+        let dir = std::env::temp_dir().join(format!("ar-webui-live-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("credentials.db");
+        let master = ar_keys::Secret::generate();
+        let store =
+            ar_keys::CredentialStore::open_with_material(&path, &master).expect("the store opens");
+        let live = Arc::new(livegate::LiveGate::new(
+            Some(Arc::new(Mutex::new(store))),
+            None,
+            None,
+        ));
+        (live, path, master)
+    }
+
+    /// Writes the gate row into a store, the way `aroute keys arm-gate` does.
+    fn arm_the_gate(store: &ar_keys::CredentialStore, master: &ar_keys::Secret) {
+        store
+            .insert(
+                livegate::GATE_ROW,
+                livegate::GATE_ROW,
+                master,
+            )
+            .expect("the gate row is written");
+    }
+
+    /// A8: the panel's gate is resolved **per request**, so a gate armed while
+    /// the proxy runs turns the panel's gate on.
+    ///
+    /// The old shape resolved the gate once at boot, so the panel stayed
+    /// unarmed for the life of the process — and the operator's own
+    /// `aroute keys arm-gate` did nothing to it.
+    #[tokio::test]
+    async fn arming_the_gate_while_the_proxy_runs_should_arm_the_panel() {
+        let (live, path, master) = live_gate_fixture("arm-while-running");
+        // The gate is unarmed to begin with.
+        assert!(
+            !live.resolve().is_armed(),
+            "precondition: the panel starts unarmed"
+        );
+
+        // Arm the gate through the store the live gate is watching.
+        let opened =
+            ar_keys::CredentialStore::open_with_material(&path, &master).expect("the store reopens");
+        arm_the_gate(&opened, &master);
+
+        // The panel now sees it.
+        let state = live.resolve();
+        assert!(
+            state.is_armed(),
+            "the panel must see a gate armed after boot: {state:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("a parent"));
+    }
+
+    /// A8: an unchanged gate row must NOT re-derive the master.
+    ///
+    /// This is the only test that can catch a re-derive per request: every
+    /// behavioural test passes even then, and the cost is argon2id's 19 MiB
+    /// and ~40 ms on **every** panel request.
+    #[tokio::test]
+    async fn an_unchanged_gate_row_should_not_re_derive_the_master() {
+        let (live, path, master) = live_gate_fixture("no-rederive");
+        let opened =
+            ar_keys::CredentialStore::open_with_material(&path, &master).expect("the store opens");
+        arm_the_gate(&opened, &master);
+
+        // The first resolution derives.
+        assert!(live.resolve().is_armed(), "the gate is armed");
+        let after_first = live.derivations();
+        assert!(after_first > 0, "the first resolution derives the master");
+
+        // Ten more resolutions of an UNCHANGED row must not.
+        for _ in 0..10 {
+            assert!(live.resolve().is_armed(), "the gate stays armed");
+        }
+        assert_eq!(
+            live.derivations(),
+            after_first,
+            "an unchanged gate row must not re-derive the master: the cost is \
+             19 MiB and ~40 ms per derivation"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("a parent"));
+    }
+
+    /// A8: a store that cannot be read must never resolve to `Unarmed`.
+    ///
+    /// `Unarmed` permits writes. A panel that cannot read the gate row and
+    /// answers `Unarmed` has **opened up**, which is the failure the
+    /// three-arm split exists to prevent.
+    #[tokio::test]
+    async fn an_unreadable_store_should_never_resolve_to_unarmed() {
+        let (live, path, master) = live_gate_fixture("unreadable");
+        let opened =
+            ar_keys::CredentialStore::open_with_material(&path, &master).expect("the store opens");
+        arm_the_gate(&opened, &master);
+        assert!(live.resolve().is_armed(), "precondition: the gate is armed");
+
+        // Now break the store: replace the file with something sqlite cannot
+        // read as a database.
+        drop(opened);
+        std::fs::write(&path, b"this is not a sqlite database at all").expect("the file is clobbered");
+
+        let state = live.resolve();
+        assert!(
+            !matches!(state, auth::GateState::Unarmed),
+            "a store that cannot be read must never read as 'there is no gate'"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("a parent"));
+    }
+
+    /// A8: with no env master, a gate row that will not open is `Broken`, and
+    /// the state **persists** across a second request.
+    ///
+    /// The stickiness is the point: an earlier shape returned `Broken` from
+    /// the failure path but left the cache saying "no row", so the next
+    /// request answered `Unarmed` — and `Unarmed` permits writes.
+    #[tokio::test]
+    async fn a_broken_gate_should_stay_broken_across_requests() {
+        let (live, path, _master) = live_gate_fixture("sticky-broken");
+        // A row that is present but will not decrypt: written under a
+        // DIFFERENT master, so the ciphertext is there and the plaintext is
+        // not reachable.
+        let other = ar_keys::Secret::generate();
+        let opened =
+            ar_keys::CredentialStore::open_with_material(&path, &other).expect("the store opens");
+        arm_the_gate(&opened, &other);
+
+        let first = live.resolve();
+        assert!(
+            matches!(first, auth::GateState::Broken(_)),
+            "a row that will not open, with no env master, is Broken: {first:?}"
+        );
+
+        // The second request must NOT fall back to `Unarmed`.
+        let second = live.resolve();
+        assert!(
+            matches!(second, auth::GateState::Broken(_)),
+            "Broken must persist: the state that permits writes is Unarmed, so a \
+             one-request Broken is decorative: {second:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("a parent"));
+    }
+
+    /// A8: a host with **no store** but an env master has an armed gate on
+    /// `/v1`, and the panel must agree.
+    ///
+    /// The server's gate falls back to `AR_HTTP_MASTER_KEY` when the store
+    /// has no gate row, and the panel used to answer `Unarmed` in that case —
+    /// so the server was gated and the panel was open. That is the exact
+    /// divergence the live gate exists to close, and it is the shape the VPS
+    /// runs in if `AR_MASTER_KEY` is not in the service's environment.
+    #[tokio::test]
+    async fn an_env_only_host_should_show_an_armed_panel() {
+        let env = ar_keys::Secret::generate();
+        let live = livegate::LiveGate::new(None, Some(env), None);
+        let state = live.resolve();
+        assert!(
+            state.is_armed(),
+            "a host with an env master has a gate, and the panel must show it: {state:?}"
+        );
+    }
+
     fn ui_with_gate(
         tag: &str,
         ledger: Option<ar_tokens::Ledger>,
@@ -2407,7 +2679,7 @@ mod http_tests {
             })
             .expect("token")
             .access;
-        (auth::GateState::Armed(tokens, revocations), token)
+        (auth::GateState::Armed(Arc::new(tokens), revocations), token)
     }
 
     async fn call(app: &Router, method: Method, uri: &str, body: &str) -> (StatusCode, Value) {

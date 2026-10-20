@@ -1320,6 +1320,22 @@ fn parse_timeouts(raw: &str) -> BTreeMap<String, Duration> {
     out
 }
 
+/// The env-derived HTTP master, or `None` when the variable is unset or holds
+/// something that is not 32 bytes.
+///
+/// The **same** variable and the **same** decoder the server's own gate uses
+/// ([`Self::with_http_master_key_from_env`]), exposed so the control panel
+/// can resolve the same master. The panel and `/v1` must agree about which
+/// master is in force, or the panel refuses tokens the proxy accepts.
+///
+/// Read once, at boot: an environment variable cannot change under a running
+/// process.
+#[must_use]
+pub fn http_master_key_from_env() -> Option<Secret> {
+    let raw = env(HTTP_MASTER_KEY_VAR)?;
+    decode_master(&raw).ok()
+}
+
 /// Decodes 64 hex characters or 32 raw bytes into a [`Secret`].
 ///
 /// Two shapes and no more, because every shape added here is a shape a `Secret`

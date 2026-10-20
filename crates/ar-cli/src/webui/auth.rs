@@ -93,18 +93,24 @@ use ar_keys::{Revocations, Scope, ScopeSet, Tokens};
 /// `Tokens` is not `Clone` and holds the master key's bytes, so the engine is
 /// built once and shared behind the panel's own `Arc` — one argon2id
 /// derivation at boot, and a signature check per request.
+#[derive(Clone)]
 pub enum GateState {
     /// No gate row exists. The socket's trust boundary applies: the panel
     /// inherits the loopback bind `/v1` has on this build.
     Unarmed,
     /// A gate row that decrypts. The API requires a valid token.
     ///
+    /// The engine is behind an `Arc` because the live gate **caches** it:
+    /// re-deriving the master costs argon2id's 19 MiB and ~40 ms, so the
+    /// engine is built once and reused until the gate row's ciphertext
+    /// changes. See [`super::livegate`].
+    ///
     /// The revocation list is carried alongside the engine, and it is the
     /// **same** `Arc` `/v1`'s gate holds. `None` means the deployment runs no
     /// revocation table, which is a supported configuration — the table is
     /// optional — and the honest consequence of it is that a token revoked by
     /// any other means stays good until it expires.
-    Armed(Tokens, Option<Arc<Revocations>>),
+    Armed(Arc<Tokens>, Option<Arc<Revocations>>),
     /// A gate row that will not decrypt under the current master.
     ///
     /// The reason is `ar-keys`' own and is redacted by construction: it names
@@ -150,7 +156,7 @@ impl GateState {
     #[must_use]
     pub fn tokens(&self) -> Option<&Tokens> {
         match self {
-            Self::Armed(tokens, _) => Some(tokens),
+            Self::Armed(tokens, _) => Some(tokens.as_ref()),
             _ => None,
         }
     }
@@ -339,7 +345,7 @@ mod tests {
 
     #[test]
     fn an_armed_panel_refuses_a_request_with_no_credential() {
-        let state = GateState::Armed(engine(), None);
+        let state = GateState::Armed(Arc::new(engine()), None);
         assert!(check(&HeaderMap::new(), &state).is_err());
     }
 
@@ -347,7 +353,7 @@ mod tests {
     fn an_armed_panel_admits_an_execute_completions_token() {
         let tokens = engine();
         let token = token_with(&tokens, ScopeSet::of([Scope::ExecuteCompletions]));
-        let state = GateState::Armed(tokens, None);
+        let state = GateState::Armed(Arc::new(tokens), None);
         assert!(check(&headers(&token), &state).is_ok());
     }
 
@@ -355,7 +361,7 @@ mod tests {
     fn an_armed_panel_admits_a_write_token() {
         let tokens = engine();
         let token = token_with(&tokens, ScopeSet::of([Scope::WriteAll]));
-        let state = GateState::Armed(tokens, None);
+        let state = GateState::Armed(Arc::new(tokens), None);
         assert!(check(&headers(&token), &state).is_ok());
     }
 
@@ -363,7 +369,7 @@ mod tests {
     fn an_armed_panel_refuses_a_read_only_token() {
         let tokens = engine();
         let token = token_with(&tokens, ScopeSet::of([Scope::ReadAll]));
-        let state = GateState::Armed(tokens, None);
+        let state = GateState::Armed(Arc::new(tokens), None);
         assert!(
             check(&headers(&token), &state).is_err(),
             "a read-only token must not open the control panel"
@@ -378,13 +384,13 @@ mod tests {
         )
         .expect("master");
         let foreign = token_with(&Tokens::new(&other), ScopeSet::of([Scope::WriteAll]));
-        let state = GateState::Armed(engine(), None);
+        let state = GateState::Armed(Arc::new(engine()), None);
         assert!(check(&headers(&foreign), &state).is_err());
     }
 
     #[test]
     fn the_refusal_never_echoes_the_token() {
-        let state = GateState::Armed(engine(), None);
+        let state = GateState::Armed(Arc::new(engine()), None);
         let Err(reason) = check(&headers("secret-token-value"), &state) else {
             panic!("a bad token is refused");
         };

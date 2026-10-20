@@ -266,6 +266,9 @@ ON CONFLICT(name) DO UPDATE SET provider = ?2, envelope = ?3
 ";
 
 const SELECT_CREDENTIAL: &str = "SELECT provider, envelope FROM credentials WHERE name = ?1";
+
+/// The ciphertext alone, for a change check that does not decrypt.
+const SELECT_ENVELOPE: &str = "SELECT envelope FROM credentials WHERE name = ?1";
 const SELECT_NAMES: &str = "SELECT name FROM credentials ORDER BY name";
 
 const DELETE_CREDENTIAL: &str = "DELETE FROM credentials WHERE name = ?1";
@@ -714,6 +717,32 @@ impl CredentialStore {
             name,
             &envelope,
         )?))
+    }
+
+    /// The **ciphertext** behind `name`, or `None` when no row carries it.
+    ///
+    /// The envelope, not the plaintext. A caller that wants to know whether the
+    /// row CHANGED — and not what it says — reads this and compares it with
+    /// what it read before. The ciphertext changes when the row is rewritten,
+    /// which is the only signal that the master behind it may have changed
+    /// too; the plaintext would require a decryption, and a decryption costs
+    /// an argon2id derivation at 19 MiB and ~40 ms.
+    ///
+    /// This is what makes a **cached** token engine safe to reuse: the signing
+    /// key is the master bytes themselves ([`crate::MasterKey::signing_key`]),
+    /// so an engine built from a master stays correct exactly as long as the
+    /// row it came from is unchanged.
+    ///
+    /// The envelope is a ciphertext, not a secret in the clear, but it is still
+    /// not something to log: it is the thing a re-derivation is gated on.
+    ///
+    /// # Errors
+    /// [`KeyError::Store`] on a read failure.
+    pub fn envelope(&self, name: &str) -> Result<Option<String>, KeyError> {
+        self.conn
+            .query_row(SELECT_ENVELOPE, [name], |row| row.get::<_, String>(0))
+            .optional()
+            .map_err(sql)
     }
 
     /// [`Self::get`] as a header value.
