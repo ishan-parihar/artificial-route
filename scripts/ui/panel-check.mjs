@@ -78,6 +78,14 @@ ok("settings names the env-backed variables",
 ok("settings marks the boot-read values", envText.includes("read at boot"));
 
 // ── the settings Save button is WIRED ─────────────────────────────────────
+// The reason this check exists and the reason it CLICKS rather than merely
+// asserting that a button exists: a listener attached to a form that does
+// not exist yet is silently absent. The settings pane's "Save server" was
+// once wired at boot, where `#settings-form` is still null, so the save did
+// nothing — and the button looked perfect the whole time. It rendered, it
+// was the right size, it had the right label, and clicking it was a no-op.
+// No probe can see that (a probe measures layout, not behaviour), so this
+// check counts the POST. Do not "simplify" it into a DOM-presence assert.
 ok("the settings pane has a Save server button",
   (await page.locator("#settings-form button[type=submit]").count()) === 1);
 await page.click("#settings-form button[type=submit]");

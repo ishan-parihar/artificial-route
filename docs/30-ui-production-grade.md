@@ -349,7 +349,7 @@ Two gaps the pass found and deliberately did **not** close, both in
 
 ## 8. The traps that already exist (do not rediscover)
 
-From `docs/23` §0.1, plus this pass adds three:
+From `docs/23` §0.1, plus this pass adds four:
 
 - All three assets are `include_str!` — **every** HTML/CSS/JS edit needs an
   `ar-cli` rebuild, and the probe must run `target/release/aroute`, never
@@ -368,3 +368,14 @@ From `docs/23` §0.1, plus this pass adds three:
 - **new:** `ar_route::Resilience::snapshot` takes each table's lock once. Do
   not add a second read of the same table elsewhere and expect the two to
   agree.
+- **new:** a pane's DOM exists only after `route()` builds it, so every
+  `wire*()` call belongs **inside** the pane function (as `wireAddCombo`,
+  `wireMint` and `wirePlayground` do), never at boot. A listener attached to
+  a form that does not exist yet is **silently absent**, and the button looks
+  perfect — it renders, it is the right size, it has the right label, and
+  clicking it does nothing. This pass shipped exactly that bug once: the
+  settings pane's "Save server" was wired at boot, where `#settings-form` is
+  still `null`, so the save silently did nothing. **No probe can see it** —
+  the probe measures layout, not behaviour. The reason
+  `scripts/ui/panel-check.mjs` clicks "Save server" and counts the POST is
+  to keep that class of bug findable; do not "simplify" that check away.
