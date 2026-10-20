@@ -32,6 +32,7 @@
 | [`28-gap-ledger.md`](28-gap-ledger.md) | LIVE | 28 — The gap ledger: every OPEN bug, decision and implementation gap, in one place — Status: consolidated 2026-10-19. Owner: this doc, for the state of every open item. Companions: TODO… |
 | [`29-routing-quality.md`](29-routing-quality.md) | LIVE | Routing quality: the audit and the fixes — Dated-frozen: written 2026-10-19. The state of every item below is in [docs/28-gap-ledger.md](28-gap… |
 | [`30-ui-production-grade.md`](30-ui-production-grade.md) | LIVE | 30 — /ui production-grade: the design brief, the direction, and what shipped — Status: written 2026-10-20. The record of the U0-U5 pass over the control panel.… |
+| [`31-remaining-gaps-execution-outline.md`](31-remaining-gaps-execution-outline.md) | LIVE | 31 — Remaining gaps: the execution outline — Status: written 2026-10-20. Owns the **order and shape** of the remaining work; the ledger owns the state. Six phases… |
 | [`2026-10-19-skill-redundancy-audit.md`](audit/2026-10-19-skill-redundancy-audit.md) | LIVE | Skill redundancy audit — 2026-10-19 — The library is large but the aroute and harness clusters were the fragmented ones: 27 aroute-named s… |
 | [`2026-10-19-ui-dashboard-contrast.md`](audit/2026-10-19-ui-dashboard-contrast.md) | LIVE | ui dashboard contrast — Dated-frozen: audited 2026-10-19; findings mark verified vs asserted.… |
 | [`STATE.md`](handoff/STATE.md) | LIVE | State — Current snapshot only (no history: that is the worklog). The first ## block is what genome wake show… |

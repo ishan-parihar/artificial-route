@@ -6,6 +6,9 @@ Companions: `TODO.md` (the register — the *work items*, which point here for d
 eleven fixes, with the live smoke evidence),
 `docs/27-dashboard-contrast-and-upgrade-plan.md` (the `/ui` audit and contrast),
 `docs/24-remaining-gaps-outline.md` (the **execution record** of the 2026-10-18 pass),
+[`docs/31-remaining-gaps-execution-outline.md`](31-remaining-gaps-execution-outline.md)
+(the **execution outline** of what is left — the order and the shape; this doc owns
+the state, that doc owns the sequence),
 `docs/21-remaining-gaps.md` (the register that pass read), `docs/07-blockers.md` (provider
 blockers), `docs/26-benchmarks-parity-gaps.md` (parity).
 
