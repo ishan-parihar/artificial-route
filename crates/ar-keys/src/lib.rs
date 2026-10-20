@@ -30,10 +30,12 @@
 //! let envelope = encrypt(&master, "openai", "key-1", &secret)?;
 //! assert!(verify(&master, "openai", "key-1", &envelope, &secret)?);
 //!
-//! // A scoped token, revocable by `jti`.
-//! let path = std::env::temp_dir().join("ar-keys-doctest.redb");
+//! // A scoped token, revocable by `jti`. The revocation list lives in the
+//! // credential store's sqlite file, so it supports a concurrent reader (the
+//! // server) and one writer (the operator's `aroute keys revoke`).
+//! let path = std::env::temp_dir().join("ar-keys-doctest.sqlite");
 //! let _ = std::fs::remove_file(&path);
-//! let revocations = Revocation::open(&path, 64)?;
+//! let revocations = Revocations::open(&path, 64)?;
 //! let tokens = Tokens::new(&master);
 //! let issued = tokens.issue(Issue {
 //!     key_id: "key-1",
@@ -42,9 +44,9 @@
 //!     ttl: None,
 //! })?;
 //!
-//! assert!(tokens.verify(&issued.access, Scope::ExecuteCompletions, &revocations).is_ok());
+//! assert!(tokens.verify(&issued.access, Scope::ExecuteCompletions, Some(&revocations)).is_ok());
 //! tokens.revoke(&issued.access, &revocations)?;
-//! assert!(tokens.verify(&issued.access, Scope::ExecuteCompletions, &revocations).is_err());
+//! assert!(tokens.verify(&issued.access, Scope::ExecuteCompletions, Some(&revocations)).is_err());
 //!
 //! // Lane admission.
 //! let admission = Admission::new(
@@ -59,6 +61,14 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # The revocation list
+//!
+//! [`Revocations`] is the `jti` → `exp` table that makes a reported leak dead
+//! immediately rather than at the token's expiry. It is a sqlite table in the
+//! **credential store's own file** — see the module's docs for why it is not
+//! a separate redb file (redb takes an exclusive lock, so a running proxy
+//! would keep the operator's revoke command from opening it).
 
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
@@ -68,7 +78,7 @@ mod audit;
 mod codec;
 mod error;
 mod hash;
-mod revoke;
+mod revocations;
 mod secret;
 mod store;
 mod token;
@@ -87,7 +97,7 @@ pub use hash::{
     HashParams, LEGACY_PREFIX, NONCE_LEN, PREFIX, SALT_LEN, TAG_LEN, VERSION, decrypt, encrypt,
     verify,
 };
-pub use revoke::{DEFAULT_CAP, Revocation};
+pub use revocations::{DEFAULT_CAP, Revocations};
 pub use secret::{KEY_LEN, KeyMeta, MasterKey, MasterKeySource, Salt, Secret};
 pub use store::{CredentialStore, MASTER_KEY_VAR, OAuthSession, QuotaSnapshot, SessionKind};
 pub use token::{

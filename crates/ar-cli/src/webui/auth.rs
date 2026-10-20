@@ -59,19 +59,20 @@
 //!
 //! ## What the panel does NOT check
 //!
-//! `introspect` verifies the signature and the expiry and nothing else. **A
-//! revoked token still opens the panel** — and that is not a regression this
-//! module introduces, because `/v1`'s own `AuthGate::verify` does exactly the
-//! same thing (`ar-server/src/keys.rs`). The two surfaces are consistent,
-//! which is the right property while both share the same engine.
+//! The panel's gate consults the **same** revocation list `/v1`'s gate does,
+//! and both surfaces are given the **same** `Arc` at boot, so a token revoked
+//! through the panel is dead on `/v1` too. Two handles on the same file would
+//! be two sqlite connections with two independent read snapshots, able to
+//! disagree about a just-revoked `jti`; one handle cannot.
 //!
-//! Revocation is a real gap and it is a **separate change**: the revoke list
-//! lives in the credential store, the panel's gate holds only the token
-//! engine, and wiring the list in means opening a second connection and
-//! consulting it on every request. It is worth doing for `/v1` and the panel
-//! **together** — a panel-only fix would leave `/v1` with the same hole and
-//! would make the two surfaces disagree, which is worse than either being
-//! consistently incomplete. Recorded in `docs/28-gap-ledger.md` as **A7**.
+//! What the panel still does not check is the *scope* the token carries beyond
+//! what the gate needs: a `read:*` token is refused here, and a
+//! `write:*` token is admitted, because the panel both reads and writes.
+//!
+//! Revocation itself is now wired: `aroute keys revoke` writes the token's
+//! `jti` into the revocation table in the credential store, and every gate
+//! that consults that table refuses it. Recorded in
+//! `docs/28-gap-ledger.md` as **A7**.
 //!
 //! ## The refusal
 //!
@@ -81,9 +82,11 @@
 //! would make the page's own error handling impossible to read. Only the
 //! `/ui/api/*` surface is gated.
 
+use std::sync::Arc;
+
 use axum::http::{HeaderMap, header};
 
-use ar_keys::{Scope, ScopeSet, Tokens};
+use ar_keys::{Revocations, Scope, ScopeSet, Tokens};
 
 /// The panel's gate, resolved once at boot.
 ///
@@ -95,7 +98,13 @@ pub enum GateState {
     /// inherits the loopback bind `/v1` has on this build.
     Unarmed,
     /// A gate row that decrypts. The API requires a valid token.
-    Armed(Tokens),
+    ///
+    /// The revocation list is carried alongside the engine, and it is the
+    /// **same** `Arc` `/v1`'s gate holds. `None` means the deployment runs no
+    /// revocation table, which is a supported configuration — the table is
+    /// optional — and the honest consequence of it is that a token revoked by
+    /// any other means stays good until it expires.
+    Armed(Tokens, Option<Arc<Revocations>>),
     /// A gate row that will not decrypt under the current master.
     ///
     /// The reason is `ar-keys`' own and is redacted by construction: it names
@@ -111,7 +120,7 @@ impl GateState {
     /// The badge naming it "unarmed" is at least the truth.
     #[must_use]
     pub fn is_armed(&self) -> bool {
-        matches!(self, Self::Armed(_))
+        matches!(self, Self::Armed(..))
     }
 
     /// Whether an API request must carry a token.
@@ -121,7 +130,7 @@ impl GateState {
     /// where the refusal belongs.
     #[must_use]
     pub fn requires_token(&self) -> bool {
-        matches!(self, Self::Armed(_))
+        matches!(self, Self::Armed(..))
     }
 
     /// The reason a write must refuse, or `None` when a write may proceed.
@@ -141,7 +150,19 @@ impl GateState {
     #[must_use]
     pub fn tokens(&self) -> Option<&Tokens> {
         match self {
-            Self::Armed(tokens) => Some(tokens),
+            Self::Armed(tokens, _) => Some(tokens),
+            _ => None,
+        }
+    }
+
+    /// The revocation list, when the gate is armed and the deployment has one.
+    ///
+    /// The **same** `Arc` `/v1`'s gate holds — one handle for the process, so
+    /// the two surfaces cannot disagree about a just-revoked `jti`.
+    #[must_use]
+    pub fn revocations(&self) -> Option<&Arc<Revocations>> {
+        match self {
+            Self::Armed(_, revocations) => revocations.as_ref(),
             _ => None,
         }
     }
@@ -156,7 +177,7 @@ impl GateState {
 /// is visible at a glance.
 pub fn gate_badge(gate: &GateState) -> (&'static str, &'static str) {
     match gate {
-        GateState::Armed(_) => ("gate armed", "on"),
+        GateState::Armed(..) => ("gate armed", "on"),
         GateState::Unarmed => ("gate unarmed", "off"),
         GateState::Broken(_) => ("gate BROKEN - serving ungated", "bad"),
     }
@@ -168,7 +189,7 @@ impl std::fmt::Debug for GateState {
         // summary, and nothing else is worth saying.
         match self {
             Self::Unarmed => f.write_str("GateState::Unarmed"),
-            Self::Armed(_) => f.write_str("GateState::Armed"),
+            Self::Armed(..) => f.write_str("GateState::Armed"),
             Self::Broken(reason) => f.debug_tuple("GateState::Broken").field(reason).finish(),
         }
     }
@@ -219,11 +240,29 @@ pub fn check(headers: &HeaderMap, state: &GateState) -> Verdict {
             "this panel needs a credential; paste one from `aroute keys mint`".to_owned(),
         );
     };
-    let scopes = match tokens.introspect(token) {
-        Ok(verified) => verified.scopes,
+    // The order matters: signature and expiry first (both inside the token
+    // engine), then **revocation**, then scope. Checking scope before
+    // revocation would let a caller use a scope check to probe which `jti`s
+    // are live — and a `read:*` token would learn that a revoked token is
+    // revoked rather than merely unscoped.
+    let verified = match tokens.introspect(token) {
+        Ok(verified) => verified,
         Err(_) => return Err("this token is not valid".to_owned()),
     };
-    if admits(scopes) {
+    if let Some(list) = state.revocations()
+        && match list.is_revoked(&verified.jti) {
+            Ok(true) => true,
+            Ok(false) => false,
+            // A revocation table that cannot be read is a table that cannot say
+            // "not revoked". Refusing is the safe direction: a panel that
+            // admits a revoked token because the table was unreadable is the
+            // same hole the table was added to close.
+            Err(_) => true,
+        }
+    {
+        return Err("this token has been revoked".to_owned());
+    }
+    if admits(verified.scopes) {
         Ok(())
     } else {
         Err(format!(
@@ -300,7 +339,7 @@ mod tests {
 
     #[test]
     fn an_armed_panel_refuses_a_request_with_no_credential() {
-        let state = GateState::Armed(engine());
+        let state = GateState::Armed(engine(), None);
         assert!(check(&HeaderMap::new(), &state).is_err());
     }
 
@@ -308,7 +347,7 @@ mod tests {
     fn an_armed_panel_admits_an_execute_completions_token() {
         let tokens = engine();
         let token = token_with(&tokens, ScopeSet::of([Scope::ExecuteCompletions]));
-        let state = GateState::Armed(tokens);
+        let state = GateState::Armed(tokens, None);
         assert!(check(&headers(&token), &state).is_ok());
     }
 
@@ -316,7 +355,7 @@ mod tests {
     fn an_armed_panel_admits_a_write_token() {
         let tokens = engine();
         let token = token_with(&tokens, ScopeSet::of([Scope::WriteAll]));
-        let state = GateState::Armed(tokens);
+        let state = GateState::Armed(tokens, None);
         assert!(check(&headers(&token), &state).is_ok());
     }
 
@@ -324,7 +363,7 @@ mod tests {
     fn an_armed_panel_refuses_a_read_only_token() {
         let tokens = engine();
         let token = token_with(&tokens, ScopeSet::of([Scope::ReadAll]));
-        let state = GateState::Armed(tokens);
+        let state = GateState::Armed(tokens, None);
         assert!(
             check(&headers(&token), &state).is_err(),
             "a read-only token must not open the control panel"
@@ -339,13 +378,13 @@ mod tests {
         )
         .expect("master");
         let foreign = token_with(&Tokens::new(&other), ScopeSet::of([Scope::WriteAll]));
-        let state = GateState::Armed(engine());
+        let state = GateState::Armed(engine(), None);
         assert!(check(&headers(&foreign), &state).is_err());
     }
 
     #[test]
     fn the_refusal_never_echoes_the_token() {
-        let state = GateState::Armed(engine());
+        let state = GateState::Armed(engine(), None);
         let Err(reason) = check(&headers("secret-token-value"), &state) else {
             panic!("a bad token is refused");
         };

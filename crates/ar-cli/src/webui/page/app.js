@@ -726,9 +726,12 @@ function paneKeys(root, st) {
         H("form", { id: "mint-form", class: "row-form" },
           H("label", { for: "mint-id", text: "Key id" }),
           H("input", { id: "mint-id", autocomplete: "off", spellcheck: "false", placeholder: "ci-runner", style: "width:auto" }),
+          H("label", { for: "mint-ttl", text: "days" }),
+          H("input", { id: "mint-ttl", type: "number", min: "0", max: "3650", value: "7", style: "width:80px" }),
           H("label", { for: "mint-rpm", text: "rpm" }),
           H("input", { id: "mint-rpm", type: "number", min: "1", max: "100000", placeholder: "unset", style: "width:90px" }),
           H("button", { type: "submit", class: "btn btn-primary", "data-cta": "primary", text: "Mint key" })),
+        H("p", { class: "hint", text: "The token lives for the number of days above. 0 mints one that never expires, which is the wrong default for anything that might leak: the panel can revoke a token, but only a token it minted with a life it can outlive." }),
         H("details", { id: "minted", class: "minted", hidden: true, open: "open" },
           H("summary", null, "Token for ", H("span", { id: "minted-id" }), " - copy it now"),
           H("code", { id: "minted-token" }),
@@ -810,9 +813,10 @@ function wireMint() {
   $("mint-form").addEventListener("submit", async (e) => {
     e.preventDefault();
     const key_id = $("mint-id").value.trim();
+    const ttl = $("mint-ttl").value.trim();
     const rpm = $("mint-rpm").value === "" ? null : Number($("mint-rpm").value);
     try {
-      const res = await api("/ui/api/keys/mint", { key_id });
+      const res = await api("/ui/api/keys/mint", { key_id, ttl_days: Number(ttl || 0) });
       if (rpm != null) await api("/ui/api/limits", { key: key_id, rpm });
       MINTED = { key_id: res.key_id, access: res.access };
       showMinted();

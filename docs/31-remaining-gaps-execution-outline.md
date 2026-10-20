@@ -146,21 +146,46 @@ is good for its whole lifetime and the only remedy is rotating the master,
 which invalidates every legitimate token at once. The machinery is already
 built and tested — it is simply not reachable.
 
-**2.1 — the CLI subcommand.** *(agent)* `aroute keys revoke <token>` writes the token's
-`jti` into the revocation store.
+**2.1 — the store, and where it lives.** *(agent)* The revocation table is a
+`jti` → `exp` row, and it goes **in the credential store's sqlite**, not in a
+separate redb file.
 
-- The store is `Revocation::open(path, cap)` (`crates/ar-keys/src/revoke.rs:49`),
-  a redb file keyed by `jti` → `exp`, capped at `DEFAULT_CAP` = 4096.
-- It **refuses** the write at the cap when nothing is expired
-  (`KeyError::RevokeListFull`) rather than evicting a live entry — evicting a
-  live revocation un-revokes a stolen token, and the existing test
+That is a correction to what this outline said first, and the reason is
+concrete. `Revocation` is a **redb** table, and redb takes an **exclusive**
+`flock(LOCK_EX | LOCK_NB)` on its file
+(`redb-2.6/src/tree_store/page_store/file_backend/unix.rs:37`) and returns
+`DatabaseAlreadyOpen` when it cannot. So a redb revocation file would mean the
+running proxy holds an exclusive lock on it, and `aroute keys revoke` — which
+must run **while the proxy is up**, because that is when a token needs
+revoking — could not open it. `ar-keys/src/revoke.rs:35-37` already says so:
+"handing a second handle to the same file is a footgun (redb takes an
+exclusive lock, so it would fail at runtime rather than compile time)".
+
+sqlite is already the credential store's format (`crates/ar-keys/src/store.rs`),
+`rusqlite` is already a dependency, and it supports **concurrent readers with
+one writer** — which is exactly the access pattern: the server reads a `jti`
+per request, and the operator's `aroute keys revoke` writes one row.
+
+The `jti` → `exp` row is a natural fit beside the store's other tables, and
+putting it in the same file settles the question this outline previously
+deferred ("where the store lives is the decision"): **one file, one path, one
+master.** The store's path is `commands::store_path`
+(`crates/ar-cli/src/commands.rs:113`), which honours `$AR_CRED_STORE` and
+otherwise resolves beside the config.
+
+- The cap stays: 4096 live entries, and the write is **refused** at the cap
+  with nothing expired rather than evicting a live entry. Evicting a live
+  revocation un-revokes a stolen token, and the existing test
   `never_drops_a_live_entry_to_make_room` pins that.
-- `Tokens::revoke(&self, token, &revocations)` (`crates/ar-keys/src/token.rs:390`)
-  does the `jti` extraction and the expiry write.
-- **Where the store lives is the decision:** beside the credential store, so
-  one file holds the credentials and one holds the revocations. The credential
-  store's path is `commands::store_path` (`crates/ar-cli/src/commands.rs:113`),
-  which honours `$AR_CRED_STORE` and otherwise resolves beside the config.
+- The store's journal mode is left at SQLite's default rollback journal
+  (`store.rs:100-103`), deliberately: WAL buys concurrent-reader throughput
+  and costs two sidecar files next to ones an operator must keep out of git.
+  The revocation read is one point lookup, so the default is enough — and
+  **the cost is measured** (2.4), not assumed.
+- `Tokens::verify` now takes `Option<&Revocation>`'s sqlite equivalent, so a
+  deployment with no store is a supported configuration rather than a
+  forced-open failure. With no store, a revoked token is good for its whole
+  lifetime, and the row says so.
 
 **2.2 — the server consults it.** *(agent)* Both gates must, **together**:
 
@@ -173,17 +198,33 @@ built and tested — it is simply not reachable.
   would disagree about the same token, and a token revoked in the panel would
   still work on `/v1`.
 
-**The cost is one store read per request.** `Revocation` is redb, and
-`is_revoked` is a point read on a `jti` key — cheap, but it is on the hot path
-of every `/v1` request. **Measure it before shipping**: the release already has
-a bench harness (ledger C3's `scripts/soak.sh`), and the gate's own cost is
-the number that decides whether the lookup is acceptable.
+**2.4 — the cost is one point read per request.** *(agent)* A sqlite point
+lookup on a `jti` primary key is cheap, but it is on the hot path of every
+`/v1` request, so **the number is measured, not assumed**.
+
+**Measured** (release build, 500 live entries, 2000 lookups — the bench is
+`crates/ar-keys/tests/keys.rs::the_revocation_lookup_stays_under_its_budget`,
+following the repo's own `ar-guard` precedent of `std::time` over `criterion`):
+
+| p50 | p95 | p99 | budget |
+|---|---|---|---|
+| 11.2 µs | 12.3 µs | 17.6 µs | 1 ms at p95 |
+
+The budget is deliberately loose. The lookup is a point read on a primary key
+and should be microseconds; the budget exists to catch an order-of-magnitude
+regression (a full table scan, a synchronous fsync), not to police the last
+digit.
 
 **2.3 — the panel's mint default.** *(agent)* `--ttl-days 30` is the current default and
 `--ttl-days 0` mints a token that **never expires**. A panel that mints
 30-day credentials by default is a panel that hands out long-lived secrets to
 whoever reaches it. The panel's mint should default to the **CLI's shortest
 defensible life** and say so on the page.
+
+**Landed:** the panel's default is **7 days**, the field is on the page with
+its own label, and `0` (never expires) has to be typed. The lifetime is
+bounded at 365 days and validated **before** the store is consulted, so a bad
+input is named as a bad input rather than as a missing store.
 
 **Phase 2 gate:** `aroute keys revoke <token>` exists; the revoked token
 answers **401** on **both** `/v1` and `/ui`; the bench shows the lookup's cost;

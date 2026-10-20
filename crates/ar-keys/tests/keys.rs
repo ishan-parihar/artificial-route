@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ar_keys::{
     ACCESS_TTL, Action, Audit, HashParams, Issue, KeyError, KeyMeta, MasterKey, Outcome,
-    REFRESH_TTL, Revocation, Salt, Scope, ScopeSet, Secret, Tokens, decrypt, encrypt, verify,
+    REFRESH_TTL, Revocations, Salt, Scope, ScopeSet, Secret, Tokens, decrypt, encrypt, verify,
 };
 
 /// A fast-params master key. `HashParams::RECOMMENDED` costs 19 MiB and ~40 ms
@@ -27,16 +27,22 @@ fn master() -> MasterKey {
     .expect("derive a test master key")
 }
 
-/// A unique redb path. redb takes an exclusive lock, so parallel tests must not
-/// share a file.
-fn temp_store(tag: &str) -> (Revocation, std::path::PathBuf) {
+/// A unique sqlite path.
+///
+/// The file is a **sqlite** file, not a redb one, and that is the point: the
+/// running proxy holds its handle open for the life of the process, and the
+/// operator's `aroute keys revoke` has to open the same file while it runs.
+/// A redb file could not be opened twice, so each test still gets its own path
+/// (parallel tests must not share a file) — but the file itself now supports
+/// the concurrent reader-and-writer pattern the design depends on.
+fn temp_store(tag: &str) -> (Revocations, std::path::PathBuf) {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
     let path =
-        std::env::temp_dir().join(format!("ar-keys-it-{tag}-{}-{n}.redb", std::process::id()));
+        std::env::temp_dir().join(format!("ar-keys-it-{tag}-{}-{n}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
     (
-        Revocation::open(&path, 256).expect("open the revocation store"),
+        Revocations::open(&path, 256).expect("open the revocation store"),
         path,
     )
 }
@@ -72,7 +78,7 @@ fn rejects_when_revoked() {
     // about a token that was never valid.
     assert!(
         tokens
-            .verify(&issued.access, Scope::ReadAll, &revocations)
+            .verify(&issued.access, Scope::ReadAll, Some(&revocations))
             .is_ok(),
         "precondition: the token must verify before it is revoked"
     );
@@ -82,7 +88,7 @@ fn rejects_when_revoked() {
     // The signature is still valid and `exp` is 15 minutes out, so the revoke
     // list is the only thing that can be refusing this.
     let err = tokens
-        .verify(&issued.access, Scope::ReadAll, &revocations)
+        .verify(&issued.access, Scope::ReadAll, Some(&revocations))
         .expect_err("a revoked token must be refused");
     assert!(matches!(err, KeyError::Revoked { .. }), "{err}");
     let _ = std::fs::remove_file(path);
@@ -108,7 +114,7 @@ fn expires_when_stolen() {
     // verbatim working credential and nothing distinguishes it from the original.
     let stolen = issued.access;
     assert!(
-        tokens.verify(&stolen, Scope::ReadAll, &revocations).is_ok(),
+        tokens.verify(&stolen, Scope::ReadAll, Some(&revocations)).is_ok(),
         "precondition: the stolen copy starts valid"
     );
 
@@ -121,7 +127,7 @@ fn expires_when_stolen() {
     std::thread::sleep(Duration::from_millis(2_100));
 
     let err = tokens
-        .verify(&stolen, Scope::ReadAll, &revocations)
+        .verify(&stolen, Scope::ReadAll, Some(&revocations))
         .expect_err("an expired token must be refused");
     assert!(matches!(err, KeyError::Expired), "{err}");
     let _ = std::fs::remove_file(path);
@@ -160,7 +166,7 @@ fn revoking_one_half_does_not_revoke_the_other() {
         .expect("revoke access");
     assert!(
         tokens
-            .verify(&issued.refresh, Scope::ReadAll, &revocations)
+            .verify(&issued.refresh, Scope::ReadAll, Some(&revocations))
             .is_ok(),
         "the refresh token must survive"
     );
@@ -182,13 +188,13 @@ fn revoking_survives_a_restart() {
     let issued = issue(&tokens, ScopeSet::all());
 
     {
-        let revocations = Revocation::open(&path, 256).expect("open");
+        let revocations = Revocations::open(&path, 256).expect("open");
         tokens.revoke(&issued.access, &revocations).expect("revoke");
     }
 
-    let revocations = Revocation::open(&path, 256).expect("reopen");
+    let revocations = Revocations::open(&path, 256).expect("reopen");
     assert!(matches!(
-        tokens.verify(&issued.access, Scope::ReadAll, &revocations),
+        tokens.verify(&issued.access, Scope::ReadAll, Some(&revocations)),
         Err(KeyError::Revoked { .. })
     ));
     let _ = std::fs::remove_file(path);
@@ -200,7 +206,7 @@ fn refuses_a_scope_the_token_does_not_carry() {
     let tokens = Tokens::new(&master());
     let read_only = issue(&tokens, ScopeSet::of([Scope::ReadAll]));
     let err = tokens
-        .verify(&read_only.access, Scope::WriteAll, &revocations)
+        .verify(&read_only.access, Scope::WriteAll, Some(&revocations))
         .expect_err("a read-only token must not write");
     assert!(
         matches!(
@@ -222,7 +228,7 @@ fn an_unscoped_token_does_nothing() {
     let unscoped = issue(&tokens, ScopeSet::EMPTY);
     assert!(
         tokens
-            .verify(&unscoped.access, Scope::ReadAll, &revocations)
+            .verify(&unscoped.access, Scope::ReadAll, Some(&revocations))
             .is_err()
     );
     let _ = std::fs::remove_file(path);
@@ -238,12 +244,12 @@ fn execute_completions_is_a_separate_grant_from_write() {
     let issued = issue(&tokens, ScopeSet::of([Scope::ExecuteCompletions]));
     assert!(
         tokens
-            .verify(&issued.access, Scope::ExecuteCompletions, &revocations)
+            .verify(&issued.access, Scope::ExecuteCompletions, Some(&revocations))
             .is_ok()
     );
     assert!(
         tokens
-            .verify(&issued.access, Scope::WriteAll, &revocations)
+            .verify(&issued.access, Scope::WriteAll, Some(&revocations))
             .is_err()
     );
     let _ = std::fs::remove_file(path);
@@ -348,4 +354,173 @@ fn the_audit_ring_is_bounded() {
         audit.record("key-1".into(), Action::Verify, Outcome::Denied, "expired");
     }
     assert!(audit.len() <= 8, "the ring grew to {}", audit.len());
+}
+
+/// The design's central claim, as a test.
+///
+/// The revocation list lives in the credential store's **sqlite** file, so a
+/// second handle can be opened while the first is open. That is what lets the
+/// operator's `aroute keys revoke` run **while the proxy is up** — which is
+/// the only time a token needs revoking.
+///
+/// The redb design this replaced could not do this: redb takes an exclusive
+/// `flock` on its file and returns `DatabaseAlreadyOpen`. A test that only
+/// exercised one handle would not have caught that, so the test opens a second
+/// handle and writes through it while the first is still open.
+#[test]
+fn a_second_handle_may_write_while_the_first_is_open() {
+    let (reader, path) = temp_store("concurrent");
+
+    // The "server" handle is open and holding the file.
+    assert!(
+        reader.is_empty().expect("the reader sees an empty list"),
+        "precondition: the list starts empty"
+    );
+
+    // The "operator" opens the same file and writes through it.
+    let writer = Revocations::open(&path, 256).expect("a second handle opens the same file");
+    writer.revoke("jti-1", now() + 600).expect("the second handle writes");
+
+    // The first handle sees the write. This is the property the redb file
+    // could not provide.
+    assert!(
+        reader.is_revoked("jti-1").expect("the reader sees the revocation"),
+        "the reader must see what the writer wrote"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A revoked token is dead on the list, and the list is shared.
+#[test]
+fn a_revocation_written_by_one_handle_kills_the_token_for_both() {
+    let (reader, path) = temp_store("shared-kill");
+    let writer = Revocations::open(&path, 256).expect("a second handle opens the same file");
+    let tokens = Tokens::new(&master());
+    let issued = issue(&tokens, ScopeSet::all());
+
+    writer.revoke(&issued.jti, issued.expires_at).expect("revoke");
+
+    assert!(
+        tokens
+            .verify(&issued.access, Scope::ReadAll, Some(&reader))
+            .is_err(),
+        "a token revoked through the writer must not verify through the reader"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The cap is on **live** entries, so expired ones are collectable.
+#[test]
+fn the_cap_counts_live_entries_not_rows_ever_written() {
+    let (_list, path) = temp_store("cap-live");
+    let capped = Revocations::open(&path, 2).expect("open");
+
+    // Two expired rows. A write sweeps first, so the first is collected when
+    // the second is written: the list holds what is LIVE, not what was ever
+    // written. That is the property the cap depends on — a list full of dead
+    // tokens is not full.
+    capped.revoke("jti-old-1", now() - 10).expect("revoke");
+    capped.revoke("jti-old-2", now() - 10).expect("revoke");
+    assert_eq!(
+        capped.len().expect("len"),
+        1,
+        "the sweep collects the expired row on the next write"
+    );
+
+    // Two expired rows and the cap is 2: a third write must still be accepted,
+    // because the list is not full of **live** entries.
+    capped.revoke("jti-live", now() + 600).expect("a live write after expired rows");
+    capped.revoke("jti-live-2", now() + 600).expect("a second live write");
+
+    assert!(
+        !capped.is_revoked("jti-old-1").expect("an expired row is not live"),
+        "an expired row must not read as revoked"
+    );
+    assert!(
+        capped.is_revoked("jti-live").expect("the live row is revoked"),
+        "the live row must read as revoked"
+    );
+    assert!(
+        capped.is_revoked("jti-live-2").expect("the second live row is revoked"),
+        "the second live row must read as revoked"
+    );
+
+    // Now the list holds two live entries, which IS the cap — a third live
+    // write is refused rather than evicting one of them.
+    let err = capped
+        .revoke("jti-live-3", now() + 600)
+        .expect_err("the cap refuses a third live entry");
+    assert!(matches!(err, KeyError::RevokeListFull { cap: 2 }), "{err}");
+    assert!(
+        capped.is_revoked("jti-live").expect("the first live row survives"),
+        "a refused write must not evict a live revocation"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The revocation lookup's cost, as a budget check.
+///
+/// This is the crate's benchmark, and it follows the repo's own precedent
+/// (`ar-guard/tests/guard.rs`): `std::time` over a fixed number of iterations,
+/// a percentile, and a release-only budget. No `criterion` — adding a
+/// benchmark dependency to measure one point lookup would be a larger change
+/// than the thing being measured.
+///
+/// The number matters because the lookup is on the **hot path of every `/v1`
+/// request**: the gate consults the table before it admits a request. A
+/// revocation list that is correct but slow would make every request pay for
+/// the security it buys.
+///
+/// The budget is 1 ms at p95. That is deliberately loose — the lookup is a
+/// point read on a primary key and should be microseconds — because the budget
+/// exists to catch an order-of-magnitude regression (a full table scan, a
+/// synchronous fsync), not to police the last digit.
+#[test]
+fn the_revocation_lookup_stays_under_its_budget() {
+    let (_list, path) = temp_store("bench");
+    // A table with a realistic number of live entries, so the measurement is
+    // of a populated index and not of an empty one. The cap is raised for the
+    // bench because the fixture's 256 is the *default* cap and the point is
+    // to measure a populated table, not to test the cap.
+    let list = Revocations::open(&path, 4_096).expect("the list opens with a bench-sized cap");
+    for i in 0..500 {
+        list.revoke(&format!("jti-{i}"), now() + 3600)
+            .expect("the revoke lands");
+    }
+
+    let iters = 2_000;
+    let mut samples = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let t = std::time::Instant::now();
+        let revoked = list.is_revoked("jti-7").expect("the lookup answers");
+        samples.push(t.elapsed().as_nanos());
+        assert!(revoked, "an entry in the list must read as revoked");
+    }
+    samples.sort_unstable();
+
+    let rank = |p: f64| {
+        let r = (p * samples.len() as f64).ceil() as usize;
+        samples[r.saturating_sub(1).clamp(0, samples.len() - 1)]
+    };
+    eprintln!(
+        "ar-keys revocation lookup p50={}ns p95={}ns p99={}ns  entries=500",
+        rank(0.50),
+        rank(0.95),
+        rank(0.99),
+    );
+
+    // An unoptimised build has no budget; the SLO is a release number.
+    if cfg!(debug_assertions) {
+        return;
+    }
+    assert!(
+        rank(0.95) < Duration::from_millis(1).as_nanos(),
+        "the revocation lookup p95 {}ns exceeds the 1ms budget",
+        rank(0.95),
+    );
+
+    let _ = std::fs::remove_file(&path);
 }

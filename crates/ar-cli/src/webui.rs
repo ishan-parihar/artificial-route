@@ -1653,6 +1653,22 @@ fn set_env_var(path: &std::path::Path, name: &str, value: &str) -> std::io::Resu
     commands::write_private(path, &(lines.join("\n") + "\n"))
 }
 
+/// The panel's default token lifetime, in days.
+///
+/// Shorter than the CLI's 30 on purpose. The CLI's default is for a token an
+/// operator hands to a harness they configured; the panel's default is for a
+/// token minted from a browser, and a shorter life is the one a leaked
+/// credential cannot outlive. The panel can also **revoke** what it mints
+/// (`aroute keys revoke`), but a revocation is only useful for a token that
+/// is still alive when someone remembers to use it.
+const PANEL_MINT_TTL_DAYS: u32 = 7;
+
+/// The longest lifetime the panel will mint.
+///
+/// A year is generous for a credential; a decade is a credential that has
+/// stopped being one.
+const MAX_MINT_TTL_DAYS: u32 = 365;
+
 /// Mints a client token through the same gate the proxy verifies against.
 async fn mint_key(
     State(ctx): State<Arc<Ctx>>,
@@ -1682,6 +1698,41 @@ async fn mint_key(
             "pick a name the ledger can key rows by",
         );
     }
+    // The token's lifetime, validated BEFORE the store is consulted: a bad
+    // input is a bad input whether or not there is a store, and validating
+    // the body first means the error names the field rather than the
+    // environment.
+    //
+    // The panel's default is **7 days**, not the CLI's 30: a panel hands the
+    // token to whoever reaches it, and a shorter life is the one a leaked
+    // credential cannot outlive. `0` mints a token that never expires, and the
+    // operator has to ask for that explicitly.
+    let ttl_days = match body.get("ttl_days") {
+        None | Some(Value::Null) => PANEL_MINT_TTL_DAYS,
+        Some(Value::Number(n)) => match n.as_u64() {
+            Some(v) if v <= u64::from(MAX_MINT_TTL_DAYS) => {
+                u32::try_from(v).unwrap_or(MAX_MINT_TTL_DAYS)
+            }
+            Some(_) => {
+                return bad_request(
+                    format!("ttl_days is too large; the maximum is {MAX_MINT_TTL_DAYS}"),
+                    "0 mints a token that never expires",
+                );
+            }
+            None => {
+                return bad_request(
+                    "ttl_days must be a whole number of days".into(),
+                    "0 mints a token that never expires",
+                );
+            }
+        },
+        Some(_) => {
+            return bad_request(
+                "ttl_days must be a number".into(),
+                "0 mints a token that never expires",
+            );
+        }
+    };
     let Some(store) = ctx.store.as_ref() else {
         return conflict(
             "no credential store".into(),
@@ -1697,13 +1748,14 @@ async fn mint_key(
             "run `aroute keys arm-gate` first; minting without a master would issue tokens nothing verifies",
         );
     };
-    match commands::mint_from(&master, &key_id) {
+    match commands::mint_from_with_ttl(&master, &key_id, ttl_days) {
         Ok(issued) => Json(json!({
             "ok": true,
             "key_id": key_id,
             "access": issued.access,
             "refresh": issued.refresh,
             "expires_at": issued.expires_at,
+            "ttl_days": ttl_days,
         }))
         .into_response(),
         Err(e) => bad_request(
@@ -2329,6 +2381,17 @@ mod http_tests {
 
     /// A gate state that is armed, plus a token it admits.
     fn armed_gate() -> (auth::GateState, String) {
+        armed_gate_with_list(None)
+    }
+
+    /// The same, with a revocation list attached.
+    ///
+    /// The list is the **same handle** the server's `/v1` gate would hold, so
+    /// a token revoked through it is dead on both surfaces — which is the
+    /// "both or neither" property the whole design rests on.
+    fn armed_gate_with_list(
+        revocations: Option<std::sync::Arc<ar_keys::Revocations>>,
+    ) -> (auth::GateState, String) {
         let master = ar_keys::MasterKey::new(
             ar_keys::Secret::from_slice(&[3u8; 32]).expect("32 bytes"),
             ar_keys::KeyMeta::generate(),
@@ -2344,7 +2407,7 @@ mod http_tests {
             })
             .expect("token")
             .access;
-        (auth::GateState::Armed(tokens), token)
+        (auth::GateState::Armed(tokens, revocations), token)
     }
 
     async fn call(app: &Router, method: Method, uri: &str, body: &str) -> (StatusCode, Value) {
@@ -2504,6 +2567,38 @@ mod http_tests {
     }
 
     #[tokio::test]
+    async fn an_out_of_range_lifetime_should_be_refused() {
+        // The mint's lifetime is bounded. A year is generous for a
+        // credential; a decade is a credential that has stopped being one.
+        let (app, _) = ui("mint-ttl-range", None);
+        let (status, body) = call(
+            &app,
+            Method::POST,
+            "/ui/api/keys/mint",
+            r#"{"key_id":"forever","ttl_days":36500}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["error"].as_str().unwrap_or_default().contains("too large"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_lifetime_should_be_refused() {
+        let (app, _) = ui("mint-ttl-bad", None);
+        let (status, body) = call(
+            &app,
+            Method::POST,
+            "/ui/api/keys/mint",
+            r#"{"key_id":"x","ttl_days":"forever"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    #[tokio::test]
     async fn an_unarmed_panel_should_refuse_a_cross_site_write() {
         // The loopback install's ONLY CSRF defence. The panel mints spendable
         // tokens, and on a box with no gate the socket is the trust boundary —
@@ -2576,6 +2671,67 @@ mod http_tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_revoked_token_should_be_refused_by_the_panel() {
+        // The "both or neither" property, from the panel's side.
+        //
+        // The panel and `/v1` share ONE revocation handle. A token revoked
+        // through `aroute keys revoke` writes a `jti` into the table in the
+        // credential store, and both gates consult that table. If only one of
+        // them did, a token revoked through the panel would still work on
+        // `/v1` — and two surfaces that disagree about the same token is
+        // worse than either being consistently incomplete.
+        let dir = std::env::temp_dir().join(format!("ar-webui-revoke-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let store_path = dir.join("credentials.db");
+        let list = Arc::new(
+            ar_keys::Revocations::open(&store_path, 64).expect("the revocation list opens"),
+        );
+
+        let (gate, token) = armed_gate_with_list(Some(Arc::clone(&list)));
+        let (app, _) = ui_with_gate("revoked-token", None, gate);
+
+        // Before the revoke: the token opens the panel.
+        let (status, _) = call_full(
+            &app,
+            Method::GET,
+            "/ui/api/state",
+            "",
+            Some(&token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "precondition: the token opens the panel");
+
+        // Revoke it through the same path `aroute keys revoke` uses: the
+        // token's `jti`, with the token's own `exp`.
+        let master = ar_keys::MasterKey::new(
+            ar_keys::Secret::from_slice(&[3u8; 32]).expect("32 bytes"),
+            ar_keys::KeyMeta::generate(),
+        )
+        .expect("master");
+        let tokens = ar_keys::Tokens::new(&master);
+        let verified = tokens.introspect(&token).expect("the token verifies");
+        list.revoke(&verified.jti, verified.expires_at)
+            .expect("the revoke lands");
+
+        // After the revoke: it does not.
+        let (status, body) = call_full(
+            &app,
+            Method::GET,
+            "/ui/api/state",
+            "",
+            Some(&token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert_eq!(body["error"]["code"], "credential_rejected");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

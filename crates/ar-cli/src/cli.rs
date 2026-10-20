@@ -315,6 +315,37 @@ pub enum KeysCommand {
     ///   aroute keys mint --key-id ci-runner
     #[command(verbatim_doc_comment)]
     Mint(MintArgs),
+
+    /// Revoke a token, so it stops working immediately.
+    ///
+    /// The token is dead the moment this returns, without waiting for its
+    /// expiry: its `jti` is written to the revocation table in the credential
+    /// store, and every gate that consults that table refuses it.
+    ///
+    /// This is the remedy for a **leaked** token. The other remedy — rotating
+    /// the master — invalidates every token at once, including the ones that
+    /// are still wanted, so it is the blunt instrument. This one is the scalpel.
+    ///
+    /// The token is read from a file or from stdin rather than as an argument,
+    /// because a token on a command line lands in the shell history and in the
+    /// process table.
+    ///
+    /// Examples:
+    ///   aroute keys revoke --token-file ~/.config/ar/leaked.jwt
+    ///   aroute keys revoke --token-file - < leaked.jwt
+    #[command(verbatim_doc_comment)]
+    Revoke(RevokeArgs),
+}
+
+/// Options for `aroute keys revoke`.
+#[derive(Debug, Args)]
+pub struct RevokeArgs {
+    /// A file holding the token to revoke. `-` reads stdin.
+    ///
+    /// A token is a secret, and a secret on a command line is in the shell
+    /// history and in the process table for as long as the command runs.
+    #[arg(long, value_name = "PATH")]
+    pub token_file: String,
 }
 
 /// Options for `aroute keys arm-gate`.

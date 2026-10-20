@@ -45,7 +45,14 @@ pub const OBS_DIR_VAR: &str = "AR_OBS_DIR";
 /// cannot be opened" are different problems, and collapsing them into
 /// "unarmed" would silently reopen the panel on a box whose operator
 /// believes it is closed.
-fn gate_state(cli: &Cli) -> webui::auth::GateState {
+/// The panel's gate state, and the revocation list it consults.
+///
+/// One `Arc` for the whole process. The panel's gate and `/v1`'s gate must
+/// consult the **same** list: a token revoked through the panel has to be
+/// dead on `/v1` too, and two handles on the same file would be two sqlite
+/// connections with two independent read snapshots — able to disagree about a
+/// just-revoked `jti` for the length of a transaction.
+fn gate_state(cli: &Cli, revocations: Option<&Arc<ar_keys::Revocations>>) -> webui::auth::GateState {
     let Some(store) = commands::credential_store(cli) else {
         return webui::auth::GateState::Unarmed;
     };
@@ -60,7 +67,10 @@ fn gate_state(cli: &Cli) -> webui::auth::GateState {
                 master.to_owned_secret(),
                 ar_keys::KeyMeta::generate(),
             ) {
-                Ok(master) => webui::auth::GateState::Armed(ar_keys::Tokens::new(&master)),
+                Ok(master) => webui::auth::GateState::Armed(
+                    ar_keys::Tokens::new(&master),
+                    revocations.cloned(),
+                ),
                 Err(e) => webui::auth::GateState::Broken(e.to_string()),
             }
         }
@@ -74,12 +84,17 @@ fn gate_state(cli: &Cli) -> webui::auth::GateState {
 /// client's `model` against the combo ids. Failures name the exact thing that is
 /// wrong — a target whose provider is not in the registry fails here rather than
 /// as a 502 three layers down.
+///
+/// Returns the components **and** the revocation list, because the list has to
+/// be shared: the server's `/v1` gate and the control panel's gate must
+/// consult the same handle, or they are two sqlite connections with two
+/// independent read snapshots and can disagree about a just-revoked `jti`.
 fn components(
     cli: &Cli,
     cfg: &Config,
     port: Option<u16>,
     want: Option<&str>,
-) -> anyhow::Result<Components> {
+) -> anyhow::Result<(Components, Option<Arc<ar_keys::Revocations>>)> {
     if let Some(id) = want
         && !cfg.combos.iter().any(|c| c.id == id)
     {
@@ -174,12 +189,71 @@ fn components(
             .map(|secret| secret.as_bytes().to_vec())
     });
 
-    Ok(Components {
-        master_key,
-        ledger,
-        obs_dir,
-        ..Components::with_exec(config, exec)
-    })
+    // The revocation table, in the credential store's own file.
+    //
+    // It is a **sqlite** table, not a separate file, and that is the whole
+    // point: the running proxy holds this handle open for the life of the
+    // process, and `aroute keys revoke` has to open the same file while it
+    // runs — because that is when a token needs revoking. A redb file could
+    // not be opened twice (redb takes an exclusive lock), so the operator's
+    // revoke command would fail for exactly as long as the proxy was up.
+    //
+    // The store is **probed first**, and the probe decides. `sqlite` creates a
+    // file it opens, so opening the revocation table on a host that has no
+    // store would leave an empty `credentials.db` behind — and the next
+    // `aroute doctor` would then report a store that holds nothing, which is
+    // a report about a file the doctor did not create. `StoreProbe` is the
+    // one resolver for this, and its own reason for existing is that `doctor`
+    // and `serve` must not disagree about whether the store is usable.
+    //
+    // This is a **second connection to the same file** as the credential
+    // store's, not a second copy of it. Two connections are what sqlite
+    // supports (concurrent readers, one writer); one shared `Mutex` around
+    // the store's connection would serialise the credential reads against
+    // the revocation reads for no gain. The split is also what lets
+    // `aroute keys revoke` work when the master has been rotated and the
+    // store's own rows will not decrypt — the list needs no master.
+    let revocations = match commands::store_probe(&cli.config) {
+        commands::StoreProbe::Live { path, .. } | commands::StoreProbe::Open { path, .. } => {
+            match ar_keys::Revocations::open(&path, ar_keys::DEFAULT_CAP) {
+                Ok(list) => Some(Arc::new(list)),
+                Err(e) => {
+                    // A proxy that cannot open the revocation table still
+                    // serves: the table is optional, and a token revoked by
+                    // other means is still good for its lifetime. The warning
+                    // says so, because an operator who believes revocation
+                    // works and does not is worse off than one who knows it
+                    // does not.
+                    eprintln!(
+                        "ar: revocation table not available — revoked tokens stay valid until they expire: {e}"
+                    );
+                    None
+                }
+            }
+        }
+        commands::StoreProbe::Absent(_) => None,
+        commands::StoreProbe::Unreadable { reason, .. } => {
+            // The store is there and will not open. The revocation table is a
+            // table in that same file, so it is not trustworthy either — and
+            // saying so is better than reporting a table that is available
+            // while the store behind it is broken.
+            eprintln!(
+                "ar: credential store unreadable — the revocation table is unavailable: {reason}"
+            );
+            None
+        }
+    };
+
+    Ok((
+        Components {
+            master_key,
+            ledger,
+            obs_dir,
+            revocations: revocations.clone(),
+            ..Components::with_exec(config, exec)
+        },
+        revocations,
+    ))
 }
 
 /// Boots the listener and blocks until interrupted.
@@ -204,6 +278,7 @@ pub async fn serve(cli: &Cli, args: &ServeArgs) -> anyhow::Result<()> {
     let cfg = commands::load(cli)?;
     refuse_empty_api_keys(&cfg)?;
     let built = components(cli, &cfg, args.port, None)?;
+    let (built, revocations) = built;
 
     // The control page (docs/16 Option B): the ledger Arc is cloned before the
     // server consumes `Components`, and the credential store is a second
@@ -229,7 +304,7 @@ pub async fn serve(cli: &Cli, args: &ServeArgs) -> anyhow::Result<()> {
     // ungated", so the operator believes the gate is on while it is not. The
     // panel's answer to that is what `GateState::Broken` is for — reads
     // degrade, writes refuse.
-    ui_ctx.set_gate(gate_state(cli));
+    ui_ctx.set_gate(gate_state(cli, revocations.as_ref()));
 
     let server = ar_server::server(built);
     let count = server.state.config.providers.len();
@@ -295,6 +370,9 @@ pub async fn serve(cli: &Cli, args: &ServeArgs) -> anyhow::Result<()> {
     if discovery_task.is_some() {
         eprintln!("model discovery armed ({})", ar_server::DISCOVERY_VAR);
     }
+    // The revocation table's sweep. Silent when there is no table — the
+    // default install has none, and a line about it would be noise.
+    let _sweep_task = server.spawn_revocation_sweep();
     if server.state.obs.is_some() {
         let dir = std::env::var(OBS_DIR_VAR).unwrap_or_default();
         eprintln!("observability write path armed ({OBS_DIR_VAR}={dir})");
@@ -418,7 +496,8 @@ pub async fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<()> {
         })?,
     };
 
-    let server = ar_server::server(components(cli, &cfg, None, Some(&model))?);
+    let (built, _revocations) = components(cli, &cfg, None, Some(&model))?;
+    let server = ar_server::server(built);
     let payload = serde_json::json!({
         "model": model,
         "stream": false,
@@ -475,6 +554,43 @@ mod tests {
     /// The sample config's `cheap` combo: two openai tiers, both priced, the
     /// nano an order of magnitude under the flagship.
     const CHEAP: &str = "keys:\n  k: v\nproviders:\n  - id: openai\n    key: k\ncombos:\n  - id: cheap\n    strategy: cost-optimized\n    targets:\n      - openai/gpt-5.4\n      - openai/gpt-5.4-nano\n";
+
+    /// `sqlite` creates a file it opens, so the revocation table must not be
+    /// opened on a host that has no credential store — otherwise `serve` on an
+    /// env-only install leaves an empty `credentials.db` behind, and the next
+    /// `aroute doctor` reports a store that holds nothing: a report about a
+    /// file the doctor did not create.
+    ///
+    /// The house rule is already written down at `commands.rs`: "Not opened
+    /// when absent: `open` would *create* the file, and a read-only check that
+    /// leaves a database behind is a check that lies about what it found."
+    /// This test is that rule, on the serve path.
+    #[test]
+    fn an_absent_store_leaves_no_file_behind() {
+        let dir = std::env::temp_dir().join(format!("ar-serve-nostore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let config = dir.join("config.yaml");
+        std::fs::write(&config, CHEAP).expect("config");
+        let store_path = commands::store_path(&config);
+        assert!(
+            !store_path.exists(),
+            "precondition: there is no store to begin with"
+        );
+
+        // The probe is what decides, and it must not create the file either.
+        let probe = commands::store_probe(&config);
+        assert!(
+            matches!(probe, commands::StoreProbe::Absent(_)),
+            "the probe reports an absent store"
+        );
+        assert!(
+            !store_path.exists(),
+            "the probe must not leave a database behind"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn candidates_for(yaml: &str, combo: &str) -> Vec<ar_route::Candidate> {
         let cfg = Config::parse(yaml, |_| Ok(Some("v".to_owned()))).expect("the fixture parses");

@@ -35,7 +35,7 @@
 //! percentage, exhausted flag, reset time, recorded time, and the three indices
 //! that make it a time series rather than a log. One deviation, deliberate: the
 //! two timestamps are `INTEGER` unix seconds rather than the reference's `TEXT`
-//! `datetime('now')`, matching [`crate::Revocation`] and this repository's other
+//! `datetime('now')`, matching [`crate::Revocations`] and this repository's other
 //! tables. A column a time-series query sorts on wants an integer key.
 //!
 //! Append-only by the same argument as the ledger: a snapshot's value is its
@@ -202,6 +202,12 @@ CREATE INDEX IF NOT EXISTS quota_snapshots_by_window
     ON quota_snapshots (provider, window_key, recorded_at);
 CREATE INDEX IF NOT EXISTS quota_snapshots_by_recorded_at
     ON quota_snapshots (recorded_at);
+CREATE TABLE IF NOT EXISTS revoked_tokens (
+    jti        TEXT PRIMARY KEY,
+    expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS revoked_tokens_by_expiry
+    ON revoked_tokens (expires_at);
 ",
         kind_check = session_kind_check(),
         terminal = ar_exec::oauth::terminal_check_constraint(),
@@ -594,7 +600,7 @@ impl OAuthSession {
 /// Not `Debug`: [`MasterKey`] has no printable form and neither should anything
 /// holding one.
 ///
-/// Blocking: `rusqlite` is synchronous, like [`crate::Revocation`]. Nothing on
+/// Blocking: `rusqlite` is synchronous, like [`crate::Revocations`]. Nothing on
 /// the request path calls it — the store is read once while a config is built.
 pub struct CredentialStore {
     conn: Connection,

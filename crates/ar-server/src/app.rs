@@ -209,6 +209,14 @@ pub struct AppState {
     /// safe because [`crate::config::ServerConfig::public`] then holds the bind to
     /// loopback. See [`bind_addr`] for the other half of that pair.
     pub auth: Option<Arc<AuthGate>>,
+    /// The revocation table, when the deployment has one.
+    ///
+    /// The **same** handle the bearer gate consults and the control panel's
+    /// gate consults — one per process, so the two surfaces cannot disagree
+    /// about a just-revoked `jti`. `None` when the deployment runs no table,
+    /// which is a supported configuration: a token revoked by any other means
+    /// is then good for its whole lifetime.
+    pub revocations: Option<Arc<ar_keys::Revocations>>,
     /// How the gate treats a request with no usable credential.
     ///
     /// Carried on the state rather than read from `config` at the call site so
@@ -289,6 +297,19 @@ pub struct Components {
     /// carries the env-derived one for every shipped path, so leaving this
     /// `None` is the ordinary case and not an omission.
     pub master_key: Option<Vec<u8>>,
+    /// The revocation list the bearer gate consults.
+    ///
+    /// `None` means the deployment runs no revocation table, and a token
+    /// revoked by any other means is good for its whole lifetime. That is a
+    /// supported configuration — the table is optional — but it is the reason
+    /// this is a `Components` field: a caller that has a store hands the list
+    /// over, and one that does not leaves it `None`.
+    ///
+    /// The list is shared as an `Arc`, because the server's gate and the
+    /// control panel's gate must consult the **same** list: a token revoked
+    /// through one surface has to be dead in the other, and two lists would
+    /// make the two surfaces disagree about the same token.
+    pub revocations: Option<Arc<ar_keys::Revocations>>,
 }
 impl Components {
     /// The minimal configuration: no cache, no bearer gate, no extra models, and
@@ -309,6 +330,7 @@ impl Components {
             ledger: None,
             obs_dir: None,
             master_key: None,
+            revocations: None,
         }
     }
 
@@ -479,7 +501,17 @@ impl Components {
             .map(Arc::new),
             // `Secret` has no `Deref`, so the gate takes the bytes rather than the
             // wrapper; the wrapper stays in `master` so it is zeroized on drop.
-            auth: master.as_ref().map(|m| m.as_bytes()).and_then(build_gate),
+            //
+            // The revocation list is optional, and a gate **without** it is
+            // still a gate: dropping the whole gate because the operator did
+            // not configure a revocation table would be a far worse failure
+            // than a gate that cannot see revocations. So the list is attached
+            // when there is one and the gate is built either way.
+            auth: master
+                .as_ref()
+                .map(|m| m.as_bytes())
+                .and_then(|bytes| build_gate(bytes, self.revocations.as_ref())),
+            revocations: self.revocations.clone(),
         }
     }
 }
@@ -514,9 +546,19 @@ fn build_cache(bytes: Option<Option<u64>>) -> Option<Arc<ar_cache::Cache>> {
 /// being a line that scrolls past. [`ServerConfig::public`] through
 /// [`bind_addr`] is the other half of the same property: a server with no
 /// gate refuses a routable bind unless the operator declared it public.
-fn build_gate(master: &[u8]) -> Option<Arc<AuthGate>> {
+///
+/// The revocation list is attached here, before the `Arc`: the gate holds the
+/// master and is deliberately not `Clone`, so the list has to be handed over
+/// while the gate is still owned.
+fn build_gate(
+    master: &[u8],
+    revocations: Option<&Arc<ar_keys::Revocations>>,
+) -> Option<Arc<AuthGate>> {
     match AuthGate::new(master) {
-        Ok(gate) => Some(Arc::new(gate)),
+        Ok(gate) => Some(Arc::new(match revocations {
+            Some(revocations) => gate.with_revocations(Arc::clone(revocations)),
+            None => gate,
+        })),
         Err(e) => {
             // stderr, not stdout: stdout is the data channel (`docs/06`).
             eprintln!("ar: bearer gate DISABLED — the master key was rejected ({e})");
@@ -1015,6 +1057,42 @@ impl Server {
                         providers = discovery.providers_hint(),
                         "model discovery refresh failed; serving the cached catalog"
                     );
+                }
+            }
+        }))
+    }
+
+    /// Sweeps the revocation table every minute, dropping entries whose token
+    /// has expired.
+    ///
+    /// A write also sweeps, so this is about reclaiming space when the proxy
+    /// is **idle** — a list whose entries were all written before the proxy
+    /// started would otherwise keep its dead rows until the next revoke. The
+    /// cap is on live entries, so a table full of expired rows is not full,
+    /// but it is still rows.
+    ///
+    /// The interval is the one `docs/04-subsystems.md` names. The failure mode
+    /// is logged and the loop continues: a table that cannot be swept is a
+    /// space problem, not a correctness one, and the entries are dead either
+    /// way.
+    ///
+    /// Returns the task handle so a shutdown path can join it. `None` when the
+    /// deployment runs no revocation table, so there is no idle task in the
+    /// default configuration.
+    pub fn spawn_revocation_sweep(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let revocations = self.state.revocations.clone()?;
+        Some(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                ticker.tick().await;
+                match revocations.purge_expired() {
+                    Ok(gone) if gone > 0 => {
+                        tracing::debug!(gone, "swept expired revocations");
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "the revocation sweep failed; the table still works");
+                    }
                 }
             }
         }))

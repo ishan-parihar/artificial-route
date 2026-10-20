@@ -66,7 +66,9 @@
 //! configuration, because a server that degrades an invalid key to anonymous and
 //! one that 401s it are the same code with a different operator decision, and
 //! only the operator knows which one they deployed.
-use ar_keys::{KeyError, KeyMeta, MasterKey, Scope, Secret, Tokens};
+use std::sync::Arc;
+
+use ar_keys::{KeyError, KeyMeta, MasterKey, Revocations, Scope, Secret, Tokens};
 use axum::http::HeaderMap;
 
 use crate::config::AuthMode;
@@ -211,13 +213,24 @@ fn path_token(path: &str) -> Option<&str> {
 /// Verifies bearer tokens. Shared behind an `Arc`, never cloned.
 pub struct AuthGate {
     tokens: Tokens,
+    /// The revocation list, when the server was given one.
+    ///
+    /// `None` means the operator runs a server with no revocation store, and a
+    /// revoked token is then good for its whole lifetime. That is a supported
+    /// configuration, not a bug: the store is optional and a single-box
+    /// install may not want a second file. It is also the reason the panel and
+    /// this gate must agree — a token revoked in one surface has to be dead in
+    /// the other, so both take the **same** list or neither takes one.
+    revocations: Option<Arc<Revocations>>,
 }
 
 impl std::fmt::Debug for AuthGate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // `Tokens` holds the master key's bytes. Its count is the only safe
         // summary, and there is nothing else worth saying.
-        f.debug_struct("AuthGate").finish_non_exhaustive()
+        f.debug_struct("AuthGate")
+            .field("revocations", &self.revocations.is_some())
+            .finish_non_exhaustive()
     }
 }
 
@@ -238,7 +251,19 @@ impl AuthGate {
         let master = MasterKey::new(Secret::from_slice(master)?, KeyMeta::generate())?;
         Ok(Self {
             tokens: Tokens::new(&master),
+            revocations: None,
         })
+    }
+
+    /// Attaches a revocation list to this gate.
+    ///
+    /// The list is shared, not owned: one `Arc<Revocation>` is opened per
+    /// process and handed to every surface that verifies a token, so the panel
+    /// and `/v1` are looking at the same file and the same entries.
+    #[must_use]
+    pub fn with_revocations(mut self, revocations: Arc<Revocations>) -> Self {
+        self.revocations = Some(revocations);
+        self
     }
 
     /// Introspects `token` for the completions scope and names the key it
@@ -251,13 +276,14 @@ impl AuthGate {
     /// expiry, a revoked `jti` or a missing scope names which, and none of them
     /// echoes the token.
     pub fn verify(&self, token: &str) -> Result<String, String> {
-        let verified = self.tokens.introspect(token).map_err(|e| reason(&e))?;
-        if !verified.scopes.grants(Scope::ExecuteCompletions) {
-            return Err(format!(
-                "this token lacks the {} scope",
-                Scope::ExecuteCompletions
-            ));
-        }
+        let verified = self
+            .tokens
+            .verify(
+                token,
+                Scope::ExecuteCompletions,
+                self.revocations.as_deref(),
+            )
+            .map_err(|e| reason(&e))?;
         Ok(verified.key_id)
     }
 

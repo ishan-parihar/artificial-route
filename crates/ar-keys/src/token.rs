@@ -30,7 +30,7 @@ use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 
 use crate::error::KeyError;
-use crate::revoke::Revocation;
+use crate::revocations::Revocations;
 use crate::secret::{MasterKey, Secret};
 
 /// Access-token lifetime. A stolen token is worthless after this.
@@ -327,14 +327,17 @@ impl Tokens {
         })
     }
 
-    /// Verifies `token`, then checks it is not revoked and grants `need`.
+    /// Verifies signature, expiry, revocation and scope.
     ///
-    /// The order matters: signature, then expiry (both inside
-    /// `jsonwebtoken`), then revocation, then scope. Checking scope before
-    /// revocation would let a caller use a slow scope check to probe which `jti`s
-    /// are live.
+    /// `revocations` is `None` when the deployment runs no revocation store. That
+    /// is a supported configuration, not a hole by accident: the store is
+    /// optional, and a single-box install may not want the revocation table
+    /// written next to its credentials. The consequence is honest and worth
+    /// stating — **with no store, a revoked token is good for its whole
+    /// lifetime**, and the only remedy is rotating the master.
     ///
     /// # Errors
+    ///
     /// [`KeyError::BadSignature`], [`KeyError::Expired`],
     /// [`KeyError::NotYetValid`] for a bad or stale token,
     /// [`KeyError::MissingJti`] if there is nothing to revoke against,
@@ -344,10 +347,12 @@ impl Tokens {
         &self,
         token: &str,
         need: Scope,
-        revocations: &Revocation,
+        revocations: Option<&Revocations>,
     ) -> Result<Verified, KeyError> {
         let verified = self.introspect(token)?;
-        if revocations.is_revoked(&verified.jti)? {
+        if let Some(list) = revocations
+            && list.is_revoked(&verified.jti)?
+        {
             return Err(KeyError::Revoked { jti: verified.jti });
         }
         if !verified.scopes.grants(need) {
@@ -357,6 +362,16 @@ impl Tokens {
             });
         }
         Ok(verified)
+    }
+
+    /// Revokes this token's `jti` until its `exp`.
+    ///
+    /// # Errors
+    /// [`KeyError::BadSignature`] / [`KeyError::Expired`] if the token does not
+    /// verify, and as [`Revocations::revoke`] otherwise.
+    pub fn revoke(&self, token: &str, revocations: &Revocations) -> Result<(), KeyError> {
+        let verified = self.introspect(token)?;
+        revocations.revoke(&verified.jti, verified.expires_at)
     }
 
     /// Verifies signature and expiry only. Does not consult the revoke list and
@@ -380,16 +395,6 @@ impl Tokens {
             scopes,
             expires_at: claims.exp,
         })
-    }
-
-    /// Revokes this token's `jti` until its `exp`.
-    ///
-    /// # Errors
-    /// [`KeyError::BadSignature`] / [`KeyError::Expired`] if the token does not
-    /// verify, and as [`Revocation::revoke`] otherwise.
-    pub fn revoke(&self, token: &str, revocations: &Revocation) -> Result<(), KeyError> {
-        let verified = self.introspect(token)?;
-        revocations.revoke(&verified.jti, verified.expires_at)
     }
 
     fn mint(&self, req: &Issue<'_>, now: i64, ttl: Duration) -> Result<Half, KeyError> {

@@ -414,6 +414,90 @@ pub fn arm_gate(cli: &Cli, key_id: &str, explicit: Option<&str>) -> anyhow::Resu
     Ok(())
 }
 
+/// `aroute keys revoke` — kill one token without touching the others.
+///
+/// The token's `jti` is written to the revocation table in the credential
+/// store, and every gate that consults that table refuses it from then on.
+/// The master is **not** touched, so every other token keeps working — which
+/// is the whole point of this verb against rotating the master, which
+/// invalidates all of them at once.
+///
+/// The token is read from a file or stdin, never from an argument: a token on
+/// a command line is in the shell history and in the process table.
+pub fn keys_revoke(cli: &Cli, token_file: &str) -> anyhow::Result<()> {
+    let token = read_token_file(token_file)?;
+    let Some(store) = credential_store(cli) else {
+        return Err(fail(
+            "no credential store to write the revocation into",
+            "the revocation table lives in the credential store; run this where the store is",
+        ));
+    };
+    let Some(master) = store.get(GATE_ROW).map_err(|e| {
+        fail(
+            e,
+            "the gate row could not be decrypted; was $AR_MASTER_KEY rotated?",
+        )
+    })?
+    else {
+        return Err(fail(
+            "the gate is not armed — no master key row in the store",
+            "a token can only be revoked against the master that signed it",
+        ));
+    };
+    // The same `Tokens` engine the server's gate builds, so the `jti` the
+    // server reads is the `jti` written here. The `KeyMeta` is a fresh salt:
+    // it only ever feeds the AEAD key, and the SIGNING key is the master
+    // bytes themselves, so a fresh salt still verifies the same tokens.
+    let tokens = ar_keys::Tokens::new(&ar_keys::MasterKey::new(
+        master.to_owned_secret(),
+        ar_keys::KeyMeta::generate(),
+    )?);
+    let revocations = ar_keys::Revocations::open(&store_path(&cli.config), ar_keys::DEFAULT_CAP)
+        .map_err(|e| {
+            fail(
+                e,
+                "the revocation table could not be opened; is the store's directory writable?",
+            )
+        })?;
+    tokens.revoke(&token, &revocations).map_err(|e| {
+        fail(
+            e,
+            "the token could not be revoked; it may be malformed, expired, or signed by another master",
+        )
+    })?;
+    let verified = tokens
+        .introspect(&token)
+        .map_err(|e| fail(e, "the token could not be read back"))?;
+    println!("revoked: key id {} (jti {})", verified.key_id, verified.jti);
+    println!("expires: {} (unix) — the entry is swept after this", verified.expires_at);
+    Ok(())
+}
+
+/// The token to revoke, from a file or from stdin.
+///
+/// A token is a secret. Reading it from a file keeps it out of the shell
+/// history and out of the process table, which is why the verb takes a path
+/// and not the token itself.
+fn read_token_file(path: &str) -> anyhow::Result<String> {
+    let raw = if path == "-" {
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+            .map_err(|e| fail(e, "the token could not be read from stdin"))?;
+        buf
+    } else {
+        std::fs::read_to_string(path)
+            .map_err(|e| fail(e, "the token file could not be read"))?
+    };
+    let token = raw.trim();
+    if token.is_empty() {
+        return Err(fail(
+            "the token is empty",
+            "the file must hold the token, and nothing else",
+        ));
+    }
+    Ok(token.to_owned())
+}
+
 /// `aroute keys mint` — another client token from the stored gate master.
 pub fn keys_mint(cli: &Cli, key_id: &str, ttl_days: u32) -> anyhow::Result<()> {
     let Some(store) = credential_store(cli) else {
@@ -742,6 +826,7 @@ pub fn dispatch(cli: &Cli) -> anyhow::Result<()> {
                 arm_gate(cli, &args.key_id, args.key.as_deref())
             }
             crate::cli::KeysCommand::Mint(args) => keys_mint(cli, &args.key_id, args.ttl_days),
+            crate::cli::KeysCommand::Revoke(args) => keys_revoke(cli, &args.token_file),
         },
         Some(Command::Limits(a)) => match &a.command {
             None => limits_view(cli),
