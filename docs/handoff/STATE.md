@@ -291,10 +291,10 @@ several of them had gone stale (A1 said "v0.1.16 is the newest tag" when `v0.1.1
 tagged; B6 said "14 orphan pages" when the count is now 0). The old documents keep the
 **history** of their pass and point at the ledger; the ledger owns the **state**.
 
-<!-- genome:zone status sha=5ae886beb35f -->
+<!-- genome:zone status sha=17fcc9596728 -->
 | status | items |
 |---|---|
-| open | 40 |
+| open | 41 |
 | in-progress | 1 |
 | done | 26 |
 
