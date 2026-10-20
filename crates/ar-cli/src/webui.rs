@@ -2715,7 +2715,7 @@ mod http_tests {
         .expect("master");
         let tokens = ar_keys::Tokens::new(&master);
         let verified = tokens.introspect(&token).expect("the token verifies");
-        list.revoke(&verified.jti, verified.expires_at)
+        list.revoke(&verified.session_id, verified.expires_at)
             .expect("the revoke lands");
 
         // After the revoke: it does not.

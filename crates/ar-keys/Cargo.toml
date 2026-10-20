@@ -39,10 +39,14 @@ argon2 = "0.5"
 base64 = "0.22"
 governor = "0.10"
 jsonwebtoken = "9.3"
-redb = "2.6"
 # Already in the graph via `ar-tokens`' ledger and pinned in the workspace as
 # `rusqlite = { version = "0.32", features = ["bundled"] }`. The credential store
-# is the second consumer; `bundled` keeps the static binary self-contained.
+# and the revocation table are the other consumers; `bundled` keeps the static
+# binary self-contained.
+#
+# The revocation list USED to be a redb file, and redb is still a dependency of
+# `ar-cache` and `ar-mcp` — on 4.3. `ar-keys` was the only crate on 2.6, so
+# dropping it removed a second redb version from the graph entirely.
 rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

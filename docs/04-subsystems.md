@@ -25,8 +25,9 @@ Accept: `cargo test -p ar-compress` shows the 3 rungs of each ladder differ; `li
 OmniRoute `enc:v1:iv:ct:tag` AES-GCM, `scrypt(secret, STATIC_SALT)`, IV 16B, fail-open on encrypt.
 Fix: `enc:v2:` argon2id + 12B nonce + AAD=`provider|key-id|v`, per-install salt in `key.meta`,
 `Zeroizing` heap, `keyring` desktop / `age` file VPS, fail-closed both ways, v1 read-migrate.
-Tokens JWT 15m + refresh 30d + jti, scopes `models:read llm:write admin:*`, device-id, `revoke<jti>` polled 60s.
-Process-spawn routes loopback-only enforced server-side. Accept: no-env write refuses; rotation re-encrypts; stolen token expires.
+Tokens JWT 15m + refresh 30d + jti + sid, scopes `models:read llm:write admin:*`, device-id, `revoke<sid>` polled 60s.
+The revoke list is a `revoked_tokens` table in the credential store's own sqlite file, keyed on the **session id** (`sid`), not the `jti`: a minted token is a pair and the refresh half is itself a valid bearer credential, so one revoke must kill both halves. The entry carries the **later** of the two halves' expiries.
+Process-spawn routes loopback-only enforced server-side. Accept: no-env write refuses; rotation re-encrypts; stolen token expires; stolen token is revocable by session (`aroute keys revoke`).
 
 **Credential store** (audit F-CRIT-2): gitignored `credentials.db` (default beside the config
 file, `$AR_CRED_STORE` overrides) holding `enc:v2:` envelopes, one row per `keys:` name. The

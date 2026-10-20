@@ -250,7 +250,7 @@ pub fn check(headers: &HeaderMap, state: &GateState) -> Verdict {
         Err(_) => return Err("this token is not valid".to_owned()),
     };
     if let Some(list) = state.revocations()
-        && match list.is_revoked(&verified.jti) {
+        && match list.is_revoked(&verified.session_id) {
             Ok(true) => true,
             Ok(false) => false,
             // A revocation table that cannot be read is a table that cannot say

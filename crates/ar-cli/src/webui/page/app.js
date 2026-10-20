@@ -727,14 +727,15 @@ function paneKeys(root, st) {
           H("label", { for: "mint-id", text: "Key id" }),
           H("input", { id: "mint-id", autocomplete: "off", spellcheck: "false", placeholder: "ci-runner", style: "width:auto" }),
           H("label", { for: "mint-ttl", text: "days" }),
-          H("input", { id: "mint-ttl", type: "number", min: "0", max: "3650", value: "7", style: "width:80px" }),
+          H("input", { id: "mint-ttl", type: "number", min: "0", max: "365", value: "7", style: "width:80px" }),
           H("label", { for: "mint-rpm", text: "rpm" }),
           H("input", { id: "mint-rpm", type: "number", min: "1", max: "100000", placeholder: "unset", style: "width:90px" }),
           H("button", { type: "submit", class: "btn btn-primary", "data-cta": "primary", text: "Mint key" })),
-        H("p", { class: "hint", text: "The token lives for the number of days above. 0 mints one that never expires, which is the wrong default for anything that might leak: the panel can revoke a token, but only a token it minted with a life it can outlive." }),
+        H("p", { class: "hint", text: "The token lives for the number of days above. 0 mints one that never expires, which is the wrong default for anything that might leak. Revoking a token needs the token itself, so a shorter life is what bounds a leak you did not keep a copy of." }),
         H("details", { id: "minted", class: "minted", hidden: true, open: "open" },
           H("summary", null, "Token for ", H("span", { id: "minted-id" }), " - copy it now"),
           H("code", { id: "minted-token" }),
+          H("p", { id: "minted-life", class: "hint" }),
           H("button", { id: "minted-use", type: "button", class: "btn small ghost", text: "Use in playground",
             onclick: () => { if (MINTED) { PG_TOKEN = MINTED.access; location.hash = "#/playground"; } } })),
         H("p", { id: "keys-error", class: "error", role: "alert", hidden: true }))),
@@ -760,6 +761,15 @@ function showMinted() {
   $("minted").hidden = false;
   $("minted-id").textContent = MINTED.key_id;
   $("minted-token").textContent = MINTED.access;
+  // The lifetime, in days — the form the operator set it in. A raw unix
+  // timestamp is not actionable, and `ttl_days === 0` means "never", which
+  // has to read as such rather than as "0 days".
+  const life = $("minted-life");
+  if (life) {
+    life.textContent = MINTED.ttl_days === 0
+      ? "never expires"
+      : "lives for " + MINTED.ttl_days + (MINTED.ttl_days === 1 ? " day" : " days");
+  }
 }
 
 function renderKeys(st) {
@@ -813,12 +823,17 @@ function wireMint() {
   $("mint-form").addEventListener("submit", async (e) => {
     e.preventDefault();
     const key_id = $("mint-id").value.trim();
-    const ttl = $("mint-ttl").value.trim();
+    // The lifetime is omitted when the field is empty, so the server's own
+    // default applies. Sending 0 instead would mint a token that NEVER
+    // expires — the exact opposite of what a cleared field should mean.
+    const ttlText = $("mint-ttl").value.trim();
+    const body = { key_id };
+    if (ttlText !== "") body.ttl_days = Number(ttlText);
     const rpm = $("mint-rpm").value === "" ? null : Number($("mint-rpm").value);
     try {
-      const res = await api("/ui/api/keys/mint", { key_id, ttl_days: Number(ttl || 0) });
+      const res = await api("/ui/api/keys/mint", body);
       if (rpm != null) await api("/ui/api/limits", { key: key_id, rpm });
-      MINTED = { key_id: res.key_id, access: res.access };
+      MINTED = { key_id: res.key_id, access: res.access, ttl_days: res.ttl_days, expires_at: res.expires_at };
       showMinted();
       await refresh();
     } catch (err) { showError("keys-error", err); }

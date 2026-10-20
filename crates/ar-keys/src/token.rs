@@ -203,6 +203,16 @@ struct Claims {
     /// Unique token id. The revoke list keys on this.
     #[serde(default)]
     jti: String,
+    /// The **session** id: one per mint, shared by both halves.
+    ///
+    /// This is what the revoke list keys on, and the reason is that a session
+    /// has two credentials and they must die together. The access half lives
+    /// 15 minutes and the refresh half 30 days, and the refresh half is itself
+    /// a valid bearer token — so revoking only the access half would leave a
+    /// 30-day credential live, which is exactly the outcome a "revoke this
+    /// token" command exists to prevent.
+    #[serde(default)]
+    sid: String,
     iat: i64,
     nbf: i64,
     exp: i64,
@@ -235,6 +245,10 @@ pub struct Issued {
     pub refresh: String,
     /// The access token's `jti`.
     pub jti: String,
+    /// The **session** id, shared by both halves.
+    ///
+    /// The revoke list keys on this, so one revoke kills the whole session.
+    pub session_id: String,
     /// The access token's `exp`, as a Unix timestamp.
     pub expires_at: i64,
     /// The refresh token's `exp`, as a Unix timestamp.
@@ -248,12 +262,24 @@ pub struct Verified {
     pub key_id: String,
     /// The token id, from `jti`.
     pub jti: String,
+    /// The session id, from `sid`.
+    ///
+    /// The revoke list keys on this, so a token is revoked together with every
+    /// other half of the same mint.
+    pub session_id: String,
     /// The device this token was issued to, if any.
     pub device_id: Option<String>,
     /// What it may do.
     pub scopes: ScopeSet,
     /// `exp` as a Unix timestamp.
     pub expires_at: i64,
+    /// `iat` as a Unix timestamp.
+    ///
+    /// The session's longest-lived half expires at `issued_at + REFRESH_TTL`,
+    /// and which half that is depends on the requested lifetime — so a revoke
+    /// needs `iat` to write the right expiry. Writing the presented token's own
+    /// `exp` would let the other half come back to life.
+    pub issued_at: i64,
 }
 
 /// Mints and verifies tokens.
@@ -312,14 +338,20 @@ impl Tokens {
     /// make `exp` negative) or if signing fails.
     pub fn issue(&self, req: Issue<'_>) -> Result<Issued, KeyError> {
         let now = now_epoch()?;
-        let access = self.mint(&req, now, req.ttl.unwrap_or(ACCESS_TTL))?;
+        // ONE session id for the pair. The two halves carry different `jti`s
+        // (so a `jti` names one credential) but the SAME `sid` (so the revoke
+        // list can kill the session in one write). A session id that was
+        // generated per half would be the old bug with a new name.
+        let session_id = new_jti();
+        let access = self.mint(&req, now, req.ttl.unwrap_or(ACCESS_TTL), &session_id)?;
         // The refresh lifetime is never shortened by `req.ttl`: an override
         // exists so a test can watch an access token die, and a caller that
         // could mint a 1-second refresh token would have a far more interesting
         // bug.
-        let refresh = self.mint(&req, now, REFRESH_TTL)?;
+        let refresh = self.mint(&req, now, REFRESH_TTL, &session_id)?;
         Ok(Issued {
             jti: access.jti,
+            session_id,
             expires_at: access.expires_at,
             refresh_expires_at: refresh.expires_at,
             access: access.token,
@@ -351,9 +383,11 @@ impl Tokens {
     ) -> Result<Verified, KeyError> {
         let verified = self.introspect(token)?;
         if let Some(list) = revocations
-            && list.is_revoked(&verified.jti)?
+            && list.is_revoked(&verified.session_id)?
         {
-            return Err(KeyError::Revoked { jti: verified.jti });
+            return Err(KeyError::Revoked {
+                jti: verified.session_id,
+            });
         }
         if !verified.scopes.grants(need) {
             return Err(KeyError::ScopeDenied {
@@ -364,14 +398,37 @@ impl Tokens {
         Ok(verified)
     }
 
-    /// Revokes this token's `jti` until its `exp`.
+    /// The expiry a session's revocation entry must carry: the **later** of
+    /// the two halves' expiries.
+    ///
+    /// The refresh half is minted with [`REFRESH_TTL`] from `iat`, and the
+    /// access half with the requested lifetime — so which is later depends on
+    /// the lifetime. A 15-minute access token dies before its 30-day refresh
+    /// sibling, but a 365-day access token outlives it. Writing the earlier of
+    /// the two would let the other half come back to life when the entry is
+    /// swept.
+    fn session_expiry(verified: &Verified) -> i64 {
+        let refresh_expiry = verified.issued_at.saturating_add(
+            i64::try_from(REFRESH_TTL.as_secs()).unwrap_or(i64::MAX),
+        );
+        verified.expires_at.max(refresh_expiry)
+    }
+
+    /// Revokes this token's **session** until the session's longest-lived half
+    /// expires.
+    ///
+    /// The whole session dies, not one half of it. A session has two
+    /// credentials — a 15-minute access token and a 30-day refresh token — and
+    /// the refresh half is itself a valid bearer token, so revoking only the
+    /// access half would leave a 30-day credential live. That is the outcome
+    /// this command exists to prevent.
     ///
     /// # Errors
     /// [`KeyError::BadSignature`] / [`KeyError::Expired`] if the token does not
     /// verify, and as [`Revocations::revoke`] otherwise.
     pub fn revoke(&self, token: &str, revocations: &Revocations) -> Result<(), KeyError> {
         let verified = self.introspect(token)?;
-        revocations.revoke(&verified.jti, verified.expires_at)
+        revocations.revoke(&verified.session_id, Self::session_expiry(&verified))
     }
 
     /// Verifies signature and expiry only. Does not consult the revoke list and
@@ -391,13 +448,21 @@ impl Tokens {
         Ok(Verified {
             key_id: claims.sub,
             jti: claims.jti,
+            session_id: claims.sid,
             device_id: claims.device_id,
             scopes,
             expires_at: claims.exp,
+            issued_at: claims.iat,
         })
     }
 
-    fn mint(&self, req: &Issue<'_>, now: i64, ttl: Duration) -> Result<Half, KeyError> {
+    fn mint(
+        &self,
+        req: &Issue<'_>,
+        now: i64,
+        ttl: Duration,
+        session_id: &str,
+    ) -> Result<Half, KeyError> {
         let exp = now
             .checked_add(i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX))
             .ok_or(KeyError::Crypto("token-exp overflow"))?;
@@ -405,9 +470,10 @@ impl Tokens {
             iss: self.iss.clone(),
             aud: self.aud.clone(),
             sub: req.key_id.to_string(),
-            // A fresh id per half: revoking the access token must not silently
-            // revoke the refresh token that can mint another one.
+            // A fresh id per half: a `jti` names one credential, and the
+            // session id is what ties the halves together for revocation.
             jti: new_jti(),
+            sid: session_id.to_owned(),
             iat: now,
             nbf: now,
             exp,

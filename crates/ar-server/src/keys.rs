@@ -372,6 +372,13 @@ fn reason(e: &KeyError) -> String {
         }
         // Everything else is a signature or shape problem, and distinguishing
         // them for a caller who presented a bad token only helps them guess.
+        //
+        // This arm is LOAD-BEARING: a revocation table that cannot be read
+        // (a sqlite failure) lands here too, and lands here as a 401 rather
+        // than a 500. That is the right direction — a gate that cannot check
+        // must not admit — and it must stay a 401, because a 500 would tell
+        // the client "I could not check" where the panel says "this token is
+        // not valid", and the two surfaces must agree.
         _ => "this token is not valid".to_owned(),
     }
 }
@@ -392,6 +399,69 @@ mod tests {
 
     fn gate() -> AuthGate {
         AuthGate::new(b"0123456789abcdef0123456789abcdef").expect("master key accepted")
+    }
+
+    /// A revocation list in a fresh temp file, and that file's path.
+    fn revocation_list(tag: &str) -> (std::sync::Arc<ar_keys::Revocations>, std::path::PathBuf) {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "ar-server-revoke-{tag}-{}-{n}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        (
+            std::sync::Arc::new(
+                ar_keys::Revocations::open(&path, 64).expect("the revocation list opens"),
+            ),
+            path,
+        )
+    }
+
+    /// The revoked half of the "both or neither" property.
+    ///
+    /// `docs/31`'s Phase 2 gate says a revoked token answers **401** on **both**
+    /// `/v1` and `/ui`. The `/ui` half is proven in `ar-cli`; this is the
+    /// `/v1` half, and it is the test that would catch a future edit reverting
+    /// `verify` to `introspect`.
+    ///
+    /// It asserts the **reason string**, not just `is_err`: a client that
+    /// cannot tell "your token was revoked" from "your token is malformed"
+    /// cannot tell an operator to rotate the master.
+    #[test]
+    fn refuses_a_token_that_was_revoked() {
+        let (list, path) = revocation_list("v1");
+        let g = gate().with_revocations(std::sync::Arc::clone(&list));
+        let issued = g.issue_for_tests("key-1").expect("token mints");
+
+        // Before the revoke: the token works.
+        assert!(
+            g.verify(&issued.access).is_ok(),
+            "precondition: the token must work before it is revoked"
+        );
+
+        // Revoke it the way `aroute keys revoke` does: the session id, with
+        // the session's longest-lived expiry.
+        list.revoke(&issued.session_id, issued.refresh_expires_at)
+            .expect("the revoke lands");
+
+        let err = g
+            .verify(&issued.access)
+            .expect_err("a revoked token must be refused");
+        assert!(
+            err.contains("revoked"),
+            "the reason must say the token was revoked, not that it was invalid: {err}"
+        );
+
+        // The refresh half dies with the session. It is itself a valid bearer
+        // token, so a revoke that left it alive would leave a 30-day
+        // credential in the wild.
+        let refresh_err = g
+            .verify(&issued.refresh)
+            .expect_err("the session's refresh half must be refused too");
+        assert!(refresh_err.contains("revoked"), "{refresh_err}");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {

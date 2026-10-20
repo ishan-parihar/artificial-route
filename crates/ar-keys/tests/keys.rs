@@ -157,20 +157,66 @@ fn an_access_token_is_short_and_its_refresh_is_long() {
 }
 
 #[test]
-fn revoking_one_half_does_not_revoke_the_other() {
+fn revoking_a_session_kills_both_halves() {
+    // A session is two credentials: a short-lived access token and a 30-day
+    // refresh token. The refresh half is ITSELF a valid bearer token — the
+    // same gate accepts it, with the same scopes — so revoking only the
+    // access half would leave a 30-day credential live, which is the outcome
+    // a "revoke this token" command exists to prevent.
+    //
+    // The two halves carry different `jti`s and the SAME `sid`, and the revoke
+    // list keys on the `sid`. So one write kills the session.
     let (revocations, path) = temp_store("half");
     let tokens = Tokens::new(&master());
     let issued = issue(&tokens, ScopeSet::all());
     tokens
         .revoke(&issued.access, &revocations)
         .expect("revoke access");
+
+    assert!(
+        tokens
+            .verify(&issued.access, Scope::ReadAll, Some(&revocations))
+            .is_err(),
+        "the access token must be dead"
+    );
     assert!(
         tokens
             .verify(&issued.refresh, Scope::ReadAll, Some(&revocations))
-            .is_ok(),
-        "the refresh token must survive"
+            .is_err(),
+        "the refresh token must die with the session: it is a valid bearer \
+         token for 30 days, and a revoke that left it alive would be a lie"
     );
     let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn the_two_halves_share_a_session_id_and_differ_in_jti() {
+    // The shape the revocation depends on.
+    let tokens = Tokens::new(&master());
+    let issued = issue(&tokens, ScopeSet::all());
+    let access = tokens.introspect(&issued.access).expect("access verifies");
+    let refresh = tokens.introspect(&issued.refresh).expect("refresh verifies");
+
+    assert_eq!(
+        access.session_id, refresh.session_id,
+        "both halves must name the same session, or one revoke cannot kill both"
+    );
+    assert_ne!(
+        access.jti, refresh.jti,
+        "each half names one credential, so the jtis must differ"
+    );
+}
+
+#[test]
+fn two_sessions_do_not_share_a_session_id() {
+    // A revoke must not reach a session it was not aimed at.
+    let tokens = Tokens::new(&master());
+    let first = issue(&tokens, ScopeSet::all());
+    let second = issue(&tokens, ScopeSet::all());
+    assert_ne!(
+        first.session_id, second.session_id,
+        "two mints are two sessions"
+    );
 }
 
 #[test]
@@ -179,7 +225,7 @@ fn revoking_survives_a_restart() {
     // un-revoke anything.
     static N: AtomicU64 = AtomicU64::new(0);
     let path = std::env::temp_dir().join(format!(
-        "ar-keys-it-restart-{}-{}.redb",
+        "ar-keys-it-restart-{}-{}.sqlite",
         std::process::id(),
         N.fetch_add(1, Ordering::Relaxed)
     ));
@@ -399,7 +445,9 @@ fn a_revocation_written_by_one_handle_kills_the_token_for_both() {
     let tokens = Tokens::new(&master());
     let issued = issue(&tokens, ScopeSet::all());
 
-    writer.revoke(&issued.jti, issued.expires_at).expect("revoke");
+    writer
+        .revoke(&issued.session_id, issued.expires_at)
+        .expect("revoke");
 
     assert!(
         tokens

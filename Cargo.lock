@@ -136,7 +136,7 @@ dependencies = [
  "blake3",
  "bytes",
  "quick_cache",
- "redb 4.3.0",
+ "redb",
  "serde",
  "serde_json",
  "thiserror",
@@ -254,7 +254,6 @@ dependencies = [
  "governor",
  "jsonwebtoken",
  "keyring",
- "redb 2.6.3",
  "rusqlite",
  "serde",
  "serde_json",
@@ -280,7 +279,7 @@ dependencies = [
  "ar-tokens",
  "axum",
  "blake3",
- "redb 4.3.0",
+ "redb",
  "rmcp",
  "serde",
  "serde_json",
@@ -296,7 +295,7 @@ version = "0.1.17"
 dependencies = [
  "ar-keys",
  "crossbeam-channel",
- "redb 4.3.0",
+ "redb",
  "sha2",
  "subtle",
  "thiserror",
@@ -2095,15 +2094,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "498cd0dc59d73224351ee52a95fee0f1a617a2eae0e7d9d720cc622c73a54186"
 dependencies = [
  "bitflags 2.13.2",
-]
-
-[[package]]
-name = "redb"
-version = "2.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8eca1e9d98d5a7e9002d0013e18d5a9b000aee942eb134883a82f06ebffb6c01"
-dependencies = [
- "libc",
 ]
 
 [[package]]

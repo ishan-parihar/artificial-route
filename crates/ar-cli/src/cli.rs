@@ -319,8 +319,14 @@ pub enum KeysCommand {
     /// Revoke a token, so it stops working immediately.
     ///
     /// The token is dead the moment this returns, without waiting for its
-    /// expiry: its `jti` is written to the revocation table in the credential
-    /// store, and every gate that consults that table refuses it.
+    /// expiry: its session is written to the revocation table in the
+    /// credential store, and every gate that consults that table refuses it.
+    ///
+    /// **The whole session dies, not one half of it.** A minted token is a
+    /// pair — a short-lived access token and a long-lived refresh token — and
+    /// both are valid bearer credentials. Revoking only the access half would
+    /// leave the refresh half live for 30 days, which is the outcome this
+    /// command exists to prevent.
     ///
     /// This is the remedy for a **leaked** token. The other remedy — rotating
     /// the master — invalidates every token at once, including the ones that

@@ -228,7 +228,31 @@ input is named as a bad input rather than as a missing store.
 
 **Phase 2 gate:** `aroute keys revoke <token>` exists; the revoked token
 answers **401** on **both** `/v1` and `/ui`; the bench shows the lookup's cost;
-the panel's mint default is shorter and says so.
+the panel's mint default is shorter and says so. — **all met, 2026-10-20.**
+
+- `aroute keys revoke --token-file <path>` writes the token's **session id**
+  into a `revoked_tokens` table in the credential store's own sqlite file.
+- **Both** surfaces refuse a revoked session, and both are **tested**:
+  `ar-cli`'s `a_revoked_token_should_be_refused_by_the_panel` and
+  `ar-server`'s `refuses_a_token_that_was_revoked`. The `/v1` test asserts the
+  **reason string**, so the revocation path is pinned as distinct from a
+  generic rejection.
+- The lookup is **p95 12.3 us** (p50 11.2, p99 17.6) against a 1 ms budget,
+  with 500 live entries. The number is *lock acquisition plus one indexed
+  point query, uncontended* — under concurrency the `Mutex` is the ceiling,
+  not sqlite.
+- The panel's mint defaults to **7 days**, says so on the page, and the
+  lifetime is bounded at a year.
+
+**One thing the gate did not ask for, and the phase needed anyway:** the
+revocation list keys on a **session id**, not a `jti`. A minted token is a
+pair — a 15-minute access token and a 30-day refresh token — and **the refresh
+half is itself a valid bearer credential** that the same gate accepts with
+the same scopes. Revoking only the access half would have left a 30-day
+credential live, which is the outcome the command exists to prevent. The two
+halves share a `sid`; the list keys on it; one revoke kills the session. The
+expiry written is the **later** of the two halves', so the entry is not swept
+while the other half is still good.
 
 ---
 

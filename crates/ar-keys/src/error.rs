@@ -145,14 +145,13 @@ pub enum KeyError {
         placement: String,
     },
 
-    /// A local store refused a read or a write — the redb revocation ledger
-    /// ([`crate::Revocation`]) or the sqlite credential table
+    /// A local store refused a read or a write — the sqlite revocation table
+    /// ([`crate::Revocations`]) or the sqlite credential table
     /// ([`crate::CredentialStore`]).
     ///
-    /// Carries SQLite's or redb's own message as text rather than the error
-    /// itself: `KeyError` promises `Clone`/`PartialEq`, and neither library's
-    /// error type offers them. The text is the library's, never a value read out
-    /// of the store.
+    /// Carries SQLite's own message as text rather than the error itself:
+    /// `KeyError` promises `Clone`/`PartialEq`, and sqlite's error type offers
+    /// neither. The text is the library's, never a value read out of the store.
     #[error("store: {0}")]
     Store(String),
 

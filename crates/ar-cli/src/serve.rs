@@ -214,7 +214,27 @@ fn components(
     // `aroute keys revoke` work when the master has been rotated and the
     // store's own rows will not decrypt — the list needs no master.
     let revocations = match commands::store_probe(&cli.config) {
-        commands::StoreProbe::Live { path, .. } | commands::StoreProbe::Open { path, .. } => {
+        commands::StoreProbe::Absent(_) => {
+            // No store file. Opening the revocation table would CREATE one
+            // (sqlite creates a file it opens), and a host that never had a
+            // store should not grow one because it started a proxy.
+            None
+        }
+        commands::StoreProbe::Open { path, .. }
+        | commands::StoreProbe::Live { path, .. }
+        | commands::StoreProbe::Unreadable { path, .. } => {
+            // The file is there. Whether the **credential store** can read it
+            // is a different question from whether **sqlite** can open it:
+            // the probe reports `Unreadable` when `$AR_MASTER_KEY` is unset
+            // (the store needs it to decrypt) even though the file opens
+            // perfectly.
+            //
+            // The revocation table needs no master, so it is opened whenever
+            // the FILE is there, and its own result decides. A host that
+            // arms the gate from `AR_HTTP_MASTER_KEY` with no credential
+            // store still gets a working revocation list — and a host whose
+            // master was rotated still has one, which is exactly the case
+            // where the operator needs to revoke something.
             match ar_keys::Revocations::open(&path, ar_keys::DEFAULT_CAP) {
                 Ok(list) => Some(Arc::new(list)),
                 Err(e) => {
@@ -230,17 +250,6 @@ fn components(
                     None
                 }
             }
-        }
-        commands::StoreProbe::Absent(_) => None,
-        commands::StoreProbe::Unreadable { reason, .. } => {
-            // The store is there and will not open. The revocation table is a
-            // table in that same file, so it is not trustworthy either — and
-            // saying so is better than reporting a table that is available
-            // while the store behind it is broken.
-            eprintln!(
-                "ar: credential store unreadable — the revocation table is unavailable: {reason}"
-            );
-            None
         }
     };
 
