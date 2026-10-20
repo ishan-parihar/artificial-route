@@ -149,7 +149,10 @@ mod tests {
         let mut limits = Limits::default();
         let mut model_tokens = std::collections::BTreeMap::new();
         model_tokens.insert("nvidia/z-ai/glm-5.3".to_owned(), 500_000_000);
-        model_tokens.insert("kilocode/minimax/minimax-m3.1-flash:free".to_owned(), 1_000_000_000);
+        model_tokens.insert(
+            "kilocode/minimax/minimax-m3.1-flash:free".to_owned(),
+            1_000_000_000,
+        );
         limits.keys.insert(
             "k".to_owned(),
             Limit {

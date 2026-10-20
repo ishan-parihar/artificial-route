@@ -158,9 +158,7 @@ impl LiveGate {
         env_master: Option<Secret>,
         revocations: Option<Arc<Revocations>>,
     ) -> Self {
-        let env = env_master.map(|master| {
-            Arc::new(engine_for(master, &AtomicU64::new(0)))
-        });
+        let env = env_master.map(|master| Arc::new(engine_for(master, &AtomicU64::new(0))));
         Self {
             store,
             env,
@@ -252,9 +250,7 @@ impl LiveGate {
             // Answering `Unarmed` here would OPEN the panel, which is the
             // failure the three-arm split exists to prevent.
             Err(reason) => match &self.env {
-                Some(tokens) => {
-                    GateState::Armed(Arc::clone(tokens), self.revocations.clone())
-                }
+                Some(tokens) => GateState::Armed(Arc::clone(tokens), self.revocations.clone()),
                 None => GateState::Broken(reason),
             },
             // No row: the gate is the env one, or there is none.
@@ -284,8 +280,6 @@ impl LiveGate {
         }
     }
 
-
-
     /// The gate row's ciphertext.
     ///
     /// Three answers, and the third is the one that matters:
@@ -304,10 +298,7 @@ impl LiveGate {
     ///
     /// This is the expensive half: an argon2id derivation at 19 MiB and
     /// ~40 ms. It runs only when the row's ciphertext changed.
-    fn decrypt(
-        &self,
-        store: &Arc<Mutex<CredentialStore>>,
-    ) -> Result<Arc<Tokens>, String> {
+    fn decrypt(&self, store: &Arc<Mutex<CredentialStore>>) -> Result<Arc<Tokens>, String> {
         let store = store.lock().unwrap_or_else(|e| e.into_inner());
         let master: Secret = store
             .get(GATE_ROW)

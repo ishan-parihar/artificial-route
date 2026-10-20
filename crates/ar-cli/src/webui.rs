@@ -256,7 +256,10 @@ impl Ctx {
     /// The *production* caller does not set it, so the warning is about the
     /// method being reachable only from the test fixture, which is exactly
     /// what it is for.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the test fixture pins the gate"))]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the test fixture pins the gate")
+    )]
     pub fn set_gate(&mut self, gate: auth::GateState) {
         self.gate = Arc::new(gate);
     }
@@ -366,7 +369,7 @@ pub fn mount(proxy: Router, ctx: Ctx) -> Router {
         Arc::clone(&ctx),
         ui_guard,
     ))
-        .merge(proxy)
+    .merge(proxy)
 }
 
 /// The panel's own guard: the `Host` rebinding check, the credential on the
@@ -459,9 +462,7 @@ fn origin_is_absent_or_loopback(headers: &axum::http::HeaderMap) -> bool {
         v.to_str()
             .ok()
             .and_then(|o| o.split_once("://"))
-            .is_some_and(|(_, rest)| {
-                loopback_authority(rest.split('/').next().unwrap_or_default())
-            })
+            .is_some_and(|(_, rest)| loopback_authority(rest.split('/').next().unwrap_or_default()))
     })
 }
 
@@ -1133,10 +1134,7 @@ async fn budgets(State(ctx): State<Arc<Ctx>>) -> Response {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for key in cfg.limits.keys.keys() {
             if let Ok(s) = guard.spend(key) {
-                spend.insert(
-                    key.clone(),
-                    (s.usd.micros as f64 / 1_000_000.0, s.tokens),
-                );
+                spend.insert(key.clone(), (s.usd.micros as f64 / 1_000_000.0, s.tokens));
             }
         }
     }
@@ -1169,7 +1167,8 @@ async fn budgets(State(ctx): State<Arc<Ctx>>) -> Response {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut out = Vec::new();
             for provider in &cfg.providers {
-                let Ok(Some(snapshot)) = guard.latest_quota_snapshot(&provider.id, "default") else {
+                let Ok(Some(snapshot)) = guard.latest_quota_snapshot(&provider.id, "default")
+                else {
                     continue;
                 };
                 out.push(json!({
@@ -1345,11 +1344,8 @@ async fn save_settings(
             Err((message, help)) => return bad_request(message, &help),
         };
         cfg.limits.default = row;
-        next = commands::splice_section(
-            &next,
-            "limits",
-            &crate::import::limits::render(&cfg.limits),
-        );
+        next =
+            commands::splice_section(&next, "limits", &crate::import::limits::render(&cfg.limits));
     }
 
     if means_the_same(&doc, &next) {
@@ -2641,11 +2637,7 @@ mod http_tests {
     /// Writes the gate row into a store, the way `aroute keys arm-gate` does.
     fn arm_the_gate(store: &ar_keys::CredentialStore, master: &ar_keys::Secret) {
         store
-            .insert(
-                livegate::GATE_ROW,
-                livegate::GATE_ROW,
-                master,
-            )
+            .insert(livegate::GATE_ROW, livegate::GATE_ROW, master)
             .expect("the gate row is written");
     }
 
@@ -2665,8 +2657,8 @@ mod http_tests {
         );
 
         // Arm the gate through the store the live gate is watching.
-        let opened =
-            ar_keys::CredentialStore::open_with_material(&path, &master).expect("the store reopens");
+        let opened = ar_keys::CredentialStore::open_with_material(&path, &master)
+            .expect("the store reopens");
         arm_the_gate(&opened, &master);
 
         // The panel now sees it.
@@ -2733,7 +2725,8 @@ mod http_tests {
 
         // Now break the file under the live gate's feet.
         drop(opened);
-        std::fs::write(&path, b"this is not a sqlite database at all").expect("the file is clobbered");
+        std::fs::write(&path, b"this is not a sqlite database at all")
+            .expect("the file is clobbered");
 
         let state = live.resolve();
         assert!(
@@ -3036,7 +3029,11 @@ mod http_tests {
             .body(Body::empty())
             .expect("request");
         let resp = app.clone().oneshot(req).await.expect("router answers");
-        assert_eq!(resp.status(), StatusCode::OK, "the page is served, not redirected");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the page is served, not redirected"
+        );
         assert_eq!(
             resp.headers().get("location"),
             None,
@@ -3057,11 +3054,15 @@ mod http_tests {
         let resp = app.clone().oneshot(req).await.expect("router answers");
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
-            resp.headers().get("referrer-policy").and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get("referrer-policy")
+                .and_then(|v| v.to_str().ok()),
             Some("no-referrer")
         );
         assert_eq!(
-            resp.headers().get("x-frame-options").and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get("x-frame-options")
+                .and_then(|v| v.to_str().ok()),
             Some("DENY")
         );
     }
@@ -3079,14 +3080,8 @@ mod http_tests {
     async fn an_armed_panel_should_admit_an_api_call_with_a_valid_token() {
         let (gate, token) = armed_gate();
         let (app, _) = ui_with_gate("armed-ok", None, gate);
-        let (status, _) = call_with_token(
-            &app,
-            Method::GET,
-            "/ui/api/state",
-            "",
-            Some(&token),
-        )
-        .await;
+        let (status, _) =
+            call_with_token(&app, Method::GET, "/ui/api/state", "", Some(&token)).await;
         assert_eq!(status, StatusCode::OK);
     }
 
@@ -3123,7 +3118,10 @@ mod http_tests {
         .await;
         assert_eq!(write_status, StatusCode::CONFLICT);
         assert!(
-            body["error"].as_str().unwrap_or_default().contains("cannot be read"),
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("cannot be read"),
             "the refusal names the cause: {body}"
         );
         assert_eq!(
@@ -3147,7 +3145,10 @@ mod http_tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(
-            body["error"].as_str().unwrap_or_default().contains("too large"),
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("too large"),
             "{body}"
         );
     }
@@ -3262,16 +3263,13 @@ mod http_tests {
         let (app, _) = ui_with_gate("revoked-token", None, gate);
 
         // Before the revoke: the token opens the panel.
-        let (status, _) = call_full(
-            &app,
-            Method::GET,
-            "/ui/api/state",
-            "",
-            Some(&token),
-            None,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "precondition: the token opens the panel");
+        let (status, _) =
+            call_full(&app, Method::GET, "/ui/api/state", "", Some(&token), None).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "precondition: the token opens the panel"
+        );
 
         // Revoke it through the same path `aroute keys revoke` uses: the
         // token's `jti`, with the token's own `exp`.
@@ -3286,15 +3284,8 @@ mod http_tests {
             .expect("the revoke lands");
 
         // After the revoke: it does not.
-        let (status, body) = call_full(
-            &app,
-            Method::GET,
-            "/ui/api/state",
-            "",
-            Some(&token),
-            None,
-        )
-        .await;
+        let (status, body) =
+            call_full(&app, Method::GET, "/ui/api/state", "", Some(&token), None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
         assert_eq!(body["error"]["code"], "credential_rejected");
 
@@ -3562,7 +3553,9 @@ mod http_tests {
             assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} was accepted");
         }
         assert!(
-            !std::fs::read_to_string(&config).expect("config").contains("model_tokens"),
+            !std::fs::read_to_string(&config)
+                .expect("config")
+                .contains("model_tokens"),
             "a refused write changed nothing"
         );
     }

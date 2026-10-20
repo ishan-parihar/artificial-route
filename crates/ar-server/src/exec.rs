@@ -1044,8 +1044,9 @@ impl ArRouteExec for HttpExec {
                     .to_owned()));
             }
 
-            let endpoint = ar_exec::MediaEndpoint::from_path(endpoint)
-                .ok_or_else(|| ExecError::Transport(format!("unknown media endpoint path: {endpoint}")))?;
+            let endpoint = ar_exec::MediaEndpoint::from_path(endpoint).ok_or_else(|| {
+                ExecError::Transport(format!("unknown media endpoint path: {endpoint}"))
+            })?;
 
             let shape = cfg.dispatch(false);
             // The caller's model wins over the provider's configured one. The

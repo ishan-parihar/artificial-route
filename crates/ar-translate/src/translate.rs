@@ -1129,17 +1129,16 @@ fn ollama_tool_calls(rest: &serde_json::Value) -> Result<Vec<ToolCall>, Translat
     calls
         .iter()
         .map(|call| {
-            let id = call
-                .get("id")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| TranslateError::InvalidTool {
-                    reason: "a tool call has no `id`".to_owned(),
-                })?;
-            let function = call.get("function").ok_or_else(|| {
+            let id = call.get("id").and_then(|v| v.as_str()).ok_or_else(|| {
                 TranslateError::InvalidTool {
-                    reason: "a tool call has no `function`".to_owned(),
+                    reason: "a tool call has no `id`".to_owned(),
                 }
             })?;
+            let function = call
+                .get("function")
+                .ok_or_else(|| TranslateError::InvalidTool {
+                    reason: "a tool call has no `function`".to_owned(),
+                })?;
             let name = function
                 .get("name")
                 .and_then(|v| v.as_str())
@@ -1147,9 +1146,8 @@ fn ollama_tool_calls(rest: &serde_json::Value) -> Result<Vec<ToolCall>, Translat
                     reason: "a tool call has no function `name`".to_owned(),
                 })?;
             let arguments = match function.get("arguments") {
-                Some(serde_json::Value::String(raw)) => {
-                    serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.clone()))
-                }
+                Some(serde_json::Value::String(raw)) => serde_json::from_str(raw)
+                    .unwrap_or_else(|_| serde_json::Value::String(raw.clone())),
                 Some(value) => value.clone(),
                 None => json!({}),
             };
@@ -1263,8 +1261,9 @@ fn responses_function_call(item: ResponsesItem) -> Result<Msg, TranslateError> {
     let arguments = match item.rest.get("arguments") {
         // A string is the wire's spelling: parse it into the value the
         // canonical form carries.
-        Some(serde_json::Value::String(raw)) => serde_json::from_str(raw)
-            .unwrap_or_else(|_| serde_json::Value::String(raw.clone())),
+        Some(serde_json::Value::String(raw)) => {
+            serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.clone()))
+        }
         Some(value) => value.clone(),
         None => serde_json::json!({}),
     };
@@ -1415,7 +1414,10 @@ mod tests {
         assert_eq!(canonical.messages[0].tool_calls.len(), 1);
         assert_eq!(canonical.messages[0].tool_calls[0].id, "c1");
         assert_eq!(canonical.messages[0].tool_calls[0].name, "add");
-        assert_eq!(canonical.messages[0].tool_calls[0].arguments, json!({"a": 2}));
+        assert_eq!(
+            canonical.messages[0].tool_calls[0].arguments,
+            json!({"a": 2})
+        );
         // The tool turn is correlated by the same id.
         assert_eq!(canonical.messages[1].role, Role::Tool);
         assert_eq!(canonical.messages[1].tool_call_id.as_deref(), Some("c1"));
@@ -1454,8 +1456,14 @@ mod tests {
 
         assert_eq!(body["tools"][0]["function"]["name"], "get_weather");
         let result = body["messages"][2]["content"].as_str().unwrap_or_default();
-        assert!(result.contains("<tool_name>get_weather</tool_name>"), "{result}");
-        assert!(result.contains("<tool_call_id>c1</tool_call_id>"), "{result}");
+        assert!(
+            result.contains("<tool_name>get_weather</tool_name>"),
+            "{result}"
+        );
+        assert!(
+            result.contains("<tool_call_id>c1</tool_call_id>"),
+            "{result}"
+        );
         assert!(result.contains("4C"), "{result}");
     }
 
@@ -1469,8 +1477,8 @@ mod tests {
                 "description":"Current weather","parameters":{"type":"object"}}}]}"#;
         let chat = to_canonical(openai(raw)).expect("valid request");
         let body = parsed(crate::outbound::render_kiro_body(&chat));
-        let spec = &body["conversationState"]["currentMessage"]["userInputMessage"]
-            ["userInputMessageContext"]["tools"][0]["toolSpecification"];
+        let spec = &body["conversationState"]["currentMessage"]["userInputMessage"]["userInputMessageContext"]
+            ["tools"][0]["toolSpecification"];
         assert_eq!(spec["name"], "get_weather");
         assert_eq!(spec["description"], "Current weather");
         assert_eq!(spec["inputSchema"]["json"], json!({"type": "object"}));
@@ -1484,8 +1492,8 @@ mod tests {
             "tools":[{"type":"function","function":{"name":"f","parameters":{}}}]}"#;
         let chat = to_canonical(openai(raw)).expect("valid request");
         let body = parsed(crate::outbound::render_kiro_body(&chat));
-        let spec = &body["conversationState"]["currentMessage"]["userInputMessage"]
-            ["userInputMessageContext"]["tools"][0]["toolSpecification"];
+        let spec = &body["conversationState"]["currentMessage"]["userInputMessage"]["userInputMessageContext"]
+            ["tools"][0]["toolSpecification"];
         assert_eq!(spec["description"], "Tool: f");
     }
 
@@ -1751,7 +1759,8 @@ mod tests {
         let req: AnthropicMessages =
             serde_json::from_str(raw).expect("fixture is valid Anthropic Messages");
 
-        let canonical = anthropic_to_canonical(req).expect("a non-modality block is dropped, not fatal");
+        let canonical =
+            anthropic_to_canonical(req).expect("a non-modality block is dropped, not fatal");
 
         assert_eq!(canonical.messages[0].content, "answer");
         assert!(canonical.messages[0].media.is_empty());

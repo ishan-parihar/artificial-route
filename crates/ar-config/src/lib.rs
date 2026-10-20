@@ -1983,7 +1983,8 @@ combos:
 
     #[test]
     fn a_per_target_ceiling_parses_and_reads_back() {
-        let yaml = "limits:\n  default:\n    model_tokens:\n      \"p/m\": 1000\n      \"q/m2\": 20\n";
+        let yaml =
+            "limits:\n  default:\n    model_tokens:\n      \"p/m\": 1000\n      \"q/m2\": 20\n";
         let cfg = Config::parse(yaml, stub_lookup).unwrap();
         assert_eq!(cfg.limits.default.model_tokens.get("p/m"), Some(&1_000));
         assert_eq!(cfg.limits.default.model_tokens.get("q/m2"), Some(&20));

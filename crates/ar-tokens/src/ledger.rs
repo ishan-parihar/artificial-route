@@ -807,10 +807,14 @@ impl Ledger {
                 tokens: to_u64(row.get::<_, i64>(4)?),
             };
             breakdown.total.tokens = breakdown.total.tokens.saturating_add(total.tokens);
-            breakdown.total.usd.micros = breakdown.total.usd.micros.saturating_add(total.usd.micros);
+            breakdown.total.usd.micros =
+                breakdown.total.usd.micros.saturating_add(total.usd.micros);
             breakdown.windowed.tokens = breakdown.windowed.tokens.saturating_add(windowed.tokens);
-            breakdown.windowed.usd.micros =
-                breakdown.windowed.usd.micros.saturating_add(windowed.usd.micros);
+            breakdown.windowed.usd.micros = breakdown
+                .windowed
+                .usd
+                .micros
+                .saturating_add(windowed.usd.micros);
             breakdown.targets.push(TargetSpendRow {
                 provider,
                 model,
@@ -1660,25 +1664,16 @@ mod tests {
         // A breakdown whose parts did not add up would let a budget deny a
         // request on a spend that never happened.
         let ledger = Ledger::open_in_memory().expect("open");
-        ledger
-            .record(&entry("k1", "p", "m", 100))
-            .expect("record");
-        ledger
-            .record(&entry("k1", "p", "m", 50))
-            .expect("record");
-        ledger
-            .record(&entry("k1", "q", "m2", 25))
-            .expect("record");
-        ledger
-            .record(&entry("k2", "p", "m", 999))
-            .expect("record");
+        ledger.record(&entry("k1", "p", "m", 100)).expect("record");
+        ledger.record(&entry("k1", "p", "m", 50)).expect("record");
+        ledger.record(&entry("k1", "q", "m2", 25)).expect("record");
+        ledger.record(&entry("k2", "p", "m", 999)).expect("record");
         let breakdown = ledger.spend_breakdown("k1", None).expect("breakdown");
         assert_eq!(breakdown.total.tokens, 175);
         assert_eq!(breakdown.target("p", "m").total.tokens, 150);
         assert_eq!(breakdown.target("q", "m2").total.tokens, 25);
         assert_eq!(
-            breakdown.target("p", "m").total.tokens
-                + breakdown.target("q", "m2").total.tokens,
+            breakdown.target("p", "m").total.tokens + breakdown.target("q", "m2").total.tokens,
             breakdown.total.tokens,
             "the parts add up to the whole"
         );
@@ -1694,9 +1689,7 @@ mod tests {
         // A target with no spend is a target the budget must NOT refuse, so
         // the lookup has to answer zero rather than "unknown".
         let ledger = Ledger::open_in_memory().expect("open");
-        ledger
-            .record(&entry("k1", "p", "m", 100))
-            .expect("record");
+        ledger.record(&entry("k1", "p", "m", 100)).expect("record");
         let breakdown = ledger.spend_breakdown("k1", None).expect("breakdown");
         assert_eq!(breakdown.target("q", "m2").total.tokens, 0);
     }
@@ -1723,10 +1716,14 @@ mod tests {
             .spend_breakdown("k1", Some(5_000))
             .expect("breakdown");
         assert_eq!(breakdown.total.tokens, 110, "the total is every row");
-        assert_eq!(breakdown.windowed.tokens, 10, "the window is the recent one");
+        assert_eq!(
+            breakdown.windowed.tokens, 10,
+            "the window is the recent one"
+        );
         assert_eq!(breakdown.target("p", "m").windowed.tokens, 10);
         assert_eq!(
-            breakdown.target("p", "m").total.tokens, 110,
+            breakdown.target("p", "m").total.tokens,
+            110,
             "the cumulative figure is unaffected by the window"
         );
     }

@@ -471,7 +471,10 @@ pub fn keys_revoke(cli: &Cli, token_file: &str) -> anyhow::Result<()> {
         .introspect(&token)
         .map_err(|e| fail(e, "the token could not be read back"))?;
     println!("revoked: key id {} (jti {})", verified.key_id, verified.jti);
-    println!("expires: {} (unix) — the entry is swept after this", verified.expires_at);
+    println!(
+        "expires: {} (unix) — the entry is swept after this",
+        verified.expires_at
+    );
     Ok(())
 }
 
@@ -487,8 +490,7 @@ fn read_token_file(path: &str) -> anyhow::Result<String> {
             .map_err(|e| fail(e, "the token could not be read from stdin"))?;
         buf
     } else {
-        std::fs::read_to_string(path)
-            .map_err(|e| fail(e, "the token file could not be read"))?
+        std::fs::read_to_string(path).map_err(|e| fail(e, "the token file could not be read"))?
     };
     let token = raw.trim();
     if token.is_empty() {
@@ -558,7 +560,8 @@ pub(crate) fn mint_from_with_ttl(
         std::time::Duration::from_secs(365 * 24 * 3600 * 100)
     } else {
         std::time::Duration::from_secs(u64::from(ttl_days) * 24 * 3600)
-    };    tokens
+    };
+    tokens
         .issue(ar_keys::Issue {
             key_id,
             scopes: ar_keys::ScopeSet::of([ar_keys::Scope::ExecuteCompletions]),
@@ -806,8 +809,17 @@ pub fn limits_set(cli: &Cli, args: &SetLimitsArgs) -> anyhow::Result<()> {
     write_file(&cli.config, &next)?;
     println!(
         "limits: {label} — rpm={} usd_micros={} tokens={} refuse_unpriced={} model={} spend_window={} model_tokens={}",
-        summary.0, summary.1, summary.2, summary.3, summary.4, summary.5,
-        if targets.is_empty() { "-".to_owned() } else { targets.join(",") }
+        summary.0,
+        summary.1,
+        summary.2,
+        summary.3,
+        summary.4,
+        summary.5,
+        if targets.is_empty() {
+            "-".to_owned()
+        } else {
+            targets.join(",")
+        }
     );
     Ok(())
 }
@@ -3655,8 +3667,9 @@ mod tests {
         let dir = tmpdir("doctor-gate");
         let path = dir.join("credentials.db");
         // The store is written with one master...
-        let store = ar_keys::CredentialStore::open_with_material(&path, &ar_keys::Secret::generate())
-            .expect("store opens");
+        let store =
+            ar_keys::CredentialStore::open_with_material(&path, &ar_keys::Secret::generate())
+                .expect("store opens");
         store
             .insert(GATE_PROVIDER, GATE_ROW, &ar_keys::Secret::generate())
             .expect("row stores");
@@ -3664,7 +3677,8 @@ mod tests {
         // ...and read back with a DIFFERENT one, which is the real situation:
         // the operator's $AR_MASTER_KEY no longer matches the store.
         let other = ar_keys::Secret::generate();
-        let store = ar_keys::CredentialStore::open_with_material(&path, &other).expect("store reopens");
+        let store =
+            ar_keys::CredentialStore::open_with_material(&path, &other).expect("store reopens");
         let probe = StoreProbe::Live {
             store: &store,
             path,
@@ -3693,12 +3707,14 @@ mod tests {
         let dir = tmpdir("doctor-gate-ok");
         let path = dir.join("credentials.db");
         let master = ar_keys::Secret::generate();
-        let store = ar_keys::CredentialStore::open_with_material(&path, &master).expect("store opens");
+        let store =
+            ar_keys::CredentialStore::open_with_material(&path, &master).expect("store opens");
         store
             .insert(GATE_PROVIDER, GATE_ROW, &ar_keys::Secret::generate())
             .expect("row stores");
         drop(store);
-        let store = ar_keys::CredentialStore::open_with_material(&path, &master).expect("store reopens");
+        let store =
+            ar_keys::CredentialStore::open_with_material(&path, &master).expect("store reopens");
         let probe = StoreProbe::Live {
             store: &store,
             path,
@@ -3923,10 +3939,7 @@ mod tests {
         )
         .unwrap();
         let row = &load(&cli).unwrap().limits.keys["prod"];
-        assert_eq!(
-            row.model_tokens.get("openai/gpt-5.4"),
-            Some(&500_000_000)
-        );
+        assert_eq!(row.model_tokens.get("openai/gpt-5.4"), Some(&500_000_000));
         assert_eq!(row.spend_window.as_deref(), Some("24h"));
         assert_eq!(
             row.tokens,
@@ -3951,7 +3964,11 @@ mod tests {
         .unwrap();
         let row = &load(&cli).unwrap().limits.keys["prod"];
         assert_eq!(row.model_tokens.len(), 2, "both targets are carried");
-        assert_eq!(row.spend_window.as_deref(), Some("24h"), "the window survived");
+        assert_eq!(
+            row.spend_window.as_deref(),
+            Some("24h"),
+            "the window survived"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3976,7 +3993,10 @@ mod tests {
             err.is_err(),
             "a ceiling for a target nothing routes to is a ceiling that never applies"
         );
-        assert!(load(&cli).unwrap().limits.keys.is_empty(), "nothing was written");
+        assert!(
+            load(&cli).unwrap().limits.keys.is_empty(),
+            "nothing was written"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -4000,7 +4020,10 @@ mod tests {
             );
             assert!(err.is_err(), "{bad:?} was accepted");
         }
-        assert!(load(&cli).unwrap().limits.keys.is_empty(), "nothing was written");
+        assert!(
+            load(&cli).unwrap().limits.keys.is_empty(),
+            "nothing was written"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -83,6 +83,7 @@ mod resilience;
 mod simulate;
 mod strategy;
 
+pub use attempt::attempt_loop_with_pins;
 pub use attempt::{AbortReport, AttemptOutcome, MAX_ATTEMPTS, attempt_loop};
 pub use auto::{
     AUTO_VARIANTS, AccountTier, AutoCandidate, AutoCombo, AutoSelector, AutoVariant, CircuitState,
@@ -102,11 +103,10 @@ pub use pipeline::{
     build_pipeline_config, execute_pipeline, parse_reflect_json,
 };
 pub use resilience::{
-    DEFAULT_BASE_BACKOFF, DEFAULT_MAX_BACKOFF, BreakerState, ProviderResilience, Resilience,
+    BreakerState, DEFAULT_BASE_BACKOFF, DEFAULT_MAX_BACKOFF, ProviderResilience, Resilience,
     ScopeCooling,
 };
 pub use simulate::{ChainTarget, RoutePlan, simulate_route};
-pub use attempt::attempt_loop_with_pins;
 pub use strategy::{
     FusionOutcome, PanelVerdict, PipelineOutcome, StageVerdict, Strategy, TargetLoad, TargetLoads,
     dispatch_fusion, dispatch_pipeline, pick, pick_filtered, pick_for_model,

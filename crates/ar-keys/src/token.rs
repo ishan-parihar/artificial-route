@@ -408,9 +408,9 @@ impl Tokens {
     /// the two would let the other half come back to life when the entry is
     /// swept.
     fn session_expiry(verified: &Verified) -> i64 {
-        let refresh_expiry = verified.issued_at.saturating_add(
-            i64::try_from(REFRESH_TTL.as_secs()).unwrap_or(i64::MAX),
-        );
+        let refresh_expiry = verified
+            .issued_at
+            .saturating_add(i64::try_from(REFRESH_TTL.as_secs()).unwrap_or(i64::MAX));
         verified.expires_at.max(refresh_expiry)
     }
 

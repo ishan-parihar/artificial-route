@@ -242,9 +242,7 @@ pub fn check(headers: &HeaderMap, state: &GateState) -> Verdict {
         return Err("the panel's gate is not armed".to_owned());
     };
     let Some(token) = bearer(headers) else {
-        return Err(
-            "this panel needs a credential; paste one from `aroute keys mint`".to_owned(),
-        );
+        return Err("this panel needs a credential; paste one from `aroute keys mint`".to_owned());
     };
     // The order matters: signature and expiry first (both inside the token
     // engine), then **revocation**, then scope. Checking scope before

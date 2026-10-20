@@ -740,7 +740,8 @@ impl Resilience {
                 let (provider, model) = split_scope_key(key);
                 for row in &mut out {
                     if row.provider == provider {
-                        row.retired_models.push(model.unwrap_or_default().to_owned());
+                        row.retired_models
+                            .push(model.unwrap_or_default().to_owned());
                     }
                 }
             }
@@ -752,7 +753,9 @@ impl Resilience {
                         row.breaker = breaker.state;
                         row.breaker_failures = breaker.failures;
                         row.breaker_threshold = breaker.class.threshold();
-                        row.breaker_reset_secs = self.reset_window(breaker.class, breaker.open_cycles).as_secs();
+                        row.breaker_reset_secs = self
+                            .reset_window(breaker.class, breaker.open_cycles)
+                            .as_secs();
                     }
                 }
             }
@@ -1018,7 +1021,12 @@ mod tests {
     #[test]
     fn snapshot_should_report_the_model_lockout_under_its_provider() {
         let r = Resilience::new();
-        r.lock_model("openai", "gpt-4o", LockReason::Throttled, Duration::from_secs(120));
+        r.lock_model(
+            "openai",
+            "gpt-4o",
+            LockReason::Throttled,
+            Duration::from_secs(120),
+        );
         let snap = r.snapshot(&["openai"]);
         assert_eq!(snap[0].locks.len(), 1);
         assert_eq!(

@@ -293,7 +293,11 @@ pub async fn serve(cli: &Cli, args: &ServeArgs) -> anyhow::Result<()> {
     // disagreed with it would be a gate that works on one surface and not the
     // other. An environment variable cannot change under a running process,
     // so it is captured once.
-    let env_master = built.config.http_master_key.as_ref().map(|s| s.to_owned_secret());
+    let env_master = built
+        .config
+        .http_master_key
+        .as_ref()
+        .map(|s| s.to_owned_secret());
     if let Some(live) = ui_ctx.live_gate(revocations.clone(), env_master) {
         ui_ctx.set_live_gate(live);
     }

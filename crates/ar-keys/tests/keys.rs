@@ -38,8 +38,10 @@ fn master() -> MasterKey {
 fn temp_store(tag: &str) -> (Revocations, std::path::PathBuf) {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    let path =
-        std::env::temp_dir().join(format!("ar-keys-it-{tag}-{}-{n}.sqlite", std::process::id()));
+    let path = std::env::temp_dir().join(format!(
+        "ar-keys-it-{tag}-{}-{n}.sqlite",
+        std::process::id()
+    ));
     let _ = std::fs::remove_file(&path);
     (
         Revocations::open(&path, 256).expect("open the revocation store"),
@@ -114,7 +116,9 @@ fn expires_when_stolen() {
     // verbatim working credential and nothing distinguishes it from the original.
     let stolen = issued.access;
     assert!(
-        tokens.verify(&stolen, Scope::ReadAll, Some(&revocations)).is_ok(),
+        tokens
+            .verify(&stolen, Scope::ReadAll, Some(&revocations))
+            .is_ok(),
         "precondition: the stolen copy starts valid"
     );
 
@@ -195,7 +199,9 @@ fn the_two_halves_share_a_session_id_and_differ_in_jti() {
     let tokens = Tokens::new(&master());
     let issued = issue(&tokens, ScopeSet::all());
     let access = tokens.introspect(&issued.access).expect("access verifies");
-    let refresh = tokens.introspect(&issued.refresh).expect("refresh verifies");
+    let refresh = tokens
+        .introspect(&issued.refresh)
+        .expect("refresh verifies");
 
     assert_eq!(
         access.session_id, refresh.session_id,
@@ -290,7 +296,11 @@ fn execute_completions_is_a_separate_grant_from_write() {
     let issued = issue(&tokens, ScopeSet::of([Scope::ExecuteCompletions]));
     assert!(
         tokens
-            .verify(&issued.access, Scope::ExecuteCompletions, Some(&revocations))
+            .verify(
+                &issued.access,
+                Scope::ExecuteCompletions,
+                Some(&revocations)
+            )
             .is_ok()
     );
     assert!(
@@ -425,12 +435,16 @@ fn a_second_handle_may_write_while_the_first_is_open() {
 
     // The "operator" opens the same file and writes through it.
     let writer = Revocations::open(&path, 256).expect("a second handle opens the same file");
-    writer.revoke("jti-1", now() + 600).expect("the second handle writes");
+    writer
+        .revoke("jti-1", now() + 600)
+        .expect("the second handle writes");
 
     // The first handle sees the write. This is the property the redb file
     // could not provide.
     assert!(
-        reader.is_revoked("jti-1").expect("the reader sees the revocation"),
+        reader
+            .is_revoked("jti-1")
+            .expect("the reader sees the revocation"),
         "the reader must see what the writer wrote"
     );
 
@@ -479,19 +493,29 @@ fn the_cap_counts_live_entries_not_rows_ever_written() {
 
     // Two expired rows and the cap is 2: a third write must still be accepted,
     // because the list is not full of **live** entries.
-    capped.revoke("jti-live", now() + 600).expect("a live write after expired rows");
-    capped.revoke("jti-live-2", now() + 600).expect("a second live write");
+    capped
+        .revoke("jti-live", now() + 600)
+        .expect("a live write after expired rows");
+    capped
+        .revoke("jti-live-2", now() + 600)
+        .expect("a second live write");
 
     assert!(
-        !capped.is_revoked("jti-old-1").expect("an expired row is not live"),
+        !capped
+            .is_revoked("jti-old-1")
+            .expect("an expired row is not live"),
         "an expired row must not read as revoked"
     );
     assert!(
-        capped.is_revoked("jti-live").expect("the live row is revoked"),
+        capped
+            .is_revoked("jti-live")
+            .expect("the live row is revoked"),
         "the live row must read as revoked"
     );
     assert!(
-        capped.is_revoked("jti-live-2").expect("the second live row is revoked"),
+        capped
+            .is_revoked("jti-live-2")
+            .expect("the second live row is revoked"),
         "the second live row must read as revoked"
     );
 
@@ -502,7 +526,9 @@ fn the_cap_counts_live_entries_not_rows_ever_written() {
         .expect_err("the cap refuses a third live entry");
     assert!(matches!(err, KeyError::RevokeListFull { cap: 2 }), "{err}");
     assert!(
-        capped.is_revoked("jti-live").expect("the first live row survives"),
+        capped
+            .is_revoked("jti-live")
+            .expect("the first live row survives"),
         "a refused write must not evict a live revocation"
     );
 

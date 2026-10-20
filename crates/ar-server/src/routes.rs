@@ -1692,7 +1692,11 @@ async fn pipeline_response(
             outcome.status(),
             "pipeline_failed",
             "stage_failed",
-            &format!("stage {} of {} failed: {reason}", failed + 1, outcome.trace.len()),
+            &format!(
+                "stage {} of {} failed: {reason}",
+                failed + 1,
+                outcome.trace.len()
+            ),
         );
     };
 
@@ -2585,11 +2589,10 @@ pub(crate) fn resolve(
                 // such a combo answered 501 naming a strategy this build
                 // ships.
                 let chain = match combo.strategy {
-                    Strategy::Auto(variant) => {
-                        auto_chain_over(state, combo, variant).unwrap_or_else(|| {
+                    Strategy::Auto(variant) => auto_chain_over(state, combo, variant)
+                        .unwrap_or_else(|| {
                             chain(state, combo, canonical.session.as_deref(), model)
-                        })
-                    }
+                        }),
                     _ => chain(state, combo, canonical.session.as_deref(), model),
                 };
                 Ok(RoutePlan {
@@ -2629,17 +2632,14 @@ pub(crate) fn resolve(
 /// The inverse-latency factor is `1.0` for an instant answer and `0.0` for
 /// the slowest answer the target has produced, so the scale is relative: a
 /// target that answers in 50 ms is `1.0` until something beats it.
-fn observe_target_outcome(
-    outcome: &AttemptOutcome,
-    chain: &[ChainTarget],
-    elapsed: Duration,
-) {
+fn observe_target_outcome(outcome: &AttemptOutcome, chain: &[ChainTarget], elapsed: Duration) {
     let (Some(provider), Some(model)) = (outcome.provider(), outcome.serving_model()) else {
         return;
     };
-    let Some(target) = chain.iter().find(|t| {
-        t.provider.as_str() == provider.as_str() && t.model.as_ref() == model
-    }) else {
+    let Some(target) = chain
+        .iter()
+        .find(|t| t.provider.as_str() == provider.as_str() && t.model.as_ref() == model)
+    else {
         return;
     };
     let candidate = ar_route::Candidate::new(target.provider.clone(), target.model.as_ref());
@@ -2904,11 +2904,7 @@ fn budget_filtered_candidates(
     };
     // A key with no per-target ceiling is never filtered: the arm is opt-in,
     // and reading the ledger for it would be a cost for nothing.
-    if state.policy.spend_window(key_id).is_none()
-        && !state
-            .policy
-            .has_target_caps(key_id)
-    {
+    if state.policy.spend_window(key_id).is_none() && !state.policy.has_target_caps(key_id) {
         return Ok(candidates.to_vec());
     }
     let window = state.policy.spend_window(key_id);
@@ -4340,7 +4336,11 @@ mod tests {
             _content_type: &'a str,
             _body: &'a [u8],
         ) -> Pin<Box<dyn Future<Output = Result<MediaReply, ExecError>> + Send + 'a>> {
-            Box::pin(async move { Err(ExecError::Transport("no media dispatch in this fixture".to_owned())) })
+            Box::pin(async move {
+                Err(ExecError::Transport(
+                    "no media dispatch in this fixture".to_owned(),
+                ))
+            })
         }
     }
 
@@ -4497,13 +4497,11 @@ mod tests {
             if let Ok(mut seen) = self.seen.lock() {
                 seen.push((name.clone(), body));
             }
-            let answer = format!(
-                r#"{{"choices":[{{"message":{{"content":"from {name}"}}}}]}}"#
-            );
+            let answer = format!(r#"{{"choices":[{{"message":{{"content":"from {name}"}}}}]}}"#);
             Box::pin(async move {
-                Ok(Upstream::success(Box::pin(futures::stream::once(async move {
-                    bytes::Bytes::from(answer)
-                }))))
+                Ok(Upstream::success(Box::pin(futures::stream::once(
+                    async move { bytes::Bytes::from(answer) },
+                ))))
             })
         }
 
@@ -4515,9 +4513,9 @@ mod tests {
             _content_type: &'a str,
             _body: &'a [u8],
         ) -> Pin<Box<dyn Future<Output = Result<MediaReply, ExecError>> + Send + 'a>> {
-            Box::pin(async move {
-                Err(ExecError::Transport("no media in this fixture".to_owned()))
-            })
+            Box::pin(
+                async move { Err(ExecError::Transport("no media in this fixture".to_owned())) },
+            )
         }
     }
 
@@ -4609,7 +4607,11 @@ mod tests {
             _content_type: &'a str,
             _body: &'a [u8],
         ) -> Pin<Box<dyn Future<Output = Result<MediaReply, ExecError>> + Send + 'a>> {
-            Box::pin(async move { Err(ExecError::Transport("no media dispatch in this fixture".to_owned())) })
+            Box::pin(async move {
+                Err(ExecError::Transport(
+                    "no media dispatch in this fixture".to_owned(),
+                ))
+            })
         }
     }
 
@@ -4650,7 +4652,9 @@ mod tests {
             // The chat recorder is only pointed at chat paths; a media dispatch
             // reaching it means a test wired the wrong route.
             Box::pin(async move {
-                Err(ExecError::Transport("the recording exec serves no media path".to_owned()))
+                Err(ExecError::Transport(
+                    "the recording exec serves no media path".to_owned(),
+                ))
             })
         }
     }
@@ -4744,9 +4748,7 @@ mod tests {
         let state = lkgp_state();
         // The pin names the *second* provider, so a config-order chain and a
         // pin-honouring chain differ.
-        state
-            .lkgp
-            .record("sess-1", &ProviderId::new("second"));
+        state.lkgp.record("sess-1", &ProviderId::new("second"));
         let plan = resolve(
             &state,
             &CanonicalRequest {
@@ -4770,9 +4772,7 @@ mod tests {
     #[test]
     fn a_request_without_a_session_ignores_the_pin() {
         let state = lkgp_state();
-        state
-            .lkgp
-            .record("sess-1", &ProviderId::new("second"));
+        state.lkgp.record("sess-1", &ProviderId::new("second"));
         let plan = resolve(
             &state,
             &CanonicalRequest {
@@ -7224,10 +7224,7 @@ mod tests {
     impl RecordingProviders {
         fn new() -> (Arc<Self>, Arc<Mutex<Vec<String>>>) {
             let seen = Arc::new(Mutex::new(Vec::new()));
-            (
-                Arc::new(Self { seen: seen.clone() }),
-                seen,
-            )
+            (Arc::new(Self { seen: seen.clone() }), seen)
         }
     }
 
@@ -7258,13 +7255,22 @@ mod tests {
             _content_type: &'a str,
             _body: &'a [u8],
         ) -> Pin<Box<dyn Future<Output = Result<MediaReply, ExecError>> + Send + 'a>> {
-            Box::pin(async move { Err(ExecError::Transport("no media dispatch in this fixture".to_owned())) })
+            Box::pin(async move {
+                Err(ExecError::Transport(
+                    "no media dispatch in this fixture".to_owned(),
+                ))
+            })
         }
     }
 
     /// Seeds one target's spend, so a test can start from a key that has
     /// already spent against one model and not another.
-    fn seed_spend(ledger: &Arc<Mutex<ar_tokens::Ledger>>, provider: &str, model: &str, tokens: u32) {
+    fn seed_spend(
+        ledger: &Arc<Mutex<ar_tokens::Ledger>>,
+        provider: &str,
+        model: &str,
+        tokens: u32,
+    ) {
         ledger
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -7320,7 +7326,10 @@ mod tests {
         );
         let resp = drive(
             &router,
-            chat("{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}", &[]),
+            chat(
+                "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
+                &[],
+            ),
         )
         .await;
         assert_ne!(
@@ -7328,7 +7337,9 @@ mod tests {
             StatusCode::PAYMENT_REQUIRED,
             "the other panel member still has budget"
         );
-        let seen = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let seen = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(
             !seen.iter().any(|s| s.starts_with("a/")),
             "the over-budget panel member was dispatched to anyway: {seen:?}"
@@ -7374,10 +7385,15 @@ mod tests {
         );
         let resp = drive(
             &router,
-            chat("{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}", &[]),
+            chat(
+                "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
+                &[],
+            ),
         )
         .await;
-        let seen = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let seen = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(
             !seen.iter().any(|(provider, _)| provider == "a"),
             "the over-budget stage was dispatched to anyway: {seen:?}"
@@ -7411,7 +7427,9 @@ mod tests {
             StatusCode::PAYMENT_REQUIRED,
             "the sibling still has budget, so the request is served"
         );
-        let seen = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let seen = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(
             seen.first().map(String::as_str),
             Some("q/m2"),
@@ -7449,9 +7467,17 @@ mod tests {
         let body = body_of(resp).await;
         assert_eq!(body["error"]["reason"], "model_token_cap");
         let message = body["error"]["message"].as_str().unwrap_or_default();
-        assert!(message.contains("p/m"), "the message names the models: {message}");
-        assert!(message.contains("q/m2"), "the message names the models: {message}");
-        let seen = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            message.contains("p/m"),
+            "the message names the models: {message}"
+        );
+        assert!(
+            message.contains("q/m2"),
+            "the message names the models: {message}"
+        );
+        let seen = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(
             seen.is_empty(),
             "an over-budget chain dispatched anyway: {seen:?}"
@@ -7494,7 +7520,9 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
         assert_eq!(body_of(resp).await["error"]["reason"], "token_cap");
-        let seen = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let seen = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(seen.is_empty(), "dispatched past the key ceiling: {seen:?}");
     }
 
@@ -7541,7 +7569,9 @@ mod tests {
             StatusCode::PAYMENT_REQUIRED,
             "spend outside the window does not count against it"
         );
-        let seen = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let seen = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(seen.first().map(String::as_str), Some("p/m"));
     }
 
@@ -7576,7 +7606,9 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
         assert_eq!(body_of(resp).await["error"]["reason"], "token_cap");
-        let seen = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let seen = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(seen.is_empty(), "dispatched past the ceiling: {seen:?}");
     }
 
@@ -7812,7 +7844,9 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
-            Box::pin(async move { next.ok_or_else(|| ExecError::Transport("no second target".to_owned())) })
+            Box::pin(async move {
+                next.ok_or_else(|| ExecError::Transport("no second target".to_owned()))
+            })
         }
 
         fn post_media<'a>(
@@ -7823,7 +7857,11 @@ mod tests {
             _content_type: &'a str,
             _body: &'a [u8],
         ) -> Pin<Box<dyn Future<Output = Result<MediaReply, ExecError>> + Send + 'a>> {
-            Box::pin(async move { Err(ExecError::Transport("no media dispatch in this fixture".to_owned())) })
+            Box::pin(async move {
+                Err(ExecError::Transport(
+                    "no media dispatch in this fixture".to_owned(),
+                ))
+            })
         }
     }
 
@@ -8122,7 +8160,9 @@ mod tests {
                 _body: &'a [u8],
             ) -> Pin<Box<dyn Future<Output = Result<MediaReply, ExecError>> + Send + 'a>>
             {
-                Box::pin(async move { Err(ExecError::Transport("no media in this fixture".to_owned())) })
+                Box::pin(
+                    async move { Err(ExecError::Transport("no media in this fixture".to_owned())) },
+                )
             }
         }
 

@@ -1007,7 +1007,9 @@ async fn bearer_guard(
         return next.run(req).await;
     };
     let Some(token) = bearer_token(req.headers()) else {
-        return unauthorized("this control plane needs a credential; mint one with `aroute keys mint`");
+        return unauthorized(
+            "this control plane needs a credential; mint one with `aroute keys mint`",
+        );
     };
     if let Err(reason) = gate.verify(token) {
         return unauthorized(&reason);
@@ -1017,7 +1019,10 @@ async fn bearer_guard(
 
 /// The bearer a request presents, if any.
 fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
-    let raw = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
+    let raw = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
     raw.strip_prefix("Bearer ")
         .or_else(|| raw.strip_prefix("bearer "))
         .map(str::trim)
@@ -1593,10 +1598,7 @@ mod tests {
 
     /// One `POST /mcp` against a served control plane, with an optional
     /// bearer. Returns the status line and the body.
-    async fn post_mcp(
-        host: Host,
-        bearer: Option<&str>,
-    ) -> (String, String) {
+    async fn post_mcp(host: Host, bearer: Option<&str>) -> (String, String) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1691,7 +1693,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ar-mcp-revoke-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
-        let list = ar_keys::Revocations::open(&dir.join("credentials.db"), 64).expect("the list opens");
+        let list =
+            ar_keys::Revocations::open(&dir.join("credentials.db"), 64).expect("the list opens");
 
         let master = ar_keys::Secret::generate();
         let engine = ar_keys::Tokens::new(

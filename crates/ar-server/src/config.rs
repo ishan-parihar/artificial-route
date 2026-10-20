@@ -1662,11 +1662,19 @@ fn quota_window(snapshot: &ar_keys::QuotaSnapshot) -> Option<QuotaWindow> {
     if snapshot.exhausted {
         // Spent: a window with nothing left. The strategies rank it last and
         // the attempt loop's cooling gate skips it.
-        return Some(QuotaWindow::new(100, 100, snapshot.next_reset_at.unwrap_or(0)));
+        return Some(QuotaWindow::new(
+            100,
+            100,
+            snapshot.next_reset_at.unwrap_or(0),
+        ));
     }
     let limit = 100_u64;
     let used = limit.saturating_sub((remaining.clamp(0.0, 1.0) * limit as f64).round() as u64);
-    Some(QuotaWindow::new(limit, used, snapshot.next_reset_at.unwrap_or(0)))
+    Some(QuotaWindow::new(
+        limit,
+        used,
+        snapshot.next_reset_at.unwrap_or(0),
+    ))
 }
 
 /// The outbound headers a catalogued provider dispatches with.
@@ -2059,10 +2067,7 @@ combos:
             .expect("the openai target exists");
         let quota = openai.quota.expect("the stored reading reached the target");
         assert_eq!(quota.limit, 100, "the window is scaled onto 100 points");
-        assert_eq!(
-            quota.used, 75,
-            "a reading of 25% free means 75 of 100 used"
-        );
+        assert_eq!(quota.used, 75, "a reading of 25% free means 75 of 100 used");
         assert_eq!(
             quota.reset_at_secs, 1_800_000_000,
             "the snapshot's own reset window is carried"
@@ -2086,14 +2091,8 @@ combos:
             .with_rank(1)
             .with_quota(ar_route::QuotaWindow::new(100, 1, 0));
         let cands = [exhausted, roomy];
-        let picked = ar_route::pick(
-            Strategy::Headroom,
-            None,
-            &cands,
-            &AtomicU64::new(0),
-            None,
-        )
-        .expect("a candidate");
+        let picked = ar_route::pick(Strategy::Headroom, None, &cands, &AtomicU64::new(0), None)
+            .expect("a candidate");
         assert_eq!(
             picked.as_str(),
             "b",

@@ -261,11 +261,7 @@ impl TargetLoads {
     #[must_use]
     pub fn in_flight(&self, target: &Candidate) -> u32 {
         let live = self.load(target).in_flight;
-        if live > 0 {
-            live
-        } else {
-            target.in_flight
-        }
+        if live > 0 { live } else { target.in_flight }
     }
 
     /// Records what is known about `target` from an already-scored factor set.
@@ -2000,9 +1996,7 @@ async fn stage_answer(upstream: Upstream) -> Result<String, String> {
     let mut stream = upstream.stream;
     while let Some(chunk) = stream.next().await {
         if raw.len() + chunk.len() > PANEL_BODY_BYTES {
-            return Err(format!(
-                "stage response exceeded {PANEL_BODY_BYTES} bytes"
-            ));
+            return Err(format!("stage response exceeded {PANEL_BODY_BYTES} bytes"));
         }
         raw.extend_from_slice(&chunk);
     }
@@ -2175,9 +2169,8 @@ mod tests {
     use super::{
         DeficitMap, EXPIRY_MAX_SCORE, Factors, MAX_DRR_COMBOS, MODEL_SCOPE, PANEL_BODY_BYTES,
         Strategy, TargetLoad, TargetLoads, affinity_key, by_cursor, by_p2c, by_shuffle,
-        dispatch_fusion, dispatch_pipeline,
-        expiry_first_score_at, hours_until_reset_at, pick, pick_filtered, pick_for_model,
-        reset_aware_score, splitmix,
+        dispatch_fusion, dispatch_pipeline, expiry_first_score_at, hours_until_reset_at, pick,
+        pick_filtered, pick_for_model, reset_aware_score, splitmix,
     };
     use crate::contract::{
         Candidate, CanonicalRequest, ExecError, Executor, ProviderId, QuotaWindow, Upstream,
@@ -2606,10 +2599,7 @@ mod tests {
         // `auto/quality` is not one of the eight variants. Resolving it to
         // the family would serve `auto`'s weights under a name that promised
         // something else, so it stays deferred and the 501 names it.
-        assert_eq!(
-            Strategy::parse("auto/quality"),
-            Strategy::Deferred("auto")
-        );
+        assert_eq!(Strategy::parse("auto/quality"), Strategy::Deferred("auto"));
     }
 
     #[test]
@@ -2861,8 +2851,10 @@ mod tests {
             )),
         ];
         assert_eq!(winner("expiry-first", &cands).as_str(), "b");
-        let ranked = [expiry_first_score_at(&cands[0], now as f64),
-            expiry_first_score_at(&cands[1], now as f64)];
+        let ranked = [
+            expiry_first_score_at(&cands[0], now as f64),
+            expiry_first_score_at(&cands[1], now as f64),
+        ];
         assert!(
             ranked[0] == f64::NEG_INFINITY,
             "an exhausted window scores -inf by contract: {ranked:?}"
