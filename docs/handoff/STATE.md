@@ -324,7 +324,7 @@ several of them had gone stale (A1 said "v0.1.16 is the newest tag" when `v0.1.1
 tagged; B6 said "14 orphan pages" when the count is now 0). The old documents keep the
 **history** of their pass and point at the ledger; the ledger owns the **state**.
 
-<!-- genome:zone status sha=4ce8dab4842c -->
+<!-- genome:zone status sha=bd32dd4d769d -->
 | status | items |
 |---|---|
 | open | 41 |
@@ -338,7 +338,7 @@ tagged; B6 said "14 orphan pages" when the count is now 0). The old documents ke
 - `DEC-02` [open] **Rule whether a routable bind may be allowed while the bearer gate is armed**
 - `DEC-03` [open] **Rule what `Limit.model` scopes** — *when* a row applies, not *what it counts*
 - `DEC-04` [open] **Rule whether the panel may restart the proxy after a write**
-- `OPS-01` [open] **16 commits after `v0.1.20` are unreleased** (`81b3ce3` … `1fa7686`; **none** not yet pushed — `ori
+- `OPS-01` [open] **18 commits after `v0.1.20` are unreleased** (`81b3ce3` … `ffbf8fd`; **1** not yet pushed — `origin
 - `OPS-02` [open] **The `failures` table only exists from the release that ships it** — older rows are not backfilled,
 - `OPS-03` [open] **No 12-hour soak against a released binary**
 <!-- genome:end status -->
