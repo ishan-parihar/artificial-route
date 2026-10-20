@@ -87,23 +87,22 @@ use ar_keys::{CredentialStore, KeyMeta, MasterKey, Revocations, Secret, Tokens};
 
 use super::auth::GateState;
 
-/// The gate's live state: a cached engine plus the ciphertext it was built
-/// from.
+/// The gate's live state: the ciphertext the verdict was reached from, and
+/// the verdict itself.
+///
+/// The verdict is cached, not the **ingredients**. With the ingredients
+/// cached, the hit path and the miss path each decided "Armed or Broken or
+/// Unarmed" for themselves, and the two could disagree — an env-only host
+/// answered `Armed` on the first request and `Unarmed` on the second, because
+/// the env master was cached as "nothing" and the hit path did not know about
+/// the fallback.
+///
+/// A panel that is **weaker** than the data plane is the one thing that must
+/// never happen, so the cache holds the answer and there is one place that
+/// decides it.
 struct Cached {
-    /// The gate row's ciphertext when the engine was built. `None` means the
-    /// row was absent, which is a different state from "present and
-    /// unchanged".
-    envelope: Option<String>,
-    /// The engine, when the row decrypted.
-    tokens: Option<Arc<Tokens>>,
-    /// Why the last resolution failed, when it did.
-    ///
-    /// The `Broken` arm has to be **representable**, not just returned once.
-    /// An earlier shape returned `Broken` from the failure path but left the
-    /// cache saying "no row", so the NEXT request saw an unchanged row and
-    /// answered `Unarmed` — which permits writes. The broken state has to
-    /// live in the cache to survive a request.
-    broken: Option<String>,
+    /// The envelope read, and the verdict it produced.
+    entry: Option<(Result<Option<String>, String>, GateState)>,
 }
 
 /// The panel's live gate.
@@ -166,11 +165,7 @@ impl LiveGate {
             store,
             env,
             revocations,
-            cached: Mutex::new(Cached {
-                envelope: None,
-                tokens: None,
-                broken: None,
-            }),
+            cached: Mutex::new(Cached { entry: None }),
             derivations: AtomicU64::new(0),
         }
     }
@@ -212,25 +207,39 @@ impl LiveGate {
         // other panel request behind one derivation, and there is no lock
         // cycle to fall into.
         let envelope = self.envelope(store);
-        let cached = self.cached.lock().unwrap_or_else(|e| e.into_inner());
 
-        // The row has not changed since the last resolution: the cached
-        // engine is still the right one, and re-deriving would spend 40 ms
-        // and 19 MiB to learn nothing.
+        // The cache holds the **resolved verdict**, not the ingredients. That
+        // is the whole design: with the ingredients cached, the hit path and
+        // the miss path each decided "Armed or Broken or Unarmed" for
+        // themselves, and the two could disagree — an env-only host answered
+        // `Armed` on the first request and `Unarmed` on the second, because
+        // the env master was cached as "nothing" and the hit path did not
+        // know about the fallback. A panel that is **weaker** than the data
+        // plane is the one thing that must never happen.
         //
-        // Only a **successful** read can hit the cache. A failed read is
-        // never cached, so the next request retries — and a failed read must
-        // never match the cache, or a transient failure would be answered
-        // from a stale success.
-        let cache_hit = match &envelope {
-            Ok(read) => cached.broken.is_none() && cached.envelope.as_ref() == read.as_ref(),
-            Err(_) => false,
-        };
-        if cache_hit {
-            return state_of(&cached, self.revocations.as_ref());
+        // One decision site: the miss path decides, and the hit path returns
+        // exactly what it decided.
+        let cached = self.cached.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((seen, state)) = &cached.entry
+            && seen == &envelope
+        {
+            return state.clone();
         }
         drop(cached);
 
+        let state = self.decide(store, envelope.clone());
+        let mut cached = self.cached.lock().unwrap_or_else(|e| e.into_inner());
+        cached.entry = Some((envelope, state.clone()));
+        state
+    }
+
+    /// The verdict for one envelope read. The only place the three arms are
+    /// decided.
+    fn decide(
+        &self,
+        store: &Arc<Mutex<CredentialStore>>,
+        envelope: Result<Option<String>, String>,
+    ) -> GateState {
         match envelope {
             // The row could not be read at all. This is NOT "no gate row" —
             // it is "I could not tell", and the safe answer to that is the
@@ -242,30 +251,19 @@ impl LiveGate {
             //
             // Answering `Unarmed` here would OPEN the panel, which is the
             // failure the three-arm split exists to prevent.
-            Err(reason) => {
-                // The cache is NOT updated: the next request retries, and a
-                // store that becomes readable again recovers on its own.
-                self.cache_failure(reason.clone());
-                match &self.env {
-                    Some(tokens) => {
-                        GateState::Armed(Arc::clone(tokens), self.revocations.clone())
-                    }
-                    None => GateState::Broken(reason),
+            Err(reason) => match &self.env {
+                Some(tokens) => {
+                    GateState::Armed(Arc::clone(tokens), self.revocations.clone())
                 }
-            }
+                None => GateState::Broken(reason),
+            },
             // No row: the gate is the env one, or there is none.
-            Ok(None) => {
-                self.cache_resolution(None, None);
-                match &self.env {
-                    Some(tokens) => GateState::Armed(Arc::clone(tokens), self.revocations.clone()),
-                    None => GateState::Unarmed,
-                }
-            }
-            Ok(Some(envelope)) => match self.decrypt(store) {
-                Ok(tokens) => {
-                    self.cache_resolution(Some(envelope), Some(Arc::clone(&tokens)));
-                    GateState::Armed(tokens, self.revocations.clone())
-                }
+            Ok(None) => match &self.env {
+                Some(tokens) => GateState::Armed(Arc::clone(tokens), self.revocations.clone()),
+                None => GateState::Unarmed,
+            },
+            Ok(Some(_envelope)) => match self.decrypt(store) {
+                Ok(tokens) => GateState::Armed(tokens, self.revocations.clone()),
                 Err(reason) => {
                     // The row is there and will not open.
                     //
@@ -275,12 +273,6 @@ impl LiveGate {
                     // accepts. With no env master to fall back to, the answer
                     // is `Broken`: the operator believes there is a gate (the
                     // row exists) and there is not one.
-                    //
-                    // The cache is NOT updated, so the next request retries
-                    // the derivation. A broken gate is an operator emergency
-                    // they will fix, and a panel that keeps trying is one
-                    // that recovers when they do.
-                    self.cache_failure(reason.clone());
                     match &self.env {
                         Some(tokens) => {
                             GateState::Armed(Arc::clone(tokens), self.revocations.clone())
@@ -292,23 +284,7 @@ impl LiveGate {
         }
     }
 
-    /// Installs a successful resolution in the cache.
-    fn cache_resolution(&self, envelope: Option<String>, tokens: Option<Arc<Tokens>>) {
-        let mut cached = self.cached.lock().unwrap_or_else(|e| e.into_inner());
-        cached.envelope = envelope;
-        cached.tokens = tokens;
-        cached.broken = None;
-    }
 
-    /// Records a failed resolution.
-    ///
-    /// The envelope is deliberately **not** updated: the next request has to
-    /// retry, or a transient failure would be cached as a permanent answer.
-    fn cache_failure(&self, reason: String) {
-        let mut cached = self.cached.lock().unwrap_or_else(|e| e.into_inner());
-        cached.broken = Some(reason);
-        cached.tokens = None;
-    }
 
     /// The gate row's ciphertext.
     ///
@@ -353,19 +329,6 @@ fn engine_for(master: Secret, derivations: &AtomicU64) -> Tokens {
     let master = MasterKey::new(master.to_owned_secret(), KeyMeta::generate())
         .expect("a 32-byte master always derives");
     Tokens::new(&master)
-}
-
-/// The state a cached engine describes.
-fn state_of(cached: &Cached, revocations: Option<&Arc<Revocations>>) -> GateState {
-    // A cached failure is `Broken`, never `Unarmed`. The cache must never
-    // claim "there is no gate" when the last resolution could not tell.
-    if let Some(reason) = &cached.broken {
-        return GateState::Broken(reason.clone());
-    }
-    match &cached.tokens {
-        Some(tokens) => GateState::Armed(Arc::clone(tokens), revocations.cloned()),
-        None => GateState::Unarmed,
-    }
 }
 
 /// The gate row's name in the credential store.

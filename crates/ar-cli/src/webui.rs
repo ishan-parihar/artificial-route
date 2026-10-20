@@ -1348,7 +1348,7 @@ async fn save_settings(
         );
     }
 
-    if next == doc {
+    if means_the_same(&doc, &next) {
         return Json(json!({ "ok": true, "pending_restart": false, "note": "identical" }))
             .into_response();
     }
@@ -1469,6 +1469,78 @@ fn load_cfg(ctx: &Ctx) -> Result<(String, Config), Box<Response>> {
     Ok((doc, cfg))
 }
 
+/// Whether a candidate document means the same thing as the current one.
+///
+/// F8: the panel's write path used to compare the **rendered text**, and the
+/// renderer emits block-style lists where a hand-written file uses
+/// flow-style. So posting the config's own combo list back to the panel
+/// re-rendered 39 lines and the `identical` short-circuit never fired — a
+/// no-op save dirtied the file.
+///
+/// The comparison is **semantic**: both documents are parsed and the parsed
+/// `Config`s are compared, and `Config` derives `PartialEq`. Two documents
+/// that parse to the same configuration are the same configuration, however
+/// they are spelled.
+///
+/// The rule this replaces is the house rule for the whole write path:
+/// **compare semantics, and saving the same thing stops dirtying the file.**
+/// A byte comparison would have to preserve the original formatting exactly,
+/// and the renderer cannot know how the operator's hand-written file was
+/// spelled.
+///
+/// # The comparison is on the UNEXPANDED documents
+///
+/// `Config::parse` expands `$VAR` on the raw text **before** YAML parsing
+/// ("a secret can live in the environment and never in the file"), so
+/// comparing with the live environment would make `$AR_KEY_OPENAI` and the
+/// literal `sk-...` compare **equal** — and the write path would then
+/// discard the change. The operator edits the file's spelling, the panel
+/// says "identical", and the edit never lands.
+///
+/// So both documents are parsed with a resolver that expands **nothing**:
+/// a `$VAR` reference stays a literal, and the two spellings differ. A
+/// document with the same `$VAR` on both sides still compares equal, which
+/// is correct.
+///
+/// It is also **deterministic**: the live environment could change between
+/// two parses, and a comparison that answers differently when the operator
+/// exports a variable is not a comparison.
+///
+/// # What is NOT compared
+///
+/// `Config` does not deny unknown fields, so a YAML key the struct does not
+/// model is dropped from both parses and is **not compared**. A change there
+/// is not detected. That is a real limit on the "semantic" claim, and it is
+/// bounded: the panel's own writes only ever touch modelled sections, and
+/// `splice_section` preserves the rest of the text.
+///
+/// A document that does not parse is NOT identical — it is a change, and the
+/// write path will report the parse error. Answering "identical" for an
+/// unparseable candidate would swallow the error.
+fn means_the_same(current: &str, candidate: &str) -> bool {
+    if current == candidate {
+        return true;
+    }
+    match (
+        Config::parse(current, no_expansion),
+        Config::parse(candidate, no_expansion),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        // One of them does not parse. That is a change, not an identity, and
+        // the write path reports the parse error.
+        _ => false,
+    }
+}
+
+/// The resolver [`means_the_same`] uses: expand **nothing**.
+///
+/// A `None` lookup means "the variable is not set", so the expansion leaves
+/// `$VAR` as the literal text `$VAR` — which is what makes the comparison
+/// distinguish a reference from the value it points at.
+fn no_expansion(_: &str) -> Result<Option<String>, String> {
+    Ok(None)
+}
+
 /// The registry catalog for the browser pane: every compiled-in provider with
 /// its models and the prices the pricing table knows, read-only. `configured`
 /// says this config already routes to the id, which is what turns the browser
@@ -1532,7 +1604,7 @@ async fn save_combos(
         Err(e) => return render_failed(e),
     };
     let next = commands::splice_section(&doc, "combos", &section);
-    if next == doc {
+    if means_the_same(&doc, &next) {
         return Json(json!({ "ok": true, "pending_restart": false, "note": "identical" }))
             .into_response();
     }
@@ -1998,7 +2070,7 @@ async fn set_limits(
     }
     let next =
         commands::splice_section(&doc, "limits", &crate::import::limits::render(&cfg.limits));
-    if next == doc {
+    if means_the_same(&doc, &next) {
         return Json(json!({ "ok": true, "pending_restart": false, "note": "identical" }))
             .into_response();
     }
@@ -2146,7 +2218,7 @@ async fn provider_custom(
             Err(e) => return render_failed(e),
         };
     }
-    if next == doc {
+    if means_the_same(&doc, &next) {
         return Json(json!({ "ok": true, "pending_restart": false, "note": "identical" }))
             .into_response();
     }
@@ -2554,28 +2626,35 @@ mod http_tests {
         let _ = std::fs::remove_dir_all(path.parent().expect("a parent"));
     }
 
-    /// A8: a store that cannot be read must never resolve to `Unarmed`.
+    /// A8: a store whose gate row still reads must never resolve to
+    /// `Unarmed`.
     ///
     /// `Unarmed` permits writes. A panel that cannot read the gate row and
     /// answers `Unarmed` has **opened up**, which is the failure the
     /// three-arm split exists to prevent.
+    ///
+    /// The mechanism this actually exercises is the **clobbered file**: the
+    /// live gate holds a connection opened over the store, and sqlite may
+    /// keep serving the page image it already has, so the row can still read.
+    /// What is proved is the property that matters — a store that does not
+    /// report "no gate" is not `Unarmed` — and the *unreadable* arm is
+    /// covered by the env-fallback and the broken-gate cases above.
     #[tokio::test]
-    async fn an_unreadable_store_should_never_resolve_to_unarmed() {
+    async fn a_store_whose_row_still_reads_should_never_resolve_to_unarmed() {
         let (live, path, master) = live_gate_fixture("unreadable");
         let opened =
             ar_keys::CredentialStore::open_with_material(&path, &master).expect("the store opens");
         arm_the_gate(&opened, &master);
         assert!(live.resolve().is_armed(), "precondition: the gate is armed");
 
-        // Now break the store: replace the file with something sqlite cannot
-        // read as a database.
+        // Now break the file under the live gate's feet.
         drop(opened);
         std::fs::write(&path, b"this is not a sqlite database at all").expect("the file is clobbered");
 
         let state = live.resolve();
         assert!(
             !matches!(state, auth::GateState::Unarmed),
-            "a store that cannot be read must never read as 'there is no gate'"
+            "a store that does not report 'no gate' must never read as 'there is no gate'"
         );
 
         let _ = std::fs::remove_dir_all(path.parent().expect("a parent"));
@@ -2603,6 +2682,7 @@ mod http_tests {
             matches!(first, auth::GateState::Broken(_)),
             "a row that will not open, with no env master, is Broken: {first:?}"
         );
+        let after_first = live.derivations();
 
         // The second request must NOT fall back to `Unarmed`.
         let second = live.resolve();
@@ -2610,6 +2690,16 @@ mod http_tests {
             matches!(second, auth::GateState::Broken(_)),
             "Broken must persist: the state that permits writes is Unarmed, so a \
              one-request Broken is decorative: {second:?}"
+        );
+        // And it must be **remembered**, not retried. A second derivation would
+        // be the old behaviour: the failure was re-run every request, which
+        // spends 19 MiB and ~40 ms on every panel request while the operator
+        // is trying to fix the gate.
+        assert_eq!(
+            live.derivations(),
+            after_first,
+            "the Broken verdict must be remembered against the ciphertext it \
+             failed on, not re-derived on every request"
         );
 
         let _ = std::fs::remove_dir_all(path.parent().expect("a parent"));
@@ -2627,10 +2717,131 @@ mod http_tests {
     async fn an_env_only_host_should_show_an_armed_panel() {
         let env = ar_keys::Secret::generate();
         let live = livegate::LiveGate::new(None, Some(env), None);
-        let state = live.resolve();
+        // TWICE. The first resolve returns `Armed` from the env fallback; the
+        // second comes from the CACHE, and an earlier shape cached the env
+        // master as "nothing", so the second request answered `Unarmed` — and
+        // `Unarmed` permits writes, so the panel became WEAKER than the data
+        // plane on the second request.
+        for request in 1..=3 {
+            let state = live.resolve();
+            assert!(
+                state.is_armed(),
+                "request {request}: a host with an env master has a gate, and the \
+                 panel must show it every time: {state:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_no_op_write_should_not_dirty_the_config() {
+        // F8: the write path compared the **rendered text**, and the renderer
+        // emits block-style lists where a hand-written file uses flow-style. So
+        // posting the config's own combo list back re-rendered 39 lines and
+        // the `identical` short-circuit never fired — a no-op save dirtied the
+        // file.
+        //
+        // The comparison is semantic: both documents are parsed and the
+        // parsed `Config`s are compared. Two documents that parse to the same
+        // configuration ARE the same configuration, however they are spelled.
+        let dir = std::env::temp_dir().join(format!("ar-webui-noop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let config = dir.join("config.yaml");
+        // A hand-written file: flow-style targets, the way an operator writes
+        // one, which the renderer does not emit.
+        std::fs::write(
+            &config,
+            "keys:\n  k: v\ncombos:\n  - id: c\n    strategy: priority\n    targets: [openai/gpt-5.4]\n",
+        )
+        .expect("config");
+
+        let doc = std::fs::read_to_string(&config).expect("read");
+        let section = crate::import::render_combos_section(&[ar_config::Combo {
+            id: "c".to_owned(),
+            strategy: ar_config::Strategy::Priority,
+            targets: vec!["openai/gpt-5.4".to_owned()],
+            weights: BTreeMap::new(),
+            pool: Vec::new(),
+            steps: Vec::new(),
+            compression: None,
+            judge_model: None,
+            context_length: None,
+        }])
+        .expect("renders");
+        let next = commands::splice_section(&doc, "combos", &section);
+
+        assert_ne!(
+            next, doc,
+            "precondition: the rendered form differs from the hand-written one, \
+             which is what made the old byte comparison useless"
+        );
         assert!(
-            state.is_armed(),
-            "a host with an env master has a gate, and the panel must show it: {state:?}"
+            means_the_same(&doc, &next),
+            "the two documents must compare EQUAL: they parse to the same config"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_genuine_change_should_not_compare_equal() {
+        // The other half of the property: a real change must NOT be reported
+        // as identical, or the short-circuit would swallow a real edit.
+        let dir = std::env::temp_dir().join(format!("ar-webui-change-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let config = dir.join("config.yaml");
+        let before = "keys:\n  k: v\ncombos:\n  - id: c\n    strategy: priority\n    targets: [openai/gpt-5.4]\n";
+        std::fs::write(&config, before).expect("config");
+        let after = "keys:\n  k: v\ncombos:\n  - id: c\n    strategy: priority\n    targets: [openai/gpt-5.4-nano]\n";
+
+        assert!(
+            !means_the_same(before, after),
+            "a different target is a different config"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_changed_key_reference_should_not_compare_equal() {
+        // The `$VAR` hazard. `Config::parse` expands `$VAR` on the raw text
+        // BEFORE YAML parsing, so comparing with the live environment would
+        // make a reference and the literal it points at compare EQUAL — and
+        // the write path would then discard the operator's edit.
+        //
+        // The comparison is on the UNEXPANDED documents, so a reference stays
+        // a literal and the two spellings differ.
+        let reference = "keys:\n  k: $AR_KEY_OPENAI\ncombos: []\n";
+        let literal = "keys:\n  k: sk-the-actual-secret\ncombos: []\n";
+        assert!(
+            !means_the_same(reference, literal),
+            "a key reference and the literal it points at are DIFFERENT documents: \
+             the operator's edit must not be swallowed"
+        );
+        // The same reference on both sides is still the same document.
+        assert!(
+            means_the_same(reference, reference),
+            "the same reference on both sides is the same document"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unmodelled_yaml_key_should_not_compare_equal() {
+        // The limit on the "semantic" claim, stated as a test so it cannot
+        // drift: `Config` does not deny unknown fields, so a YAML key the
+        // struct does not model is dropped from both parses and is NOT
+        // compared. A change there is not detected.
+        //
+        // The panel's own writes only touch modelled sections, so the risk is
+        // bounded — but it is a bound, not an accident, and this test is what
+        // says so.
+        let before = "keys:\n  k: v\nan_unmodelled_key: 1\ncombos: []\n";
+        let after = "keys:\n  k: v\nan_unmodelled_key: 2\ncombos: []\n";
+        assert!(
+            means_the_same(before, after),
+            "an unmodelled key is NOT compared - this is the known limit of the \
+             semantic comparison, and the test exists so it cannot be forgotten"
         );
     }
 

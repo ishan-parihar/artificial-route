@@ -261,18 +261,43 @@ while the other half is still good.
 **3.1 — A8: the panel's gate is resolved once at boot.** *(agent)* `GateState` is built
 in `serve` and held in an `Arc` for the process's life, so arming the gate
 while the proxy runs does not turn the panel's gate on, and breaking the
-master does not turn it `Broken`.
+master does not turn it `Broken`. — **LANDED 2026-10-20.**
 
 - The **safe** direction is already the one in place: a panel that stays
   unarmed for the life of the process is safer than a gate that turns itself
   off. So this is a **usability** gap, not a security one — and it is the same
   shape as the boot-built routing the panel already reports as
   `pending_restart`.
-- The fix is to re-resolve per request, which costs a store read per request —
-  the same cost as 2.2, and **the two can share one mechanism**: one
-  `Arc<Revocation>`-shaped store handle, opened once, consulted per request.
-- **Do it after 2.2**, not before. Doing 2.2 first means the per-request store
-  read is already built and paid for.
+- **The fix is NOT a per-request re-resolve.** Resolving the gate means
+  decrypting the gate row, which means deriving the master — argon2id at
+  `HashParams::RECOMMENDED` is **19 MiB and ~40 ms** per derivation
+  (`ar-keys/src/hash.rs`: "it runs once per key load, never per request"). The
+  outline's original "one store read per request" was wrong by three orders of
+  magnitude.
+- **The shape that works: cache the engine, invalidate on a cheap signal.**
+  The signing key is the master bytes themselves, so an engine built from a
+  master stays correct as long as that master is right — and the master
+  changes only when the gate **row** changes, which is observable without
+  decrypting: the row's *ciphertext* is a sqlite point read. The master is
+  re-derived only when the ciphertext differs.
+- The file's **mtime is not the signal**: the revocation table lives in the
+  same sqlite file, so every `aroute keys revoke` would change it and force a
+  40 ms re-derivation of a gate that had not changed.
+- **The env master is the server's own resolved one**
+  (`built.config.http_master_key`), read through the server's decoder. A
+  second decoder that disagreed with it would be a gate that works on one
+  surface and not the other — the exact divergence this phase exists to close.
+- **The cache holds the resolved VERDICT, not the ingredients.** With the
+  ingredients cached, the hit path and the miss path each decided the three
+  arms for themselves and the two could disagree: an env-only host answered
+  `Armed` on the first request and `Unarmed` on the second, and `Unarmed`
+  permits writes — so the panel became **weaker** than the data plane.
+- **Scope: the env master is captured at boot.** An environment variable
+  cannot change under a running process, so rotating it is seen by a restart,
+  not live.
+- Six tests, including the two only a **counter** can prove: an unchanged gate
+  row must not re-derive, and a `Broken` verdict must be *remembered* rather
+  than re-derived on every request.
 
 **3.2 — A5: `loopback_only` refuses what a browser sends.** *(agent, after B1)* The rule refuses a
 request whose `Host` **or** `Origin` names a non-loopback authority
@@ -295,12 +320,25 @@ CSS-driven font requests are refused while a script's silence is admitted.
 a whole-section replace and the YAML renderer emits block-style lists where the
 hand-written file used flow-style, so posting the config's own combo list
 changed 39 lines and the `identical` short-circuit (`webui.rs:1253` and three
-siblings) never fired.
+siblings) never fired. — **LANDED 2026-10-20.**
 
 - The fix is a **semantic comparison before the write**: parse both documents
   and compare the parsed `Config`, rather than comparing the rendered bytes.
   `Config` derives `PartialEq` (`crates/ar-config/src/lib.rs:1047`), and `Combo`
   derives `PartialEq` too (`:489`), so the comparison is available.
+- **The comparison is on the UNEXPANDED documents.** `Config::parse` expands
+  `$VAR` on the raw text *before* YAML parsing, so comparing with the live
+  environment would make a key reference and the literal it points at compare
+  **equal** — and the write path would discard the operator's edit. Both
+  documents are parsed with a resolver that expands nothing, so a `$VAR`
+  reference stays a literal. It is also deterministic: the live environment
+  could change between two parses.
+- **Two limits, stated in the helper's doc and pinned by tests:** a YAML key
+  `Config` does not model is dropped from both parses and is **not** compared
+  (bounded: the panel's writes only touch modelled sections, and
+  `splice_section` preserves the rest of the text), and a document that does
+  not parse is a **change**, not an identity, so the parse error is reported
+  rather than swallowed.
 - The bonus is that the comparison is **the** fix for the write-path tests:
   compare semantics, and "saving the same thing" stops dirtying the config.
 - Note `Combo` derives `PartialEq` but **not** `Eq`, and `Config` derives
