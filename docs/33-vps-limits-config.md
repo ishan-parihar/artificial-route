@@ -116,7 +116,7 @@ release asset (never a local build — ledger C1), the binary verified
 | 7 | the same through the **public** endpoint | **200**, same decision header |
 | 8 | the **failover probe** | `model_tokens["nvidia/z-ai/glm-5.3"]` set to `1` (the current spend is already past it) → the request was **served by `minimax`**, not refused: `x-ar-decision: …;provider=kilocode;model=minimax/minimax-m3.1-flash:free` |
 | 9 | the ceiling restored to `500000000` and the service restarted | the config reads back as above |
-| 10 | 402s in the failure log | **8 in the 10 minutes before** the fix, **0 after**; 27 successful requests through the key since |
+| 10 | 402s in the failure log | **18 in the 30 minutes before** the restart, **0 after**; the newest 402 of any kind is 08:13:45 UTC — 48 seconds before the new code took over |
 
 **Step 8 is the one that matters.** A 402 there would have meant the failover
 did not happen, and the fix would have been "the key serves again" rather
