@@ -877,6 +877,7 @@ async fn handle_chat_inner(
             dialect,
             dispatched,
             savings_tokens,
+            policy_key,
         )
         .await
         .with_guard(guard_verdict);
@@ -888,7 +889,7 @@ async fn handle_chat_inner(
     // first stage's — so a `strategy: pipeline` combo silently did something
     // other than what it said. The engine is [`ar_route::dispatch_pipeline`].
     if plan.strategy == Strategy::Pipeline {
-        return pipeline_response(state, &canonical, &plan, dialect, dispatched)
+        return pipeline_response(state, &canonical, &plan, dialect, dispatched, policy_key)
             .await
             .with_guard(guard_verdict);
     }
@@ -1633,6 +1634,7 @@ async fn pipeline_response(
     plan: &RoutePlan,
     dialect: Dialect,
     dispatched: Instant,
+    policy_key: &str,
 ) -> Response {
     let combo = state.config.combo(canonical.model.as_ref());
     let stage_candidates = state.config.candidates(combo);
@@ -1644,6 +1646,13 @@ async fn pipeline_response(
             "the pipeline has no dispatchable stage; `ar doctor` lists what is missing",
         );
     }
+    // The per-target budget reaches the pipeline too: a stage whose own
+    // budget is spent would fail the whole chain, and the stages are not a
+    // fallback chain — each one answers a different question.
+    let stage_candidates = match budget_filtered_candidates(state, policy_key, &stage_candidates) {
+        Ok(candidates) => candidates,
+        Err(refusal) => return *refusal,
+    };
     let outcome = match tokio::time::timeout(
         state.config.stream_deadline(canonical.model.as_ref()),
         ar_route::dispatch_pipeline(&stage_candidates, canonical, state.exec.as_ref()),
@@ -1742,6 +1751,7 @@ async fn fusion_response(
     dialect: Dialect,
     dispatched: Instant,
     savings_tokens: u32,
+    policy_key: &str,
 ) -> Response {
     let combo = state.config.combo(canonical.model.as_ref());
     let panel_candidates = state.config.candidates(combo);
@@ -1753,6 +1763,12 @@ async fn fusion_response(
             "the fusion panel has no dispatchable target; `ar doctor` lists what is missing",
         );
     }
+    // The per-target budget reaches the panel too: a member whose own budget
+    // is spent would spend the operator's money for an answer nobody can use.
+    let panel_candidates = match budget_filtered_candidates(state, policy_key, &panel_candidates) {
+        Ok(candidates) => candidates,
+        Err(refusal) => return *refusal,
+    };
     let mut outcome = match tokio::time::timeout(
         state.config.stream_deadline(canonical.model.as_ref()),
         ar_route::dispatch_fusion(
@@ -2863,6 +2879,134 @@ fn target_cap_message(refused: &[RefusedTarget]) -> String {
         "every model this key may use has reached its own token ceiling: {}",
         names.join(", ")
     )
+}
+
+/// The candidates a request may dispatch to, with the per-target budget
+/// applied.
+///
+/// The `fusion` and `pipeline` strategies do not walk the chain, so they do
+/// not reach the chain filter; this is their equivalent. It reads the ledger
+/// once and drops the candidates whose own budget is spent.
+///
+/// `Err` is the refusal: every candidate was over budget, so there is nothing
+/// left to dispatch to. `Ok` with an empty list is the same fact, so it is
+/// refused here rather than reaching a dispatch that would fail anyway.
+///
+/// The refusal is boxed because an `axum` `Response` is a wide value and
+/// `Result` carries the error inline.
+fn budget_filtered_candidates(
+    state: &AppState,
+    key_id: &str,
+    candidates: &[ar_route::Candidate],
+) -> Result<Vec<ar_route::Candidate>, Box<Response>> {
+    let Some(ledger) = state.ledger.as_ref() else {
+        return Ok(candidates.to_vec());
+    };
+    // A key with no per-target ceiling is never filtered: the arm is opt-in,
+    // and reading the ledger for it would be a cost for nothing.
+    if state.policy.spend_window(key_id).is_none()
+        && !state
+            .policy
+            .has_target_caps(key_id)
+    {
+        return Ok(candidates.to_vec());
+    }
+    let window = state.policy.spend_window(key_id);
+    let since = window.map(|w| epoch_now().saturating_sub(w.as_secs() as i64));
+    let breakdown = {
+        let guard = ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.spend_breakdown(key_id, since)
+    };
+    let breakdown = match breakdown {
+        Ok(breakdown) => breakdown,
+        Err(e) => {
+            tracing::warn!(error = %e, "spend ledger could not be read");
+            let mut resp = error_because(
+                StatusCode::PAYMENT_REQUIRED,
+                "payment_required",
+                "unauditable",
+                "the spend ledger could not be read, so this key's ceilings cannot be checked",
+            );
+            stamp(&mut resp, DENY_HEADER, "unauditable");
+            return Err(Box::new(resp));
+        }
+    };
+    let (kept, refused) = filter_candidates_by_budget(
+        &state.policy,
+        key_id,
+        candidates,
+        &breakdown,
+        window.is_some(),
+    );
+    if kept.is_empty() && !refused.is_empty() {
+        let mut resp = error_because(
+            StatusCode::PAYMENT_REQUIRED,
+            "payment_required",
+            "model_token_cap",
+            &target_cap_message(&refused),
+        );
+        stamp(&mut resp, DENY_HEADER, "model_token_cap");
+        return Err(Box::new(resp));
+    }
+    Ok(kept)
+}
+
+/// Whether one target is within its own budget, given the ledger's split.
+///
+/// The one decision the chain filter and the fusion/pipeline filter both need,
+/// so it is a named function rather than the same test written twice.
+fn target_within_budget(
+    policy: &crate::policy::Policy,
+    key_id: &str,
+    provider: &str,
+    model: &str,
+    breakdown: &ar_tokens::SpendBreakdown,
+    windowed: bool,
+) -> bool {
+    let name = format!("{provider}/{model}");
+    let Some(cap) = policy.target_cap(key_id, &name) else {
+        return true;
+    };
+    let spend = breakdown.target(provider, model);
+    let spent = if windowed {
+        spend.windowed.tokens
+    } else {
+        spend.total.tokens
+    };
+    spent < cap
+}
+
+/// Drops the candidates whose own budget is spent, and names the ones dropped.
+///
+/// The `fusion` and `pipeline` strategies do not walk a chain — they build
+/// their own candidate list from the combo — so the chain filter does not
+/// reach them. A panel member over its budget would spend the operator's
+/// money for an answer nobody can use, and a pipeline stage over its budget
+/// would fail the whole chain. Both are filtered here, on the same
+/// `SpendBreakdown` the chain filter reads.
+fn filter_candidates_by_budget(
+    policy: &crate::policy::Policy,
+    key_id: &str,
+    candidates: &[ar_route::Candidate],
+    breakdown: &ar_tokens::SpendBreakdown,
+    windowed: bool,
+) -> (Vec<ar_route::Candidate>, Vec<RefusedTarget>) {
+    let mut kept = Vec::with_capacity(candidates.len());
+    let mut refused = Vec::new();
+    for candidate in candidates {
+        let provider = candidate.provider.as_str();
+        let model = candidate.model.as_ref();
+        if target_within_budget(policy, key_id, provider, model, breakdown, windowed) {
+            kept.push(candidate.clone());
+        } else {
+            refused.push(RefusedTarget {
+                target: format!("{provider}/{model}"),
+            });
+        }
+    }
+    (kept, refused)
 }
 
 /// Resolves an `auto/*` alias into a scored chain, or `None` for a concrete name.
@@ -4324,17 +4468,23 @@ mod tests {
     /// Answers each stage with a body naming the provider that served it, and
     /// records the bodies it was handed so a test can see what the *next*
     /// stage received.
+    ///
+    /// The list is shared with the test rather than owned by the executor: the
+    /// executor lives inside the server's state, and the test needs to read
+    /// what it saw.
     struct StagedExec {
-        seen: Mutex<Vec<(String, String)>>,
+        seen: Arc<Mutex<Vec<(String, String)>>>,
     }
 
     impl StagedExec {
-        fn new() -> Self {
-            Self {
-                seen: Mutex::new(Vec::new()),
-            }
+        fn new() -> (Arc<Self>, StagedSeen) {
+            let seen: StagedSeen = Arc::new(Mutex::new(Vec::new()));
+            (Arc::new(Self { seen: seen.clone() }), seen)
         }
     }
+
+    /// The stages a test can read: the provider, and the body it was handed.
+    type StagedSeen = Arc<Mutex<Vec<(String, String)>>>;
 
     impl ArExec for StagedExec {
         fn post_chat<'a>(
@@ -4383,7 +4533,7 @@ mod tests {
     /// stage's answer**, not the client's question.
     #[tokio::test]
     async fn a_pipeline_stage_feeds_the_next_stage() {
-        let exec = Arc::new(StagedExec::new());
+        let (exec, _seen) = StagedExec::new();
         let router = crate::app::app(
             Components {
                 exec: exec.clone(),
@@ -7128,6 +7278,111 @@ mod tests {
                 created_at: 1_700_000_000,
             })
             .expect("seed the spend");
+    }
+
+    #[tokio::test]
+    async fn a_fusion_panel_member_over_its_budget_is_not_dispatched_to() {
+        // `fusion` does not walk a chain — it builds its own panel from the
+        // combo — so the chain filter never reached it. A member over its own
+        // budget would spend the operator's money for an answer nobody can
+        // use, so the panel is filtered on the same split.
+        let (exec, seen) = RecordingProviders::new();
+        let mut config = fusion_config(None);
+        config.limits = ar_config::Config::parse(
+            "limits:\n  default:\n    model_tokens:\n      \"a/m\": 1\n",
+            |_| Ok(None),
+        )
+        .expect("test limits parse")
+        .limits;
+        let ledger = Arc::new(Mutex::new(
+            ar_tokens::Ledger::open_in_memory().expect("in-memory ledger"),
+        ));
+        ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(&ar_tokens::Entry {
+                key_id: "anonymous",
+                provider: "a",
+                model: "m",
+                combo: "m",
+                usage: ar_tokens::NormalizedUsage::new(100, 0),
+                cost: ar_tokens::Cost::UNPRICED,
+                created_at: 1_700_000_000,
+            })
+            .expect("seed the spend");
+        let router = crate::app::app(
+            Components {
+                exec,
+                ledger: Some(ledger),
+                ..Components::unconfigured(config)
+            }
+            .into_state(),
+        );
+        let resp = drive(
+            &router,
+            chat("{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}", &[]),
+        )
+        .await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::PAYMENT_REQUIRED,
+            "the other panel member still has budget"
+        );
+        let seen = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            !seen.iter().any(|s| s.starts_with("a/")),
+            "the over-budget panel member was dispatched to anyway: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pipeline_stage_over_its_budget_is_not_dispatched_to() {
+        // A pipeline stage is not a fallback — each one answers a different
+        // question — so a stage over its budget would fail the whole chain
+        // rather than hand over to the next one.
+        let (exec, seen) = StagedExec::new();
+        let mut config = pipeline_config();
+        config.limits = ar_config::Config::parse(
+            "limits:\n  default:\n    model_tokens:\n      \"a/m\": 1\n",
+            |_| Ok(None),
+        )
+        .expect("test limits parse")
+        .limits;
+        let ledger = Arc::new(Mutex::new(
+            ar_tokens::Ledger::open_in_memory().expect("in-memory ledger"),
+        ));
+        ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(&ar_tokens::Entry {
+                key_id: "anonymous",
+                provider: "a",
+                model: "m",
+                combo: "m",
+                usage: ar_tokens::NormalizedUsage::new(100, 0),
+                cost: ar_tokens::Cost::UNPRICED,
+                created_at: 1_700_000_000,
+            })
+            .expect("seed the spend");
+        let router = crate::app::app(
+            Components {
+                exec,
+                ledger: Some(ledger),
+                ..Components::unconfigured(config)
+            }
+            .into_state(),
+        );
+        let resp = drive(
+            &router,
+            chat("{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}", &[]),
+        )
+        .await;
+        let seen = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            !seen.iter().any(|(provider, _)| provider == "a"),
+            "the over-budget stage was dispatched to anyway: {seen:?}"
+        );
+        let _ = resp;
     }
 
     #[tokio::test]
