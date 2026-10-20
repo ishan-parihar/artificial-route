@@ -82,7 +82,7 @@ use serde_json::{Map, Value, json};
 
 use crate::canonical::{
     CanonicalChat, CanonicalResponse, CanonicalTool, FinishReason, MediaPart, Msg, Role, ToolCall,
-    ToolChoice, render_openai_body,
+    ToolChoice, openai_tool, openai_tool_choice, render_openai_body,
 };
 
 /// Which provider wire a dispatch must render into.
@@ -613,18 +613,43 @@ fn data_url(url: &str) -> Option<(&str, &str)> {
 pub fn render_cursor_body(chat: &CanonicalChat) -> Vec<u8> {
     let mut messages: Vec<Value> = Vec::with_capacity(chat.messages.len());
 
+    // The tool a call id belongs to, so a tool result can name the tool it
+    // answers. The reference builds the same map from the assistant's
+    // `tool_calls`; canonical keeps no tool registry, so the map is built here
+    // from the calls the conversation carries.
+    let mut tool_names: HashMap<&str, &str> = HashMap::new();
+    for msg in &chat.messages {
+        for call in &msg.tool_calls {
+            tool_names.insert(call.id.as_str(), call.name.as_str());
+        }
+    }
+
     for msg in &chat.messages {
         match msg.role {
             Role::System => messages.push(json!({
                 "role": "user",
                 "content": format!("[System Instructions]\n{}", msg.content),
             })),
-            Role::Tool => messages.push(json!({
-                "role": "user",
-                "content": cursor_tool_result(&msg.content),
-            })),
+            Role::Tool => {
+                // The result names the tool and the call it answers. The
+                // reference resolves the name from the assistant's tool calls
+                // and falls back to the `tool` placeholder; the id is the
+                // call's own, so the upstream can pair them.
+                let name = msg
+                    .tool_call_id
+                    .as_deref()
+                    .and_then(|id| tool_names.get(id).copied())
+                    .unwrap_or("tool");
+                messages.push(json!({
+                    "role": "user",
+                    "content": cursor_tool_result(name, msg.tool_call_id.as_deref().unwrap_or(""), &msg.content),
+                }));
+            }
             Role::User | Role::Assistant => {
-                if msg.media.is_empty() {
+                // A turn that carries calls and no text is an assistant turn
+                // whose only content IS the call, and dropping it would lose
+                // the call entirely.
+                if msg.media.is_empty() && msg.tool_calls.is_empty() {
                     if !msg.content.is_empty() {
                         messages
                             .push(json!({ "role": msg.role.as_wire(), "content": msg.content }));
@@ -644,7 +669,7 @@ pub fn render_cursor_body(chat: &CanonicalChat) -> Vec<u8> {
         }
     }
 
-    let mut body = Map::with_capacity(5);
+    let mut body = Map::with_capacity(6);
     body.insert("model".to_owned(), chat.model.as_str().into());
     body.insert("messages".to_owned(), Value::Array(messages));
     body.insert("stream".to_owned(), chat.stream.into());
@@ -654,11 +679,27 @@ pub fn render_cursor_body(chat: &CanonicalChat) -> Vec<u8> {
     if let Some(max_tokens) = chat.max_tokens {
         body.insert("max_tokens".to_owned(), max_tokens.into());
     }
+    // The declarations cross in OpenAI's shape: Cursor's dialect IS the OpenAI
+    // one, and the executor's `tools` field is the OpenAI array.
+    if !chat.tools.is_empty() {
+        body.insert(
+            "tools".to_owned(),
+            Value::Array(chat.tools.iter().map(openai_tool).collect()),
+        );
+    }
+    if let Some(choice) = &chat.tool_choice {
+        body.insert("tool_choice".to_owned(), openai_tool_choice(choice));
+    }
     encode(Value::Object(body))
 }
 
 /// Builds Cursor's `<tool_result>` block, escaping the XML it contains.
-fn cursor_tool_result(text: &str) -> String {
+///
+/// `name` and `call_id` are the tool's name and the call's id, so the upstream
+/// can pair the result with the call it answers. The reference falls back to
+/// the `tool` placeholder and an empty id when it cannot resolve them, and
+/// so does this.
+fn cursor_tool_result(name: &str, call_id: &str, text: &str) -> String {
     let escape = |s: &str| {
         s.replace('&', "&amp;")
             .replace('<', "&lt;")
@@ -672,7 +713,9 @@ fn cursor_tool_result(text: &str) -> String {
         .filter(|c| !c.is_control() || matches!(c, '\n' | '\t' | '\r'))
         .collect();
     format!(
-        "<tool_result>\n<tool_name>tool</tool_name>\n<tool_call_id></tool_call_id>\n<result>{}</result>\n</tool_result>",
+        "<tool_result>\n<tool_name>{}</tool_name>\n<tool_call_id>{}</tool_call_id>\n<result>{}</result>\n</tool_result>",
+        escape(name),
+        escape(call_id),
         escape(&clean)
     )
 }
@@ -685,12 +728,18 @@ fn cursor_tool_result(text: &str) -> String {
 /// property of the *wire* rather than of the request — typed text parts, the
 /// `maxTokens` spelling, and the vendor's `0..=1` temperature clamp, which
 /// live-verified rejection makes load-bearing.
+///
+/// **Tools cross.** The reference resolves CLOVA's mode to `tools` when the
+/// request declares any and the model is a function-calling one; the
+/// declaration shape is nearly identical to OpenAI's, so it is rendered in
+/// OpenAI's spelling with the description defaulted (CLOVA rejects a tool
+/// without a name, and a tool with no description is spelled `Tool: <name>`).
 #[must_use]
 pub fn render_clova_body(chat: &CanonicalChat) -> Vec<u8> {
     let messages: Vec<Value> = chat
         .messages
         .iter()
-        .filter(|m| !m.content.is_empty() || !m.media.is_empty())
+        .filter(|m| !m.content.is_empty() || !m.media.is_empty() || !m.tool_calls.is_empty())
         .map(|m| {
             let mut parts: Vec<Value> = Vec::with_capacity(m.media.len() + 1);
             if !m.content.is_empty() {
@@ -710,7 +759,7 @@ pub fn render_clova_body(chat: &CanonicalChat) -> Vec<u8> {
         })
         .collect();
 
-    let mut body = Map::with_capacity(4);
+    let mut body = Map::with_capacity(5);
     body.insert("messages".to_owned(), Value::Array(messages));
     if let Some(max_tokens) = chat.max_tokens {
         body.insert(
@@ -720,6 +769,14 @@ pub fn render_clova_body(chat: &CanonicalChat) -> Vec<u8> {
     }
     if let Some(temperature) = chat.temperature {
         body.insert("temperature".to_owned(), temperature.clamp(0.0, 1.0).into());
+    }
+    // CLOVA's function-calling mode is selected by the presence of `tools`,
+    // and the declarations cross in OpenAI's shape.
+    if !chat.tools.is_empty() {
+        body.insert(
+            "tools".to_owned(),
+            Value::Array(chat.tools.iter().map(openai_tool).collect()),
+        );
     }
     encode(Value::Object(body))
 }
@@ -833,8 +890,45 @@ pub fn render_kiro_body(chat: &CanonicalChat) -> Vec<u8> {
     if !images.is_empty() {
         current.insert("images".to_owned(), Value::Array(images));
     }
+    // The tool declarations cross as Kiro's `toolSpecification` entries, under
+    // the current message's `userInputMessageContext.tools`.
+    //
+    // They go on the CURRENT message rather than on a history turn because
+    // this build sends no history: the reference attaches the schema to the
+    // turn that carries the tools, and the only turn sent is the current one.
+    // A tool schema on a turn that is not sent would be a schema the upstream
+    // never sees, and the model would answer as though the tool did not
+    // exist.
+    if !chat.tools.is_empty() {
+        let mut context = Map::with_capacity(1);
+        context.insert(
+            "tools".to_owned(),
+            Value::Array(chat.tools.iter().map(kiro_tool_spec).collect()),
+        );
+        current.insert("userInputMessageContext".to_owned(), Value::Object(context));
+    }
 
     encode(kiro_payload(&current, &[], &seed, chat))
+}
+
+/// One tool declaration, as Kiro's `toolSpecification`.
+///
+/// The shape is the reference's: a name, a description, and the JSON schema
+/// under `inputSchema.json`. A tool with no description is spelled `Tool:
+/// <name>`, because the reference does that and Kiro rejects an empty one.
+fn kiro_tool_spec(tool: &CanonicalTool) -> Value {
+    let description = tool
+        .description
+        .as_deref()
+        .filter(|d| !d.trim().is_empty())
+        .map_or_else(|| format!("Tool: {}", tool.name), str::to_owned);
+    json!({
+        "toolSpecification": {
+            "name": tool.name,
+            "description": description,
+            "inputSchema": { "json": tool.parameters },
+        }
+    })
 }
 
 /// Wraps a rendered `userInputMessage` in Kiro's `conversationState` envelope.

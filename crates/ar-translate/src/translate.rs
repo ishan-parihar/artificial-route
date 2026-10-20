@@ -560,12 +560,24 @@ impl ArTranslate<OllamaChat> for OllamaInbound {
                 Some(images) if !images.is_empty() => vec![MediaPart::new("images", json!(images))],
                 _ => Vec::new(),
             };
+            // The tool calls the model made, and the id of the call a tool
+            // turn answers.
+            //
+            // Ollama's `tool_calls` arguments are a JSON **object**, where
+            // OpenAI's are a JSON **string** — the canonical form is a value,
+            // so both spellings read into it.
+            let tool_calls = ollama_tool_calls(&msg.rest)?;
+            let tool_call_id = msg
+                .rest
+                .get("tool_call_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
             messages.push(Msg {
                 role,
                 content: msg.content,
                 media,
-                tool_calls: Vec::new(),
-                tool_call_id: None,
+                tool_calls,
+                tool_call_id,
             });
         }
 
@@ -1099,8 +1111,73 @@ fn tool_result_text(content: &AnthropicBlockContent) -> Result<String, Translate
     }
 }
 
+/// The `tool_calls` array on an Ollama message.
+///
+/// Ollama's shape is OpenAI's with the arguments as a JSON **object** rather
+/// than a string: `{"id":…,"function":{"name":…,"arguments":{…}}}`. Both
+/// spellings are read, because the canonical form is a JSON value and either
+/// wire can carry it.
+fn ollama_tool_calls(rest: &serde_json::Value) -> Result<Vec<ToolCall>, TranslateError> {
+    let Some(calls) = rest.get("tool_calls").filter(|v| !v.is_null()) else {
+        return Ok(Vec::new());
+    };
+    let calls = calls
+        .as_array()
+        .ok_or_else(|| TranslateError::InvalidTool {
+            reason: "`tool_calls` must be an array".to_owned(),
+        })?;
+    calls
+        .iter()
+        .map(|call| {
+            let id = call
+                .get("id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| TranslateError::InvalidTool {
+                    reason: "a tool call has no `id`".to_owned(),
+                })?;
+            let function = call.get("function").ok_or_else(|| {
+                TranslateError::InvalidTool {
+                    reason: "a tool call has no `function`".to_owned(),
+                }
+            })?;
+            let name = function
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| TranslateError::InvalidTool {
+                    reason: "a tool call has no function `name`".to_owned(),
+                })?;
+            let arguments = match function.get("arguments") {
+                Some(serde_json::Value::String(raw)) => {
+                    serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.clone()))
+                }
+                Some(value) => value.clone(),
+                None => json!({}),
+            };
+            Ok(ToolCall {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                arguments,
+            })
+        })
+        .collect()
+}
+
 /// Normalises one Responses input item into a canonical turn.
 fn responses_item(item: ResponsesItem) -> Result<Msg, TranslateError> {
+    // A `function_call` item is a tool call the model made in a PRIOR turn,
+    // carried back as conversation history. It is not a message, and it is
+    // not refused: a client that replays a tool-calling conversation sends
+    // these, and a 400 for the whole request would make the Responses API
+    // unusable for every agent that uses tools.
+    if item.kind.as_deref() == Some("function_call") {
+        return responses_function_call(item);
+    }
+    // A `function_call_output` item is the RESULT that answers a
+    // `function_call`, so it is a **tool** turn, correlated by the same
+    // `call_id` the call carried.
+    if item.kind.as_deref() == Some("function_call_output") {
+        return responses_function_call_output(item);
+    }
     if !item.is_message() {
         return Err(TranslateError::UnsupportedPart {
             kind: item.kind_name().to_owned(),
@@ -1151,6 +1228,79 @@ fn responses_item(item: ResponsesItem) -> Result<Msg, TranslateError> {
     })
 }
 
+/// Normalises a Responses `function_call` item into a canonical turn.
+///
+/// The item is a call the model made, so it becomes an **assistant** turn
+/// carrying a [`ToolCall`] — the same canonical shape an Anthropic `tool_use`
+/// block or a Gemini `functionCall` produces. That is what makes the call
+/// renderable back out on any wire that takes one, and what lets the
+/// `function_call_output` that answers it be correlated.
+///
+/// The correlation id is `call_id`, and it is the id the **output** item
+/// repeats — the Responses API names it `call_id` on the call and
+/// `call_id` on the output, where the OpenAI chat dialect uses `tool_call_id`
+/// on both. The canonical field is `tool_call_id`, and the id is what pairs
+/// them.
+///
+/// The arguments arrive as a JSON **string** (`"{\"a\":1}"`), while the
+/// canonical field is a JSON **value** — Anthropic and Gemini take an object.
+/// A string that does not parse is carried as the raw text, because dropping
+/// the arguments would make the call answerable with no arguments at all,
+/// which is a different conversation.
+fn responses_function_call(item: ResponsesItem) -> Result<Msg, TranslateError> {
+    let name = item
+        .rest
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let call_id = item
+        .rest
+        .get("call_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let arguments = match item.rest.get("arguments") {
+        // A string is the wire's spelling: parse it into the value the
+        // canonical form carries.
+        Some(serde_json::Value::String(raw)) => serde_json::from_str(raw)
+            .unwrap_or_else(|_| serde_json::Value::String(raw.clone())),
+        Some(value) => value.clone(),
+        None => serde_json::json!({}),
+    };
+
+    let mut turn = Msg::new(Role::Assistant, "");
+    turn.tool_calls = vec![ToolCall {
+        id: call_id,
+        name,
+        arguments,
+    }];
+    Ok(turn)
+}
+
+/// Normalises a Responses `function_call_output` item into a canonical turn.
+///
+/// The result of a tool call, so it is a **tool** turn whose
+/// `tool_call_id` is the `call_id` the call carried. The output is the tool's
+/// text, flattened to a string: the canonical form carries a tool result as
+/// text, and the Responses output is a string already.
+fn responses_function_call_output(item: ResponsesItem) -> Result<Msg, TranslateError> {
+    let call_id = item
+        .rest
+        .get("call_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let output = match item.rest.get("output") {
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(value) => value.to_string(),
+        None => String::new(),
+    };
+    let mut turn = Msg::new(Role::Tool, output);
+    turn.tool_call_id = Some(call_id);
+    Ok(turn)
+}
+
 /// The modality a canonical request needs, decided by its parts.
 ///
 /// The first media part wins, and the order is the client's — a prompt that
@@ -1168,6 +1318,176 @@ pub fn chat_modality(chat: &CanonicalChat) -> Modality {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An OpenAI chat body, parsed.
+    fn openai(raw: &str) -> OpenAIChat {
+        serde_json::from_str(raw).expect("fixture is valid OpenAI chat")
+    }
+
+    /// A rendered body, parsed.
+    fn parsed(raw: Vec<u8>) -> serde_json::Value {
+        serde_json::from_slice(&raw).expect("renderer emits JSON")
+    }
+
+    #[test]
+    fn reads_a_responses_function_call_as_a_canonical_call() {
+        // The request side of a tool-calling conversation. A client that
+        // replays one sends a `function_call` item, and a 400 for the whole
+        // request would make the Responses API unusable for every agent that
+        // uses tools.
+        let raw = r#"{"model":"m","input":[
+            {"role":"user","content":"add 2 and 3"},
+            {"type":"function_call","call_id":"c1","name":"add","arguments":"{\"a\":2}"},
+            {"type":"function_call_output","call_id":"c1","output":"5"}]}"#;
+        let req: ResponsesApi = serde_json::from_str(raw).expect("fixture is valid Responses");
+
+        let canonical = responses_to_canonical(req).expect("fixture is translatable");
+
+        // The call is an assistant turn carrying a canonical call, and the
+        // output is a tool turn correlated by the SAME id.
+        assert_eq!(canonical.messages.len(), 3, "{:?}", canonical.messages);
+        let call_turn = &canonical.messages[1];
+        assert_eq!(call_turn.role, Role::Assistant);
+        assert_eq!(call_turn.tool_calls.len(), 1);
+        assert_eq!(call_turn.tool_calls[0].id, "c1");
+        assert_eq!(call_turn.tool_calls[0].name, "add");
+        // The arguments arrive as a JSON string and cross as a value.
+        assert_eq!(call_turn.tool_calls[0].arguments, json!({"a": 2}));
+
+        let out_turn = &canonical.messages[2];
+        assert_eq!(out_turn.role, Role::Tool);
+        assert_eq!(out_turn.tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(out_turn.content, "5");
+    }
+
+    #[test]
+    fn a_responses_function_call_should_leave_for_an_anthropic_upstream() {
+        // The cross-dialect case, and the reason the inbound half matters: a
+        // call read from a Responses client must leave for an Anthropic
+        // upstream under the id its output names, or the upstream cannot pair
+        // the result with the call it answers.
+        let raw = r#"{"model":"m","input":[
+            {"type":"function_call","call_id":"c1","name":"add","arguments":"{\"a\":2}"},
+            {"type":"function_call_output","call_id":"c1","output":"5"}]}"#;
+        let req: ResponsesApi = serde_json::from_str(raw).expect("fixture is valid Responses");
+        let canonical = responses_to_canonical(req).expect("fixture is translatable");
+
+        let body = crate::outbound::render_claude_body(&canonical);
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).expect("the rendered body is JSON");
+        let tool_use = &body["messages"][0]["content"][0];
+        assert_eq!(tool_use["type"], "tool_use");
+        assert_eq!(tool_use["id"], "c1");
+        assert_eq!(tool_use["name"], "add");
+        assert_eq!(tool_use["input"], json!({"a": 2}));
+    }
+
+    #[test]
+    fn a_responses_function_call_should_survive_a_round_trip() {
+        // Out and back: the canonical form renders to a Responses body and
+        // reads back to the same call.
+        let raw = r#"{"model":"m","input":[
+            {"type":"function_call","call_id":"c1","name":"add","arguments":"{\"a\":2}"}]}"#;
+        let req: ResponsesApi = serde_json::from_str(raw).expect("fixture is valid Responses");
+        let canonical = responses_to_canonical(req).expect("fixture is translatable");
+
+        let body = crate::outbound::render_openai_responses_body(&canonical);
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).expect("the rendered body is JSON");
+        assert_eq!(body["input"][0]["type"], "function_call");
+        assert_eq!(body["input"][0]["call_id"], "c1");
+        assert_eq!(body["input"][0]["name"], "add");
+    }
+
+    #[test]
+    fn ollama_tool_calls_should_read_when_the_arguments_are_an_object() {
+        // Ollama's `tool_calls` carry the arguments as a JSON **object**,
+        // where OpenAI's are a JSON string. The canonical form is a value, so
+        // both spellings read into it.
+        let raw = r#"{"model":"m","messages":[
+            {"role":"assistant","content":"",
+             "tool_calls":[{"id":"c1","function":{"name":"add","arguments":{"a":2}}}]},
+            {"role":"tool","content":"5","tool_call_id":"c1"}]}"#;
+        let chat: crate::ollama::OllamaChat =
+            serde_json::from_str(raw).expect("fixture is valid Ollama chat");
+        let canonical = ollama_to_canonical(chat).expect("fixture is translatable");
+
+        assert_eq!(canonical.messages[0].tool_calls.len(), 1);
+        assert_eq!(canonical.messages[0].tool_calls[0].id, "c1");
+        assert_eq!(canonical.messages[0].tool_calls[0].name, "add");
+        assert_eq!(canonical.messages[0].tool_calls[0].arguments, json!({"a": 2}));
+        // The tool turn is correlated by the same id.
+        assert_eq!(canonical.messages[1].role, Role::Tool);
+        assert_eq!(canonical.messages[1].tool_call_id.as_deref(), Some("c1"));
+    }
+
+    #[test]
+    fn clova_should_carry_the_tool_declarations() {
+        // CLOVA's function-calling mode is selected by the presence of
+        // `tools`, and the declaration shape is OpenAI's.
+        let raw = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{"name":"get_weather",
+                "description":"Current weather","parameters":{"type":"object"}}}]}"#;
+        let chat = to_canonical(openai(raw)).expect("valid request");
+        let body = parsed(crate::outbound::render_clova_body(&chat));
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["function"]["name"], "get_weather");
+        assert_eq!(
+            body["tools"][0]["function"]["description"],
+            "Current weather"
+        );
+    }
+
+    #[test]
+    fn cursor_should_carry_the_tool_declarations_and_name_the_tool_in_a_result() {
+        // Cursor's dialect IS the OpenAI one, so the declarations cross
+        // unchanged; and the result block names the tool and the call it
+        // answers, which is what lets the upstream pair them.
+        let raw = r#"{"model":"m","messages":[
+            {"role":"user","content":"weather in Oslo?"},
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"c1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Oslo\"}"}}]},
+            {"role":"tool","tool_call_id":"c1","content":"4C"}],
+            "tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}]}"#;
+        let chat = to_canonical(openai(raw)).expect("valid request");
+        let body = parsed(crate::outbound::render_cursor_body(&chat));
+
+        assert_eq!(body["tools"][0]["function"]["name"], "get_weather");
+        let result = body["messages"][2]["content"].as_str().unwrap_or_default();
+        assert!(result.contains("<tool_name>get_weather</tool_name>"), "{result}");
+        assert!(result.contains("<tool_call_id>c1</tool_call_id>"), "{result}");
+        assert!(result.contains("4C"), "{result}");
+    }
+
+    #[test]
+    fn kiro_should_carry_the_tool_declarations_as_tool_specifications() {
+        // Kiro's spelling is `toolSpecification` with the schema under
+        // `inputSchema.json`, and the whole array goes under the current
+        // message's `userInputMessageContext.tools`.
+        let raw = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{"name":"get_weather",
+                "description":"Current weather","parameters":{"type":"object"}}}]}"#;
+        let chat = to_canonical(openai(raw)).expect("valid request");
+        let body = parsed(crate::outbound::render_kiro_body(&chat));
+        let spec = &body["conversationState"]["currentMessage"]["userInputMessage"]
+            ["userInputMessageContext"]["tools"][0]["toolSpecification"];
+        assert_eq!(spec["name"], "get_weather");
+        assert_eq!(spec["description"], "Current weather");
+        assert_eq!(spec["inputSchema"]["json"], json!({"type": "object"}));
+    }
+
+    #[test]
+    fn kiro_should_default_a_missing_tool_description() {
+        // Kiro rejects an empty description, and the reference spells it
+        // `Tool: <name>`.
+        let raw = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{"name":"f","parameters":{}}}]}"#;
+        let chat = to_canonical(openai(raw)).expect("valid request");
+        let body = parsed(crate::outbound::render_kiro_body(&chat));
+        let spec = &body["conversationState"]["currentMessage"]["userInputMessage"]
+            ["userInputMessageContext"]["tools"][0]["toolSpecification"];
+        assert_eq!(spec["description"], "Tool: f");
+    }
 
     #[test]
     fn converts_openai_chat_when_valid() {

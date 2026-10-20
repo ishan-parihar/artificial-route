@@ -396,11 +396,11 @@ served StreamableHTTP at `/mcp`, refused a routable listener
   concludes "the MCP gate is tested" would be wrong — and the 401 path is
   exactly the kind of thing that silently stops being tested.
 
-**3.6 — D3: the Responses `function_call` item and four renderers.** *(agent)*
-Tool declarations, `tool_choice` and tool history already cross every dialect
-that has them. Two pieces remain: the inbound **Responses `function_call`
-item** is refused (`UnsupportedPart`, a 400 for the whole request), and the
-**Ollama, cursor, clova and kiro** renderers emit neither declarations nor
+**3.6 — D3: the Responses `function_call` item and four renderers.** *(agent, LANDED 2026-10-20)*
+Tool declarations, `tool_choice` and tool history already crossed every dialect
+that has them. Two pieces remained: the inbound **Responses `function_call`
+item** was refused (`UnsupportedPart`, a 400 for the whole request), and the
+**Ollama, cursor, clova and kiro** renderers emitted neither declarations nor
 calls.
 
 - The code is in `crates/ar-translate/src/translate.rs`, and it is the same
@@ -409,6 +409,25 @@ calls.
 - The inbound `function_call` is the **request** side, so it is the harder
   half: the canonical form has to be produced from a Responses item that the
   other dialects never send.
+- **What landed:** the `function_call` item is a canonical `ToolCall` on an
+  assistant turn, and the `function_call_output` item is a tool turn
+  correlated by the same `call_id`. The arguments arrive as a JSON string and
+  cross as a value, like every other dialect.
+- **The four renderers**, each in its own dialect's spelling: Ollama (inbound)
+  reads the `tool_calls` array, whose arguments are a JSON **object** rather
+  than OpenAI's string, and the tool turn's `tool_call_id`; cursor carries the
+  declarations in OpenAI's shape and its `<tool_result>` block now names the
+  **tool** and the **call id** instead of the `tool` placeholder and an empty
+  id; clova carries the declarations, which is what selects its
+  function-calling mode; kiro carries them as `toolSpecification` entries under
+  the current message's `userInputMessageContext.tools`, the schema under
+  `inputSchema.json`, and a missing description spelled `Tool: <name>`.
+- **The bound, stated rather than hidden:** the kiro schema goes on the
+  **current** message, because this build sends no history — the reference
+  attaches the schema to the turn that carries the tools, and the only turn
+  sent is the current one. A schema on a turn that is not sent is a schema the
+  upstream never sees, and the model would answer as though the tool did not
+  exist.
 - This is the one Phase 3 item that is **not** a gate or a control. It is
   ordinary feature work, and it is scheduled here only because the ledger
   keeps it open. If Phase 0-3.5 is done and this is not, the panel work is
