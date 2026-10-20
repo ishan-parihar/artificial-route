@@ -208,7 +208,7 @@ following the repo's own `ar-guard` precedent of `std::time` over `criterion`):
 
 | p50 | p95 | p99 | budget |
 |---|---|---|---|
-| 11.2 µs | 12.3 µs | 17.6 µs | 1 ms at p95 |
+| 7.8 µs | 11.7 µs | 19.2 µs | 1 ms at p95 |
 
 The budget is deliberately loose. The lookup is a point read on a primary key
 and should be microseconds; the budget exists to catch an order-of-magnitude
@@ -237,7 +237,7 @@ the panel's mint default is shorter and says so. — **all met, 2026-10-20.**
   `ar-server`'s `refuses_a_token_that_was_revoked`. The `/v1` test asserts the
   **reason string**, so the revocation path is pinned as distinct from a
   generic rejection.
-- The lookup is **p95 12.3 us** (p50 11.2, p99 17.6) against a 1 ms budget,
+- The lookup is **p95 11.7 us** (p50 7.8, p99 19.2) against a 1 ms budget,
   with 500 live entries. The number is *lock acquisition plus one indexed
   point query, uncontended* — under concurrency the `Mutex` is the ceiling,
   not sqlite.
@@ -437,7 +437,22 @@ calls.
 `loopback_only` ignores `Origin` when `Host` is loopback; a no-op write leaves
 the file byte-identical; one credential store exists and `AR_CRED_STORE` names
 it; `/mcp` needs a bearer; a Responses `function_call` item is accepted rather
-than refused.
+than refused. — **the four agent items are met, 2026-10-20; the two that are
+not the agent's are still open.**
+
+| gate item | who | state |
+|---|---|---|
+| the panel's gate is live, seen per request | agent | **met** — `webui/livegate.rs`, five tests, `docs/28` A8 |
+| a no-op write leaves the file unchanged | agent | **met** — the comparison is semantic and on the **unexpanded** documents, four tests, `docs/28` F8 |
+| `/mcp` needs a bearer | agent | **met** — the same `execute:completions` scope `/v1` accepts, five tests, `docs/28` A6 |
+| a Responses `function_call` item is accepted | agent | **met** — and the four renderers emit declarations and calls, seven tests, `docs/28` D3 |
+| `loopback_only` ignores `Origin` when `Host` is loopback | agent, **after B1** | **open** — 3.2 is blocked on the operator's ruling on whether `/ui` should be public at all. The PANEL's own guard already does this; the proxy's shared rule does not. |
+| one credential store exists, named by `AR_CRED_STORE` | **operator** | **open** — 3.4 is the operator's ruling (Q8) plus deleting the other file. The code half is done: `AR_CRED_STORE` is honoured by both paths. |
+
+The Phase 3 gate therefore has **two open items, and neither is code this
+outline can close**: one waits on a ruling, one is an operator's file
+decision. The four agent items are what the exposure depended on, and they
+are met.
 
 ---
 
