@@ -25,8 +25,16 @@ port-reference `../OmniRoute/open-sse/*`. Never invent provider wire formats —
 * Delegate by domain: `visual-engineering` never (no UI), `ultrabrain` hard logic, `deep` research+impl, `quick` single-file typo only. Load relevant skills in `load_skills`.
 * Subagent prompts must have TASK/EXPECTED/TOOLS/MUST-DO/MUST-NOT-DO/CONTEXT. Vague <5 lines = rejected.
 * Explore/librarian always `run_in_background=true` parallel; never re-grep same scope yourself; end turn and wait for `<system-reminder>`, then `background_output`. Cancel individually, never `all=true`.
+* This repo has a genome: start with `./scripts/genome wake`, find an answer with `./scripts/genome ask "<question>"`, end the iteration with `./scripts/genome close`.
+
 ## 5. File map
 
 `docs/00-overview` vision+parity-law, `01-copy*` vendor+`ar-mcp` gate, `02-port*` TS->Rust + deferred-parity table,
 `03-crates*` deps+why, `04-subsystems*` hardened specs incl. MCP hooks, `05-roadmap*` P0-P6 gates, `06-axi-mcp*` normative AXI+MCP-8.
+
+`docs/28-gap-ledger.md` the state of every OPEN item, `TODO.md` the register of the work items,
+`docs/35-cap-surface-removal-plan.md` every path that can put a `limits:` row back,
+`docs/36-cli-agentic-workflow-plan.md` the CLI as an agent-facing surface,
+`docs/37-dashboard-deployability-plan.md` the compiled dashboard's deployability and auth.
+
 Update docs when scope changes, before code. Never call P0 routing "done" — P2 is done.
