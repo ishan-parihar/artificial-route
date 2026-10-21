@@ -19,7 +19,7 @@ itself uses.** Not behind an SSH tunnel, not on loopback. That ruling answers th
 ## Contents
 
 - [§0 The decision, and the three facts that make it cheap](#0-the-decision-and-the-three-facts-that-make-it-cheap)
-- [§1 Serving topology: a new hostname](#1-serving-topology-a-new-hostname)
+- [§1 Serving topology: a path on the aroute hostname — /dash](#1-serving-topology-a-path-on-the-aroute-hostname--dash)
 - [§2 The auth configuration, exactly](#2-the-auth-configuration-exactly)
 - [§3 The launch, as a service](#3-the-launch-as-a-service)
 - [§4 Delivery, concretely](#4-delivery-concretely)
@@ -87,7 +87,8 @@ proven by fingerprint, not inferred from a count:
   `dashboard/dist/.build/next/server/chunks/*.js` returns **zero matches**. The
   file is absent.
 
-**So the plan has two independent parts: an env-only step that publishes safely,
+**So the plan has two independent parts: an env-and-patch step that publishes
+safely on the `aroute` hostname at `/dash`,
 and a rebuild step that publishes CURRENTLY-safe.** §8 sequences them so the
 operator's goal is met in hours, not weeks, and the security delta lands as its own
 release.
@@ -103,34 +104,66 @@ the `OMNIROUTE_*` env names, the `auth_token` cookie, the `manage`/`admin`/
 pipeline never SETS the env**, not that it changed behaviour. Publish is therefore
 an *enablement* task, not a repair task.
 
-## §1 — Serving topology: a new hostname
+## §1 — Serving topology: a path on the `aroute` hostname — `/dash`
 
-**Recommendation: a NEW HOSTNAME — Option A.** Three options were weighed on
-evidence.
+**Recommendation, AMENDED 2026-10-21 after the operator's ruling: the dashboard is
+integrated INTO `aroute.ishanparihar.com` at the path `/dash`.** The first draft
+of this plan recommended a separate hostname; the operator overruled it, and the
+overrule is cheaper than the first draft believed — because **upstream ships a
+runtime base-path patcher** that the first draft missed:
 
-| | Option A — new hostname | Option B — path mount | Option C — Cloudflare Access |
+> `external-repos/OmniRoute/scripts/docker/ensure-docker-base-path.mjs` +
+> `patch-standalone-base-path.mjs`: at container start they compare
+> `OMNIROUTE_BASE_PATH` against a `BUILD_OMNIROUTE_BASE_PATH` sentinel, and when
+> they differ **they rewrite the standalone bundle in place** — the five JSON
+> manifests (`routes-manifest.json`, `prerender-manifest.json`,
+> `required-server-files.json`, `images-manifest.json`,
+> `app-path-routes-manifest.json`) and every embedded `basePath`/`assetPrefix`/
+> `NEXT_PUBLIC_OMNIROUTE_BASE_PATH` literal (the regex at
+> `patch-standalone-base-path.mjs:56`).
+
+**PROVEN on our own dist, 2026-10-21** (a scratch copy, not the tree): running
+`patchStandaloneBasePath({ appRoot, fromBasePath: '', toBasePath: '/dash' })` over
+`dashboard/dist` reported `{"changed":true,"patchedManifests":4,
+"patchedTextFiles":171}` and `server.js` went from `"basePath":""` to
+`"basePath":"/dash"`, as did `routes-manifest.json` and
+`required-server-files.json`. **The patch is one-way by design** — reverting
+`/dash` → root throws (`runtime OMNIROUTE_BASE_PATH ((root)) does not match the
+image build (/dash)`), so the patch runs once at install, on a fresh copy, and
+rollback is the installer's `.old` swap, not a reverse patch.
+
+So the honest constraint table, corrected:
+
+| | **Path mount `/dash` (chosen)** | Separate hostname (rejected by the operator) | Cloudflare Access |
 |---|---|---|---|
-| Rebuild needed | **No** — the compiled `basePath` is `""`, which is *correct* for a root mount (`server.js:12`, `required-server-files.json`) | **Yes** — `next.config.mjs:111` computes `basePath` at BUILD time from `OMNIROUTE_BASE_PATH`, mirrored into `assetPrefix` (`:117`) and `NEXT_PUBLIC_OMNIROUTE_BASE_PATH` (`:123`); nothing at runtime moves it | No |
-| Changes to `aroute.ishanparihar.com` | **none** | adds `/dash` → :20149 on the SAME origin as `/v1` | none, adds its own |
-| DNS work | one record; **`cert.pem` is present** in `~/.cloudflared/` and `cloudflared tunnel list` works as `nerd`, so **no Cloudflare login is needed** | none | one record + an Access app |
-| Blast radius | isolated: a mistake exposes the dashboard, not `/v1` | **highest of the three** — a second gateway co-hosted with the inference path | isolated |
-| Precedent on this tunnel | yes — `browser.` and `paperclip.` already serve | none | — |
+| Rebuild needed | **No** — the runtime patcher converts the shipped root-built bundle (PROVEN, above). Baking it at build (`OMNIROUTE_BASE_PATH=/dash`) is the *cleaner* variant and happens anyway with the §5 rebuild | No | No |
+| One origin with `/v1` | **yes — managed by ingress ORDER** (below) | no | no |
+| DNS work | **none** — the hostname already resolves | one record | one record + an Access app |
+| Blast radius | a mis-ordered ingress rule could reach the dashboard's gateway — mitigated by `REQUIRE_API_KEY=true` (its gateway 401s) and by control 5's ordering check | isolated | isolated |
+| The operator's URL | `https://aroute.ishanparihar.com/dash` — what was asked for | a second name to remember | a second name + an IdP login |
 
-**Why not B:** a path mount forces a full upstream build (a Next 16 production
-build of a 1.6 GiB app) purely to relocate, and it puts a second full gateway on
-the same origin as `/v1`, so one proxy misrule exposes the inference path. The
-benefit over A is only a nicer URL.
+**Why the first draft said no, and why that was wrong.** The draft read only
+`next.config.mjs:111-123` (basePath is a build-time constant) and concluded a path
+mount needs a full rebuild. That is true of the *build*, but the standalone bundle
+is **patchable at start** by upstream's own script — the Docker flow has always
+done this (`scripts/check-permissions.sh:14-16` runs it), and the first draft
+missed it because the vendored dist does not ship the script (confirmed:
+`dashboard/dist/docker/` is absent). The lesson is recorded here: **the vendored
+pipeline dropped `scripts/docker/` from the copy** — `rebrand-dist.sh:46-51` copies
+`server.js`, `package.json`, `public/`, `node_modules/`, `.build/`, `migrations/`
+only. Shipping the patcher alongside the dist is part of this plan (§4).
 
-**Why not C as the FIRST step:** Cloudflare Access is the best long-term answer
-(it is a real IdP wall in front, and it does not depend on the dashboard's own
-auth being perfect), but it needs a Cloudflare dashboard app creation, which the
-operator must do. It is §8 Phase 2, layered on top of A, not a prerequisite.
+**Cloudflare Access** stays §8 Phase 2 as an optional hardening layer — an IdP
+wall in front of `/dash`, independent of the dashboard's own auth.
 
-**The exact change.** Add this block to `~/.cloudflared/hermes-config.yml`, before
-the catch-all, alongside the existing hostnames:
+**The exact change.** Add this block to `~/.cloudflared/hermes-config.yml`,
+BEFORE the existing `aroute.ishanparihar.com` passthrough rule (ingress matches
+in order; the more specific `/dash` rule must come first) and before the
+catch-all:
 
 ```yaml
-  - hostname: dash.ishanparihar.com
+  - hostname: aroute.ishanparihar.com
+    path: ^/dash(/.*)?$
     service: http://127.0.0.1:20149
     originRequest:
       httpHostHeader: 127.0.0.1:20149
@@ -143,13 +176,20 @@ this — re-measured 2026-10-21 by inserting a probe rule via
 ```bash
 sudo systemctl restart cloudflared     # reads ingress at startup
 cloudflared tunnel --config ~/.cloudflared/hermes-config.yml ingress validate
-cloudflared tunnel --config ~/.cloudflared/hermes-config.yml ingress rule https://dash.ishanparihar.com/
+cloudflared tunnel --config ~/.cloudflared/hermes-config.yml ingress rule https://aroute.ishanparihar.com/dash
 ```
 
-**What the rule must NOT do:** it must not forward `/v1/*`, `/api/v1/*`, `/chat/*`
-or `/responses/*` to :20149 — a hostname rule with no `path:` forwards everything to
-the dashboard's own gateway, which is the anonymous-spend surface. §7 gates that.
-The `aroute.ishanparihar.com` rules (the `/ui` 404 and the :20128 passthrough) are
+**What the rule must NOT do, and why ordering carries the safety.** The dashboard
+under a basePath only claims `/dash/*` — its own `/v1` rewrites become
+`/dash/v1/*`, so the dashboard's gateway is NOT reachable at the origin's top
+level while the bake is in place. The tunnel's rule sends ONLY `/dash(/.*)?` to
+:20149; everything else (including the whole `/v1` family) falls through to the
+existing :20128 rule untouched. The one failure mode is a rule written WITHOUT the
+`path:` selector — that would forward the entire origin to the second gateway.
+Control 5 in §7 catches exactly that: `/dash/*` → the dashboard (2xx/3xx), and
+`/v1/models` at the top level → still the aroute gate's **401**, never the
+dashboard's answer. The existing `aroute.ishanparihar.com` rules (the `/ui` 404
+and the :20128 passthrough) are
 untouched by this change.
 
 ## §2 — The auth configuration, exactly
@@ -165,9 +205,10 @@ are upstream, and all are read at launch or request time by the compiled bundle
 | `JWT_SECRET` | generated, ≥32 chars, never in the dist | login **500s** at boot (`login/route.ts:65-80`); a weak value is on the block list in `secretsValidator` (`change-me`, `omniroute-default-secret-change-me`, …) | `login/route.ts:65-80`; `runtimeEnv.ts:59` |
 | `API_KEY_SECRET` | generated, ≥16 chars | key mint/validation breaks; `validateSecrets` marks it `required:!0`, `minLength:16` (compiled `[root-of-the-server]__16g15nu._.js`) | `secretsValidator.ts`; `runtimeEnv.ts:60` |
 | `AUTH_COOKIE_SECURE` | `true` | without it the cookie's `secure` flag depends on `x-forwarded-proto: https` arriving — true through the tunnel, but by inference not configuration | `login/route.ts:228-239`; `pipeline.ts:115-119` |
-| `OMNIROUTE_PUBLIC_BASE_URL` | `https://dash.ishanparihar.com` | the CSRF origin check fails or falls through; redirects and OAuth callbacks go to the wrong host | `pipeline.ts:201-205`; `publicOrigin.ts:19-22` |
+| `OMNIROUTE_PUBLIC_BASE_URL` | `https://aroute.ishanparihar.com/dash` — the **origin**, and `OMNIROUTE_BASE_PATH=/dash` carries the path. Upstream's `normalizeOrigin` keeps the path when the configured value has one, and the client mirror `NEXT_PUBLIC_OMNIROUTE_BASE_PATH` (patched in by §1's patcher) handles the browser-side prefixes | the CSRF origin check fails or falls through; redirects and OAuth callbacks go to the wrong host | `pipeline.ts:201-205`; `publicOrigin.ts:19-22`; `next.config.mjs:111-123` |
 | `DATA_DIR` | `~/.config/ar/dashboard-data` (the Rust side already computes it) | a second, empty store on a different path — the dashboard boots "fresh" and loses `api_keys`/history | `crates/ar-cli/src/dashboard.rs:25` |
 | `HOSTNAME` | `127.0.0.1` | binding every interface exposes an **unauthenticated** :20149 to the LAN/internet regardless of the tunnel | `dashboard.rs:111` (already set) |
+| `OMNIROUTE_BASE_PATH` | **`/dash`** — set it in the launch env so `ensure-docker-base-path` patches the root-built bundle at start (§1). It must MATCH what the bundle carries or the patcher throws; with the §5 rebuilt dist it is baked and the patcher is a no-op | a mismatch throws at start (`ensure-docker-base-path.mjs` main); an unset value against a `/dash`-built bundle also throws — the error names the fix | `ensure-docker-base-path.mjs`; `patch-standalone-base-path.mjs:56` |
 | `OMNIROUTE_MEMORY_MB` | **1024** — see §3's arithmetic, NOT upstream's 2048 | too low → V8 OOM → the dashboard dies → the hostname 502s while aroute keeps serving; too high on this box → the dashboard's heap competes with the proxy | `.env.selfhost.example` |
 | `OMNIROUTE_PEER_STAMP_TOKEN` | **pin it** in the env file (the launcher otherwise mints a per-process random, mints a fresh one on every restart, and every restart then re-opens the first-password window) | not pinned → each restart looks like a fresh install to the peer-stamp contract | `peer-stamp-launcher.cjs:30-33` |
 | `OMNIROUTE_TRUST_PROXY` | `true` (upstream default "none") | with "none" the launcher's own relay helpers are inert; see B3 in §6 | upstream `peer-stamp.mjs:396-412` |
@@ -267,7 +308,12 @@ on 2 vCPU, fall back to including `node_modules` (≈330 MB) and skipping `npm c
 ```bash
 # on the build machine
 cd dashboard/dist && tar -czf /tmp/aroute-dashboard-vX.tgz --exclude=node_modules \
-  --exclude=old --exclude=.old server.js package.json .build public migrations peer-stamp-launcher.cjs
+  --exclude=old --exclude=.old server.js package.json .build public migrations \
+  peer-stamp-launcher.cjs patch-base-path.mjs
+# patch-base-path.mjs = upstream's scripts/docker/patch-standalone-base-path.mjs + its
+# BUILD_OMNIROUTE_BASE_PATH sentinel check, copied into the dist root — the vendored
+# pipeline drops scripts/docker/ (rebrand-dist.sh:46-51), so the patcher must ride along.
+# The install runs it ONCE, before first boot: node patch-base-path.mjs  (root → /dash).
 sha256sum /tmp/aroute-dashboard-vX.tgz | tee SHA256SUMS   # publish BOTH to the release
 
 # on the VPS — the sanctioned install path, not an scp of 1.6 GiB
@@ -319,10 +365,7 @@ order:
    2 vCPU, `844 MiB` available, no `node_modules`; a Next production build there is
    not viable.
 
-**The build recipe.** `OMNIROUTE_BASE_PATH` is **empty** (a root mount on its own
-hostname — §1); `next.config.mjs:187` adds `output:"standalone"` automatically
-when `shouldBuildStandalone(process.env)`. Auth env is **not** set at build time —
-it is read at run time (§0a), so nothing auth-related must be baked in.
+**The build recipe.** `OMNIROUTE_BASE_PATH=/dash` is **baked** (§1's chosen topology — the path mount is the operator's ruling, and baking beats patching for a rebuilt artifact); `next.config.mjs:187` adds `output:"standalone"` automatically when `shouldBuildStandalone(process.env)`. Auth env is **not** set at build time — it is read at run time (§0a), so nothing auth-related must be baked in. Until that rebuild ships, the runtime patcher (§1, PROVEN) converts the current dist.
 
 **Launcher decision on rebuild: use UPSTREAM's `scripts/dev/peer-stamp.mjs`, and
 retire `dashboard/peer-stamp-launcher.cjs` from the pipeline.** Our launcher exists
@@ -331,7 +374,7 @@ the Cloudflare handling we lack. Keep our file in the tree (it still serves the
 v3.8.52 fallback path if the rebuild is deferred), but do not use it in a rebuilt
 dist.
 
-**The honest statement of the trade-off:** the env-only step is hours and needs no
+**The honest statement of the trade-off:** the env-and-patch step is hours and needs no
 rebuild; the rebuild is a day and closes two GHSAs plus 1108 commits. So §8
 publishes first and rebuilds second — and the rebuild is **required**, not
 optional, before this is called done.
@@ -348,7 +391,7 @@ Severity: **AUTH** (changes who gets in), **FUNC** (changes what works),
 | A3 | `AUTH_COOKIE_SECURE` never set | `login/route.ts:228-239` sets it from the env | unset; secure in practice only via `x-forwarded-proto` | **AUTH** | §2 env, Phase 1 |
 | A4 | `enforceWebRuntimeEnv` live but its `API_KEY_SECRET` requirement masked | `instrumentation-node.ts:583` validator | same validator present, auto-generation hides a missing secret | AUTH (low) | §2 env + §5 rebuild |
 | A5 | `cf-connecting-ip` + Cloudflare CIDRs dropped from the locality check | `peer-stamp.mjs:340-347` OR-clause; `isCloudflareIP` `:170-186` | `peer-stamp-launcher.cjs:62-114` accepts only `x-forwarded-*`/`x-real-ip`/`forwarded`/`via` | AUTH (**bounded** — see §0b: not a bypass in this topology) | §5 rebuild (or patch) |
-| B1 | `basePath` baked at build time | `next.config.mjs:111-123` | `""` frozen in `server.js:12` / `required-server-files.json` | FUNC (blocks a path mount) | §1 new hostname |
+| B1 | `basePath` baked at build time | runtime-patchable: `ensure-docker-base-path.mjs` rewrites the bundle at start | `""` frozen in `server.js:12` / `required-server-files.json`; **the patcher is PROVEN to convert it** (§1) but is not shipped in the dist | FUNC | §1 path mount + §4 ship the patcher |
 | B2 | Cloudflare CIDRs missing from `isTrustedProxyPeer` | `peer-stamp.mjs:170-186, 277-283` | only loopback + RFC-1918/CGNAT (`peer-stamp-launcher.cjs:40-49`) | FUNC | §5 rebuild |
 | B3 | `relayForwardingHeaders` / `OMNIROUTE_TRUST_PROXY` dropped | `peer-stamp.mjs:396-412` | absent | FUNC | §5 rebuild |
 | B4 | `OMNI_ROOT` default points at a non-existent path | `$AR_ROOT/../external-repos/OmniRoute` | `rebrand-dist.sh:30`, `update-dist.sh:12` → `$AR_ROOT/../OmniRoute` | FUNC (build dies) | §4 one-line fix |
@@ -371,14 +414,14 @@ proves it. Gate the publish on all of these.
 
 | # | Condition | Proof command |
 |---|---|---|
-| 1 | The gateway tier refuses anonymous | `curl -s -o /dev/null -w "%{http_code}\n" https://dash.ishanparihar.com/api/v1/models` → **401** (same for `/v1/models`) |
-| 2 | The dashboard requires login | `curl -s -o /dev/null -w "%{http_code}\n" https://dash.ishanparihar.com/` → a redirect to the login page, not the dashboard |
-| 3 | `LOCAL_ONLY` closed to the internet | `curl -s -o /dev/null -w "%{http_code}\n" https://dash.ishanparihar.com/api/discovery/` → **403 LOCAL_ONLY** (never 200) |
+| 1 | The gateway tier refuses anonymous | `curl -s -o /dev/null -w "%{http_code}\n" https://aroute.ishanparihar.com/dash/api/v1/models` → **401** |
+| 2 | The dashboard requires login | `curl -s -o /dev/null -w "%{http_code}\n" -L https://aroute.ishanparihar.com/dash/` → the login page, not the dashboard |
+| 3 | `LOCAL_ONLY` closed to the internet | `curl -s -o /dev/null -w "%{http_code}\n" https://aroute.ishanparihar.com/dash/api/discovery/` → **403 LOCAL_ONLY** (never 200) |
 | 4 | The bootstrap window is closed | a password exists: the unit log shows **no** `[BOOTSTRAP] Fresh install detected` line |
-| 5 | The ingress does NOT forward `/v1` to the dashboard | `curl -s -o /dev/null -w "%{http_code}\n" https://dash.ishanparihar.com/v1/models` → **404** (the dashboard's own gateway is not on that path) |
+| 5 | The ingress sends ONLY `/dash/*` to :20149, and `/v1` still reaches the proxy | `curl -s -o /dev/null -w "%{http_code}\n" https://aroute.ishanparihar.com/v1/models` → **401** (the ARROUTE gate — if this ever answers with the dashboard's shape, the rule is wrong); and `curl .../dash/` → 2xx/3xx |
 | 6 | aroute's own `/v1` is unaffected | `curl -s -o /dev/null -w "%{http_code}\n" https://aroute.ishanparihar.com/v1/models` → **401** (the ar gate), unchanged from before |
 | 7 | The tunnel forwards `x-forwarded-for` | the method in §0b — `strings /usr/bin/cloudflared \| grep -c X-Forwarded-For` ≥ 1; plus (after a temp echo rule with the operator's restart) `curl https://<echo-host>/ \| grep -i x-forwarded-for` non-empty |
-| 8 | The cookie is `secure` | `curl -sI https://dash.ishanparihar.com/ \| grep -i set-cookie` → contains `Secure` and `SameSite` |
+| 8 | The cookie is `secure` | `curl -sI https://aroute.ishanparihar.com/dash/ \| grep -i set-cookie` → contains `Secure` and `SameSite` |
 | 9 | The store is not world-readable | `stat -c %a ~/.config/ar/dashboard-data` → `700` or `750`; `storage.sqlite` not `-rw-r--r--` |
 | 10 | The dashboard binds loopback | `ss -ltnp \| grep 20149` → `127.0.0.1:20149`, never `0.0.0.0` |
 | 11 | Memory guarded | `systemctl --user show aroute-dashboard -p MemoryMax` → `1536M`; and after 24 h, the proxy's RSS unchanged |
@@ -394,7 +437,7 @@ force BEFORE anything is exposed.**
 | Phase | Change | Verification | Rollback | Closes |
 |---|---|---|---|---|
 | **0 — code, no exposure** | fix `OMNI_ROOT` (one line ×2); wire the §2 env into `crates/ar-cli/src/dashboard.rs:106-114` so the verb *and* the unit both inherit them; write the unit and `dashboard.env` | the verb boots on loopback with the env; anonymous `POST /ui/api/keys/mint` still 401; `aroute serve` unaffected | revert the commit | F9 (partly), DASH-02 |
-| **1 — publish, env-only** | add the §1 ingress rule; **operator: `sudo systemctl restart cloudflared`**; create the password (`INITIAL_PASSWORD`); start + enable the unit | the **whole §7 control set** — all 13 rows that apply pre-rebuild | remove the ingress rule + restart; stop the unit. Nothing in the serving path changes | **F10, DASH-01, DASH-03, Q18** |
+| **1 — publish on `/dash`, env + patch** | run the base-path patcher once on the installed copy (§1, PROVEN: `{patchedManifests:4, patchedTextFiles:171}`); add the §1 ingress rule (with `path:`, BEFORE the passthrough); **operator: `sudo systemctl restart cloudflared`**; create the password (`INITIAL_PASSWORD`); start + enable the unit | the **whole §7 control set** — all 13 rows that apply pre-rebuild, with rows 1–5 and 8 pointed at `/dash` | remove the ingress rule + restart; stop the unit. Nothing in the serving path changes | **F10, DASH-01, DASH-03, Q18** |
 | **2 — Cloudflare Access (optional, operator)** | an Access application in front of `dash.*` | an unauthenticated browser redirect is blocked by Access **before** the dashboard | delete the Access app | hardens F10 |
 | **3 — rebuild, REQUIRED** | build upstream (node v24.19.0, empty `OMNIROUTE_BASE_PATH`), rebrand, use upstream's `peer-stamp.mjs`, ship as the §4 tarball, installer-install | control set row 14: both GHSA fingerprints gone; `BUILD_ID` new; control set rows 1–13 re-run green | keep the v3.8.52 dist and the `.old` swap the installer left | **C1, C2, A5, B2, B3, DASH-04** |
 | **4 — the panel's own publish decision** | the operator rules whether `/ui` is republished (delete the 404 rule) or stays SSH-only | if published: the same control-set discipline with the ar-keys gate in front, not OmniRoute's | re-add the 404 rule + restart | ledger A2/F1 follow-up, `Q7` |
@@ -434,7 +477,8 @@ optional: the cost of two UIs is a vendored Node app to track, and the rebuild i
 what keeps that cost from becoming a security debt.
 
 **What the operator ends up with** after phases 1 and 3: a public, authenticated,
-122-page control plane at `dash.ishanparihar.com` running a current build; the
+122-page control plane at `https://aroute.ishanparihar.com/dash` running a current
+build; the
 private, live-state `/ui` panel behind an SSH forward; and the aroute inference
 path untouched. Phase 4 then decides whether the panel moves public too.
 
