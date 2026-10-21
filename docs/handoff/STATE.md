@@ -353,12 +353,12 @@ several of them had gone stale (A1 said "v0.1.16 is the newest tag" when `v0.1.1
 tagged; B6 said "14 orphan pages" when the count is now 0). The old documents keep the
 **history** of their pass and point at the ledger; the ledger owns the **state**.
 
-<!-- genome:zone status sha=ebe61ec9a80b -->
+<!-- genome:zone status sha=9e81af816ffc -->
 | status | items |
 |---|---|
-| open | 39 |
-| in-progress | 1 |
-| done | 28 |
+| open | 35 |
+| in-progress | 3 |
+| done | 30 |
 
 - `UI-08` [open] **Rule the canonical credential store on the VPS** and delete the other
 - `SEC-02` [open] **Every token minted since 2026-10-19 20:07:58 is valid** — the exposure window opened when a parall
