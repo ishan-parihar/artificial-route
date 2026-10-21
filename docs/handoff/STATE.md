@@ -3,12 +3,13 @@
 Current snapshot only (no history: that is the worklog). The first `## ` block is
 what `genome wake` shows.
 
-## State — 2026-10-20
+## State — 2026-10-21
 
-Date: 2026-10-20. Branch `feat/per-model-token-budgets` @ `ebc14dd` (local `main` is
-`d24e854`; `origin/main` is `2bec852`). The three plans were committed at `638a284`.
-**15 commits after `v0.1.20` are unreleased** — 7 already on `origin/main`, 8 more on
-this branch and unpushed. The proxy runs **only** on the VPS (`racknerd`), public at
+Date: 2026-10-21. Branch `feat/per-model-token-budgets` @ `15f027c` (local `main` is
+`ad233e7`; `origin/main` is `15f027c`). The three plans were committed at `638a284`.
+**19 commits after `v0.1.20` are unreleased** — all 19 are already on `origin/main`,
+none are unpushed (`git rev-list --count origin/main..HEAD` = 0; measure with
+`git rev-list --count`). The proxy runs **only** on the VPS (`racknerd`), public at
 `https://aroute.ishanparihar.com/v1` behind a cloudflared tunnel; the gate is armed
 and every harness holds a non-expiring token.
 
@@ -26,6 +27,27 @@ with the token from `~/.config/ar/racknerd-gate-token.jwt` on the VPS. **Use a l
 port other than 20128**: a local aroute **v0.1.17** still listens on `127.0.0.1:20128`
 on the dev box and answers first. The panel's own gate is armed: an anonymous
 `POST http://127.0.0.1:20128/ui/api/keys/mint` → **401** `credential_rejected`.
+
+**The 2026-10-21 public outage — measured, and it RECOVERED.** A ~15-minute total
+outage: `2026-10-20T23:59:27Z` cloudflared logged `Failed to refresh DNS … i/o
+timeout`; `00:29–00:31Z` the VPS **refused every TCP port with RST** (25897, 22, 80,
+443, 8080 and a 17-port scan — the host's own sshd was not accepting) while **ICMP
+still answered** (rtt ~267 ms), so the guest kernel was up; and every public path
+answered **530 / Cloudflare 1033** (v4 and v6 alike). The tunnel was restarted at
+**`00:39:13Z`** and re-registered 4 conns — its precheck passed, including "Cloudflare
+API is reachable", so the credentials were never invalid — and by `00:45:20Z`
+`/healthz` → **200**, `/v1/models` → **401** (the gate), `/ui/` → **404** (the ingress
+rule live again). **aroute was never down**: `NRestarts=0` and `loopback=200` in every
+watchdog check during the window, including the degraded ones — the watchdog is what
+recorded the degradation and the recovery. Cause, ranked: a **provider/network-side
+fault** on the VPS (the DNS timeout, then every listener refusing, then an unclean
+journald resume with an `oom_reaper` reap on the host's 00:12 reboot) plus the
+**cloudflared tunnel losing its connections**; a guest VM stall explains the RST-only
+behaviour but not the DNS timeout. RULED OUT: an aroute crash, lost tunnel credentials.
+`[UNKNOWN]` the exact reason the guest TCP stack refused every port for ~15 minutes.
+**A provider-side network incident report is warranted for 2026-10-20 23:45Z –
+2026-10-21 00:40Z** — the cause could not be determined from inside the host (no
+sudo, no provider console). Ledger row **C6** carries the full record.
 
 **What was just done — the 402 incident, its cause and its closure.** The 402 was
 **aroute's OWN refusal, not a provider's**: the prose is `ar-tokens`'s
@@ -211,7 +233,12 @@ as-found file in `~/.config/ar/evidence-20261020-limits-restore/`.
   refuse (it prints "No owning system pool found" and **exits 0**). Six laws (L1–L6)
   are specified in `docs/39` §7 (`CAP-07`, ledger **D15**).
 
-**What to read next.** The three plans committed at `638a284` are the executor's
+**What to read next.** Start with **`docs/40-project-closing-outline.md`** — the
+closing outline: what "done" means per surface, the measured state of both registers,
+the closure sequence in dependency order, the operator's decisions and which phase
+each one blocks, what is NOT a gap, and the starting procedure. It owns the *order and
+the shape*; the ledger and the register below own the state, and the plans own the
+detail. Then the three plans committed at `638a284` are the executor's
 inputs, in this order: **`docs/35-cap-surface-removal-plan.md`** — closing every path
 that can put a `limits:` row back (**five** write paths, not two; the live block on
 the VPS is the reason it is urgent, not theoretical); **`docs/36-cli-agentic-workflow-plan.md`**
@@ -234,7 +261,9 @@ decisions are `docs/kb/ASKS.md` **Q15**–**Q18**. For the forensic record of th
 `limits:` block and its writer, read **`~/.config/ar/evidence-20261020-limits-restore/`**
 on the VPS — it holds the as-found config, the backups, the guard's original script
 and units (`aroute-limits-guard.timer` / `.service`) and the unit journal that
-recorded `limits missing or drifted — restoring`.
+recorded `limits missing or drifted — restoring`. For the **2026-10-21 public
+outage** and its recovery, the record is the ledger's row **C6** (and the paragraph
+above) — the watchdog log holds the transition timestamps.
 
 ---
 
@@ -309,7 +338,7 @@ the audit's own probe tokens. Tracked as **Q10**.
 | question | owner |
 |---|---|
 | **what is actually still open, across the whole project** | **`docs/28-gap-ledger.md`** — one row per open item, each re-verified against the tree on 2026-10-19 |
-| the work items, and their state | `TODO.md` (32 open: `UI-00`…`UI-08`, `SEC-01`…`SEC-04`, `DEC-01`…`DEC-04`, `OPS-01`…`OPS-06`, `GAP-01`…`GAP-09`) |
+| the work items, and their state | `TODO.md` (40 open: `UI-08`, `SEC-02`, `SEC-04`, `DEC-01`…`DEC-04`, `OPS-01`…`OPS-05`, `GAP-02`…`GAP-10`, `ROUTE-08`, `CAP-01`…`CAP-07`, `CLI-01`…`CLI-08`, `DASH-01`…`DASH-04`) |
 | what the audit found, and the evidence | `docs/audit/2026-10-19-ui-dashboard-contrast.md` (+ `docs/audit/2026-10-19-ui-dashboard/`, probe JSON + 13 screenshots) |
 | the contrast with OmniRoute, the CRAFT score, the design baseline, the reasoning | `docs/27-dashboard-contrast-and-upgrade-plan.md` |
 | the executable phases and their gates | `docs/plans/2026-10-19-ui-dashboard-upgrade.md` |
@@ -324,12 +353,12 @@ several of them had gone stale (A1 said "v0.1.16 is the newest tag" when `v0.1.1
 tagged; B6 said "14 orphan pages" when the count is now 0). The old documents keep the
 **history** of their pass and point at the ledger; the ledger owns the **state**.
 
-<!-- genome:zone status sha=bd32dd4d769d -->
+<!-- genome:zone status sha=ebe61ec9a80b -->
 | status | items |
 |---|---|
-| open | 41 |
+| open | 39 |
 | in-progress | 1 |
-| done | 26 |
+| done | 28 |
 
 - `UI-08` [open] **Rule the canonical credential store on the VPS** and delete the other
 - `SEC-02` [open] **Every token minted since 2026-10-19 20:07:58 is valid** — the exposure window opened when a parall
@@ -338,7 +367,7 @@ tagged; B6 said "14 orphan pages" when the count is now 0). The old documents ke
 - `DEC-02` [open] **Rule whether a routable bind may be allowed while the bearer gate is armed**
 - `DEC-03` [open] **Rule what `Limit.model` scopes** — *when* a row applies, not *what it counts*
 - `DEC-04` [open] **Rule whether the panel may restart the proxy after a write**
-- `OPS-01` [open] **18 commits after `v0.1.20` are unreleased** (`81b3ce3` … `ffbf8fd`; **1** not yet pushed — `origin
+- `OPS-01` [open] **19 commits after `v0.1.20` are unreleased** (`81b3ce3` … `15f027c`; **0** not yet pushed — `origin
 - `OPS-02` [open] **The `failures` table only exists from the release that ships it** — older rows are not backfilled,
 - `OPS-03` [open] **No 12-hour soak against a released binary**
 <!-- genome:end status -->

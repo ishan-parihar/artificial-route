@@ -35,6 +35,7 @@ port-reference `../OmniRoute/open-sse/*`. Never invent provider wire formats —
 `docs/28-gap-ledger.md` the state of every OPEN item, `TODO.md` the register of the work items,
 `docs/35-cap-surface-removal-plan.md` every path that can put a `limits:` row back,
 `docs/36-cli-agentic-workflow-plan.md` the CLI as an agent-facing surface,
-`docs/37-dashboard-deployability-plan.md` the compiled dashboard's deployability and auth.
+`docs/37-dashboard-deployability-plan.md` the compiled dashboard's deployability and auth,
+`docs/40-project-closing-outline.md` the closing outline — the order of the remaining work and what "done" means.
 
 Update docs when scope changes, before code. Never call P0 routing "done" — P2 is done.

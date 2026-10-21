@@ -101,7 +101,7 @@ rows imply.
 | REL-3 | The credential store on the VPS is **unambiguous** — one canonical file, `AR_CRED_STORE` set explicitly, the other deleted. | Ledger **A4** (register **UI-08**), operator ruling ask **Q8**. |
 | REL-4 | Every token minted during the exposure window is **dead**. | Ledger **A2** (register **SEC-02**, ask **Q10**): the master rotated and re-pushed. |
 | REL-5 | The registry snapshot is inside its TTL, or the staleness is an accepted decision. | Ledger **C4** (register **OPS-04**). |
-| REL-6 | The doc gate and the tunnel's ingress are **settled** — `docs-check` gating is ruled, and the tunnel's rules are live. | Ledger **C5** (register **OPS-05**, ask **Q14**) and **C6** (register **OPS-06**). |
+| REL-6 | The doc gate and the tunnel's ingress are **settled** — `docs-check` gating is ruled, and the tunnel's rules are live. | Ledger **C5** (register **OPS-05**, ask **Q14**); **C6** is **closed** — the tunnel's rules are live (register **OPS-06**, done). |
 | REL-7 | The instruction corpus can **stop** a repeat of the out-of-tree guard, in a workspace that is not a pool. | Ledger **D15** (register `CAP-07`): laws L1–L6 in `docs/39` §7. |
 | REL-8 | A **fresh agent** can orient in one call and find the owner of any question. | `genome wake` → `genome ask "<question>"` → `genome close`; §7 below. |
 
@@ -132,41 +132,41 @@ status cell begins with `open` or `blocked`; every other status (`fixed`,
 `TODO.md`: one row per `| <id> | <status> | …` line, where a status of `open` or
 `in-progress` counts as open.
 
-**Ledger** — 59 rows total, **32 open** (open *or* blocked), 27 closed:
+**Ledger** — 59 rows total, **31 open** (open *or* blocked), 28 closed:
 
 | Section | Open/blocked | Closed | Total | Owner document |
 |---|---|---|---|---|
 | **A** — security and access control | 3 | 5 | 8 | `docs/28` §A; plan `docs/31` Phases 0–3 |
 | **B** — decisions the operator owns | 5 | 0 | 5 | `docs/28` §B; asks `Q7`–`Q12`, `Q14` |
-| **C** — release, soak, operations | 6 | 0 | 6 | `docs/28` §C; plan `docs/31` Phases 1, 5 |
+| **C** — release, soak, operations | 5 | 1 | 6 | `docs/28` §C; plan `docs/31` Phases 1, 5 |
 | **D** — code gaps in the proxy | 12 | 10 | 22 | `docs/28` §D; plans `docs/35`, `docs/36`, `docs/38` |
 | **E** — live probes | 4 | 0 | 4 | `docs/28` §E; plan `docs/31` Phase 5 |
 | **F** — the panel | 2 | 8 | 10 | `docs/28` §F; plan `docs/30` |
 | **F2** — context window / harness surfaces | 0 | 4 | 4 | `docs/28` §F2 (all closed) |
-| **Total** | **32** | **27** | **59** | |
+| **Total** | **31** | **28** | **59** | |
 
-The 32 open ledger rows, by id: **A2, A4, A5** (A); **B1, B2, B3, B4, B5** (B);
-**C1, C2, C3, C4, C5, C6** (C); **D2, D4, D5, D6, D7, D8, D9, D11, D12, D13,
+The 31 open ledger rows, by id: **A2, A4, A5** (A); **B1, B2, B3, B4, B5** (B);
+**C1, C2, C3, C4, C5** (C); **D2, D4, D5, D6, D7, D8, D9, D11, D12, D13,
 D14, D15** (D); **E1, E2, E3, E4** (E); **F9, F10** (F).
 
 **E4 is counted as open by that rule** (its status cell begins with `open`), but
 it is a **known trait, not a defect** — see §5. The count of *work* is therefore
-**31**, not 32.
+**30**, not 31.
 
-**Register (`TODO.md`)** — 68 rows total, **42 open** (41 `open` + 1
-`in-progress`), 26 done:
+**Register (`TODO.md`)** — 68 rows total, **40 open** (39 `open` + 1
+`in-progress`), 28 done:
 
 | Register section | Open | Done | Total | Ledger rows it carries | Operator-gated? |
 |---|---|---|---|---|---|
 | Panel (unnamed section, `UI-00`…`UI-10`) | 1 | 10 | 11 | F1–F8, A3 | no |
 | Security and access control (`SEC-*`) | 2 | 4 | 6 | A2, A5, A6, A7, A8 | **yes** — SEC-02 |
 | Decisions (`DEC-01`…`DEC-04`) | 4 | 0 | 4 | B2, B3, B4, B5 | **yes** — all four |
-| Release / soak / ops (`OPS-*`) | 6 | 0 | 6 | C1–C6 | **yes** — OPS-01, OPS-06 |
-| Proxy code gaps (`GAP-*`, `ROUTE-*`, `CTX-*`, `LIMIT-*`) | 10 | 12 | 22 | D2–D10, D1b–D1h | no (except the provider-key rows) |
+| Release / soak / ops (`OPS-*`) | 5 | 1 | 6 | C1–C6 | **yes** — OPS-01 |
+| Proxy code gaps (`GAP-*`, `ROUTE-*`, `CTX-*`, `LIMIT-*`) | 9 | 13 | 22 | D2–D10, D1b–D1h | no (except the provider-key rows) |
 | Spend-cap write surfaces (`CAP-*`) | 7 | 0 | 7 | D11, D12, D14, D15 | **yes** — CAP-03, CAP-04, CAP-05 |
 | CLI as an agent surface (`CLI-*`) | 8 | 0 | 8 | D13 | **yes** — CLI-06 (the plan's decision `docs/36` §5 DEC-2) |
 | Compiled dashboard (`DASH-*`) | 4 | 0 | 4 | F9, F10 | **yes** — all four |
-| **Total** | **42** | **26** | **68** | | |
+| **Total** | **40** | **28** | **68** | | |
 
 **How the two registers differ — read this before counting.** The ledger and the
 register are **not** 1:1, and the difference is structural, not an error:
@@ -207,8 +207,9 @@ those are §2 Phases 2 and 3, and they are the largest open block.
 
 ### Phase 0 — Close the exposure and settle the store (operator; minutes; no release)
 
-**Closes:** ledger **A2** (register `SEC-02`, ask **Q10**), **A4** (register
-`UI-08`, ask **Q8**), and the operational half of **C6** (register `OPS-06`).
+**Closes:** ledger **A2** (register `SEC-02`, ask **Q10**) and **A4** (register
+`UI-08`, ask **Q8**). **The operational half of `C6` is already closed** (register
+`OPS-06`, done): the tunnel's `^/ui(/.*)?$` → 404 rule is live.
 
 **Depends on:** nothing. This is first because the exposure is live and because
 **A2 is the only row whose window closes on its own** — the panel's mint
@@ -255,9 +256,9 @@ linked**; the panel is still armed and `/v1` still answers.
 
 **Release:** §0.6. **Never scp a local build** (memory #113, ledger **C1**).
 
-**Measured at the time of writing:** `git rev-list --count v0.1.20..HEAD` = **18**
-commits, of which **1** is not yet pushed (`origin/main` is at `ad233e7`, one
-commit behind `HEAD` `ffbf8fd`). The range runs `81b3ce3` … `ffbf8fd`: the
+**Measured at the time of writing:** `git rev-list --count v0.1.20..HEAD` = **19**
+commits, of which **0** are not yet pushed (`origin/main` is at `15f027c`, the
+same commit as `HEAD` `15f027c`). The range runs `81b3ce3` … `15f027c`: the
 docs, the audits, a behaviour-neutral formatter pass and the five plans — **the
 blast radius is documentation, not the panel**. The ledger's **C1** row and
 register `OPS-01` carry the same pair; re-measure before releasing.
