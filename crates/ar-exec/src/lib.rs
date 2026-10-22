@@ -144,9 +144,50 @@ const BASE_START_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// The longest silence allowed on an upstream body between two chunks, once
 /// headers have landed. A ceiling for a stalled connection, not a bound on a
-/// healthy stream: a slow stream that keeps sending is never cut by it. Not
-/// measured against a provider; adjust here if a real stream pauses longer.
+/// healthy stream: a slow stream that keeps sending is never cut by it.
+///
+/// 120s proved too short for reasoning models that pause mid-body while they
+/// think (nvidia `z-ai/glm-5.3` and `stepfun-ai/step-5-preview` were cut 109
+/// times in three days on the live gateway, every cut at exactly this bound,
+/// docs/42). The value is still the default so a server that never says
+/// otherwise behaves as before; [`AR_IDLE_BODY_TIMEOUT_SECS`] raises it.
 const IDLE_BODY_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Environment variable overriding [`IDLE_BODY_TIMEOUT`], in seconds.
+///
+/// One number, not the per-model table `AR_STREAM_TIMEOUT_SECS` carries: the
+/// idle ceiling guards a *connection* (a socket that went silent), and the
+/// socket a stalled request sits on belongs to whichever model the router
+/// picked, decided after the chain failed over — a per-model entry could not
+/// name that in advance. A model that needs longer mid-body pauses gets the
+/// raised global, which is what an operator means when they say "these
+/// reasoning models think for minutes".
+pub const IDLE_BODY_TIMEOUT_VAR: &str = "AR_IDLE_BODY_TIMEOUT_SECS";
+
+/// Reads [`IDLE_BODY_TIMEOUT_VAR`], falling back to [`IDLE_BODY_TIMEOUT`].
+///
+/// A value that is not a positive number of whole seconds is dropped with a
+/// warning on stderr and the default kept: the same policy
+/// `with_timeouts_from_env` applies to a bad deadline, because one typo must
+/// not take down a server that was routing fine.
+fn idle_body_timeout_from_env() -> Duration {
+    let Some(raw) = std::env::var(IDLE_BODY_TIMEOUT_VAR)
+        .ok()
+        .filter(|v| !v.is_empty())
+    else {
+        return IDLE_BODY_TIMEOUT;
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(secs) if secs > 0 => Duration::from_secs(secs),
+        _ => {
+            eprintln!(
+                "ar: {IDLE_BODY_TIMEOUT_VAR} ignored — keeping the {}s idle-body ceiling ({raw:?})",
+                IDLE_BODY_TIMEOUT.as_secs()
+            );
+            IDLE_BODY_TIMEOUT
+        }
+    }
+}
 
 /// OmniRoute's `DEFAULT_FETCH_START_TIMEOUT_CAP_MS`: a streaming request may not
 /// take longer than this to produce its first byte, even when the provider
@@ -289,6 +330,10 @@ pub enum ExecError {
 #[derive(Debug, Clone)]
 pub struct ArExec {
     client: reqwest::Client,
+    /// The mid-body idle ceiling this executor's streams are cut at. Read once
+    /// at construction from [`IDLE_BODY_TIMEOUT_VAR`] so the env is not parsed
+    /// per request; see [`IDLE_BODY_TIMEOUT`].
+    idle_body_timeout: Duration,
 }
 
 impl ArExec {
@@ -307,7 +352,10 @@ impl ArExec {
             .pool_max_idle_per_host(8)
             .build()
             .map_err(|e| ExecError::Transport(e.to_string()))?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            idle_body_timeout: idle_body_timeout_from_env(),
+        })
     }
 
     /// The pooled client, for a component that has to reuse the *same* pool.
@@ -453,6 +501,7 @@ impl ArExec {
             retry_after: retry_after_of(start.headers()),
             response: start,
             abort: abort.clone(),
+            idle_body_timeout: self.idle_body_timeout,
         })
     }
 
@@ -792,6 +841,10 @@ pub struct ChatStream {
     response: reqwest::Response,
     retry_after: Option<Duration>,
     abort: CancellationToken,
+    /// The mid-body idle ceiling, taken from the [`ArExec`] that made this
+    /// stream so `into_bytes`/`into_sse` cut at the operator's bound, not a
+    /// crate constant the operator cannot reach.
+    idle_body_timeout: Duration,
 }
 
 impl ChatStream {
@@ -846,7 +899,10 @@ impl ChatStream {
     /// incomplete, and silently ending early looks identical to a short answer.
     pub fn into_bytes(self) -> impl Stream<Item = Result<Bytes, ExecError>> + Send + use<> {
         let Self {
-            response, abort, ..
+            response,
+            abort,
+            idle_body_timeout,
+            ..
         } = self;
         stream! {
             let mut body = response.bytes_stream();
@@ -857,13 +913,13 @@ impl ChatStream {
                     biased;
                     () = abort.cancelled() => Err(ExecError::Aborted),
                     next = tokio::time::timeout(
-                        IDLE_BODY_TIMEOUT,
+                        idle_body_timeout,
                         tokio_stream::StreamExt::next(&mut body),
                     ) => match next {
                         Ok(item) => Ok(item),
                         Err(_) => Err(ExecError::Transport(format!(
                             "upstream body idle for {}s",
-                            IDLE_BODY_TIMEOUT.as_secs()
+                            idle_body_timeout.as_secs()
                         ))),
                     },
                 };
@@ -916,7 +972,10 @@ impl ChatStream {
     /// Ends on `data: [DONE]` or on upstream EOF, whichever comes first.
     pub fn into_sse(self) -> impl Stream<Item = Result<SseEvent, ExecError>> + Send + use<> {
         let Self {
-            response, abort, ..
+            response,
+            abort,
+            idle_body_timeout,
+            ..
         } = self;
         stream! {
             let mut decoder = SseDecoder::new(DEFAULT_FRAME_CAP);
@@ -930,13 +989,13 @@ impl ChatStream {
                     biased;
                     () = abort.cancelled() => Err(ExecError::Aborted),
                     next = tokio::time::timeout(
-                        IDLE_BODY_TIMEOUT,
+                        idle_body_timeout,
                         tokio_stream::StreamExt::next(&mut body),
                     ) => match next {
                         Ok(item) => Ok(item),
                         Err(_) => Err(ExecError::Transport(format!(
                             "upstream body idle for {}s",
-                            IDLE_BODY_TIMEOUT.as_secs()
+                            idle_body_timeout.as_secs()
                         ))),
                     },
                 };
@@ -1220,6 +1279,47 @@ mod tests {
     fn sets_accept_sse_when_streaming() {
         let headers = build_headers(WireFormat::Openai, "sk-x", true, &BTreeMap::new());
         assert_eq!(headers[reqwest::header::ACCEPT], "text/event-stream");
+    }
+
+    /// The env override is read through the process environment, which is
+    /// global: the test serialises with a lock so two of these cannot race,
+    /// and restores the variable so a later test sees the default path.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Sets [`IDLE_BODY_TIMEOUT_VAR`] for one call, clearing it after.
+    ///
+    /// Mirrors `ar_server::config`'s `with_env`: the guard serialises the
+    /// module's only writers to the environment.
+    fn with_idle_env<T>(value: &str, read: impl FnOnce() -> T) -> T {
+        let _held = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the guard above holds this module's only claim on the
+        // environment, and the variable is cleared before it is released.
+        unsafe { std::env::set_var(IDLE_BODY_TIMEOUT_VAR, value) };
+        let out = read();
+        // SAFETY: as above — still holding the guard.
+        unsafe { std::env::remove_var(IDLE_BODY_TIMEOUT_VAR) };
+        out
+    }
+
+    #[test]
+    fn reads_idle_body_timeout_from_env_when_set() {
+        let secs = with_idle_env("600", idle_body_timeout_from_env);
+        assert_eq!(secs, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn keeps_idle_body_timeout_default_when_env_is_garbage() {
+        let secs = with_idle_env("not-a-number", idle_body_timeout_from_env);
+        assert_eq!(secs, IDLE_BODY_TIMEOUT);
+    }
+
+    #[test]
+    fn keeps_idle_body_timeout_default_when_env_is_empty_or_unset() {
+        assert_eq!(
+            with_idle_env("", idle_body_timeout_from_env),
+            IDLE_BODY_TIMEOUT
+        );
+        assert_eq!(idle_body_timeout_from_env(), IDLE_BODY_TIMEOUT);
     }
 
     #[test]

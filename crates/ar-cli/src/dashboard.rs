@@ -190,10 +190,10 @@ impl LaunchEnv {
         // the *first-password* window reopens on every restart. A pinned
         // token in the unit's env file closes that window. Left unset, the
         // child's own mint stands, exactly as upstream does it.
-        if let Some(token) = parent.get("OMNIROUTE_PEER_STAMP_TOKEN") {
-            if !token.trim().is_empty() {
-                vars.insert("OMNIROUTE_PEER_STAMP_TOKEN".to_string(), token.clone());
-            }
+        if let Some(token) = parent.get("OMNIROUTE_PEER_STAMP_TOKEN")
+            && !token.trim().is_empty()
+        {
+            vars.insert("OMNIROUTE_PEER_STAMP_TOKEN".to_string(), token.clone());
         }
 
         // The public origin, when the operator has named one. Redirects and
@@ -206,10 +206,10 @@ impl LaunchEnv {
             "OMNIROUTE_TRUSTED_PROXIES",
             "OMNIROUTE_TRUST_PROXY",
         ] {
-            if let Some(value) = parent.get(key) {
-                if !value.trim().is_empty() {
-                    vars.insert(key.to_string(), value.clone());
-                }
+            if let Some(value) = parent.get(key)
+                && !value.trim().is_empty()
+            {
+                vars.insert(key.to_string(), value.clone());
             }
         }
 
