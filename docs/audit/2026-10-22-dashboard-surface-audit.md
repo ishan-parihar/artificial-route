@@ -116,9 +116,21 @@ wrapper covers every client API call. Ledger **F11**, register **DASH-05**.
 ## 4. WebSockets — the honest verdict (ledger F13, register DASH-07)
 
 **[CORRECTED] — this section replaces the first report's "works/broken"
-split, which mixed inference with measurement.** All three surfaces were
+split, which mixed inference with measurement.** All four surfaces were
 live-tested 2026-10-22 against the rebuilt dist with a real `ws` client,
-root and `/dash` variants:
+root and `/dash` variants. **[ENUMERATION COMPLETED — third pass]:** a full
+sweep of every client `new WebSocket` call site found **4 chunk sites =
+ONE LiveWS hook bundled into 3 page chunks** (`1u-n6dhbqfml9`,
+`2x9yqxgbtcrmn`, `362sekb3marn3` — same hook: fetch `/api/v1/ws?handshake=1`,
+then dial `ws://<host>:20132/live-ws` unless the handshake overrides) **+
+the traffic-inspector client** (`4273mqo-xu5m0`). The `/api/v1/ws` entry in
+the pre-patch 404 list was the hook's handshake FETCH (plain fetch, same
+shim bug — now 200), not a straggler WS dial. The handshake route itself
+advertises a **fourth WS surface** — request-streaming `/v1/ws`
+(`wsPath:"/v1/ws"`, server chunk `_1tpi2ci._.js`) — whose upgrade has no
+handler anywhere in the dist (`server-ws.mjs` routes only `LIVE_WS_PATH` and
+the 3 responses paths, then falls to Next's listener, which destroys the
+socket):
 
 | Surface | root variant | `/dash` variant | verdict |
 |---|---|---|---|
@@ -127,10 +139,12 @@ root and `/dash` variants:
 | LiveWS `/live-ws` via :20149 | **101 open** | timeout | server relay works; `LIVE_WS_PATH` match is basePath-blind |
 | LiveWS direct `:20132` | **101 open** | n/a (the client default dials `ws://<hostname>:20132/live-ws`, chunk `1u-n6dhbqfml9.js`) | works same-host; **unreachable behind the tunnel** (the port is never forwarded) |
 | Traffic-inspector `/api/tools/traffic-inspector/ws` | **404** (client hardcodes root, chunk `4273mqo-xu5m0.js`) | GET → **426** (handler exists) but a real upgrade **hangs with zero bytes** | **dead in standalone mode regardless of base path** — the handler writes 101 on `e.socket`, which an App Router request never exposes |
+| Request-streaming `/v1/ws` (advertised by the handshake route) | upgrade → **handshake timeout** | upgrade → **socket hang-up** | **dead in standalone regardless of base path** — the route only answers handshake JSON (200/401) or 426; NO handler in the dist mounts its upgrade (rg `v1/ws` in `server-ws.mjs`/`responses-ws-proxy.mjs`/`run-standalone.mjs` → zero hits) |
 
-**Net: on the `/dash` publish, none of the three WS surfaces works from a
+**Net: on the `/dash` publish, none of the four WS surfaces works from a
 browser.** On a root-mounted dist, LiveWS works same-host and responses-WS
-would work with credentials once its bridge path is right.
+would work with credentials once its bridge path is right; the streaming
+`/v1/ws` and the traffic inspector are dead at any mount.
 
 **Fixes, cheapest first (ours, env-only):** set
 `NEXT_PUBLIC_LIVE_WS_PUBLIC_URL=wss://aroute.ishanparihar.com/dash/live-ws` —
@@ -140,9 +154,11 @@ through the tunnel**. Responses-WS needs the four `/dash` spellings in
 `RESPONSES_WS_PUBLIC_PATHS` (`responses-ws-proxy.mjs:27-31`) and a basePath
 prefix on `INTERNAL_ROUTE` — upstream-shaped but small. Traffic-inspector
 needs an upstream-shaped rewrite (its upgrade can never work in the App
-Router; it must be hosted by the custom server like LiveWS). Until they land,
-treat the three as root-mount-only features and say so in the publish notes;
-docs/41 §7's control set should gain the row.
+Router; it must be hosted by the custom server like LiveWS); so does the
+request-streaming `/v1/ws` — nothing in the dist mounts its upgrade, so an
+upgrade handler must be hosted on the custom server first. Until they land,
+treat the four as root-mount-only-or-broken features and say so in the
+publish notes; docs/41 §7's control set should gain the row.
 
 ## 5. Database/config integration — the drift map
 
@@ -187,7 +203,12 @@ carried it, and the spawned server child (513267) came up `HOSTNAME=0.0.0.0`
 (upstream default `false` → its gateway tier admits anonymous completions;
 spend is blocked only because no credentials are configured). Exposure is
 bounded to the LAN (the tunnel routes neither `:20149` nor `/dash`), but the
-posture is wrong.
+posture is wrong. **[FIXED LIVE 2026-10-22, third pass]:** the preview unit
+was relaunched with `OMNIROUTE_HOSTNAME=127.0.0.1` and the wrapper honoured
+it — the new server child binds `127.0.0.1:20149` (verified in `ss` and
+`/proc/<pid>/environ`; the same restart also set `REQUIRE_API_KEY=true` →
+anonymous gateway POST now 401s, and `OMNIROUTE_MEMORY_MB=1024` →
+`NODE_OPTIONS=--max-old-space-size=1024`).
 
 **[CORRECTED] — the first report overstated the scope.** It claimed "the
 `aroute dashboard` verb is equally defeated." That is false: the verb's entry
@@ -248,9 +269,21 @@ The dashboard costs **~20× the proxy's idle budget**. Levers, ranked:
 
 ## 8. What the operator should do next (ranked)
 
-1. **Restart the preview with a correct env** — `REQUIRE_API_KEY=true`,
-   `OMNIROUTE_HOSTNAME=127.0.0.1`, `OMNIROUTE_MEMORY_MB=1024`, and
-   `DATA_DIR` pointed at the canonical store (or accept it as throwaway).
+1. **Restart the preview with a correct env — DONE 2026-10-22, later the same evening.**
+   The transient preview unit (`ar-dash-preview.service`) was stopped and
+   relaunched via `systemd-run` with `OMNIROUTE_HOSTNAME=127.0.0.1`,
+   `OMNIROUTE_REQUIRE_API_KEY=true`, `OMNIROUTE_MEMORY_MB=1024`, and the
+   same throwaway `DATA_DIR=/tmp/ar-dashboard-data`. All four checks green
+   post-restart: listener `127.0.0.1:20149` (`ss`), the server child's env
+   shows `HOSTNAME=127.0.0.1` surviving the wrapper (the `OMNIROUTE_HOSTNAME`
+   pin working live, `/proc/<pid>/environ`) and
+   `NODE_OPTIONS=--max-old-space-size=1024`, `/dash/healthz` → 200, and an
+   anonymous `POST /dash/v1/chat/completions` → **401**. The banner stays
+   absent after the restart (re-verified in headless Chromium: `banner
+   present: false`, `/api/health/ping` 200) — the shim patch survives
+   because it lives in the dist itself, not the old process. The upstream-shaped
+   remainder stays open (F12): the wrapper still drops a caller-set bare
+   `HOSTNAME`.
 2. Before the docs/41 publish: set
    `NEXT_PUBLIC_LIVE_WS_PUBLIC_URL=wss://aroute.ishanparihar.com/dash/live-ws`
    (one variable revives LiveWS through the tunnel), and accept that
