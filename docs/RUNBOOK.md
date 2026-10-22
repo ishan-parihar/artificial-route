@@ -9,6 +9,16 @@
   glibc 2.39 and fails on the VPS with `GLIBC_2.39 not found`. Use the release recipe:
   `cargo build --release --locked --target x86_64-unknown-linux-musl --bin aroute`, then
   `strip`. Stage it as `~/.local/bin/aroute.new`, run `./aroute.new --version` before the `mv`.
+- **Operator ruling (2026-10-22): releases carry the binary built on the operator's
+  machine, and no PRs.** Land changes on `main` by direct merge/push, not pull requests.
+  The release asset is the local musl build from the tag's own tree, not the CI
+  runner's: `release.yml` still runs as the gate (tests, smoke, attestation) but its
+  published asset is replaced — `gh release delete-asset` the CI binary, then
+  `gh release upload <tag> dist/aroute-x86_64-unknown-linux-musl dist/SHA256SUMS
+  --clobber` from a clean checkout of the tag (`git worktree add … <tag>`, same
+  build recipe, `sha256sum` over the packaged file). Provenance: record the tree hash
+  in the release notes. The VPS installs only from the release asset, checksum-verified
+  (v0.1.21 flow, 2026-10-22).
 - **Install from the GitHub release on the VPS** (v0.1.17 flow): download the
   `aroute-x86_64-unknown-linux-musl` asset, verify `sha256sum` against the published
   `SHA256SUMS` **by comparing the two hash strings directly** — `sha256sum -c` fails on
