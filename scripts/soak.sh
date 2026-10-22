@@ -24,7 +24,7 @@ WORKERS="${SOAK_CONCURRENCY:-8}"
 SAMPLE_EVERY="${SOAK_SAMPLE_EVERY:-60}"
 GROWTH_LIMIT="${SOAK_RSS_GROWTH_LIMIT_KB:-65536}"
 LOG="${SOAK_LOG:-/tmp/ar-soak.csv}"
-PORT="${SOAK_PORT:-20128}"
+PORT="${SOAK_PORT:-29128}"
 
 AR="$DIR/target/release/ar"
 [ -x "$AR" ] || { echo "soak: build first (cargo build --release)"; exit 1; }

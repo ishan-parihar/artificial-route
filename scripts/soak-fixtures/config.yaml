@@ -9,10 +9,15 @@
 #   SOAK_DURATION=600 scripts/soak.sh
 #
 # Keys are literals, no dollar signs (the loader expands env refs in prose too).
+#
+# Port 29128, deliberately NOT the production 20128: a soak left running must
+# never hold the port the live `aroute.service` binds, or the service
+# crash-loops on EADDRINUSE for hours while clients silently talk to the
+# soak's stub catalog instead of real providers (seen 2026-10-22).
 
 server:
   host: 127.0.0.1
-  port: 20128
+  port: 29128
 
 keys:
   stub: sk-soak-stub
