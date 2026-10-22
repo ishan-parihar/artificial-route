@@ -139,6 +139,53 @@ for f in "${MANIFEST_FILES[@]}"; do
   ' "$f"
 done
 
+# ── 2.5 Client env-shim patch: the browser must learn the base path ─────────
+# The client bundle resolves its basePath from `process.env` at RUNTIME
+# (`BasePathNetworkProvider` → `installBasePathFetch` reads
+# NEXT_PUBLIC_OMNIROUTE_BASE_PATH || OMNIROUTE_BASE_PATH from the Turbopack
+# `process` shim). That shim ships `env:{}` — the build bakes basePath into
+# the manifests and SOME literals, but NOT into the shim — so in the browser
+# every root-relative `fetch("/api/…")` and `EventSource` stays on the ROOT
+# and 404s on a subpath-served dist, which trips the amber
+# "Server is experiencing issues" banner after two failed `/api/health/ping`
+# polls (reproduced 2026-10-22: banner on, 14 root-path 404s; shim patched →
+# banner gone, all calls hit `${basePath}/api/…`). Upstream's own patcher has
+# `patchProcessEnvShim` for exactly this, but it only runs root→subpath; a
+# dist BUILT for /dash never passes through it, so the pipeline does the
+# equivalent splice here, unconditionally, for whatever the sentinel names.
+log "patching the client process-shim env with the baked base path"
+if [ -f "$DST/BUILD_OMNIROUTE_BASE_PATH" ]; then
+  SHIM_BP="$(tr -d '[:space:]' < "$DST/BUILD_OMNIROUTE_BASE_PATH")"
+else
+  SHIM_BP=""
+fi
+if [ -n "$SHIM_BP" ] && [ "$SHIM_BP" != "/" ]; then
+  SHIM_COUNT=$(node - "$DST/.build/next/static/chunks" "$SHIM_BP" <<'SHIM_EOF'
+const fs = require("node:fs");
+const path = require("node:path");
+const [dir, bpRaw] = process.argv.slice(2);
+const bp = JSON.stringify(bpRaw).slice(1, -1); // escape quotes/backslashes
+let n = 0;
+for (const f of fs.readdirSync(dir)) {
+  if (!f.endsWith(".js")) continue;
+  const p = path.join(dir, f);
+  const before = fs.readFileSync(p, "utf8");
+  // Mirrors upstream patchProcessEnvShim: the shim's `.env={}` gains the two
+  // keys the app reads. `.env={}` is unique to the shim factory in practice;
+  // the parse gate below re-checks every touched file.
+  const after = before.replaceAll(
+    ".env={}",
+    `.env={OMNIROUTE_BASE_PATH:"${bp}",NEXT_PUBLIC_OMNIROUTE_BASE_PATH:"${bp}"}`,
+  );
+  if (after !== before) { fs.writeFileSync(p, after); n++; }
+}
+process.stdout.write(String(n));
+SHIM_EOF
+  )
+  log "client env-shim patched in ${SHIM_COUNT} chunk(s) with basePath ${SHIM_BP}"
+  [ "${SHIM_COUNT}" -ge 1 ] || die "the client process-shim (.env={}) was not found under $DST/.build/next/static/chunks — the base-path fix did not land"
+fi
+
 # ── 3. General display-text rebrand ──────────────────────────────────────────
 # Guard: not inside identifiers (chars before/after), not in URLs (slash),
 # not a package name (@), not X-OmniRoute-* headers (hyphen-before).
@@ -248,6 +295,7 @@ log "boot smoke on :$PORT (base path $BASE_PATH)"
 systemd-run --user --collect --unit="$SMOKE_UNIT" \
   --property=WorkingDirectory="$DST" \
   --setenv=PORT="$PORT" --setenv=HOSTNAME=127.0.0.1 \
+  --setenv=OMNIROUTE_HOSTNAME=127.0.0.1 \
   --setenv=DATA_DIR="$DATA_DIR" \
   node "$DST/dev/run-standalone.mjs" >/dev/null 2>&1 || die "systemd-run failed"
 trap "systemctl --user stop '$SMOKE_UNIT' >/dev/null 2>&1 || true; rm -f '$PASS' '$FAIL' '$NOCHECK'" EXIT

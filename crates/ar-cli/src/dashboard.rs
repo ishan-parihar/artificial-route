@@ -299,7 +299,18 @@ pub fn run(args: &DashboardArgs) -> anyhow::Result<()> {
         .current_dir(&dist)
         // Loopback only: the dashboard manages credentials, and the child
         // would otherwise bind every interface like its parent project does.
+        //
+        // TWO names, on purpose. `HOSTNAME` is what the bare standalone
+        // `server.js` reads. But upstream's `dev/run-standalone.mjs` wrapper
+        // recomputes the child's env (`build/runtime-env.mjs`
+        // `withRuntimePortEnv`) and OVERWRITES `HOSTNAME` with
+        // `OMNIROUTE_HOSTNAME || "0.0.0.0"`, dropping this value — measured
+        // 2026-10-22: a unit that set `HOSTNAME=127.0.0.1` produced a
+        // `0.0.0.0` listener (ledger F12). `OMNIROUTE_HOSTNAME` is the INPUT
+        // that wrapper honours, so pinning it keeps the loopback contract
+        // through both entry shapes.
         .env("HOSTNAME", "127.0.0.1")
+        .env("OMNIROUTE_HOSTNAME", "127.0.0.1")
         .env("PORT", args.port.to_string())
         .env("DATA_DIR", data_dir());
     for (key, value) in launch.vars() {

@@ -1,0 +1,20 @@
+A HARD RESOURCE CONSTRAINT I measured on the VPS just now. It changes the deployment shape materially — please reflect it in §3 (the launch, as a service) and §4 (delivery), and add it to the control set.
+
+MEASURED ON `racknerd` (2026-10-21):
+  Filesystem /dev/vda1  43G total  34G used  6.9G available  84% used
+  RAM: 2.4 GiB total, 1.6 GiB used, 153 MiB free, 870 MiB in buff/cache, 844 MiB available
+  Swap: 3.0 GiB total, 954 MiB used
+  nproc: 2
+  Node v22.22.2 is present.
+
+WHAT THIS FORCES:
+1. **Disk.** The vendored dist is 1.6 GiB (1.6G total; `.build/next/static` 86M, `node_modules` 284M, and the bulk is `.build/next/server` at ~1.1G). Extracting a 277 MB tar.gz gives 1.6 GiB on disk; keeping the tarball too is another 277 MB. Against 6.9 GB free that fits, but it is a THIRD of the free space, and the VPS also runs the aroute proxy, the watchdog, the other tunnels' origins (8080, 3100, 42617) and the dashboard's own SQLite store. State the arithmetic in §4 and say whether to keep the tarball after extraction, and where the dist lives (`~/.local/share/aroute-dashboard/` or `~/.config/ar/dashboard/` — pick one and say why).
+2. **RAM.** Upstream's self-host guidance says `OMNIROUTE_MEMORY_MB=2048` for coding agents. This box has **2.4 GiB total and only 844 MiB available**, with the aroute proxy and two other origins already resident. A 2048 MB V8 old-space ceiling on this box is not merely a recommendation to tune — it is larger than the free memory. So: set `OMNIROUTE_MEMORY_MB` to a value that FITS (compute and state it — something in the 512–1024 MB range, justified against the 844 MiB available and the 2 GB of swap), and say what degrades at that ceiling (the dashboard is a control plane, not the inference path — the inference traffic goes through the aroute proxy, not through the dashboard's own /v1). Add a swap-pressure guard to §7: a check that the dashboard's RSS stays under the budget.
+3. **The `OMNIROUTE_MEMORY_MB` row in §2** must therefore carry a REAL value, not upstream's 2048, and the "what breaks if it is wrong" cell must say what a too-small ceiling does (V8 OOM → the dashboard dies → the public hostname 502s while the aroute proxy keeps serving /v1).
+4. Also state in §3: the dashboard must be a `systemd --user` unit with `MemoryMax=`/`MemoryHigh=` set, so a leak cannot OOM-kill the aroute proxy on the same box. Say the value and that it must be BELOW the proxy's needs.
+
+Also relevant to §4: because the dist is 1.6 GiB and the VPS has 6.9 GB free, prefer shipping the tar.gz to a release asset and having `install.sh`'s existing dashboard path (`install.sh:437-479`, which already accepts a `*.tar.gz` and does the `.new`→`.old` atomic swap) do the extraction, with a sha256 check — rather than an ad-hoc scp of 1.6 GiB, which the project's own release discipline (never scp a build artifact; publish then install) argues against.
+
+And in §5, when you recommend the REBUILD: state that the rebuild happens on the BUILD machine (this box, node v24.19.0, `npm run build`), NOT on the VPS — the VPS has 2 vCPU, 844 MiB available and no node_modules; a Next production build there is not viable. The rebuilt, rebranded dist is then shipped as the tarball.
+
+Keep the twelve sections and the final-message format. Add the resource arithmetic as a short subsection under §3 or §4 — do not add a thirteenth top-level section, but you MAY add a subheading.
