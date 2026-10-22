@@ -171,7 +171,10 @@ pub const IDLE_BODY_TIMEOUT_VAR: &str = "AR_IDLE_BODY_TIMEOUT_SECS";
 /// `with_timeouts_from_env` applies to a bad deadline, because one typo must
 /// not take down a server that was routing fine.
 fn idle_body_timeout_from_env() -> Duration {
-    let Some(raw) = std::env::var(IDLE_BODY_TIMEOUT_VAR).ok().filter(|v| !v.is_empty()) else {
+    let Some(raw) = std::env::var(IDLE_BODY_TIMEOUT_VAR)
+        .ok()
+        .filter(|v| !v.is_empty())
+    else {
         return IDLE_BODY_TIMEOUT;
     };
     match raw.trim().parse::<u64>() {
