@@ -44,7 +44,9 @@
 # Env knobs: AR_VERSION (pin a tag), AR_INSTALL_DIR (install dir),
 #            AR_SERVICE (unit scope), AR_CONFIG (config path for the unit),
 #            AR_DASHBOARD (1 = --with-dashboard), AR_DASHBOARD_SRC (dist source),
-#            AR_DASHBOARD_PORT (the dashboard unit's port, default 20149).
+#            AR_DASHBOARD_PORT (the dashboard unit's port, default 20149),
+#            AR_DASHBOARD_BASE_PATH (subpath for the one-way base-path patch,
+#            default /dash; empty serves at /).
 #            SKIP_CTA=1, FORCE_ROOT=1, SKIP_HARNESS=1, ALL_HARNESS=1.
 #
 # Runtime on/off, once installed: the dashboard is its own systemd unit so the
@@ -91,6 +93,11 @@ SERVICE="${AR_SERVICE:-auto}"
 DASHBOARD="${AR_DASHBOARD:-0}"
 DASH_SRC="${AR_DASHBOARD_SRC:-}"
 DASH_PORT="${AR_DASHBOARD_PORT:-20149}"
+# The subpath the installed dist serves under, when the tarball was built for
+# the domain root and the installer converts it (the one-way patch). A dist
+# already baked for /dash carries a BUILD_OMNIROUTE_BASE_PATH sentinel and
+# the patch is skipped; empty means serve at /.
+DASH_BASE_PATH="${AR_DASHBOARD_BASE_PATH:-/dash}"
 CHECK_ONLY=0
 UNINSTALL=0
 SKIP_CTA="${SKIP_CTA:-0}"
@@ -470,6 +477,37 @@ install_dashboard() {
     *) cp -a "$DASH_SRC/." "${DASH_DEST}.new/" ;;
   esac
   [ -f "${DASH_DEST}.new/server.js" ] || die "the unpacked dist has no server.js — bad source?"
+
+  # ── the node_modules the 277 MB tarball deliberately omits ──────────────────
+  # The release asset ships without node_modules (277 MB instead of ~330 MB,
+  # docs/41 §4), so the host resolves the traced tree once, here, where npm
+  # can verify it. A tarball WITH node_modules (or a directory source, which
+  # was copied wholesale above) skips this: `npm ci` over an already-resolved
+  # tree is a no-op that still costs minutes on a 2-vCPU box.
+  if [ ! -d "${DASH_DEST}.new/node_modules" ] && [ -f "${DASH_DEST}.new/package.json" ]; then
+    echo "resolving the dashboard's node_modules (npm ci --omit=dev --legacy-peer-deps) ..."
+    # --legacy-peer-deps: upstream's own .npmrc sets it for their tree (a real
+    # marked@18 vs marked-terminal@<16 peer conflict); a plain npm ci hard-fails.
+    # The dist's .npmrc (copied by the rebrand pipeline) also carries
+    # onnxruntime-node-install=skip — without it the postinstall pulls
+    # ~300 MB of CUDA binaries on linux/x64.
+    ( cd "${DASH_DEST}.new" && npm ci --omit=dev --legacy-peer-deps --no-audit --no-fund ) \
+      || die "npm ci failed inside the unpacked dist — the release tarball and its package-lock are out of sync"
+  fi
+
+  # ── the one-way base-path patch, once, on a root-built dist ──────────────
+  # A dist baked for /dash at BUILD time already carries it in the manifests
+  # and its BUILD_OMNIROUTE_BASE_PATH sentinel says so; the patcher refuses
+  # those (a mismatch is a hard error by design). A ROOT-built dist (the
+  # local-operator shape, and any pre-rebuild artifact) converts here, once —
+  # the only place the file exists to do it.
+  if [ -f "${DASH_DEST}.new/patch-base-path.mjs" ] && [ ! -f "${DASH_DEST}.new/BUILD_OMNIROUTE_BASE_PATH" ]; then
+    echo "patching the dist's base path to ${DASH_BASE_PATH:-/dash} (one-way, once) ..."
+    ( cd "${DASH_DEST}.new" && OMNIROUTE_BASE_PATH="${DASH_BASE_PATH:-/dash}" \
+        node patch-base-path.mjs ) \
+      || die "the base-path patch failed — the dist stays root-built; re-run with DASH_BASE_PATH empty to serve at /"
+  fi
+
   rm -rf "${DASH_DEST}.old"
   [ -d "$DASH_DEST" ] && mv "$DASH_DEST" "${DASH_DEST}.old"
   mv "${DASH_DEST}.new" "$DASH_DEST"
@@ -485,6 +523,12 @@ install_dashboard() {
 # never needed it, and the operator's box (OOM history) wants the choice.
 # Same discipline as the proxy unit: env file outside the unit, secrets never
 # in the process table.
+#
+# THE ENV FILE IS THE DASHBOARD'S OWN, NOT ar.env (docs/41 §3). ar.env carries
+# the proxy's AR master keys — a credential the dashboard must never hold —
+# so the dashboard unit points at dashboard.env, which carries only the
+# dashboard's own launch posture. The supervisor (`aroute dashboard`) reads
+# the same names, so the interactive verb and the unit cannot drift.
 install_dashboard_unit() {
   DASH_UNIT=""
   DASH_UNIT_STATE="not managed"
@@ -500,22 +544,91 @@ install_dashboard_unit() {
   DASH_UNIT_DIR="${DASH_UNIT%/*}"
   [ "$DASH_UNIT_DIR" = "$DASH_UNIT" ] && DASH_UNIT_DIR="."
   mkdir -p "$DASH_UNIT_DIR"
+
+  # The dashboard's env file. Written when absent, kept when present — the
+  # operator's secrets and the pinned peer-stamp token must survive an
+  # upgrade. First write generates the secrets the dashboard demands (a weak
+  # JWT_SECRET is on its own block list and login 500s; INITIAL_PASSWORD
+  # CHANGEME is refused at login) plus the pinned stamp token, and prints
+  # the password ONCE, here, because it is a secret nobody can recover later.
+  DASH_ENV_FILE="$HOME/.config/ar/dashboard.env"
+  if [ ! -f "$DASH_ENV_FILE" ]; then
+    gen_secret() {
+      # 32 hex chars from /dev/urandom: no openssl dependency, POSIX-portable.
+      od -An -tx1 -N32 /dev/urandom 2>/dev/null | tr -d ' \n' \
+        || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'
+    }
+    DASH_JWT="$(gen_secret)"
+    DASH_API_KEY_SECRET="$(gen_secret)"
+    DASH_INITIAL_PASSWORD="$(gen_secret)"
+    DASH_STAMP_TOKEN="$(gen_secret)"
+    cat > "$DASH_ENV_FILE" <<DASHENVEOF
+# The dashboard's launch environment. chmod 600 this file; it holds secrets.
+# This file is the DASHBOARD's own — the proxy's ar.env is deliberately not
+# inherited here (it carries the proxy's credential-store master key).
+#
+# The supervisor (aroute dashboard) already defaults REQUIRE_API_KEY=true,
+# AUTH_COOKIE_SECURE=true and OMNIROUTE_MEMORY_MB=1024; they are written out
+# explicitly so this file is the single source of truth an operator can read.
+
+# The gateway tier: refuse anonymous completions. Upstream ships "false".
+REQUIRE_API_KEY=true
+
+# The login cookie's secure flag, by configuration rather than inference.
+AUTH_COOKIE_SECURE=true
+
+# The child's heap ceiling in MiB, measured for a 2.4 GiB box with the proxy
+# resident (docs/41 §3). MemoryMax below is the hard kill at 1.5x.
+OMNIROUTE_MEMORY_MB=1024
+
+# The pinned peer-stamp token: without it every restart mints a new one and
+# the first-password window reopens. Generated once, kept forever.
+OMNIROUTE_PEER_STAMP_TOKEN=$DASH_STAMP_TOKEN
+
+# The public origin, when the dashboard is published at a path (docs/41 §1).
+#OMNIROUTE_PUBLIC_BASE_URL=https://aroute.example.com/dash
+#OMNIROUTE_BASE_PATH=/dash
+
+# Secrets generated at install. JWT_SECRET signs the login cookie (login
+# 500s without it); API_KEY_SECRET validates the dashboard's own sk- keys;
+# INITIAL_PASSWORD is the FIRST login's password — change it after the first
+# login, and this file is the only record of the generated value.
+JWT_SECRET=$DASH_JWT
+API_KEY_SECRET=$DASH_API_KEY_SECRET
+INITIAL_PASSWORD=$DASH_INITIAL_PASSWORD
+DASHENVEOF
+    chmod 600 "$DASH_ENV_FILE"
+    echo "dashenv:   wrote $DASH_ENV_FILE (secrets generated)"
+    echo "           FIRST LOGIN PASSWORD: $DASH_INITIAL_PASSWORD"
+    echo "           (shown once; change it from inside the dashboard)"
+  else
+    echo "dashenv:   kept existing $DASH_ENV_FILE"
+  fi
+
   cat > "$DASH_UNIT" <<DASHEOF
 [Unit]
 Description=artificial-route (ar) — web dashboard
 Documentation=https://github.com/$REPO
+After=network-online.target
 
 [Service]
 Type=simple
 # Same dist-resolution chain as any other aroute dashboard run: \$AR_DASHBOARD_DIR,
 # a dist beside the binary, then the install location. No --path needed.
 ExecStart=$TARGET dashboard --port $DASH_PORT
-EnvironmentFile=$ENV_FILE
+# The DASHBOARD's env file — never ar.env, which carries the proxy's master.
+EnvironmentFile=$DASH_ENV_FILE
 # Same as the proxy unit: HOME decides where \$HOME/.config/ar/dashboard-data
 # lives, and it stays out of the process table.
 Environment=HOME=$HOME
 Restart=on-failure
 RestartSec=5s
+# The dashboard shares the box with the proxy; the memory guard is what
+# keeps a misbehaving Node child from OOM-killing the proxy (docs/41 §3:
+# MemoryHigh starts reclaiming at 1280M, MemoryMax is the hard kill at 1536M,
+# 1.5x the heap ceiling the env pins).
+MemoryHigh=1280M
+MemoryMax=1536M
 # The Node child holds roughly 700 MB RSS while the UI is served; stopping
 # this unit is how that is given back.
 KillSignal=SIGTERM
@@ -534,6 +647,7 @@ DASHEOF
   echo "dashsvc:   wrote $DASH_UNIT (not started)"
   echo "          start:  $DASH_CTL start $SERVICE_NAME-dashboard"
   echo "          stop:   $DASH_CTL stop $SERVICE_NAME-dashboard   (reclaims ~700 MB RSS)"
+  echo "          memory: MemoryHigh=1280M MemoryMax=1536M (the proxy is protected)"
 }
 
 # ------------------------------------------------------------------ install --

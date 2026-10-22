@@ -324,6 +324,11 @@ pub fn mount(proxy: Router, ctx: Ctx) -> Router {
         .route("/ui/", get(page_slash))
         .route("/ui/app.css", get(css))
         .route("/ui/app.js", get(js))
+        // Both spellings: the page names `/ui/favicon.ico` via <link>, but a
+        // browser also probes the bare `/favicon.ico` on its own for the
+        // host's root, and a 404 there shows up in the journal on every visit.
+        .route("/ui/favicon.ico", get(favicon))
+        .route("/favicon.ico", get(favicon))
         .route("/ui/fonts/inter-var-latin.woff2", get(font_inter))
         .route("/ui/fonts/sora-var-latin.woff2", get(font_sora))
         .route("/ui/api/state", get(state))
@@ -564,6 +569,31 @@ async fn js() -> Response {
     asset(
         include_str!("webui/page/app.js"),
         "text/javascript; charset=utf-8",
+    )
+}
+
+/// The favicon, served at BOTH `/ui/favicon.ico` and `/favicon.ico`.
+///
+/// A browser requests `/favicon.ico` on its own for any page that does not
+/// name one, and the panel is the top-level page of this server's host — so
+/// without this route every page load logs a 404 (both in this server's
+/// journal and in every reverse proxy in front of it). The icon is the
+/// brand-mark gradient as inline SVG: it is 4 lines, weighs ~300 bytes, and
+/// needs no binary asset in the tree. `image/svg+xml` in an `.ico` route is
+/// fine — every modern browser accepts SVG favicons by content type, and
+/// the `<link rel="icon">` in the page names the same bytes.
+async fn favicon() -> Response {
+    asset(
+        concat!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\">",
+            "<defs><linearGradient id=\"g\" x1=\"0\" y1=\"0\" x2=\"1\" y2=\"1\">",
+            "<stop offset=\"0\" stop-color=\"#7c8cff\"/><stop offset=\"1\" stop-color=\"#5a63e8\"/>",
+            "</linearGradient></defs>",
+            "<rect width=\"32\" height=\"32\" rx=\"7\" fill=\"url(#g)\"/>",
+            "<text x=\"16\" y=\"21.5\" font-family=\"Sora,sans-serif\" font-size=\"13\" font-weight=\"700\" ",
+            "text-anchor=\"middle\" fill=\"#07080d\">ar</text></svg>"
+        ),
+        "image/svg+xml",
     )
 }
 

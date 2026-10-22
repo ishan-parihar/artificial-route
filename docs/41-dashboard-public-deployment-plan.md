@@ -298,28 +298,40 @@ The installer is already ready for this: `install.sh:150-160` selects a
 unit. **Measured: Node v22.22.2 on racknerd satisfies that check.**
 
 The measured sizes set the recipe: `tar.gz` of the dist **without `node_modules`**
-is **277 MB** (1.6 GiB raw; `.build/next/static` 86 M; `node_modules` 284 M).
-Ship the **`node_modules`-free** tarball and run `npm ci --omit=dev` once on the
-host (the standalone layout needs its own `node_modules` beside `server.js`) — that
-keeps the artifact at 277 MB and the host install at ~1.6 GB, and the dependency
-resolution happens on the host where npm can verify it. If that is judged too slow
-on 2 vCPU, fall back to including `node_modules` (≈330 MB) and skipping `npm ci`.
+is **280 MB** (measured 2026-10-22 on the rebuilt dist; 1.6 GiB raw after the
+ONNX prune). Two tarball shapes ship, both proven 2026-10-22:
+
+* **`--with-deps` (335 MB) — the recommended VPS artifact.** It carries the
+  exact pruned tree the pipeline booted and gate-checked, so the 2-vCPU host
+  runs NO `npm ci` at all. This matters because a host-side `npm ci` re-pulls
+  the ONNX stack the pipeline deliberately prunes (the lockfile lists it),
+  costing disk AND minutes of 2-vCPU postinstall work the .npmrc
+  `onnxruntime-node-install=skip` flag only partially avoids.
+* **no-deps (280 MB)** — requires `npm ci --omit=dev --legacy-peer-deps` on the
+  host. `--legacy-peer-deps` is MANDATORY (upstream's own .npmrc sets it; the
+  tree has a real marked@18 vs marked-terminal@<16 peer conflict), and the
+  dist's `package.json` must carry NO `scripts` block (upstream's standalone
+  package.json retains the dev `postinstall` → it dies on the missing
+  `scripts/` dir; the pipeline strips it). The pipeline ships
+  `package-lock.json` + `.npmrc` in the dist for exactly this path.
+  Proven 2026-10-22: extract → npm ci (670 pkgs, exit 0) → boot 2s →
+  /dash/healthz 200, manifest + login branded.
+
+Both are produced by `dashboard/pack-dist.sh [--with-deps]`, checksummed
+`.sha256` files beside them.
 
 ```bash
-# on the build machine
-cd dashboard/dist && tar -czf /tmp/aroute-dashboard-vX.tgz --exclude=node_modules \
-  --exclude=old --exclude=.old server.js package.json .build public migrations \
-  peer-stamp-launcher.cjs patch-base-path.mjs
-# patch-base-path.mjs = upstream's scripts/docker/patch-standalone-base-path.mjs + its
-# BUILD_OMNIROUTE_BASE_PATH sentinel check, copied into the dist root — the vendored
-# pipeline drops scripts/docker/ (rebrand-dist.sh:46-51), so the patcher must ride along.
-# The install runs it ONCE, before first boot: node patch-base-path.mjs  (root → /dash).
-sha256sum /tmp/aroute-dashboard-vX.tgz | tee SHA256SUMS   # publish BOTH to the release
+# on the build machine — pack-dist.sh does the packing, member list, and
+# checksum (its member list carries the whole launch family: server-ws.mjs's
+# guard imports, dev/run-standalone.mjs, build/, package-lock.json, .npmrc,
+# the BUILD_OMNIROUTE_BASE_PATH sentinel — and the patcher rides along).
+dashboard/pack-dist.sh --with-deps     # → aroute-dashboard-vX-deps.tar.gz (335 MB)
+dashboard/pack-dist.sh                 # → aroute-dashboard-vX.tar.gz (280 MB, npm ci on host)
 
 # on the VPS — the sanctioned install path, not an scp of 1.6 GiB
-curl -fLO https://github.com/ishan-parihar/artificial-route/releases/download/vX/aroute-dashboard-vX.tgz
-curl -fLO .../SHA256SUMS && sha256sum -c SHA256SUMS
-~/install.sh --dashboard-src ~/aroute-dashboard-vX.tgz
+curl -fLO https://github.com/ishan-parihar/artificial-route/releases/download/vX/aroute-dashboard-vX-deps.tar.gz
+curl -fLO .../aroute-dashboard-vX-deps.tar.gz.sha256 && sha256sum -c aroute-dashboard-vX-deps.tar.gz.sha256
+~/install.sh --with-dashboard --dashboard-src ~/aroute-dashboard-vX-deps.tar.gz
 ```
 
 **The `OMNI_ROOT` build defect, and its fix.** `rebrand-dist.sh:30` defaults to

@@ -93,31 +93,38 @@ done <<<"$TARGETS"
 log "parse gate: $COUNT file(s) still parse"
 
 # ── 3. Boot smoke on an OS-picked free port ──────────────────────────────────
+# The dist may be baked for a subpath (the /dash mount docs/41 §1 chose):
+# read the sentinel the rebuild writes and probe under that prefix. A dist
+# without the sentinel is root-built, and an empty prefix is exactly right.
+BASE_PATH="$(cat "$DIST/BUILD_OMNIROUTE_BASE_PATH" 2>/dev/null || true)"
 SMOKE_UNIT="ar-patch-smoke.$$"
 mkdir -p "$DATA_DIR"
 if [ -n "${AR_PATCH_PORT:-}" ]; then PORT="$AR_PATCH_PORT"; else
   PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
 fi
 
+# Prefer upstream's run-standalone.mjs (peer-stamp + heap/port env); the
+# vendored peer-stamp-launcher.cjs is the fallback for dists without it.
+if [ -f "$DIST/dev/run-standalone.mjs" ]; then SMOKE_ENTRY="$DIST/dev/run-standalone.mjs"; else SMOKE_ENTRY="$DIST/peer-stamp-launcher.cjs"; fi
 systemd-run --user --collect --unit="$SMOKE_UNIT" \
   --property=WorkingDirectory="$DIST" \
   --setenv=PORT="$PORT" --setenv=HOSTNAME=127.0.0.1 \
   --setenv=DATA_DIR="$DATA_DIR" \
-  node "$DIST/peer-stamp-launcher.cjs" >/dev/null 2>&1 || die "systemd-run failed"
+  node "$SMOKE_ENTRY" >/dev/null 2>&1 || die "systemd-run failed"
 SMOKE_STARTED=1
 trap 'rm -rf "$BACKUP"; [ -n "${SMOKE_STARTED:-}" ] && systemctl --user stop "$SMOKE_UNIT" >/dev/null 2>&1 || true' EXIT
 
 ok=0
 for _ in $(seq 1 30); do
-  if curl -sf -m 3 "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then ok=1; break; fi
+  if curl -sf -m 3 "http://127.0.0.1:$PORT$BASE_PATH/healthz" >/dev/null 2>&1; then ok=1; break; fi
   sleep 1
 done
 [ "$ok" = 1 ] || { journalctl --user -u "$SMOKE_UNIT" -n 30 --no-pager >&2 || true; die "dashboard did not come up"; }
 
-MANIFEST_NAME=$(curl -sf -m 5 "http://127.0.0.1:$PORT/manifest.webmanifest" | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])' 2>/dev/null || echo MISSING)
+MANIFEST_NAME=$(curl -sf -m 5 "http://127.0.0.1:$PORT$BASE_PATH/manifest.webmanifest" | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])' 2>/dev/null || echo MISSING)
 [ "$MANIFEST_NAME" = "Artificial Route" ] || die "manifest name is '$MANIFEST_NAME', expected 'Artificial Route'"
 
-LOGIN=$(curl -sf -m 10 "http://127.0.0.1:$PORT/login" 2>/dev/null || true)
+LOGIN=$(curl -sf -m 10 "http://127.0.0.1:$PORT$BASE_PATH/login" 2>/dev/null || true)
 case "$LOGIN" in
   *"Artificial Route"*) : ;;
   *) die "login page does not mention Artificial Route" ;;

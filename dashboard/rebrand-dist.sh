@@ -27,11 +27,21 @@
 set -euo pipefail
 
 AR_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-OMNI_ROOT="${OMNI_ROOT:-$AR_ROOT/../OmniRoute}"
+# The upstream checkout lives in the sibling `external-repos` tree, not beside
+# this repo. The old default (`$AR_ROOT/../OmniRoute`) pointed at a path that
+# does not exist, so the pipeline died at its first step (docs/41 §4, gap B4).
+OMNI_ROOT="${OMNI_ROOT:-$AR_ROOT/../external-repos/OmniRoute}"
 SRC="$OMNI_ROOT/.build/next/standalone"
 DST="$AR_ROOT/dashboard/dist"
 PORT="${AR_DASH_PORT:-20149}"
 DATA_DIR="${AR_DASH_DATA:-/tmp/ar-dashboard-data}"
+# The subpath the bundle is served under. Baked at BUILD time (the dist's own
+# `BUILD_OMNIROUTE_BASE_PATH` sentinel records it), and it must match the
+# runtime env exactly — the standalone server refuses to start when the two
+# disagree. `/dash` is the path mount docs/41 §1 chose for the aroute
+# hostname; an empty value means a root-built dist, which is what a local
+# operator run wants.
+BASE_PATH="${AR_BASE_PATH:-/dash}"
 
 log() { printf '[rebrand] %s\n' "$*"; }
 die() { printf '[rebrand] FATAL: %s\n' "$*" >&2; exit 1; }
@@ -44,11 +54,74 @@ log "copying standalone essentials → $DST"
 rm -rf "$DST"
 mkdir -p "$DST"
 cp "$SRC/server.js" "$SRC/package.json" "$DST/"
+# package-lock.json is REQUIRED in the dist: any host that resolves deps
+# with `npm ci --omit=dev` (the --with-deps-less tarball shape) hard-fails
+# without it. Upstream's own install posture rides along too: their .npmrc
+# carries legacy-peer-deps=true (their tree has a real marked/marked-terminal
+# peer conflict), fetch-retry hardening, and onnxruntime-node-install=skip
+# (without it the postinstall pulls ~300 MB of CUDA binaries on linux/x64).
+[ -f "$SRC/package-lock.json" ] && cp "$SRC/package-lock.json" "$DST/"
+[ -f "$OMNI_ROOT/.npmrc" ] && cp "$OMNI_ROOT/.npmrc" "$DST/.npmrc"
+# The standalone package.json carries upstream's full DEV scripts block, all
+# pointing at scripts/ dirs that do not exist in a standalone dist. npm ci
+# runs `postinstall` on every install and dies on the missing file, so the
+# scripts block is stripped from the dist's copy: the standalone runtime
+# never calls them, and npm ci resolves the tree purely from dependencies.
+node -e '
+  const fs = require("fs");
+  const p = process.argv[1];
+  const pkg = JSON.parse(fs.readFileSync(p, "utf8"));
+  delete pkg.scripts;
+  fs.writeFileSync(p, JSON.stringify(pkg, null, 2) + "\n");
+' "$DST/package.json"
 cp "$AR_ROOT/dashboard/peer-stamp-launcher.cjs" "$DST/"
 cp -r "$SRC/public" "$DST/public"
 cp -r "$SRC/node_modules" "$DST/node_modules"
 cp -r "$SRC/.build" "$DST/.build"
 [ -d "$OMNI_ROOT/src/lib/db/migrations" ] && cp -r "$OMNI_ROOT/src/lib/db/migrations" "$DST/migrations"
+
+# ── 1.5 The upstream launch family and the base-path patcher ride along ──────
+# Upstream's own `assembleStandalone` co-locates `server-ws.mjs` (the
+# WS-aware wrapper that installs the peer-stamp), `peer-stamp.mjs` (the
+# stamping helper WITH the Cloudflare-edge CIDRs and
+# OMNIROUTE_TRUSTED_PROXIES handling — gaps A5/B2/B3 in docs/41 §6), and
+# `dev/run-standalone.mjs` (the entrypoint that picks server-ws over the
+# bare server.js). A v3.8.52-era source tree does not carry them, so each
+# copy is guarded: the file lands when upstream shipped it, and the
+# vendored `peer-stamp-launcher.cjs` remains the fallback entry otherwise
+# (`crates/ar-cli/src/dashboard.rs` picks `server-ws.mjs` first).
+#
+# The base-path patcher (`patch-base-path.mjs`, upstream's
+# `scripts/docker/patch-standalone-base-path.mjs` + the
+# `BUILD_OMNIROUTE_BASE_PATH` sentinel contract from
+# `ensure-docker-base-path.mjs`) is REQUIRED in the dist even though the
+# rebuild bakes `/dash`: the vendored pipeline drops `scripts/docker/` from
+# the copy, the installer runs the patcher once on an installed dist, and a
+# root-built dist (the local-operator shape) cannot be converted without it.
+log "copying upstream launch family + base-path patcher"
+# The whole top-level launch family rides along: server-ws.mjs imports the
+# guard modules (h2c-upgrade-guard.cjs, webdav-handler.mjs, tls-options.mjs,
+# …) by relative path, and upstream keeps adding them — enumerating the set
+# breaks on every upstream bump. Every top-level *.mjs/*.cjs is copied; the
+# stray config files (next/eslint/postcss/prettier) are inert at runtime and
+# a few KB. The vendored peer-stamp-launcher.cjs stays the fallback entry
+# for a v3.8.52-era dist that carried none of these.
+for f in "$SRC"/*.mjs "$SRC"/*.cjs; do
+  [ -f "$f" ] && cp "$f" "$DST/"
+done
+[ -f "$SRC/dev/run-standalone.mjs" ] && { mkdir -p "$DST/dev"; cp "$SRC/dev/run-standalone.mjs" "$DST/dev/run-standalone.mjs"; }
+# run-standalone.mjs imports ../build/{runtime-env,bootstrap-env}.mjs (port
+# resolution, heap sizing, .env bootstrap) — the whole build/ dir rides along.
+[ -d "$SRC/build" ] && { mkdir -p "$DST/build"; cp -r "$SRC/build/." "$DST/build/"; }
+node "$AR_ROOT/dashboard/vendor-base-path-patcher.cjs" "$OMNI_ROOT" "$DST/patch-base-path.mjs" \
+  || die "could not vendor the base-path patcher"
+# The sentinel records what the bundle was BUILT for. The build writes it
+# when upstream's assemble step runs; a dist rebuilt from this pipeline
+# carries it, and the launcher (`aroute dashboard`) reads it to keep the
+# runtime env in agreement with the bundle.
+if [ -f "$SRC/BUILD_OMNIROUTE_BASE_PATH" ]; then
+  cp "$SRC/BUILD_OMNIROUTE_BASE_PATH" "$DST/BUILD_OMNIROUTE_BASE_PATH"
+fi
 
 # ── 2. Targeted PWA manifest patches (before the general pass so short_name
 #       becomes "aroute" rather than the long form) ───────────────────────────
@@ -92,11 +165,6 @@ perl -pi -e 's/(?<![A-Za-z0-9_\/@-])OmniRoute(?![A-Za-z0-9_\/])/Artificial Route
 log "scrubbing sponsor branding"
 node "$AR_ROOT/dashboard/scrub-sponsors.cjs" "$DST"
 
-# ── 3.5 Artificial closeout: the user-visible "omni" wording the passes
-# above leave (key sentinel copy, repo refs) — docs/16 §4.
-log "artificial closeout"
-"$AR_ROOT/dashboard/patch-artificial.sh" "$DST"
-
 # ── 4. Parse gate: baseline pass-set, patch, re-check ───────────────────────
 log "baseline node --check over compiled JS"
 mapfile -t JS_FILES < <(find "$DST/.build" "$DST/public" -type d -name node_modules -prune -o \
@@ -104,9 +172,14 @@ mapfile -t JS_FILES < <(find "$DST/.build" "$DST/public" -type d -name node_modu
 PASS=/tmp/ar-rebrand-pass.$$; FAIL=/tmp/ar-rebrand-fail.$$; NOCHECK=/tmp/ar-rebrand-nocheck.$$
 trap 'rm -f "$PASS" "$FAIL" "$NOCHECK"' EXIT
 : >"$PASS"; : >"$NOCHECK"
-for f in "${JS_FILES[@]}"; do
-  if node --check "$f" >/dev/null 2>&1; then echo "$f" >>"$PASS"; else echo "$f" >>"$NOCHECK"; fi
-done
+# Parallel: ~20k files × node --check is minutes serial, seconds fanned out
+# over the cores. One line per file so the pass/no-check split stays exact.
+printf '%s\n' "${JS_FILES[@]}" | xargs -P "$(nproc)" -I{} sh -c \
+  'node --check "$1" >/dev/null 2>&1 && echo "$1" || true' _ {} \
+  | sort > "$PASS.tmp.$$" || true
+ALLF=/tmp/ar-rebrand-all.$$; printf '%s\n' "${JS_FILES[@]}" | sort > "$ALLF"
+comm -23 "$ALLF" "$PASS.tmp.$$" > "$NOCHECK"
+mv "$PASS.tmp.$$" "$PASS"; rm -f "$ALLF"
 log "baseline: $(wc -l <"$PASS") parse, $(wc -l <"$NOCHECK") don't (ESM etc. — anchored patch only)"
 
 log "applying general rebrand"
@@ -119,9 +192,8 @@ find "$DST/public" -type f \( -name '*.js' -o -name '*.html' -o -name '*.css' -o
 
 log "re-checking parse gate"
 : >"$FAIL"
-while IFS= read -r f; do
-  node --check "$f" >/dev/null 2>&1 || echo "$f" >>"$FAIL"
-done <"$PASS"
+# Same parallel shape as the baseline pass; failures land in $FAIL.
+xargs -P "$(nproc)" -I{} sh -c 'node --check "$1" >/dev/null 2>&1 || echo "$1"' _ {} < "$PASS" >> "$FAIL" || true
 
 if [ -s "$FAIL" ]; then
   log "gate rejected $(wc -l <"$FAIL") file(s) — restoring originals, applying anchored patch"
@@ -172,28 +244,67 @@ for pkg in onnxruntime-node onnxruntime-web onnxruntime-common @huggingface @atj
 done
 log "ONNX prune: $((BEFORE_KB - $(du -sk "$DST" | cut -f1))) KB lighter — dist is $(du -sh "$DST" | cut -f1)"
 
-log "boot smoke on :$PORT"
+log "boot smoke on :$PORT (base path $BASE_PATH)"
 systemd-run --user --collect --unit="$SMOKE_UNIT" \
   --property=WorkingDirectory="$DST" \
   --setenv=PORT="$PORT" --setenv=HOSTNAME=127.0.0.1 \
   --setenv=DATA_DIR="$DATA_DIR" \
-  node "$DST/peer-stamp-launcher.cjs" >/dev/null 2>&1 || die "systemd-run failed"
+  node "$DST/dev/run-standalone.mjs" >/dev/null 2>&1 || die "systemd-run failed"
 trap "systemctl --user stop '$SMOKE_UNIT' >/dev/null 2>&1 || true; rm -f '$PASS' '$FAIL' '$NOCHECK'" EXIT
 ok=0
 for _ in $(seq 1 30); do
-  if curl -sf -m 3 "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then ok=1; break; fi
+  if curl -sf -m 3 "http://127.0.0.1:$PORT$BASE_PATH/healthz" >/dev/null 2>&1; then ok=1; break; fi
   sleep 1
 done
 [ "$ok" = 1 ] || { journalctl --user -u "$SMOKE_UNIT" -n 30 --no-pager >&2 || true; die "dashboard did not come up"; }
 
-MANIFEST_NAME=$(curl -sf -m 5 "http://127.0.0.1:$PORT/manifest.webmanifest" | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])' 2>/dev/null || echo MISSING)
+MANIFEST_NAME=$(curl -sf -m 5 "http://127.0.0.1:$PORT$BASE_PATH/manifest.webmanifest" | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])' 2>/dev/null || echo MISSING)
 [ "$MANIFEST_NAME" = "Artificial Route" ] || die "manifest name is '$MANIFEST_NAME', expected 'Artificial Route'"
 
-LOGIN=$(curl -sf -m 10 "http://127.0.0.1:$PORT/login" 2>/dev/null || true)
+LOGIN=$(curl -sf -m 10 "http://127.0.0.1:$PORT$BASE_PATH/login" 2>/dev/null || true)
 case "$LOGIN" in
   *"Artificial Route"*) : ;;
   *) die "login page does not mention Artificial Route" ;;
 esac
 
 systemctl --user stop "$SMOKE_UNIT" >/dev/null 2>&1 || true
+
+# ── 6. Security fingerprint gate (docs/41 §7 control 14) ───────────────────
+# The dist this pipeline publishes must not carry the two advisory paths the
+# 2026-10-07 build carried. Both checks are fingerprints OF THE VULNERABLE
+# COMPILED SHAPE — not version guesses, and not identifier hunts (minifiers
+# rename identifiers; they cannot rewrite string literals or restructure an
+# inlined branch). Both validated in both directions 2026-10-22: each matches
+# dashboard/dist (2026-10-07, v3.8.52) and neither matches the v3.8.53 rebuild.
+#
+#   GHSA-66vh-35g3-78qv — the Redis-hit short-circuit that authorized an API
+#   key from the cache alone (.get on the `auth:api_key:` key, return BEFORE
+#   the SQLite read). Upstream fix 709a00a2ca deleted the entire read path;
+#   post-fix the key is only ever .set() after a SQLite confirmation or
+#   .del() on revoke — a .get() on it IS the vulnerability.
+#
+#   GHSA-3fxv-j4h8-9mgg — the OAuth relay callback compared state only when
+#   the callback supplied one, so a code with NO state was accepted as the
+#   operator's active attempt (account-linking CSRF). Upstream fix
+#   faed233501 inverted the check: when the active attempt carries a state,
+#   the callback must echo exactly it. The fixed bundle inlines the inverted
+#   shape and cannot match the loose pre-fix shape.
+#
+# A failure is fatal: the pipeline refuses to produce a publishable dist
+# that carries a known-vulnerable auth path.
+log "security fingerprint gate (GHSA-66vh, GHSA-3fxv)"
+G1=$(grep -rlP 'auth:api_key:\$\{[a-zA-Z0-9_$]{1,4}\}.{0,16}\.get\(' "$DST/.build/next/server/chunks" 2>/dev/null | wc -l || true)
+[ "$G1" -eq 0 ] || die "GHSA-66vh fingerprint present: the Redis-hit short-circuit (.get on auth:api_key:, return before SQLite) survives in $G1 chunk(s) — the upstream fix (709a00a2ca) did not reach this build"
+G2=$(grep -rlP 'state&&[a-zA-Z]&&[a-zA-Z]!==.{0,60}errorStateMismatch' "$DST/.build/next/server/chunks" 2>/dev/null | wc -l || true)
+[ "$G2" -eq 0 ] || die "GHSA-3fxv fingerprint present: the loose OAuth callback state check (received state required, missing supplied state accepted) survives in $G2 chunk(s) — the upstream fix (faed233501) did not reach this build"
+log "both GHSA fingerprints clear"
+
+# ── 7. Artificial closeout: the user-visible "omni" wording the passes
+# above leave (key sentinel copy, repo refs) — docs/16 §4. Runs AFTER the
+# general rebrand and AFTER the gates: its own boot smoke asserts the
+# login page says "Artificial Route", which only the general pass
+# produces, and its sk-artificial sentinel patch must see the final tree.
+log "artificial closeout"
+"$AR_ROOT/dashboard/patch-artificial.sh" "$DST"
+
 log "OK — dist rebuilt at $DST ($(du -sh "$DST" | cut -f1)), manifest=$MANIFEST_NAME"
