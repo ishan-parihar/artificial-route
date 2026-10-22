@@ -61,12 +61,11 @@ they say "these reasoning models think for minutes".
 
 ### VPS deployment (2026-10-22)
 
-`~/.config/ar/ar.env` on racknerd gains:
+`~/.config/ar/ar.env` on racknerd now carries (with `ar.env.bak-20261022-idle`
+preserved first):
 
 ```
-# docs/42: reasoning models pause >120s mid-body while they think (nvidia
-# z-ai/glm-5.3, stepfun-ai/step-5-preview). 300s covers observed pauses; a
-# genuinely dead socket still cannot outwait the 150s stream deadline.
+AR_STREAM_TIMEOUT_SECS=large-stack=600
 AR_IDLE_BODY_TIMEOUT_SECS=300
 ```
 
@@ -112,12 +111,21 @@ change settled in, and rises with thinking-heavy usage.
 
 - `cargo test -p ar-exec --lib`: 223 passed (3 new tests for the env parse:
   set, garbage, empty/unset).
+- `cargo test --workspace --no-fail-fast`: **2317 passed, 0 failed**.
 - `cargo clippy --all-targets --all-features --locked -- -D warnings`: clean
   (two pre-existing collapsible-`if`s in `dashboard.rs` from the docs/41
   stream collapsed; no behaviour change).
-- `cargo test --workspace --no-fail-fast`: recorded below after the run.
-- VPS after deploy: journal shows no `body idle for 120s` warns after the
-  restart; a streamed large-stack request that pauses mid-body completes.
+- **VPS deploy, measured 2026-10-22 22:57–23:06 IST**: static musl build of
+  the tree at `485cf8c` installed over `aroute.bak-20261022-pre-idle`;
+  `/proc/<pid>/environ` shows `AR_IDLE_BODY_TIMEOUT_SECS=300` and
+  `AR_STREAM_TIMEOUT_SECS=large-stack=600` in the serving process.
+  Streamed probes through the afflicted lane and its head models all ended
+  at `[DONE]` with zero truncation frames: `large-stack` (served by
+  `stepfun-ai/step-5-preview`), `glm-5.3` direct, `small-stack`, and a
+  deliberate reasoning probe on `glm-5.3` (TTFB 34.1s, total 52.0s,
+  `finish_reason: stop`). Journal from the restart to +8 min: **0**
+  `body idle` / `ended early` warns (was ~13/hour before). The watchdog
+  reports `unit=active loopback=200 public=200`.
 
 ## Not done, and why
 
