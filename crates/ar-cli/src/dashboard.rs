@@ -198,6 +198,15 @@ impl LaunchEnv {
 
         // The public origin, when the operator has named one. Redirects and
         // the CSRF origin check read it.
+        //
+        // `NEXT_PUBLIC_LIVE_WS_PUBLIC_URL` is here for a measured reason
+        // (ledger **F13**, register **DASH-07**): the LiveWS client dials
+        // `ws://<hostname>:20132/live-ws` by default — a port no public
+        // ingress forwards — and `deriveLiveWsPath()` reads THIS variable to
+        // derive both the server-side mount match and the URL the handshake
+        // advertises. Without the passthrough the live request feed is dead
+        // in the browser no matter what the unit's env file says, because
+        // the variable never reaches the child.
         for key in [
             "OMNIROUTE_PUBLIC_BASE_URL",
             "INITIAL_PASSWORD",
@@ -205,6 +214,7 @@ impl LaunchEnv {
             "API_KEY_SECRET",
             "OMNIROUTE_TRUSTED_PROXIES",
             "OMNIROUTE_TRUST_PROXY",
+            "NEXT_PUBLIC_LIVE_WS_PUBLIC_URL",
         ] {
             if let Some(value) = parent.get(key)
                 && !value.trim().is_empty()
@@ -450,6 +460,32 @@ mod tests {
     fn launch_env_omits_the_base_path_entirely_for_a_root_built_dist() {
         let env = LaunchEnv::from_parent(&empty_parent(), "");
         assert!(!env.vars().contains_key("OMNIROUTE_BASE_PATH"));
+    }
+
+    #[test]
+    fn launch_env_carries_the_live_ws_public_url_when_the_parent_names_one() {
+        // Ledger F13 / DASH-07: this variable is BOTH ends of the LiveWS
+        // fix — `deriveLiveWsPath()` derives the server mount match from it
+        // and the handshake advertises it. If the verb drops it, the live
+        // feed stays dead in the browser no matter what the unit's env says.
+        let mut parent = empty_parent();
+        parent.insert(
+            "NEXT_PUBLIC_LIVE_WS_PUBLIC_URL".to_string(),
+            "wss://aroute.ishanparihar.com/dash/live-ws".to_string(),
+        );
+        let env = LaunchEnv::from_parent(&parent, "/dash");
+        assert_eq!(
+            env.vars()
+                .get("NEXT_PUBLIC_LIVE_WS_PUBLIC_URL")
+                .map(String::as_str),
+            Some("wss://aroute.ishanparihar.com/dash/live-ws")
+        );
+    }
+
+    #[test]
+    fn launch_env_omits_the_live_ws_public_url_when_the_parent_has_none() {
+        let env = LaunchEnv::from_parent(&empty_parent(), "/dash");
+        assert!(!env.vars().contains_key("NEXT_PUBLIC_LIVE_WS_PUBLIC_URL"));
     }
 
     #[test]
