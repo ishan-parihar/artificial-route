@@ -149,7 +149,9 @@ mount.
 
 **[MEASURED 2026-10-23 — the LiveWS env fix works end-to-end, not just in
 theory.]** Restarting the preview with
-`NEXT_PUBLIC_LIVE_WS_PUBLIC_URL=ws://127.0.0.1:20149/dash/live-ws`:
+`NEXT_PUBLIC_LIVE_WS_PUBLIC_URL=ws://127.0.0.1:20149/dash/live-ws`
+(the loopback spelling is what the local preview proves; the publish sets the
+public one — `wss://aroute.ishanparihar.com/dash/live-ws`, `docs/41` §2):
 - the handshake advertises it (`live.publicUrl` and `live.path` both carry
   the `/dash` spelling),
 - the server mount accepts the `/dash` spelling — `/dash/live-ws` upgrade
