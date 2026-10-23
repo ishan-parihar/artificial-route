@@ -59,13 +59,21 @@ CPU-bound parsing/serialisation, not the network.
 
 | Metric | Value |
 |---|---|
-| RSS (VmRSS) | **253 MB** (fell from 1.0 GB; swapped-out 259 MB stays in swap) |
-| CPU | falls off the peg once restore is done; healthz is a no-op |
+| RSS (VmRSS) | **106 MB** (from 1.0 GB; the earlier sample's 253 MB was mid-settle) |
+| Swap (VmSwap) | **410 MB** and **flat over 60 s** (t+15/30/45/60 s all identical) — cold pages from the boot peak, not an active leak |
+| Instantaneous CPU | **0% over a 5 s window**, state `Sl` (sleeping) — idle is genuinely idle |
 | `/dash/healthz` warm | **3–8 ms** (5 samples: 7.7, 3.2, 3.2, 4.0 ms) |
 | `/dash/dashboard` | **200 in 90 ms** |
 | Anonymous `POST /dash/v1/chat/completions` | **401** in 43 ms (gateway closed) |
 | Stalls in 3 min after settle | **0** |
 | Browser end-to-end | banner **absent**, LiveWS **CONNECTED**, client `/api/health/ping` **200** |
+
+**Attribution warning, so this is not misread:** the host's load average during this pass
+was **11.41 / 14.20 / 12.62** — but that belongs to three `python3` processes
+(206–212% CPU each, ~7.9 GB RSS each), not to aroute. For contrast on the same box:
+the **proxy** runs at **1% instantaneous CPU / 88 MB RSS**, comfortably inside the
+21.7 MB idle budget's order of magnitude (peak 148 MB under load is its own VmHWM).
+The dashboard is the expensive half, and the proxy is not the problem. |
 
 ### Verdict, honestly
 
