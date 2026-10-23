@@ -20,13 +20,34 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
 
-// Resolve the upstream checkout RELATIVE TO THIS SCRIPT, not the cwd: the
-// packager is invoked by rebrand-dist.sh from an arbitrary directory, and a
-// cwd-relative path silently picked up nothing (the first attempt resolved
-// `artificial-route/external-repos/…`, which does not exist).
+// Paths are resolved RELATIVE TO THIS SCRIPT (rebrand-dist.sh may run from
+// an arbitrary cwd), and the upstream checkout is overridable: an explicit
+// argument wins, because rebrand-dist.sh passes its own $OMNI_ROOT (which the
+// operator can redirect, and which is the same tree the dist is copied from).
+// Deriving a different path here would compile the worker from a different
+// checkout than the dist it lands in, so the default is only a fallback.
+//
+// Usage: node build-calllog-worker.mjs [upstreamRoot] <output.js>
+//
+// The two-argument form (used by rebrand-dist.sh) is told apart from the
+// one-argument stand-alone form by the suffix of the second-to-last argument:
+// an OUTPUT ends in .js, an UPSTREAM ROOT never does. Deciding by position
+// alone silently mis-parsed one of the two forms, so the suffix decides.
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const AR_ROOT = path.resolve(HERE, "..");
-const REPO = path.resolve(AR_ROOT, "../external-repos/OmniRoute");
+const argv = process.argv.slice(2);
+const isOutputPath = (p) => /\.(?:cjs|mjs|js)$/i.test(p);
+const upstreamArg = argv.length >= 2 && !isOutputPath(argv[argv.length - 2]) ? argv[argv.length - 2] : null;
+const out = argv[argv.length - 1];
+if (!out) {
+  console.error("usage: node build-calllog-worker.mjs [upstreamRoot] <output.js>");
+  process.exit(2);
+}
+const REPO = path.resolve(
+  // A relative upstream root follows shell convention (resolve from the cwd);
+  // an omitted one falls back to the sibling of the script's parent directory.
+  upstreamArg ?? path.join(AR_ROOT, "../external-repos/OmniRoute"),
+);
 const SRC_ROOT = path.join(REPO, "src");
 
 // Fail loudly rather than deep inside esbuild: the packager's two hard inputs
@@ -67,11 +88,9 @@ const alias = {
   "@omniroute/open-sse": path.resolve(REPO, "open-sse"),
 };
 
-const out = process.argv[2];
-if (!out) {
-  console.error("usage: node build-calllog-worker.mjs <output.js>");
-  process.exit(2);
-}
+// The output directory does not exist in a freshly copied dist (src/ is this
+// fix's own addition), so it is created rather than letting the write fail.
+fs.mkdirSync(path.dirname(path.resolve(out)), { recursive: true });
 
 await build({
   entryPoints: [path.join(SRC_ROOT, "lib/usage/callLogArtifactWorker.ts")],
@@ -98,5 +117,43 @@ await build({
   // Keep names readable in stack traces; size is irrelevant at this scale.
   minify: false,
   sourcemap: false,
-  logLevel: "info",
+  // No absolute build path ends up in the comment headers. See the post-pass
+  // below for why that is a normalisation step rather than an esbuild option.
+  logLevel: "warning",
 });
+
+// esbuild has no option to suppress the per-module provenance banners it emits
+// inside each __commonJS wrapper (`// <path-to-source>.ts`). Those paths are
+// computed RELATIVE TO THE OUTFILE, so the banner text — and therefore the
+// output hash — changes with where (and from which cwd) the bundle is written:
+// the repo build lands in $DST/src/lib/usage while an ad-hoc build lands in a
+// scratch dir, and the two never matched. They also ship the build machine's
+// absolute path inside a file that runs in a user's home directory. So the
+// banner lines are dropped and the result asserted clean and stable.
+//
+// Only FULL-LINE comments are matched, so a path that happened to appear inside
+// a string literal or a trailing comment is left alone.
+function stripModulePathHeaders(file) {
+  const lines = fs.readFileSync(file, "utf8").split("\n");
+  const kept = lines.filter((line) => !/^\/\/ \S*\.(ts|tsx|js|jsx|mjs|cjs)(#\S+)?$/.test(line));
+  const removed = lines.length - kept.length;
+  if (removed > 0) {
+    fs.writeFileSync(file, kept.join("\n"));
+  }
+  return removed;
+}
+
+const removed = stripModulePathHeaders(out);
+if (removed > 0) {
+  process.stdout.write(`[calllog-worker] normalised ${removed} esbuild path banner(s)\n`);
+}
+
+// A leaked absolute path is a real defect (it ships the builder's home layout),
+// so it fails the build rather than being noticed later by a reader. The check is
+// deliberately narrow: the bundle legitimately carries esbuild's `__toESM`
+// explanatory comments, so "no // at all" would false-positive on a correct
+// bundle. What must not appear is a whole-line banner carrying a path.
+if (fs.readFileSync(out, "utf8").match(/^\/\/ \S*\//m)) {
+  console.error("[calllog-worker] FATAL: the bundle still carries an absolute-path banner");
+  process.exit(1);
+}

@@ -142,7 +142,11 @@ fi
 # {relPath,sizeBytes,sha256} and writes the artifact at 0600 under
 # $DATA_DIR/call_logs/<date>/.
 log "compiling the call-log artifact worker into the dist"
-node "$AR_ROOT/dashboard/build-calllog-worker.mjs" \
+# $OMNI_ROOT is passed through explicitly: the operator can redirect it, and
+# everything else in this script (the copy, the base-path patcher) reads that
+# same tree. Deriving the path inside the packager instead would let the worker
+# be compiled from a different checkout than the dist it lands in.
+node "$AR_ROOT/dashboard/build-calllog-worker.mjs" "$OMNI_ROOT" \
   "$DST/src/lib/usage/callLogArtifactWorker.js" \
   || die "could not compile the call-log artifact worker"
 [ -s "$DST/src/lib/usage/callLogArtifactWorker.js" ] \
