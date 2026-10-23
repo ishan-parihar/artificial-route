@@ -136,15 +136,41 @@ socket):
 |---|---|---|---|
 | Responses-WS `/v1/responses` | proxy matched (`Upgrade: ftp` → its own **426**), then the handshake dies at the auth bridge | falls through to Next's upgrade listener → socket hang-up, no response | **broken at root, absent at /dash** |
 | Responses-WS internal bridge `/api/internal/codex-responses-ws` | POST → **404** | POST → **403** (route exists, denies without the bridge secret) | the proxy asks at the wrong place — `callInternal` POSTs `INTERNAL_ROUTE` root-relative (`responses-ws-proxy.mjs:29,411`) |
-| LiveWS `/live-ws` via :20149 | **101 open** | timeout | server relay works; `LIVE_WS_PATH` match is basePath-blind |
+| LiveWS `/live-ws` via :20149 | **101 open** | timeout | server relay works; `LIVE_WS_PATH` match is basePath-blind — **but see the env fix, proven below** |
 | LiveWS direct `:20132` | **101 open** | n/a (the client default dials `ws://<hostname>:20132/live-ws`, chunk `1u-n6dhbqfml9.js`) | works same-host; **unreachable behind the tunnel** (the port is never forwarded) |
 | Traffic-inspector `/api/tools/traffic-inspector/ws` | **404** (client hardcodes root, chunk `4273mqo-xu5m0.js`) | GET → **426** (handler exists) but a real upgrade **hangs with zero bytes** | **dead in standalone mode regardless of base path** — the handler writes 101 on `e.socket`, which an App Router request never exposes |
-| Request-streaming `/v1/ws` (advertised by the handshake route) | upgrade → **handshake timeout** | upgrade → **socket hang-up** | **dead in standalone regardless of base path** — the route only answers handshake JSON (200/401) or 426; NO handler in the dist mounts its upgrade (rg `v1/ws` in `server-ws.mjs`/`responses-ws-proxy.mjs`/`run-standalone.mjs` → zero hits) |
+| Request-streaming `/v1/ws` (advertised by the handshake route) | upgrade → **handshake timeout** (both root spellings `/v1/ws` and `/api/v1/ws`) | upgrade → **socket hang-up** (both `/dash/v1/ws` and `/dash/api/v1/ws`) | **dead in standalone regardless of base path** — the route only answers handshake JSON (200/401) or 426; NO handler in the dist mounts its upgrade (rg `v1/ws` in `server-ws.mjs`/`responses-ws-proxy.mjs`/`run-standalone.mjs` → zero hits) |
 
-**Net: on the `/dash` publish, none of the four WS surfaces works from a
-browser.** On a root-mounted dist, LiveWS works same-host and responses-WS
-would work with credentials once its bridge path is right; the streaming
-`/v1/ws` and the traffic inspector are dead at any mount.
+**Net: on the `/dash` publish, without the LiveWS env, none of the four WS
+surfaces works from a browser.** On a root-mounted dist, LiveWS works
+same-host and responses-WS would work with credentials once its bridge path
+is right; the streaming `/v1/ws` and the traffic inspector are dead at any
+mount.
+
+**[MEASURED 2026-10-23 — the LiveWS env fix works end-to-end, not just in
+theory.]** Restarting the preview with
+`NEXT_PUBLIC_LIVE_WS_PUBLIC_URL=ws://127.0.0.1:20149/dash/live-ws`:
+- the handshake advertises it (`live.publicUrl` and `live.path` both carry
+  the `/dash` spelling),
+- the server mount accepts the `/dash` spelling — `/dash/live-ws` upgrade
+  → **101 open** (the root spelling now times out: `deriveLiveWsPath()`
+  derives the match from the env, exactly as the code promised), and
+- the full browser chain connects: headless Chromium on `/dash` ran the
+  hook's own sequence — `fetch('/api/v1/ws?handshake=1')` → read
+  `live.publicUrl` → `new WebSocket(url)` → **CONNECTED**.
+
+**[POSITIVE FINDING 2026-10-23 — two live streams DO work on `/dash`, over
+SSE.]** The shim fix patches `EventSource` as well as `fetch` (the same
+`installBasePathFetch` wrapper), and both SSE surfaces in the bundle respond
+on the `/dash` mount:
+- `/dash/api/gamification/stream` → **200**, `content-type: text/event-stream`,
+  emitting real `data:` frames (leaderboard updates),
+- `/dash/api/services/cliproxy/logs` → **200**, emitting `event: snapshot`
+  frames (the services log tail).
+So the publish note is not "all live features broken": with the LiveWS env
+set, the live request feed works, and the leaderboard + services-log streams
+work over SSE; what remains broken is responses-WS, the traffic inspector,
+and the streaming `/v1/ws`.
 
 **Fixes, cheapest first (ours, env-only):** set
 `NEXT_PUBLIC_LIVE_WS_PUBLIC_URL=wss://aroute.ishanparihar.com/dash/live-ws` —
@@ -249,13 +275,18 @@ Measured 2026-10-22 from `/proc` (VmRSS / VmHWM / VmSwap):
 | Process | RSS | Peak (VmHWM) | Swap |
 |---|---|---|---|
 | aroute proxy (pid 3070309) | 138 MB under load (idle budget 21.7 MB per docs/00) | 194 MB | 29 MB |
-| dashboard node (pid 513267) | 379–433 MB | **653 MB** | 224 MB |
+| dashboard node (pid 513267, pre-restart, no heap cap) | 379–433 MB | **653 MB** | 224 MB |
+| dashboard node (post-restart child, `--max-old-space-size=1024`) | 438 MB | 552 MB | — |
 
 The dashboard costs **~20× the proxy's idle budget**. Levers, ranked:
 
-1. **`OMNIROUTE_MEMORY_MB` was never set on the preview** — the wrapper
-   defaulted `--max-old-space-size=4096` on a 47 GiB host. Set 512–1024 to
-   cap V8's heap growth (the verb already defaults to 1024).
+1. **`OMNIROUTE_MEMORY_MB` was never set on the preview — FIXED LIVE 2026-10-22:**
+   the restart set it to 1024 (`NODE_OPTIONS=--max-old-space-size=1024`
+   verified in `/proc`), and the post-restart peak dropped 653 → 552 MB
+   with idle RSS unchanged (~438 MB) — the cap bounds the ceiling, and the
+   boot RSS (the ~400 MB floor) needs the deeper V8/compiler levers below.
+   (The wrapper originally defaulted `--max-old-space-size=4096` on a 47 GiB
+   host; the verb already defaults to 1024.)
 2. **`MemoryMax`/`MemoryHigh` are `infinity` on the preview unit** — the
    docs/41 guard (1536M/1280M) was never applied to it. Apply it to any
    long-lived unit.
