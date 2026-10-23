@@ -123,6 +123,33 @@ if [ -f "$SRC/BUILD_OMNIROUTE_BASE_PATH" ]; then
   cp "$SRC/BUILD_OMNIROUTE_BASE_PATH" "$DST/BUILD_OMNIROUTE_BASE_PATH"
 fi
 
+# ── 1.7 The call-log artifact worker must be a standalone file in the dist ──
+# The compiled writer resolves its worker thread through four candidates
+# (see dashboard/build-calllog-worker.mjs). The first is
+# <moduleDir>/callLogArtifactWorker.js, where moduleDir is traced from the
+# bundled writer chunk and lands under $DST/src/lib/usage. A dist that ships no
+# `src/` tree — and no tsx for the .ts candidates — resolves NONE of them, so
+# every artifact write died with "Cannot find module …callLogArtifactWorker.js"
+# and the queue silently dropped full request/response bodies (71 journal lines
+# in one session; the detail view then renders "missing" for every row).
+#
+# Shipping the FIRST candidate fixes it and leaves the tsx/execArgv paths
+# unreachable, so the dist stays tsx-free. The worker's whole closure imports
+# only node builtins plus one type-only open-sse import (erased by esbuild), so
+# the bundle is self-contained: only node:fs/node:path/node:worker_threads stay
+# external. Verified end-to-end: spawned as the writer spawns it
+# (new Worker(pathToFileURL), no execArgv), it replies
+# {relPath,sizeBytes,sha256} and writes the artifact at 0600 under
+# $DATA_DIR/call_logs/<date>/.
+log "compiling the call-log artifact worker into the dist"
+node "$AR_ROOT/dashboard/build-calllog-worker.mjs" \
+  "$DST/src/lib/usage/callLogArtifactWorker.js" \
+  || die "could not compile the call-log artifact worker"
+[ -s "$DST/src/lib/usage/callLogArtifactWorker.js" ] \
+  || die "the call-log artifact worker bundle is missing or empty"
+node --check "$DST/src/lib/usage/callLogArtifactWorker.js" \
+  || die "the call-log artifact worker bundle is not parseable CJS"
+
 # ── 2. Targeted PWA manifest patches (before the general pass so short_name
 #       becomes "aroute" rather than the long form) ───────────────────────────
 log "patching PWA manifest"
