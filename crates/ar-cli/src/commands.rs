@@ -2069,7 +2069,108 @@ fn import_config(args: &ImportArgs) -> anyhow::Result<()> {
 /// `custom_providers:` section for ad-hoc chat nodes, and the `AR_KEY_*`
 /// values in the env file the service loads — and leaves every other section
 /// byte-for-byte. The proxy builds its routing tables at boot, so a sync that
-/// changed anything restarts `aroute.service` (unless `--no-restart`).
+/// changed anything restarts `aroute.service` (unless `--no-restart`, and
+/// `--dry-run` writes nothing at all — ledger **F16** / register **DASH-10**).
+/// Prints what a sync WOULD change, writing nothing (ledger F16 / DASH-10).
+///
+/// A unified diff per file, in the same order `sync_config` writes them:
+/// the config first, then the env file. The env plan is computed by the same
+/// `sync_env_file` walk with writes suppressed — the counts are the real
+/// planned counts, not a second implementation that could disagree.
+///
+/// Deliberately dependency-free (std only): `similar` is in `Cargo.lock` but
+/// not a dependency of this crate, and a `--dry-run` is not worth adding a
+/// workspace edge for. Line diff over `\n`, which is what these files are.
+fn print_sync_plan(
+    config_path: &Path,
+    doc: &str,
+    next: &str,
+    env_path: &Path,
+    db: &Path,
+    doc_for_env: &str,
+) -> anyhow::Result<()> {
+    println!("dry run: what `aroute sync` would change — nothing was written");
+    println!();
+    if doc != next {
+        println!("--- {}", config_path.display());
+        println!("+++ {} (after sync)", config_path.display());
+        print_line_diff(doc, next);
+        println!();
+    } else {
+        println!("{}: unchanged", config_path.display());
+    }
+    // One computation, two consumers: the same walk the writer runs, with the
+    // write suppressed. Its counts and its planned lines are therefore the
+    // real ones, and the diff below cannot drift from a future change to the
+    // write path.
+    let plan = sync_env_file(env_path, db, doc_for_env, true)?;
+    if plan.changed {
+        let before = std::fs::read_to_string(env_path).unwrap_or_default();
+        println!("--- {}", env_path.display());
+        println!("+++ {} (after sync)", env_path.display());
+        print_line_diff(&before, &format!("{}\n", plan.lines.join("\n")));
+        println!();
+    } else {
+        println!("{}: no env changes", env_path.display());
+    }
+    Ok(())
+}
+
+/// Minimal line diff: context-free, `-`/`+` only, added and removed lines.
+/// Enough for an operator to decide whether to apply a sync; not a Myers
+/// implementation, and it does not need to be.
+fn print_line_diff(before: &str, after: &str) {
+    let a: Vec<&str> = before.lines().collect();
+    let b: Vec<&str> = after.lines().collect();
+    // Longest-common-subsequence over the two line vectors, so a moved block
+    // reads as one removal plus one addition rather than a full-file rewrite.
+    let n = a.len();
+    let m = b.len();
+    // `lcs[i][j]` is the LCS length of `a[i..]` and `b[j..]`. Truncated to
+    // `usize` because these files are thousands of lines, not millions — a
+    // quadratic table is fine at this size and keeps the code obvious.
+    let mut lcs = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            lcs[i][j] = if a[i] == b[j] {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if a[i] == b[j] {
+            i += 1;
+            j += 1;
+        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+            println!("-{a}", a = a[i]);
+            i += 1;
+        } else {
+            println!("+{b}", b = b[j]);
+            j += 1;
+        }
+    }
+    while i < n {
+        println!("-{a}", a = a[i]);
+        i += 1;
+    }
+    while j < m {
+        println!("+{b}", b = b[j]);
+        j += 1;
+    }
+}
+
+/// `aroute sync` — the dashboard's integrated DB is the config surface; this
+/// verb is the bridge onto the routing engine.
+///
+/// Rewrites exactly what the dashboard owns — the `combos:` section, the
+/// `custom_providers:` section for ad-hoc chat nodes, and the `AR_KEY_*`
+/// values in the env file the service loads — and leaves every other section
+/// byte-for-byte. The proxy builds its routing tables at boot, so a sync that
+/// changed anything restarts `aroute.service` (unless `--no-restart` prints
+/// the command instead, or `--dry-run` writes nothing — see `print_sync_plan`).
 fn sync_config(cli: &Cli, args: &SyncArgs) -> anyhow::Result<()> {
     let dir = cli.config.parent().unwrap_or_else(|| Path::new("."));
     let db = args
@@ -2150,11 +2251,15 @@ fn sync_config(cli: &Cli, args: &SyncArgs) -> anyhow::Result<()> {
         next = splice_section(&next, "limits", &import::limits::render(&limits));
     }
     let config_changed = next != doc;
-    if config_changed {
+    if args.dry_run {
+        print_sync_plan(&cli.config, &doc, &next, &env_path, &db, &next)?;
+    } else if config_changed {
         write_file(&cli.config, &next)?;
     }
 
-    let (materialised, ensured, env_changed) = sync_env_file(&env_path, &db, &next)?;
+    let env_plan = sync_env_file(&env_path, &db, &next, args.dry_run)?;
+    let (materialised, ensured, env_changed) =
+        (env_plan.materialised, env_plan.ensured, env_plan.changed);
 
     let rows: Vec<Row> = combos
         .iter()
@@ -2192,6 +2297,13 @@ fn sync_config(cli: &Cli, args: &SyncArgs) -> anyhow::Result<()> {
     // rather than a command plus a reminder the operator has to remember.
     if !config_changed && !env_changed {
         println!("service: nothing changed — aroute.service left untouched");
+    } else if args.dry_run {
+        // Nothing was written, so there is nothing to apply; say so instead of
+        // printing a restart command the operator would wrongly run as if a
+        // real sync had happened.
+        println!(
+            "dry run: no files written, no service touched — re-run without --dry-run to apply"
+        );
     } else if args.no_restart {
         println!(
             "note: apply with `systemctl --user restart aroute.service` (or your deployment's restart)"
@@ -2303,6 +2415,17 @@ fn add_missing_custom_key_refs(doc: &str, custom: &[ar_registry::CustomProvider]
         out.push(line.to_owned());
     }
     out.join("\n") + "\n"
+}
+
+/// What `sync_env_file` planned for the env file: the counts the caller
+/// reports, and the resulting lines so a dry run diffs the SAME plan the
+/// writer would have written. Ledger **F16** / DASH-10: the dry run and the
+/// write must not be able to disagree, so they share one computation.
+struct EnvPlan {
+    materialised: usize,
+    ensured: usize,
+    changed: bool,
+    lines: Vec<String>,
 }
 
 /// Materialises provider keys into the env file, then guarantees every
@@ -2424,7 +2547,12 @@ fn sync_credentials(doc: &str, db: &Path) -> anyhow::Result<String> {
     Ok(out)
 }
 
-fn sync_env_file(env_path: &Path, db: &Path, doc: &str) -> anyhow::Result<(usize, usize, bool)> {
+fn sync_env_file(
+    env_path: &Path,
+    db: &Path,
+    doc: &str,
+    dry_run: bool,
+) -> anyhow::Result<EnvPlan> {
     let conn = rusqlite::Connection::open_with_flags(
         db,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
@@ -2515,7 +2643,7 @@ fn sync_env_file(env_path: &Path, db: &Path, doc: &str) -> anyhow::Result<(usize
         }
     }
     let changed = materialised + ensured > 0;
-    if changed {
+    if changed && !dry_run {
         write_private(env_path, &(lines.join("\n") + "\n")).map_err(|e| {
             fail(
                 format!("cannot write {}: {e}", env_path.display()),
@@ -2523,7 +2651,12 @@ fn sync_env_file(env_path: &Path, db: &Path, doc: &str) -> anyhow::Result<(usize
             )
         })?;
     }
-    Ok((materialised, ensured, changed))
+    Ok(EnvPlan {
+        materialised,
+        ensured,
+        changed,
+        lines,
+    })
 }
 
 /// Writes a file that holds credentials: staged at `0600` from its first byte,
@@ -2826,6 +2959,7 @@ mod tests {
                 db: Some(db),
                 env: Some(env.clone()),
                 no_restart: true,
+                dry_run: false,
             },
         )
         .unwrap();
@@ -2903,6 +3037,114 @@ mod tests {
             "a referenced var with no connection was not ensured empty:\n{envdoc}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_dry_run_should_write_nothing_when_changes_are_pending() {
+        // Ledger F16 / DASH-10: the hazard was an operator inspecting the
+        // bridge and silently rewriting their routing config. The fix has to
+        // be observable: same computation, no bytes on disk.
+        let dir = tmpdir("sync-dry-run");
+        let db = dir.join("storage.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE provider_connections (id TEXT PRIMARY KEY, provider TEXT, \
+                 api_key TEXT, is_active INTEGER, priority INTEGER, created_at TEXT); \
+                 CREATE TABLE combos (id TEXT PRIMARY KEY, strategy TEXT, targets TEXT);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO provider_connections (id, provider, api_key, is_active, priority, created_at) \
+                 VALUES ('d1', 'nvidia', 'nvapi-live', 1, 1, '2024-01-01')",
+                [],
+            )
+            .unwrap();
+            drop(conn);
+        }
+        let config = dir.join("config.yaml");
+        let original = "keys:\n  nvidia: $AR_KEY_NVIDIA\nproviders:\n  - id: nvidia\n    key: nvidia\ncombos:\n  - id: old\n    strategy: priority\n    targets:\n      - nvidia/z-ai/glm-5.3\n";
+        std::fs::write(&config, original).unwrap();
+        let env = dir.join("ar.env");
+        std::fs::write(&env, "AR_KEY_NVIDIA=stale\n").unwrap();
+        let env_before = std::fs::read_to_string(&env).unwrap();
+
+        let cli = Cli {
+            config: config.clone(),
+            command: None,
+        };
+        sync_config(
+            &cli,
+            &SyncArgs {
+                db: Some(db),
+                env: Some(env.clone()),
+                no_restart: false,
+                dry_run: true,
+            },
+        )
+        .expect("a dry run must not fail on a writable fixture");
+
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            original,
+            "the config must be byte-identical after a dry run"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&env).unwrap(),
+            env_before,
+            "the env file must be byte-identical after a dry run — this is the whole point"
+        );
+    }
+
+    #[test]
+    fn sync_dry_run_should_report_pending_changes_without_restarting_the_service() {
+        // The dry run must still SAY what it would do (a silent no-op would be
+        // useless), and it must never restart aroute.service.
+        let dir = tmpdir("sync-dry-run-report");
+        let db = dir.join("storage.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE provider_connections (id TEXT PRIMARY KEY, provider TEXT, \
+                 api_key TEXT, is_active INTEGER, priority INTEGER, created_at TEXT);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO provider_connections (id, provider, api_key, is_active, priority, created_at) \
+                 VALUES ('r1', 'groq', 'gsk-live', 1, 1, '2024-01-01')",
+                [],
+            )
+            .unwrap();
+            drop(conn);
+        }
+        let config = dir.join("config.yaml");
+        std::fs::write(&config, "keys:\n  groq: $AR_KEY_GROQ\nproviders:\n  - id: groq\n    key: groq\n").unwrap();
+        let env = dir.join("ar.env");
+        // The live value differs, so the env has a pending change to report.
+        std::fs::write(&env, "AR_KEY_GROQ=stale\n").unwrap();
+
+        let cli = Cli {
+            config,
+            command: None,
+        };
+        // `systemctl` is not on the test PATH-controlled command list; if the
+        // dry run ever tried to restart the service this would fail or be
+        // observable, so asserting success is also asserting no restart.
+        sync_config(
+            &cli,
+            &SyncArgs {
+                db: Some(db),
+                env: Some(env.clone()),
+                no_restart: false,
+                dry_run: true,
+            },
+        )
+        .expect("a dry run must succeed without touching the service");
+        assert_eq!(
+            std::fs::read_to_string(&env).unwrap(),
+            "AR_KEY_GROQ=stale\n",
+            "the stale value must still be on disk after the dry run"
+        );
     }
 
     #[test]
@@ -4155,6 +4397,7 @@ models\":[{\"kind\":\"model\",\"model\":\"nvidia/z-ai/glm-5.3\",\"providerId\":\
                 db: Some(db),
                 env: Some(env),
                 no_restart: true,
+                dry_run: false,
             },
         )
         .unwrap();

@@ -619,4 +619,12 @@ pub struct SyncArgs {
     /// not disturb in-flight traffic.
     #[arg(long)]
     pub no_restart: bool,
+
+    /// Show what WOULD change and write nothing. Ledger **F16** / register
+    /// **DASH-10**: `--no-restart` only skips the service restart — the files
+    /// are still rewritten — so an operator inspecting the bridge silently
+    /// mutated their routing config. This computes the same output and prints
+    /// a unified diff per file instead of writing them.
+    #[arg(long, conflicts_with = "no_restart")]
+    pub dry_run: bool,
 }

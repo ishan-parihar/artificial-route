@@ -8,6 +8,9 @@ over-engineering, entropy, fragmentation and implementation gaps.
 
 Companion to the surface audit: [`2026-10-22-dashboard-surface-audit.md`](2026-10-22-dashboard-surface-audit.md).
 Ledger rows **F14–F16**, register rows **DASH-08…DASH-11** are new here.
+**Same-day update:** the `sync --dry-run` gap (R2 / ledger **F16** / **DASH-10**) was
+fixed in the pass that followed this writing — see the R2 row and F16 for the
+measured proof. It read as a gap at the time of writing, and reads as fixed now.
 
 ---
 
@@ -42,7 +45,7 @@ Measured live from `/proc` and the unit journal, 2026-10-23, restored dist with
 
 | Metric | Value | Note |
 |---|---|---|
-| Boot stall count | **44** event-loop stalls, magnitudes **21.1–55.8 s** | all logged with `inflight=0` — **synchronous CPU work, not awaited I/O** |
+| Boot stall count | **46** event-loop stalls, magnitudes **21.1–55.8 s** | every single one logged `inflight=0` (46 of 46, counted from the journal) — **synchronous CPU work, not awaited I/O** |
 | Peak RSS (VmHWM) | **1 466 428 kB (1.43 GB)** | the 1024 MB V8 cap is exceeded by **RSS**, not the heap |
 | Peak RSS wall time | ~8 min of pegged CPU before it settled | `ps`: 87–95% CPU, single core |
 | First-request `/dash/healthz` | 200 in **59.6 s** | Next route compilation on top of the restore |
@@ -70,10 +73,13 @@ CPU-bound parsing/serialisation, not the network.
 
 **Attribution warning, so this is not misread:** the host's load average during this pass
 was **11.41 / 14.20 / 12.62** — but that belongs to three `python3` processes
-(206–212% CPU each, ~7.9 GB RSS each), not to aroute. For contrast on the same box:
-the **proxy** runs at **1% instantaneous CPU / 88 MB RSS**, comfortably inside the
-21.7 MB idle budget's order of magnitude (peak 148 MB under load is its own VmHWM).
-The dashboard is the expensive half, and the proxy is not the problem. |
+(206–212% CPU each, ~7.9 GB RSS each), not to aroute. The honest comparison on the
+same box, each process measured separately: **the proxy runs 1% instantaneous CPU /
+88 MB RSS** (peak 148 MB) — which is *not* the 21.7 MB idle figure from `docs/00`,
+that is an **active-serving** measurement and the budget is an idle one; compare it
+to the proxy's own under-load figure of 138 MB / 194 MB peak from the surface audit
+rather than to the idle budget. **The dashboard is the expensive half** and the Rust
+half is not the problem. |
 
 ### Verdict, honestly
 
@@ -130,7 +136,7 @@ whether anyone intended that or not.
 | # | Gap | Evidence | Impact |
 |---|---|---|---|
 | **R1** | **The call-log artifact worker was never traced into the dist** | journal: `[callLogs] Call-log artifact worker failed: Cannot find module '/home/ishanp/.config/ar/dashboard/src/lib/usage/callLogArtifactWorker.js'` — every 30 s. The file exists only as `.ts` in the sibling OmniRoute checkout (`src/lib/usage/callLogArtifactWorker.ts`), and the candidate resolver (`chunks/src_0ln7259._.js`) probes `callLogArtifactWorker.js` next to the chunk, then 3 source-relative paths, then `.ts` + tsx — none of which exist in a standalone | **call-log detail artifacts are never persisted** on any installed dist. The queue is capped (128) and the warn is throttled to 1/30 s, so it degrades silently rather than failing loudly |
-| **R2** | **`sync` has no dry-run** | `aroute sync --help`: `--no-restart` prints the restart command but the files are still rewritten | 170 lines were pruned on my exploratory run. An operator exploring the bridge silently rewrites their routing config. A `--dry-run` is the obvious missing row |
+| **R2** | **`sync` had no dry-run — FIXED LATER THE SAME DAY** | `aroute sync --help`: `--no-restart` prints the restart command but the files are still rewritten | 170 lines were pruned on my exploratory run. An operator exploring the bridge silently rewrites their routing config. **Fixed (ledger F16 / DASH-10):** `--dry-run` landed and was measured on the operator's own `~/.config/ar/` pair — it printed the full pruning, reported the real counts, and left **both files byte-identical**; it refuses to combine with `--no-restart` and closes with *no files written, no service touched*. One shared `EnvPlan` walk means the preview and the write cannot drift. |
 | **R3** | **`NEXT_PUBLIC_LIVE_WS_PUBLIC_URL` was dropped by our own launcher** | absent from `dashboard.rs`'s passthrough list before this pass; `strings` on the shipped binary had 0 occurrences | the one variable that revives LiveWS (docs/41 control 15) **did nothing** when launched by the verb. Fixed + 2 regression tests |
 | **R4** | **The dist-resolution chain silently prefers a stale copy** | `dashboard.rs:100-121` guesses `$AR_DASHBOARD_DIR` → dist beside the binary → `~/.config/ar/dashboard` → repo, first hit wins. `~/.config/ar/dashboard` was 15 days stale | the audit was verified against the repo dist while the unit served a different one. No staleness check, no sentinel comparison, no warning |
 | **R5** | **Provider icon catalog is basePath-blind** | client chunks carry `image:"/providers/codex.svg"` in a data object; the browser requests `/providers/*` at the ROOT while the assets exist at `/dash/providers/*` (measured: dash 200, root 404). `installBasePathFetch` patches only `globalThis.fetch`/`EventSource`, not `<img src>` | cosmetic: icons render broken on a `/dash` mount. `favicon.svg`/`icon-512.png` are **absent from the build entirely** (404 at both spellings) |
@@ -176,8 +182,8 @@ whether anyone intended that or not.
 3. **File R1 upstream** — the untraced `callLogArtifactWorker` is a vendoring gap
    (the release/standalone build drops `src/`); either trace it into the dist or drop
    the feature.
-4. **Add `--dry-run` to `sync`** (R2) and a staleness check to the dist resolution
-   (R4).
+4. **A staleness check to the dist resolution** (R4) — the last one of the five gaps
+   still open. (`--dry-run` on `sync` landed the same day, R2, ledger F16.)
 5. **If the dashboard is published**, the cosmetic 404s (R5) want the upstream icon
    fix; they do not block a local or published `/dash`.
 
