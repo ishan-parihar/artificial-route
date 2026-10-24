@@ -2385,15 +2385,29 @@ pub(crate) fn splice_section(content: &str, name: &str, rendered: &str) -> Strin
     }
 }
 
-/// A top-level YAML section header: unindented, one word, a colon, nothing
-/// else. Entry lines never match: they are indented, and a top-level scalar
-/// carries a value after the colon.
+/// A top-level YAML section header: **no indentation at all**, a colon, nothing
+/// else after it.
+///
+/// The first condition is the one that carries the whole correctness argument.
+/// YAML decides nesting by indentation alone — `keys:` and `api-keys:` are
+/// indistinguishable *to a parser* except by their key text, but the *shape*
+/// that matters here is that a body line always begins with whitespace (or is a
+/// `- ` list item, which also begins with whitespace once it is nested, and at
+/// depth 0 is only reachable as a sequence item of the section being skipped).
+///
+/// Recognizing a header by its *indentation* rather than by which characters
+/// appear in its key is what makes this safe: the previous version judged a
+/// header by scanning the key for `[a-z0-9_]`, and a real YAML key may legally
+/// contain `-` (and `.`) — so `api-keys:`, `custom-providers:` and
+/// `model-lifecycle.json:` were all invisible, the skip past a removed or
+/// replaced section never terminated, and the writer **silently deleted that
+/// section and everything after it**. See docs/36 B-1 and the two tests that
+/// reproduce it (`*_does_not_swallow_a_hyphenated_section_after_it`).
+///
+/// Entry lines never match either way: they are indented, and a top-level
+/// scalar carries a value after the colon.
 fn is_section_header(line: &str) -> bool {
-    !line.starts_with([' ', '#'])
-        && line.ends_with(':')
-        && line[..line.len() - 1]
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    !line.starts_with([' ', '#', '\t']) && line.ends_with(':') && line.len() > 1
 }
 
 /// Adds `keys:` entries for ad-hoc custom nodes the config does not reference
@@ -3167,6 +3181,36 @@ mod tests {
             out.contains("custom_providers:\n  - id: adhoc\ncombos:"),
             "definition must precede use:\n{out}"
         );
+    }
+
+    // The blocking finding from docs/36 B-1. A hyphen is a legal character in a
+    // YAML plain key, so `api-keys:` is a real section header -- but it was not
+    // recognized as one, so the skip never terminated and the writer swallowed
+    // that section AND everything after it. Written as the operator reproduced
+    // it: `limits clear` on a doc whose `api-keys:` follows the `limits:` it is
+    // asked to remove.
+    #[test]
+    fn remove_section_does_not_swallow_a_hyphenated_section_after_it() {
+        let doc = "limits:\n  default:\n    rpm: 10\napi-keys:\n  a: $AR_KEY_A\ncombos:\n  - id: c\n";
+        let out = remove_section(doc, "limits");
+        assert!(!out.contains("rpm: 10"), "the named section survived:\n{out}");
+        assert!(
+            out.contains("api-keys:\n  a: $AR_KEY_A"),
+            "the hyphenated section BEHIND the named one was eaten:\n{out}"
+        );
+        assert!(out.contains("combos:\n  - id: c"), "combos was eaten:\n{out}");
+    }
+
+    #[test]
+    fn splice_section_does_not_swallow_a_hyphenated_section_after_it() {
+        let doc = "limits:\n  default:\n    rpm: 10\napi-keys:\n  a: $AR_KEY_A\ncombos:\n  - id: c\n";
+        let out = splice_section(doc, "limits", "limits:\n  default:\n    rpm: 20\n");
+        assert!(out.contains("rpm: 20"), "not spliced:\n{out}");
+        assert!(
+            out.contains("api-keys:\n  a: $AR_KEY_A"),
+            "the hyphenated section BEHIND the named one was eaten:\n{out}"
+        );
+        assert!(out.contains("combos:\n  - id: c"), "combos was eaten:\n{out}");
     }
 
     #[test]
