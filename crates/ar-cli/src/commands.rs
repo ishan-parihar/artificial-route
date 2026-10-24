@@ -3213,6 +3213,67 @@ mod tests {
         assert!(out.contains("combos:\n  - id: c"), "combos was eaten:\n{out}");
     }
 
+    // The same bug through the real command, which is how the operator hit it.
+    // The ORDERING is the part that matters, and the part that is easy to get
+    // wrong when writing the test: the damage only happens when the hyphenated
+    // section sits AFTER the section being replaced, because that is the only
+    // layout where the skip has to terminate on the hyphenated header. Two
+    // earlier attempts at this test put `api-keys:` BEFORE `limits:` and passed
+    // against the buggy code -- precisely the false negative a regression test
+    // must be built to avoid, so the layout is asserted explicitly here.
+    #[test]
+    fn limits_set_keeps_a_hyphenated_section_that_follows_limits() {
+        let dir = tmpdir("limits-hyphen-sibling");
+        let cfg = dir.join("config.yaml");
+        // NOTE the order: `limits_cli` WRITES its own fixture to this same path,
+        // so it must be called first and the fixture written after it. Calling
+        // them the other way round silently discards the doc under test and the
+        // test passes/fails on the helper's content instead of the bug's.
+        let cli = limits_cli(&dir);
+        std::fs::write(
+            &cfg,
+            "server:\n  host: 127.0.0.1\n  port: 20129\nkeys:\n  openai: dummy\nlimits:\n  keys:\n    prod:\n      rpm: 600\napi-keys:\n  a: dummy\ncombos:\n- id: probe\n  strategy: priority\n  targets:\n  - openai/gpt-4o-mini\n  context_length: 128000\n",
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&cfg).unwrap();
+        assert!(
+            before.contains("api-keys:\n  a: dummy"),
+            "the fixture lost its hyphenated section before the command ran"
+        );
+
+        limits_set(
+            &cli,
+            &SetLimitsArgs {
+                key: Some("prod".to_owned()),
+                rpm: Some(700),
+                usd_micros: None,
+                tokens: None,
+                refuse_unpriced: None,
+                model: None,
+                model_tokens: Vec::new(),
+                spend_window: None,
+            },
+        )
+        .unwrap();
+        let after = std::fs::read_to_string(&cfg).unwrap();
+
+        assert!(
+            after.contains("api-keys:\n  a: dummy"),
+            "the hyphenated section BEHIND `limits:` was silently deleted:\n{after}"
+        );
+        assert!(
+            after.contains("combos:\n- id: probe"),
+            "`combos:` was deleted too:\n{after}"
+        );
+        assert!(after.contains("rpm: 700"), "the row did not land:\n{after}");
+        assert!(
+            after.len() >= before.len(),
+            "the file shrank ({} -> {}); content was dropped",
+            before.len(),
+            after.len()
+        );
+    }
+
     #[test]
     fn finds_every_ar_key_reference() {
         let refs = ar_key_refs("  a: $AR_KEY_NVIDIA\n  b: $AR_KEY_OPENAI_CHAT_ABC\nplain\n");
