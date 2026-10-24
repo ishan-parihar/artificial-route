@@ -1,7 +1,7 @@
 # The config-write surface: an outline-plan for closing it
 
-Status: **Phase 0 shipped 2026-10-24; Phase 1 shipped 2026-10-24; Phases
-2-7 unbuilt.** Written at the
+Status: **Phase 0, 1 and 2 shipped 2026-10-24 (`96cf513`, `9c46ff5`, `a34cd94`);
+Phases 3-7 unbuilt.** Written at the
 operator's request, then Phase 0 (the data-loss fix) was validated and landed
 before any new verb. It supersedes nothing: `docs/36` §4 step 8 specifies the
 first three verb groups (8a `oauth:`, 8b `server:`, 8c `providers:` add/remove)
@@ -199,36 +199,69 @@ Negative controls run and confirmed to fail: the comment-preservation fix, the
 empty-host refusal, the port-0 refusal, the no-field-given refusal, and the
 merge-not-replace behaviour.
 
-### Phase 2 — `aroute providers add|remove` *(the three-part write, the panel's semantics)*
+### Phase 2 — `aroute providers add|remove` — **SHIPPED 2026-10-24** (`a34cd94`) *(the three-part write, the panel's semantics)*
 
 The panel's add is three writes that must land together or the config refuses to
-load; the CLI must reproduce that atomically.
+load; the CLI reproduces that with the panel's exact ordering.
 
-- `aroute providers add <id> [--key <name>]` — writes, in one
-  `splice_section` pass backed by one `render_providers_section`:
-  1. the `providers:` row,
-  2. the `keys:` row it references,
-  3. the `AR_KEY_<NAME>` line in the env file the service loads.
-  A row with no binding is **refused** (`webui.rs:1795` — "has no AR_KEY_*
-  binding for its credential", with the exact fix in the same message) — a
-  provider with no credential fails at the first request, which is a worse
-  answer than an upfront refusal. `<id>` must name a registry provider
-  (`aroute providers` is how an agent discovers the ids), not a custom endpoint;
-  Phase 3 is where a custom endpoint goes.
+- `aroute providers add <id> --credential-file <PATH|->` — the row, the `keys:`
+  reference and the `$AR_KEY_*` line in `ar.env`, beside the config, the
+  convention `sync` and the panel's `Ctx::new` share. The env value is written
+  **first**, because that is what publishes the credential: a config that does
+  not change is not "nothing was written", and the output says which file
+  moved. Two splices, not one — `providers:` gets a rendered row list and
+  `keys:` gets its reference upserted — and **the credential is never an
+  argument**. `--key <SECRET>` would be visible in the process table and in the
+  shell's history, so the flag reads a file (or stdin, `-`), the same rule
+  `keys revoke` already holds. A row already configured keeps the variable its
+  own `keys:` entry names; one that points at a literal rather than an
+  `$AR_KEY_*` variable is refused rather than re-pointed (`webui.rs:1795` —
+  "has no AR_KEY_* binding for its credential", with the exact fix in the same
+  message). `<id>` must name a registry provider; an ad-hoc endpoint is
+  Phase 3's verb.
 - `aroute providers remove <id>` — refuses while any combo still references the
-  provider (`webui.rs:2452` closure, `:2468` conflict; the same set the CLI
-  already computes for `doctor`), and drops the `keys:` entries the removed row
-  alone held. A dead provider fails loudly; a dangling one fails
-  late, which is why the refusal exists.
+  provider (`webui.rs:2452` closure, `:2468` conflict; the same set
+  `doctor` computes), and drops the `keys:` entries the removed row alone held.
+  A dead provider fails loudly; a dangling one fails late, which is why the
+  refusal exists.
 
-Test contract:
+Four defects found by running the verbs, all fixed with them:
+
+- **The panel's reader could not open a config the CLI had to.** `load(cli)`
+  expands every `$VAR` and refuses on a missing one, so `providers add` refused
+  on a config whose *other* keys were unexported — which is exactly the config
+  an operator edits *because* a credential is missing. `load_edit`
+  (`commands.rs:124`) parses unexpanded, the same shape as `webui.rs`'s
+  `load_cfg`, and both write verbs use it.
+- **The remove invented a section the operator never had.**
+  `render_custom_section` emits `custom_providers:` even for an empty row list,
+  so an unconditional splice wrote it into a file that had none.
+- **Every write left an extra blank line.** The renderers end with `\n`, and
+  pushing that into a line list and joining with `\n` put two blank lines after
+  the spliced section. Fixed once in `splice_section` (`commands.rs:3524`), so
+  every writer is covered.
+- **A no-op write dirtied the file.** The renderers emit block style where a
+  hand-written file uses flow style, so re-adding an already-present provider
+  re-rendered and reordered. `means_the_same` (moved from `webui.rs` to
+  `commands.rs`, so the panel and the CLI share one owner) gates both writes.
+
+Three helpers moved from `webui.rs` to `commands.rs` — `raw_keys`,
+`with_key_binding`, `splice_remove_provider`, `set_env_var` and
+`means_the_same` — because a rule about writing the config has one answer, and
+two copies could drift. `commands.rs` is where the other writers already live.
+
+Test contract, all six shipped:
 - `providers_add_should_write_the_row_the_key_ref_and_the_env_line_together`
-- `providers_add_should_refuse_a_row_with_no_credential_binding`
 - `providers_add_should_refuse_an_id_the_registry_does_not_know`
+- `providers_add_should_work_on_a_config_whose_other_keys_are_unexported`
 - `providers_remove_should_refuse_while_a_combo_references_the_provider`
 - `providers_remove_should_drop_the_keys_row_only_it_held` — the negative case
-  for a shared row: removing one of two providers that share a `keys:` entry
-  must **not** take the row.
+  for a shared row, which also asserts no `custom_providers:` is invented
+- `splice_section_does_not_add_a_blank_line_after_the_replaced_section`
+
+Negative controls run and confirmed to fail: the registry check, the combo
+reference check, the `load_edit` (expanding) parse, the `custom_providers`
+guard, and the blank-line trim.
 
 ### Phase 3 — `aroute custom-providers add|remove` *(an endpoint that is not in the registry)*
 

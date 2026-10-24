@@ -150,8 +150,8 @@ call sites:
 
 | Config section | CLI verb that can reach it | Panel endpoint | Gap |
 |---|---|---|---|
-| `keys:` | `limits`/`import`/`sync` (whole-section rewrite). No targeted add/remove of one key row. | `POST /ui/api/provider-key`, `POST /ui/api/provider-custom` (`webui.rs:685`) | targeted key-row verb missing |
-| `providers:` | **add a row: no CLI verb.** `sync` can only attach a `keys:` list to a row that already exists (`commands.rs:2410-2412` returns early when the block is empty; an unmatched dashboard provider is ignored). `import` writes a whole new file with one row per registry provider (`import/mod.rs:379-387`). **remove a row: no CLI verb.** | `POST /ui/api/provider-key` adds a row (`webui.rs:1771-1789`); `POST /ui/api/provider-remove` removes one (`webui.rs:2399`) | **GAP 3** |
+| `keys:` | `aroute providers add|remove` (writes or drops the row a provider references, `a34cd94`); `limits`/`import`/`sync` (whole-section rewrite). No targeted add/remove of one **standalone** key row. | `POST /ui/api/provider-key`, `POST /ui/api/provider-custom` (`webui.rs:685`) | a standalone `keys:` row verb is missing |
+| `providers:` | **add and remove: `aroute providers add|remove`** (`a34cd94`), adopting the panel's three-part semantics: the row, the `keys:` reference and the `$AR_KEY_*` line in `ar.env` land together, and a removal refuses while a combo still names the provider. `sync` can still only attach a `keys:` list to a row that already exists, and `import` writes a whole new file with one row per registry provider (`import/mod.rs:379-387`). No CLI verb yet writes the `keys:` row *on its own*, or removes one without removing its provider. | `POST /ui/api/provider-key` adds a row (`webui.rs:1771-1789`); `POST /ui/api/provider-remove` removes one (`webui.rs:2399`) | **GAP 3 — closed 2026-10-24** (Phase 2). What remains: a targeted `keys:` row editor. |
 | `custom_providers:` | `import` (when the source has ad-hoc nodes); `sync` (only if the dashboard has such rows) | `POST /ui/api/provider-custom` (`webui.rs:2279`) | targeted add missing from the CLI |
 | `combos:` | `import` (whole file); `sync` (**whole-section replace** from the dashboard DB, `commands.rs:2941`) | `POST /ui/api/combos` (whole-section replace, `webui.rs:1606`) | no targeted single-combo edit anywhere |
 | `limits:` | `aroute limits set` (`commands.rs:938`), `aroute limits clear` (`commands.rs:1153`), `sync` (**rpm arm only**, `commands.rs:2993` via `import/limits::read_rpm`) | `POST /ui/api/limits` (`webui.rs:2144`), `POST /ui/api/settings` (default row only, `webui.rs:1348`) | — |
@@ -226,18 +226,26 @@ destroyed the two introducing `keys:`; and the host was written through
 `serde_json::Value`, which quoted it (`127.0.0.1` as `"127.0.0.1"`). Both
 fixes are covered by command-driven tests with negative controls.
 
-**GAP 3 — a `providers:` row can be ADDED only by the panel.** The surgical
+**GAP 3 — a `providers:` row can be ADDED only by the panel.** *(The CLI half is fixed
+2026-10-24, Phase 2 of the plan — `a34cd94`.)* The surgical
 add is `webui.rs:1771-1789`: the row, the `keys:` reference and the
-`AR_KEY_*` env line land together. On the CLI side, `sync` refuses to add a
-row (`commands.rs:2410-2412`) and `import` produces a whole new file rather
-than a targeted edit. The panel's `POST /ui/api/provider-remove`
-(`webui.rs:2399`) is likewise the only row-level delete, and it refuses while
-a combo still references the provider (`webui.rs:2436-2440`).
+`AR_KEY_*` env line land together. The CLI's `aroute providers add|remove` now
+does exactly that, in the panel's order — env value first, because that is what
+publishes the credential — and refuses while a combo still names the provider.
+What is still panel-only: a `keys:` row written or removed *on its own*, which
+the `providers` verb deliberately does not reach because removing a provider
+and removing its credential are two different questions (a shared `keys:` row
+backs two providers, and only the removed rows alone held should go).
 
 **What this means for the operator's goal.** "Agents can update everything
-through the CLI without manually configuring the config files" is false today
-in three places, and one of them (`oauth:`) is the exact half of the goal the
+through the CLI without manually configuring the config files" was false in
+three places, and one of them (`oauth:`) is the exact half of the goal the
 operator singled out ("guide the user through steps like login for oauth").
+**Two of the three are now closed for the sections an agent most often needs**:
+`server:` (Phase 1) and `providers:` (Phase 2) are reachable from the CLI with
+the panel's own semantics. `oauth:` remains, and it is not a gap in a writer so
+much as the missing half of the goal — Phase 5 of the plan builds the verb and
+the login flow together.
 
 ---
 
