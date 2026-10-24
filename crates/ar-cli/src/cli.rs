@@ -147,6 +147,20 @@ pub enum Command {
     ///   aroute limits clear --key prod-deploy
     #[command(verbatim_doc_comment)]
     Limits(LimitsCliArgs),
+    /// Show the listen address, or move it.
+    ///
+    /// Two fields, and the only two that exist: the per-model deadlines, the
+    /// discovery overlay and the auth mode live in the **environment**
+    /// (`AR_STREAM_TIMEOUT_SECS`, `AR_MODEL_DISCOVERY`, `AR_AUTH_MODE`), which
+    /// is where the systemd unit puts them and where `aroute doctor` reads
+    /// them. Writing those to the yaml would edit a file nothing reads, so this
+    /// verb has no flag for them.
+    ///
+    /// Examples:
+    ///   aroute server show
+    ///   aroute server show --json
+    ///   aroute server set --port 20129
+    Server(ServerArgs),
 
     /// Spend and token usage since the ledger's last reset, most recent first.
     ///
@@ -895,6 +909,58 @@ pub struct AuthArgs {
     /// Which half of the login lifecycle to run.
     #[command(subcommand)]
     pub command: AuthCommand,
+}
+
+/// Options for `aroute server`.
+#[derive(Debug, Args)]
+pub struct ServerArgs {
+    #[command(subcommand)]
+    pub command: Option<ServerCommand>,
+
+    /// Emit the same row as JSON instead of TOON.
+    ///
+    /// One query, two renderings: TOON stays the default for humans and this is
+    /// the machine opt-in, the same rule as the list verbs.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Subcommands of `aroute server`. `None` prints the listen address.
+#[derive(Debug, Subcommand)]
+pub enum ServerCommand {
+    /// Print the listen address, and whether either field leaves the default.
+    ///
+    /// Examples:
+    ///   aroute server show
+    ///   aroute server show --json
+    #[command(verbatim_doc_comment)]
+    Show,
+
+    /// Move the listen address, and rewrite only the `server:` section.
+    ///
+    /// Both flags are optional and merge per field: a flag not passed keeps what
+    /// the file already carries, so `set --port 20129` does not quietly change
+    /// the host. An empty host or a port outside `1..=65535` is refused naming
+    /// the field, the validation the panel applies (`webui.rs:1345-1359`),
+    /// because a written-but-unloadable address is worse than a refusal.
+    ///
+    /// Examples:
+    ///   aroute server set --port 20129
+    ///   aroute server set --host 0.0.0.0
+    #[command(verbatim_doc_comment)]
+    Set(SetServerArgs),
+}
+
+/// Options for `aroute server set`.
+#[derive(Debug, Args)]
+pub struct SetServerArgs {
+    /// Host or IP the proxy binds. Omit to leave it as it is.
+    #[arg(long, value_name = "HOST")]
+    pub host: Option<String>,
+
+    /// TCP port to listen on, `1..=65535`. Omit to leave it as it is.
+    #[arg(long, value_name = "PORT")]
+    pub port: Option<u16>,
 }
 
 /// Options for `aroute import`.

@@ -1580,3 +1580,171 @@ fn import_should_name_every_unemittable_section_with_each_one_quoted() {
         "the sentence must not end inside a quote: {text}"
     );
 }
+
+/// The three contract tests Phase 1 of the config-write surface names.
+/// `aroute server show` answers the listen address, and the two questions that
+/// follow it: is this the default, and what *is* the default.
+#[test]
+fn server_show_should_print_the_effective_listen_address() {
+    let out = empty_dir("server-show");
+    std::fs::write(
+        out.join("config.yaml"),
+        concat!(
+            "server:\n  host: 127.0.0.1\n  port: 20128\n",
+            "keys:\n  openai: sk-x\n",
+            "combos:\n  - id: c\n    strategy: priority\n    targets:\n",
+            "      - openai/gpt-5.4\n",
+        ),
+    )
+    .expect("the fixture writes");
+
+    let res = ar_in(&out, &["server", "show"]);
+    assert_eq!(code(&res), 0, "stderr: {}", stderr(&res));
+    let text = stdout(&res);
+    assert!(text.contains("127.0.0.1"), "{text}");
+    assert!(text.contains("20128"), "{text}");
+    // The default is reported, not assumed: a caller comparing the address
+    // against the default should not have to re-derive it from the source.
+    assert!(
+        text.contains("127.0.0.1:20128"),
+        "the default must be named, not implied: {text}"
+    );
+    // Both fields are at the default in this fixture, so neither is flagged.
+    assert!(
+        text.contains("false,false"),
+        "an unmodified address must not claim a change: {text}"
+    );
+}
+
+/// The write moves the address and touches nothing else — asserted on the
+/// bytes, because that is what makes it safe to hand to an agent.
+#[test]
+fn server_set_should_write_the_listen_address_and_leave_the_rest_byte_identical() {
+    let out = empty_dir("server-set-byte-identical");
+    let held = out.join("config.yaml");
+    let body = "server:\n  host: 127.0.0.1\n  port: 20128\n\nkeys:\n  openai: sk-x\n\
+                # A comment the section does not own, kept either way.\n\
+                combos:\n  - id: c\n    strategy: priority\n    targets:\n      - openai/gpt-5.4\n";
+    std::fs::write(&held, body).expect("the fixture writes");
+    let before = body.to_owned();
+
+    let res = ar_in(&out, &["server", "set", "--port", "20129"]);
+    assert_eq!(code(&res), 0, "stderr: {}", stderr(&res));
+    assert!(stdout(&res).contains("20129"), "{}", stdout(&res));
+    // The restart note is the B-3 contract: the address is bound at boot.
+    assert!(
+        stdout(&res).contains("aroute service restart"),
+        "a write that does not name the restart leaves an operator believing it is live: {}",
+        stdout(&res)
+    );
+
+    let after = std::fs::read_to_string(&held).expect("readable");
+    assert_eq!(
+        after.lines().count(),
+        before.lines().count(),
+        "the section replacement must not add or drop lines:\n{after}"
+    );
+    assert_eq!(
+        after.lines().filter(|l| l.trim() == "port: 20129").count(),
+        1,
+        "{after}"
+    );
+    assert!(
+        after.contains("# A comment the section does not own, kept either way."),
+        "a comment after the replaced section must survive: {after}"
+    );
+    // Per-field merge: only the port was passed, so the host is untouched.
+    assert!(
+        after.contains("host: 127.0.0.1"),
+        "an unpassed flag must not change its field: {after}"
+    );
+}
+
+/// A write `ar serve` would refuse to load is worse than a refusal, so both bad
+/// values are refused *before* the file is touched.
+#[test]
+fn server_set_should_refuse_an_empty_host_and_name_the_fix() {
+    let out = empty_dir("server-set-refusals");
+    let held = out.join("config.yaml");
+    std::fs::write(
+        &held,
+        "server:\n  host: 127.0.0.1\n  port: 20128\nkeys:\n  openai: sk-x\n\
+         combos:\n  - id: c\n    strategy: priority\n    targets:\n      - openai/gpt-5.4\n",
+    )
+    .expect("the fixture writes");
+    let before = std::fs::read_to_string(&held).expect("readable");
+
+    // An empty host is refused, and the refusal says what a host looks like.
+    let empty = ar_in(&out, &["server", "set", "--host", "   "]);
+    assert_eq!(code(&empty), 1, "stderr: {}", stderr(&empty));
+    assert!(
+        stdout(&empty).contains("127.0.0.1"),
+        "the help must name a valid value: {}",
+        stdout(&empty)
+    );
+
+    // Port 0 is the one value `ar serve` will not bind.
+    let zero = ar_in(&out, &["server", "set", "--port", "0"]);
+    assert_eq!(code(&zero), 1, "stderr: {}", stderr(&zero));
+    assert!(
+        stdout(&zero).contains("1 and 65535"),
+        "the help must give the range: {}",
+        stdout(&zero)
+    );
+
+    // No field at all: `set` with nothing to set is a no-op that reads as
+    // success, which is the shape this project refuses everywhere else.
+    let none = ar_in(&out, &["server", "set"]);
+    assert_eq!(code(&none), 1, "stderr: {}", stderr(&none));
+
+    assert_eq!(
+        std::fs::read_to_string(&held).expect("readable"),
+        before,
+        "a refused write must leave the file untouched"
+    );
+}
+
+/// A section replacement must not swallow the blank line and comment block that
+/// documents the *next* section.
+///
+/// Both are column-0 and neither is a section header, so the skip that removes
+/// the replaced section's body ran past them. The repo's own `config.yaml`
+/// carries those blocks, so a `server:` splice silently deleted the two comments
+/// introducing `keys:`. Indentation cannot tell them apart — YAML allows a
+/// column-0 comment anywhere — so `splice_section` has to make the distinction
+/// explicitly, and this is the test that keeps it.
+///
+/// Driven through the real verb rather than `splice_section` directly: the
+/// function is private to the bin crate, and an integration test asserting on it
+/// would pass while the command still destroyed the comments.
+#[test]
+fn server_set_should_not_swallow_the_comment_block_after_the_section() {
+    let out = empty_dir("server-set-keeps-comments");
+    let held = out.join("config.yaml");
+    // Not a line-continued literal: `\` inside a Rust string keeps the next
+    // source line's indentation, which silently indents the YAML and changes
+    // what this test is testing. `concat!` keeps each fragment's bytes exact.
+    let body = concat!(
+        "server:\n  host: 127.0.0.1\n  port: 20128\n\n",
+        "# The credentials block: declared names, secrets stay in env.\n",
+        "keys:\n  a: sk-x\n",
+    );
+    std::fs::write(&held, body).expect("the fixture writes");
+
+    let res = ar_in(&out, &["server", "set", "--port", "20129"]);
+    assert_eq!(
+        code(&res),
+        0,
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&res.stdout),
+        stderr(&res)
+    );
+
+    let after = std::fs::read_to_string(&held).expect("readable");
+    assert!(
+        after.contains("# The credentials block: declared names, secrets stay in env."),
+        "the comment block documenting the next section was eaten: {after}"
+    );
+    assert!(after.contains("keys:\n  a: sk-x"), "keys: was eaten: {after}");
+    assert!(after.contains("port: 20129"), "the write did not land: {after}");
+}

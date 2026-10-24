@@ -61,6 +61,12 @@ const LIMIT_COLUMNS: [&str; 8] = [
 ];
 /// Columns of a `doctor` finding.
 const CHECK_COLUMNS: [&str; 3] = ["check", "status", "detail"];
+/// Columns of `aroute server show`.
+///
+/// `host_changed` / `port_changed` rather than one `is_default` cell: the caller
+/// can see which of the two moved, which one boolean would hide.
+const SERVER_COLUMNS: [&str; 5] = ["host", "port", "host_changed", "port_changed", "default"];
+
 /// Columns of the `configure` dump.
 const SETTING_COLUMNS: [&str; 2] = ["key", "value"];
 /// Columns of an `import` row. `path` is the directory the pair was written to:
@@ -957,6 +963,115 @@ pub fn limits_set(cli: &Cli, args: &SetLimitsArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The listen address, and whether either field differs from the compiled default.
+///
+/// "Is this the default?" is the first question after "what is it?", and a
+/// caller that has to know the default to answer it is a caller that re-derives
+/// `Server::default()` in a second place. Compared against the `Default` impl
+/// rather than a literal pair for the same reason.
+fn server_show(cli: &Cli, json: bool) -> anyhow::Result<()> {
+    let cfg = load(cli)?;
+    let d = ar_config::Server::default();
+    let row = vec![
+        cfg.server.host.clone(),
+        cfg.server.port.to_string(),
+        (cfg.server.host != d.host).to_string(),
+        (cfg.server.port != d.port).to_string(),
+        format!("{}:{}", d.host, d.port),
+    ];
+    if json {
+        print!(
+            "{}",
+            toon::json(
+                "server",
+                &SERVER_COLUMNS,
+                &toon::every_field(&SERVER_COLUMNS),
+                &[row],
+            )
+        );
+    } else {
+        print!(
+            "{}",
+            toon::list(
+                "server",
+                "servers",
+                &SERVER_COLUMNS,
+                &toon::every_field(&SERVER_COLUMNS),
+                &[row],
+                false,
+            )
+        );
+    }
+    Ok(())
+}
+
+/// Moves the listen address, rewriting only the `server:` section.
+///
+/// The merge is per field: a flag not passed keeps the value the file already
+/// carries, so `set --port 20129` cannot quietly change the host. An empty host
+/// or a port of `0` is refused naming the field — the panel's validation
+/// (`webui.rs:1343`, `:1351`) — because a write `ar serve` then refuses to load
+/// is worse than a refusal.
+fn server_set(cli: &Cli, args: &crate::cli::SetServerArgs) -> anyhow::Result<()> {
+    if args.host.is_none() && args.port.is_none() {
+        return Err(fail("no field given", "pass --host, --port, or both"));
+    }
+    if let Some(host) = &args.host
+        && host.trim().is_empty()
+    {
+        return Err(fail(
+            "--host is empty",
+            "the listen address must be a host or an IP, e.g. 127.0.0.1",
+        ));
+    }
+    if args.port == Some(0) {
+        return Err(fail(
+            "--port 0 is refused",
+            "port 0 tells a socket to pick any free port and tells a reader nothing; the port must be between 1 and 65535",
+        ));
+    }
+    let doc = read_config_text(cli)?;
+    let mut cfg = load(cli)?;
+    if let Some(host) = &args.host {
+        cfg.server.host = host.trim().to_owned();
+    }
+    if let Some(port) = args.port {
+        cfg.server.port = port;
+    }
+    // Written raw rather than through `serde_json::Value`, which is what the
+    // panel does and which quotes the host: it is a JSON serializer, so
+    // `127.0.0.1` comes back as `"127.0.0.1"` and the config gains quotes YAML
+    // did not need. A bare host is a valid YAML scalar, so it is written as the
+    // operator would read it, and the loader parses both forms identically.
+    //
+    // No trailing newline after `port:` — `splice_section` re-joins the file's
+    // own lines and appends exactly one newline, so a rendered block that ends
+    // with `\n` would leave the config with a blank line where the operator
+    // had none.
+    let section = format!(
+        "server:\n  host: {}\n  port: {}",
+        cfg.server.host, cfg.server.port
+    );
+    let next = splice_section(&doc, "server", &section);
+    if next == doc {
+        println!(
+            "server: {}:{} — unchanged",
+            cfg.server.host, cfg.server.port
+        );
+        return Ok(());
+    }
+    write_file(&cli.config, &next)?;
+    println!("server: {}:{}", cfg.server.host, cfg.server.port);
+    // The listen address is bound at boot, so a written address is inert until a
+    // restart. The B-3 contract (`docs/36` step 3), the same note `limits set`
+    // prints: naming the restart keeps the write and the state change two
+    // decisions rather than one.
+    println!(
+        "note: the running proxy binds this address at boot only — apply with `aroute service restart proxy`"
+    );
+    Ok(())
+}
+
 /// One `--model-tokens TARGET=CEILING` pair, parsed.
 struct ModelTokens {
     /// The `provider/model` the ceiling governs.
@@ -1094,6 +1209,10 @@ pub fn dispatch(cli: &Cli) -> anyhow::Result<()> {
             None => limits_view(cli, a.json),
             Some(crate::cli::LimitsCommand::Set(args)) => limits_set(cli, args),
             Some(crate::cli::LimitsCommand::Clear(args)) => limits_clear(cli, args),
+        },
+        Some(Command::Server(a)) => match &a.command {
+            None | Some(crate::cli::ServerCommand::Show) => server_show(cli, a.json),
+            Some(crate::cli::ServerCommand::Set(args)) => server_set(cli, args),
         },
         Some(Command::CostReport(a)) => cost_report(cli, a),
         Some(Command::Service(a)) => service(cli, a),
@@ -2986,6 +3105,19 @@ pub(crate) fn splice_section(content: &str, name: &str, rendered: &str) -> Strin
             replaced = true;
             skipping = true;
             continue;
+        }
+        // A blank line or a comment ends the section being skipped.
+        //
+        // Both are column-0 and neither is a section header, so without this
+        // they are consumed with the section's body — and the block that
+        // documents the *next* section goes with it. The repo's own
+        // `config.yaml` carries those blocks, so a `server:` splice silently
+        // deleted the two comments introducing `keys:`. Indentation cannot
+        // distinguish them (YAML allows column-0 comments anywhere), so the
+        // distinction has to be made here: a body line is indented, and these
+        // are not.
+        if skipping && (line.is_empty() || line.starts_with('#')) {
+            skipping = false;
         }
         if skipping && is_section_header(line) {
             skipping = false;
