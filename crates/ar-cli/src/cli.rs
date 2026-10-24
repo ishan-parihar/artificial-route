@@ -61,13 +61,26 @@ pub enum Command {
     #[command(verbatim_doc_comment)]
     Models(ListArgs),
 
-    /// List configured providers, their wire dialect, and their key binding.
+    /// Configured providers, and the credential each one dispatches under.
+    ///
+    /// With no subcommand this is the list; `add` and `remove` write the
+    /// `providers:` section. Add is three writes that must land together or the
+    /// config refuses to load, so one verb does all three and a partial write is
+    /// not reachable: the row, the `keys:` reference and the `AR_KEY_*` value in
+    /// the env file the service loads.
+    ///
+    /// A credential is never an argument. `add` reads it from a file or stdin,
+    /// the same rule `keys revoke` already holds (`read_token_file`), because a
+    /// secret on a command line is visible in the process table and in the shell
+    /// history. `--credential-file -` reads stdin.
     ///
     /// Examples:
     ///   aroute providers
     ///   aroute providers --fields id,base_url
+    ///   aroute providers add openai --credential-file ./openai.key
+    ///   aroute providers remove openai
     #[command(verbatim_doc_comment)]
-    Providers(ListArgs),
+    Providers(ProvidersArgs),
 
     /// List routing combos and their distinct provider sets.
     ///
@@ -287,6 +300,10 @@ pub struct ServeArgs {
 }
 
 /// Shared options for the list commands.
+///
+/// No `Default` derive on purpose: nothing constructs one, and a derive that
+/// exists for hypothetical callers is a second answer to "what do the flags
+/// look like when none are passed" that clap already gives.
 #[derive(Debug, Args)]
 pub struct ListArgs {
     /// Comma-separated columns to show instead of the default set.
@@ -909,6 +926,132 @@ pub struct AuthArgs {
     /// Which half of the login lifecycle to run.
     #[command(subcommand)]
     pub command: AuthCommand,
+}
+
+/// Options for `aroute providers`.
+///
+/// `None` lists, and the list flags sit **here** rather than on the `list`
+/// subcommand alone: `aroute providers --fields id,key` is a documented surface
+/// two tests pin and every agent that learned the verb has already typed, so
+/// moving them would break callers to gain nothing. `list` accepts the same
+/// flags as an explicit spelling of the same thing.
+#[derive(Debug, Args)]
+pub struct ProvidersArgs {
+    #[command(subcommand)]
+    pub command: Option<ProviderCommand>,
+
+    /// Comma-separated columns to show instead of the default set.
+    #[arg(long, value_name = "a,b,c")]
+    pub fields: Option<String>,
+
+    /// Print values in full instead of cutting them at the truncation ceiling.
+    #[arg(long)]
+    pub full: bool,
+
+    /// Emit the same rows as JSON instead of TOON.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Rows to skip from the newest end: the page after the last one shown.
+    #[arg(long, value_name = "N")]
+    pub offset: Option<usize>,
+
+    /// Most rows to show.
+    #[arg(long, value_name = "N")]
+    pub limit: Option<usize>,
+
+    /// Narrow to the rows this provider serves.
+    #[arg(long, value_name = "ID")]
+    pub provider: Option<String>,
+
+    /// Narrow to the rows this combo serves.
+    #[arg(long, value_name = "ID")]
+    pub combo: Option<String>,
+
+    /// Only rows with an owning combo: what this config can actually route.
+    #[arg(long)]
+    pub routable: bool,
+}
+
+impl ProvidersArgs {
+    /// The list options this `aroute providers` was argued with.
+    ///
+    /// A bare `aroute providers --fields id` and `aroute providers list
+    /// --fields id` are the same question, so the parent's own flags are the
+    /// list's arguments when no subcommand was given. This method is the one
+    /// place that spelling-out happens, rather than a second `ListArgs` copy
+    /// that could drift from this struct's fields.
+    #[must_use]
+    pub fn list_args(&self) -> ListArgs {
+        ListArgs {
+            fields: self.fields.clone(),
+            full: self.full,
+            json: self.json,
+            offset: self.offset,
+            limit: self.limit,
+            provider: self.provider.clone(),
+            routable: self.routable,
+            combo: self.combo.clone(),
+        }
+    }
+}
+
+/// Subcommands of `aroute providers`. `None` lists.
+#[derive(Debug, Subcommand)]
+pub enum ProviderCommand {
+    /// List configured providers, their wire dialect, and their key binding.
+    ///
+    /// Examples:
+    ///   aroute providers list
+    ///   aroute providers list --json
+    #[command(verbatim_doc_comment)]
+    List(ListArgs),
+
+    /// Configure a registry provider: row, `keys:` reference and env value.
+    ///
+    /// The three writes land together or the proxy refuses to boot with a
+    /// dangling reference, so they are one command's work and a partial state
+    /// is not reachable. `set_env_var` merges into `ar.env` beside the config,
+    /// the convention `aroute sync` and the panel's `Ctx::new` share.
+    ///
+    /// Examples:
+    ///   aroute providers add openai --credential-file ./key
+    ///   aroute providers add openai --credential-file -
+    #[command(verbatim_doc_comment)]
+    Add(AddProviderArgs),
+
+    /// Unconfigure a provider, dropping the `keys:` entries it alone held.
+    ///
+    /// Refuses while any combo still references it: a dead provider fails
+    /// loudly at the first request, a dangling one fails late in the chain.
+    ///
+    /// Examples:
+    ///   aroute providers remove openai
+    #[command(verbatim_doc_comment)]
+    Remove(RemoveProviderArgs),
+}
+
+/// Options for `aroute providers add`.
+#[derive(Debug, Args)]
+pub struct AddProviderArgs {
+    /// Provider id from the compiled-in registry (`aroute providers`).
+    pub id: String,
+
+    /// File holding the credential, or `-` for stdin.
+    ///
+    /// Not `--key <SECRET>`: an argument is visible to every process on the box
+    /// through the process table and to the shell's history file, and the
+    /// credential belongs in the env file, not in either. The same rule
+    /// `keys revoke` already holds.
+    #[arg(long, value_name = "PATH", default_value = "-")]
+    pub credential_file: String,
+}
+
+/// Options for `aroute providers remove`.
+#[derive(Debug, Args)]
+pub struct RemoveProviderArgs {
+    /// Provider id to unconfigure.
+    pub id: String,
 }
 
 /// Options for `aroute server`.

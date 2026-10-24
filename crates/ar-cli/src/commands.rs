@@ -19,8 +19,8 @@ use clap::CommandFactory;
 use clap::error::ErrorKind;
 
 use crate::cli::{
-    ClearLimitsArgs, Cli, Command, ConfigureArgs, DoctorArgs, ImportArgs, ListArgs, ServiceArgs,
-    ServiceAction, ServiceUnit, SetLimitsArgs, SyncArgs,
+    ClearLimitsArgs, Cli, Command, ConfigureArgs, DoctorArgs, ImportArgs, ListArgs, ServiceAction,
+    ServiceArgs, ServiceUnit, SetLimitsArgs, SyncArgs,
 };
 use crate::import;
 use crate::import::ImportFrom;
@@ -107,6 +107,32 @@ pub fn load(cli: &Cli) -> anyhow::Result<Config> {
             );
             fail(e, help)
         })
+}
+
+/// The parsed config for a **writer**: the same file, read without expanding
+/// its `$VAR` references.
+///
+/// [`load`] expands, because everything that *serves* has to: a proxy that
+/// boots with `$AR_KEY_OPENAI` as a literal credential would send the string
+/// "$AR_KEY_OPENAI" as the bearer. A writer does not. It rearranges sections
+/// and names variables, and a config whose other `keys:` rows point at
+/// unexported variables is exactly the config an operator is editing
+/// *because* a credential is missing — so a writer must be able to open it.
+///
+/// `webui.rs`'s `load_cfg` is the same call with the same resolver shape; this
+/// is the CLI-side spelling, and the two agreeing is what lets the panel and
+/// the CLI edit one file.
+pub fn load_edit(cli: &Cli) -> anyhow::Result<Config> {
+    let doc = read_config_text(cli)?;
+    Config::parse(&doc, |_| Ok(None)).map_err(|e| {
+        fail(
+            e,
+            format!(
+                "fix {} by hand; a write refuses a config it cannot load",
+                cli.config.display()
+            ),
+        )
+    })
 }
 
 /// Default credential-store filename, next to the config file.
@@ -1176,7 +1202,12 @@ pub fn dispatch(cli: &Cli) -> anyhow::Result<()> {
         None => home(cli),
         Some(Command::Serve(a)) => block_on(serve::serve(cli, a)),
         Some(Command::Models(a)) => models(cli, a),
-        Some(Command::Providers(a)) => providers(cli, a),
+        Some(Command::Providers(a)) => match &a.command {
+            None => providers(cli, &a.list_args()),
+            Some(crate::cli::ProviderCommand::List(args)) => providers(cli, args),
+            Some(crate::cli::ProviderCommand::Add(args)) => providers_add(cli, args),
+            Some(crate::cli::ProviderCommand::Remove(args)) => providers_remove(cli, args),
+        },
         Some(Command::Combo(a)) => combo(cli, a),
         Some(Command::Doctor(a)) => doctor(cli, a),
         Some(Command::Auth(a)) => crate::auth::run(cli, a),
@@ -1568,6 +1599,402 @@ fn provider_rows(cfg: &Config, catalog: &Registry) -> Vec<Row> {
         .collect();
     rows.sort();
     rows
+}
+
+/// The raw `keys:` mapping as written (name -> `$VAR`), parsed from the
+/// document rather than `Config`, which resolves the same section into
+/// secrets — the page shows variable names, never values.
+///
+/// Here rather than in `webui.rs` because every writer of a `keys:` row needs
+/// it, and one owner per question (`AGENTS.md` rule 1) puts that with the other
+/// config helpers in this module.
+pub(crate) fn raw_keys(doc: &str) -> BTreeMap<String, String> {
+    serde_yaml::from_str::<serde_yaml::Value>(doc)
+        .ok()
+        .and_then(|root| root.get("keys").cloned())
+        .and_then(|keys| serde_yaml::from_value(keys).ok())
+        .unwrap_or_default()
+}
+
+/// The raw `keys:` mapping, with one binding upserted.
+pub(crate) fn with_key_binding(doc: &str, name: &str, var: &str) -> anyhow::Result<String> {
+    let mut keys = raw_keys(doc);
+    keys.insert(name.to_owned(), format!("${var}"));
+    let section = crate::import::render_keys_section(&keys)?;
+    Ok(splice_section(doc, "keys", &section))
+}
+
+/// Drops one provider's `providers:` row, the `keys:` entries only it held, and
+/// the matching `custom_providers:` row, in one document.
+///
+/// `Ok(None)` means the id is configured nowhere, which is the caller's refusal
+/// to make rather than this function's — the message names what the operator
+/// should run next.
+///
+/// Shared with the panel's removal route, which was the only caller before
+/// Phase 2. It lives here with the other config writers: the rule about a
+/// shared `keys:` row is one question with one answer, and two copies of it
+/// could disagree about which entry belongs to which provider.
+pub(crate) fn splice_remove_provider(
+    doc: &str,
+    cfg: &Config,
+    id: &str,
+) -> anyhow::Result<Option<String>> {
+    if !cfg.providers.iter().any(|p| p.id == id) && !cfg.custom_providers.iter().any(|c| c.id == id)
+    {
+        return Ok(None);
+    }
+    let providers = crate::import::render_providers_section(
+        &cfg.providers
+            .iter()
+            .filter(|p| p.id != id)
+            .cloned()
+            .collect::<Vec<_>>(),
+    )?;
+    let next = splice_section(doc, "providers", &providers);
+    let kept: BTreeSet<String> = cfg
+        .providers
+        .iter()
+        .filter(|p| p.id != id)
+        .flat_map(|p| p.key_refs().into_iter().map(str::to_owned))
+        .chain(
+            cfg.custom_providers
+                .iter()
+                .filter(|c| c.id != id)
+                .map(|c| c.key_ref.clone()),
+        )
+        .collect();
+    let customs = crate::import::render_custom_section(
+        &cfg.custom_providers
+            .iter()
+            .filter(|c| c.id != id)
+            .cloned()
+            .collect::<Vec<_>>(),
+    )?;
+    // Only splice a `custom_providers:` section that was already there.
+    //
+    // The renderer emits `custom_providers:` even for an empty row list, so an
+    // unconditional splice writes a section the operator never had into a file
+    // they asked to change in some other way — the same "a writer touched what
+    // it was not asked to touch" shape as the comment-eating bug Phase 1 found.
+    // A config that already carries ad-hoc nodes has its section rewritten;
+    // one that does not is left without it.
+    let next = if cfg.custom_providers.is_empty() {
+        next
+    } else {
+        splice_section(&next, "custom_providers", &customs)
+    };
+    // Keys entries the removed rows alone held: every entry the removed rows
+    // name, minus the entries the surviving rows name. Shared entries survive
+    // by construction, so this is exactly a "no dangling reference" edit.
+    let orphaned: BTreeSet<String> = cfg
+        .providers
+        .iter()
+        .filter(|p| p.id == id)
+        .flat_map(|p| p.key_refs().into_iter().map(str::to_owned))
+        .chain(
+            cfg.custom_providers
+                .iter()
+                .filter(|c| c.id == id)
+                .map(|c| c.key_ref.clone()),
+        )
+        .filter(|name| !kept.contains(name))
+        .collect();
+    if orphaned.is_empty() {
+        return Ok(Some(next));
+    }
+    let keys = raw_keys(doc)
+        .into_iter()
+        .filter(|(name, _)| !orphaned.contains(name))
+        .collect();
+    let section = crate::import::render_keys_section(&keys)?;
+    Ok(Some(splice_section(&next, "keys", &section)))
+}
+
+/// Whether a candidate document means the same thing as the current one.
+///
+/// F8, and the reason it lives in this module rather than beside one writer:
+/// the renderers emit block-style lists where a hand-written file uses
+/// flow-style, so **two documents that spell the same configuration
+/// differently compare equal** — and a byte comparison would re-render the
+/// file on every write, dirtying it for a change the operator never made.
+///
+/// # The comparison is on the UNEXPANDED documents
+///
+/// `Config::parse` expands `$VAR` on the raw text **before** YAML parsing, so
+/// comparing with the live environment would make `$AR_KEY_OPENAI` and the
+/// literal `sk-...` compare **equal** — and the write path would then discard
+/// the change. Both sides are therefore parsed with a resolver that expands
+/// **nothing**: a reference stays a literal and the two spellings differ.
+///
+/// It is also **deterministic**: the live environment could change between two
+/// parses, and a comparison that answers differently when the operator exports
+/// a variable is not a comparison.
+///
+/// # What is NOT compared
+///
+/// `Config` does not deny unknown fields, so a YAML key the struct does not
+/// model is dropped from both parses and is **not compared**. A change there is
+/// not detected. That is a real limit on the claim and it is bounded: the
+/// writers only ever touch modelled sections, and `splice_section` preserves
+/// the rest of the text.
+///
+/// A document that does not parse is NOT identical — it is a change, and the
+/// write path reports the parse error. Answering "identical" for an
+/// unparseable candidate would swallow the error.
+pub(crate) fn means_the_same(current: &str, candidate: &str) -> bool {
+    if current == candidate {
+        return true;
+    }
+    match (
+        Config::parse(current, no_expansion),
+        Config::parse(candidate, no_expansion),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// The resolver [`means_the_same`] uses: expand **nothing**.
+///
+/// A `None` lookup means "the variable is not set", so the expansion leaves
+/// `$VAR` as the literal text `$VAR` — which is what makes the comparison
+/// distinguish a reference from the value it points at.
+fn no_expansion(_: &str) -> Result<Option<String>, String> {
+    Ok(None)
+}
+
+/// Configures a registry provider: the `providers:` row, the `keys:` reference
+/// and the `$AR_KEY_*` value, in one pass.
+///
+/// The panel's `provider_key` (`webui.rs:1740`) is the tested semantic and this
+/// reproduces its ordering rather than inventing one: the env value is written
+/// first, because that is what publishes the credential, and a config that does
+/// not change is not "nothing was written". A row that is already configured is
+/// refused unless its binding already names an `$AR_KEY_*` variable — the
+/// alternative is silently re-pointing a hand-wired secret to a generated name
+/// the operator never chose. A row with no binding is not a partial write, it is
+/// a config the proxy refuses at boot, so it is refused here instead.
+///
+/// The credential never touches argv. `--credential-file -` reads stdin, so
+/// `printf %s "$KEY" | aroute providers add openai` is possible, and a file
+/// path is the documented form because that leaves the secret out of the shell
+/// history entirely.
+fn providers_add(cli: &Cli, args: &crate::cli::AddProviderArgs) -> anyhow::Result<()> {
+    let id = args.id.trim();
+    if id.is_empty() {
+        return Err(fail(
+            "the provider id is empty",
+            "`aroute providers` lists the ids the registry knows",
+        ));
+    }
+    let secret = read_credential(&args.credential_file)?;
+    let doc = read_config_text(cli)?;
+    let mut cfg = load_edit(cli)?;
+    let catalog = catalog(&cfg)?;
+    if catalog.get(id).is_none() {
+        return Err(fail(
+            format!("unknown provider {id:?}"),
+            "the id must name a registry provider; an ad-hoc endpoint is `aroute provider-settings` (Phase 3), not this verb",
+        ));
+    }
+
+    let var = format!("AR_KEY_{}", import::env_name(id));
+    let already = cfg.providers.iter().any(|p| p.id == id);
+    // The binding an existing row names, and the one a new row gets. A row that
+    // names a literal secret rather than an `$AR_KEY_*` variable is refused
+    // rather than re-pointed: `sync` and the panel both treat a hand-wired
+    // value as the operator's decision.
+    // Read from `raw_keys`, the file as written, not from `cfg.keys`: an
+    // unexpanded `$AR_KEY_X` and the literal it points at are different
+    // spellings of the same binding, and only the written one is what the
+    // operator's `keys:` entry actually says.
+    let bound = cfg
+        .providers
+        .iter()
+        .find(|p| p.id == id)
+        .and_then(|p| p.key_refs().first().copied())
+        .and_then(|name| raw_keys(&doc).get(name).cloned())
+        .map(|v| v.trim_start_matches('$').to_owned());
+    if already && !bound.as_deref().is_some_and(|b| b.starts_with("AR_KEY_")) {
+        return Err(fail(
+            format!("provider {id:?} has no AR_KEY_* binding for its credential"),
+            "give its `key:` entry an `$AR_KEY_*` value in config.yaml, or remove the provider row and re-add it here",
+        ));
+    }
+    let var = if already { bound.unwrap_or(var) } else { var };
+
+    // A move, not a clone: `cfg` is not read again after this point, and
+    // the whole `providers:` list is about to be re-rendered from it anyway.
+    let mut rows = std::mem::take(&mut cfg.providers);
+    if let Some(existing) = rows.iter_mut().find(|p| p.id == id) {
+        existing.key.clone_from(&id.to_owned());
+    } else {
+        rows.push(ar_config::ProviderCfg {
+            id: id.to_owned(),
+            key: id.to_owned(),
+            keys: None,
+        });
+    }
+    rows.sort_by(|a, b| a.id.cmp(&b.id));
+    let section = import::render_providers_section(&rows)?;
+    let mut next = splice_section(&doc, "providers", &section);
+    if !already {
+        next = with_key_binding(&next, id, &var)?;
+    }
+
+    // The env file first, exactly as the panel writes it: that is the write
+    // that publishes the credential, so a config that is already correct still
+    // means the credential was just written and the output says so.
+    let env = env_path(&cli.config);
+    set_env_var(&env, &var, &secret)?;
+    // Semantic, not textual: the renderers emit block style where a
+    // hand-written file uses flow style, so a byte comparison would re-render
+    // the file on every add of a provider that is already there — dirtying it
+    // for a change the operator never made (F8, `means_the_same`).
+    if !means_the_same(&doc, &next) {
+        write_file(&cli.config, &next)?;
+    }
+    println!("providers: {id} (row, keys: ref, {var})");
+    println!("note: the credential was written to {}", env.display());
+    println!(
+        "note: the running proxy reads its config at boot only — apply with `aroute service restart proxy`"
+    );
+    Ok(())
+}
+
+/// Unconfigures a provider, refusing while a combo still references it.
+///
+/// The reference check covers every place a combo can name a target — `targets`,
+/// `pool`, `steps` and `judge_model` — the same set the panel's removal checks
+/// (`webui.rs:2452`) and the set `aroute doctor` already computes. A removed
+/// provider that a combo still names is not an error at write time, it is a
+/// 502 at the first request, so the refusal is the cheaper answer.
+///
+/// The `keys:` entries the removed rows alone held are dropped with them. An
+/// entry a surviving row also names is kept: two providers sharing one secret
+/// is one line the operator maintains, not two.
+fn providers_remove(cli: &Cli, args: &crate::cli::RemoveProviderArgs) -> anyhow::Result<()> {
+    let id = args.id.trim();
+    if id.is_empty() {
+        return Err(fail(
+            "the provider id is empty",
+            "pass the id `aroute providers` lists",
+        ));
+    }
+    let doc = read_config_text(cli)?;
+    let cfg = load_edit(cli)?;
+    let configured = cfg.providers.iter().any(|p| p.id == id);
+    if !configured {
+        return Err(fail(
+            format!("provider {id:?} is not configured in this file"),
+            "`aroute providers` lists what is configured",
+        ));
+    }
+    let users: Vec<&str> = cfg
+        .combos
+        .iter()
+        .filter(|c| {
+            c.targets
+                .iter()
+                .chain(c.pool.iter())
+                .chain(c.steps.iter().map(|s| &s.target))
+                .chain(c.judge_model.iter())
+                .any(|t| target_provider(t) == id)
+        })
+        .map(|c| c.id.as_str())
+        .collect();
+    if !users.is_empty() {
+        return Err(fail(
+            format!("{id:?} is still referenced by: {}", users.join(", ")),
+            "delete or repoint those combos first; a dead provider fails loudly, a dangling one fails late",
+        ));
+    }
+    // `Ok(None)` is unreachable here: `configured` above already refused when
+    // the id is in neither list. The `expect` names that invariant rather than
+    // silently reporting "unchanged" for a config this command already
+    // rejected.
+    let next = splice_remove_provider(&doc, &cfg, id)
+        .map_err(|e| {
+            fail(
+                e,
+                "the `providers:`, `custom_providers:` and `keys:` sections could not be rendered; nothing was written",
+            )
+        })?
+        .unwrap_or_else(|| doc.to_owned());
+    // The same semantic check: a remove whose re-render means the same thing as
+    // what is on disk is a no-op, and writing it would only reorder the
+    // operator's own `keys:` rows.
+    if means_the_same(&doc, &next) {
+        println!("providers: {id} — unchanged");
+        return Ok(());
+    }
+    write_file(&cli.config, &next)?;
+    println!("providers: removed {id}");
+    println!(
+        "note: the running proxy reads its config at boot only — apply with `aroute service restart proxy`"
+    );
+    Ok(())
+}
+
+/// `ar.env` beside the config — the convention `aroute sync` follows and the
+/// panel's `Ctx::new` derives the same way (`webui.rs:155-163`).
+fn env_path(config: &std::path::Path) -> std::path::PathBuf {
+    config
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("ar.env")
+}
+
+/// Merges one `NAME=value` into the env file at 0600, preserving every other
+/// line: the same merge the panel's `set_env_var` performs (`webui.rs:1856`).
+///
+/// `write_private` rather than a plain write: the file holds credentials, so it
+/// is staged at 0600 from its first byte and renamed, never written in place.
+pub(crate) fn set_env_var(path: &std::path::Path, name: &str, value: &str) -> anyhow::Result<()> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let entry = format!("{name}={value}");
+    let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    match lines
+        .iter()
+        .position(|l| l.starts_with(&format!("{name}=")))
+    {
+        Some(i) => lines[i] = entry,
+        None => lines.push(entry),
+    }
+    write_private(path, &(lines.join("\n") + "\n")).map_err(|e| {
+        fail(
+            format!("cannot write {}: {e}", path.display()),
+            "check permissions on the config directory",
+        )
+    })
+}
+
+/// A credential from a file or from stdin, never from argv.
+///
+/// `-` is stdin, matching `keys revoke`'s `read_token_file` (`commands.rs:546`):
+/// one convention for one kind of input. Trailing whitespace is trimmed,
+/// because a credential pasted from a terminal carries a newline, and an empty
+/// file is refused rather than written as an empty variable — the loader then
+/// fails at the first request, which is worse than this.
+fn read_credential(path: &str) -> anyhow::Result<String> {
+    let raw = if path == "-" {
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+            .map_err(|e| fail(e, "the credential could not be read from stdin"))?;
+        buf
+    } else {
+        std::fs::read_to_string(path)
+            .map_err(|e| fail(e, "the credential file could not be read"))?
+    };
+    let secret = raw.trim();
+    if secret.is_empty() {
+        return Err(fail(
+            "the credential is empty",
+            "the file must hold the credential, and nothing else",
+        ));
+    }
+    Ok(secret.to_owned())
 }
 
 fn combo(cli: &Cli, args: &ListArgs) -> anyhow::Result<()> {
@@ -3101,7 +3528,7 @@ pub(crate) fn splice_section(content: &str, name: &str, rendered: &str) -> Strin
     let mut replaced = false;
     for line in content.lines() {
         if line == header {
-            out.push(rendered.to_owned());
+            out.push(rendered.trim_end_matches('\n').to_owned());
             replaced = true;
             skipping = true;
             continue;
@@ -3638,13 +4065,28 @@ pub fn usage_exit_code(kind: ErrorKind) -> u8 {
 /// the valid set depends on the command, and `docs/06` puts "invalid argument"
 /// on the usage side of the line.
 pub fn check_fields(cli: &Cli) -> Option<String> {
-    let (args, all, cmd) = match &cli.command {
-        Some(Command::Models(a)) => (a, &MODEL_COLUMNS[..], "models"),
-        Some(Command::Providers(a)) => (a, &PROVIDER_COLUMNS[..], "providers"),
-        Some(Command::Combo(a)) => (a, &COMBO_COLUMNS[..], "combo"),
+    // The column flags, as the caller wrote them: the parent's own for a bare
+    // `aroute providers --fields nope`, and the `list` subcommand's for
+    // `aroute providers list --fields nope`. Both are the same verb's question,
+    // so both exit 2. An `add`/`remove` carries no column flags at all.
+    //
+    // One match, three things: the flag, the valid columns and the verb's name.
+    // A `None` in the fields slot is not "no check" — `fields_or_default`
+    // expands it to the verb's own default set, which validates too.
+    let (fields, all, cmd) = match &cli.command {
+        Some(Command::Models(a)) => (a.fields.as_deref(), &MODEL_COLUMNS[..], "models"),
+        Some(Command::Providers(a)) => {
+            let fields = match &a.command {
+                None => a.fields.as_deref(),
+                Some(crate::cli::ProviderCommand::List(args)) => args.fields.as_deref(),
+                _ => return None,
+            };
+            (fields, &PROVIDER_COLUMNS[..], "providers")
+        }
+        Some(Command::Combo(a)) => (a.fields.as_deref(), &COMBO_COLUMNS[..], "combo"),
         _ => return None,
     };
-    columns(&toon::fields_or_default(args.fields.as_deref()), all, cmd)
+    columns(&toon::fields_or_default(fields), all, cmd)
         .err()
         .map(|e| e.to_string())
 }
@@ -4017,6 +4459,41 @@ mod tests {
             "the hyphenated section BEHIND the named one was eaten:\n{out}"
         );
         assert!(out.contains("combos:\n  - id: c"), "combos was eaten:\n{out}");
+    }
+
+    // A blank line between the replaced section and what follows it must
+    // survive as ONE blank line.
+    //
+    // The renderers emit a trailing newline (`render_providers_section` ends
+    // with `"  key: openai\n"`), so pushing the block as-is and then joining
+    // with `\n` puts TWO blank lines after the section, and every write of the
+    // same verb added one more. Found by running `providers remove` against the
+    // repo's real config and diffing the round trip.
+    #[test]
+    fn splice_section_does_not_add_a_blank_line_after_the_replaced_section() {
+        let doc = "providers:\n  - id: openai\n    key: openai\n\n# a comment\nkeys:\n  openai: $AR_KEY_OPENAI\n";
+        let out = splice_section(
+            doc,
+            "providers",
+            "providers:\n  - id: openai\n    key: openai\n",
+        );
+        assert_eq!(
+            out, doc,
+            "re-splicing the same content must not grow the file: {out:?}"
+        );
+
+        // And the same, when the added row is a real change: the blank line that
+        // separated the section from the comment must still be one line.
+        let grown = splice_section(
+            doc,
+            "providers",
+            "providers:\n  - id: deepseek\n    key: deepseek\n  - id: openai\n    key: openai\n",
+        );
+        assert_eq!(
+            grown.matches("\n\n").count(),
+            doc.matches("\n\n").count(),
+            "one blank line stayed one blank line: {grown:?}"
+        );
     }
 
     // The same bug through the real command, which is how the operator hit it.

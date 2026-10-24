@@ -696,25 +696,6 @@ fn body_error(rejection: JsonRejection) -> Response {
 
 // ── reads ────────────────────────────────────────────────────────────────────
 
-/// The raw `keys:` mapping as written (name -> `$VAR`), parsed from the
-/// document rather than `Config`, which resolves the same section into
-/// secrets — the page shows variable names, never values.
-fn raw_keys(doc: &str) -> BTreeMap<String, String> {
-    serde_yaml::from_str::<serde_yaml::Value>(doc)
-        .ok()
-        .and_then(|root| root.get("keys").cloned())
-        .and_then(|keys| serde_yaml::from_value(keys).ok())
-        .unwrap_or_default()
-}
-
-/// The raw `keys:` mapping, with one binding upserted.
-fn with_key_binding(doc: &str, name: &str, var: &str) -> anyhow::Result<String> {
-    let mut keys = raw_keys(doc);
-    keys.insert(name.to_owned(), format!("${var}"));
-    let section = crate::import::render_keys_section(&keys)?;
-    Ok(commands::splice_section(doc, "keys", &section))
-}
-
 /// The env resolver `Config::parse` wants: a present variable, or the parse
 /// failure naming the one that is missing — the same contract `serve`'s boot
 /// holds, so the page cannot show a config the proxy would refuse to load.
@@ -744,7 +725,7 @@ async fn state(State(ctx): State<Arc<Ctx>>) -> Response {
         }
     };
     let env_set = env_vars_set(&ctx.env);
-    let keys = raw_keys(&doc);
+    let keys = commands::raw_keys(&doc);
 
     let configured: Vec<Value> = cfg
         .providers
@@ -1036,7 +1017,7 @@ async fn health(State(ctx): State<Arc<Ctx>>) -> Response {
         Err(resp) => return *resp,
     };
     let env_set = env_vars_set(&ctx.env);
-    let keys = raw_keys(&doc);
+    let keys = commands::raw_keys(&doc);
 
     // The store's own view of each credential. A row that will not decrypt is
     // a *broken* credential, not a missing one, and the two need different
@@ -1378,7 +1359,7 @@ async fn save_settings(
             commands::splice_section(&next, "limits", &crate::import::limits::render(&cfg.limits));
     }
 
-    if means_the_same(&doc, &next) {
+    if commands::means_the_same(&doc, &next) {
         return Json(json!({ "ok": true, "pending_restart": false, "note": "identical" }))
             .into_response();
     }
@@ -1499,78 +1480,6 @@ fn load_cfg(ctx: &Ctx) -> Result<(String, Config), Box<Response>> {
     Ok((doc, cfg))
 }
 
-/// Whether a candidate document means the same thing as the current one.
-///
-/// F8: the panel's write path used to compare the **rendered text**, and the
-/// renderer emits block-style lists where a hand-written file uses
-/// flow-style. So posting the config's own combo list back to the panel
-/// re-rendered 39 lines and the `identical` short-circuit never fired — a
-/// no-op save dirtied the file.
-///
-/// The comparison is **semantic**: both documents are parsed and the parsed
-/// `Config`s are compared, and `Config` derives `PartialEq`. Two documents
-/// that parse to the same configuration are the same configuration, however
-/// they are spelled.
-///
-/// The rule this replaces is the house rule for the whole write path:
-/// **compare semantics, and saving the same thing stops dirtying the file.**
-/// A byte comparison would have to preserve the original formatting exactly,
-/// and the renderer cannot know how the operator's hand-written file was
-/// spelled.
-///
-/// # The comparison is on the UNEXPANDED documents
-///
-/// `Config::parse` expands `$VAR` on the raw text **before** YAML parsing
-/// ("a secret can live in the environment and never in the file"), so
-/// comparing with the live environment would make `$AR_KEY_OPENAI` and the
-/// literal `sk-...` compare **equal** — and the write path would then
-/// discard the change. The operator edits the file's spelling, the panel
-/// says "identical", and the edit never lands.
-///
-/// So both documents are parsed with a resolver that expands **nothing**:
-/// a `$VAR` reference stays a literal, and the two spellings differ. A
-/// document with the same `$VAR` on both sides still compares equal, which
-/// is correct.
-///
-/// It is also **deterministic**: the live environment could change between
-/// two parses, and a comparison that answers differently when the operator
-/// exports a variable is not a comparison.
-///
-/// # What is NOT compared
-///
-/// `Config` does not deny unknown fields, so a YAML key the struct does not
-/// model is dropped from both parses and is **not compared**. A change there
-/// is not detected. That is a real limit on the "semantic" claim, and it is
-/// bounded: the panel's own writes only ever touch modelled sections, and
-/// `splice_section` preserves the rest of the text.
-///
-/// A document that does not parse is NOT identical — it is a change, and the
-/// write path will report the parse error. Answering "identical" for an
-/// unparseable candidate would swallow the error.
-fn means_the_same(current: &str, candidate: &str) -> bool {
-    if current == candidate {
-        return true;
-    }
-    match (
-        Config::parse(current, no_expansion),
-        Config::parse(candidate, no_expansion),
-    ) {
-        (Ok(a), Ok(b)) => a == b,
-        // One of them does not parse. That is a change, not an identity, and
-        // the write path reports the parse error.
-        _ => false,
-    }
-}
-
-/// The resolver [`means_the_same`] uses: expand **nothing**.
-///
-/// A `None` lookup means "the variable is not set", so the expansion leaves
-/// `$VAR` as the literal text `$VAR` — which is what makes the comparison
-/// distinguish a reference from the value it points at.
-fn no_expansion(_: &str) -> Result<Option<String>, String> {
-    Ok(None)
-}
-
 /// The registry catalog for the browser pane: every compiled-in provider with
 /// its models and the prices the pricing table knows, read-only. `configured`
 /// says this config already routes to the id, which is what turns the browser
@@ -1634,7 +1543,7 @@ async fn save_combos(
         Err(e) => return render_failed(e),
     };
     let next = commands::splice_section(&doc, "combos", &section);
-    if means_the_same(&doc, &next) {
+    if commands::means_the_same(&doc, &next) {
         return Json(json!({ "ok": true, "pending_restart": false, "note": "identical" }))
             .into_response();
     }
@@ -1777,7 +1686,7 @@ async fn provider_key(
         Ok(v) => v,
         Err(resp) => return *resp,
     };
-    let keys = raw_keys(&doc);
+    let keys = commands::raw_keys(&doc);
 
     let (next, var) = match cfg.providers.iter().find(|row| row.id == id) {
         Some(row) => {
@@ -1813,14 +1722,14 @@ async fn provider_key(
                 Err(e) => return render_failed(e),
             };
             let next = commands::splice_section(&doc, "providers", &section);
-            match with_key_binding(&next, &id, var.as_str()) {
+            match commands::with_key_binding(&next, &id, var.as_str()) {
                 Ok(next) => (next, var),
                 Err(e) => return render_failed(e),
             }
         }
     };
 
-    if let Err(e) = set_env_var(&ctx.env, &var, key) {
+    if let Err(e) = commands::set_env_var(&ctx.env, &var, key) {
         return bad_request(
             format!("cannot write {}: {e}", ctx.env.display()),
             "check permissions on the env file",
@@ -1834,7 +1743,7 @@ async fn provider_key(
     // The comparison is semantic (F8): the renderer emits block-style lists
     // where a hand-written file uses flow-style, so a byte comparison would
     // re-render the file on every paste of the same credential.
-    if !means_the_same(&doc, &next)
+    if !commands::means_the_same(&doc, &next)
         && let Err(e) = commands::write_file(&ctx.config, &next)
     {
         return bad_request(
@@ -1849,22 +1758,6 @@ async fn provider_key(
         "note": "the credential was written to the env file",
     }))
     .into_response()
-}
-
-/// Upserts one `NAME=value` in the env file, 0600, preserving every other
-/// line: the same merge `sync_env_file` performs, minus the dashboard DB.
-fn set_env_var(path: &std::path::Path, name: &str, value: &str) -> std::io::Result<()> {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
-    let entry = format!("{name}={value}");
-    let mut lines: Vec<String> = text.lines().map(|s: &str| s.to_owned()).collect();
-    match lines
-        .iter()
-        .position(|l| l.starts_with(&format!("{name}=")))
-    {
-        Some(i) => lines[i] = entry,
-        None => lines.push(entry),
-    }
-    commands::write_private(path, &(lines.join("\n") + "\n"))
 }
 
 /// The panel's default token lifetime, in days.
@@ -2172,7 +2065,7 @@ async fn set_limits(
     }
     let next =
         commands::splice_section(&doc, "limits", &crate::import::limits::render(&cfg.limits));
-    if means_the_same(&doc, &next) {
+    if commands::means_the_same(&doc, &next) {
         return Json(json!({ "ok": true, "pending_restart": false, "note": "identical" }))
             .into_response();
     }
@@ -2275,7 +2168,7 @@ async fn provider_custom(
     // Edit keeps the binding's variable: a hand-wired `$AR_KEY_MINE` never
     // re-points to the canonical name just because a credential was pasted.
     let canonical = format!("AR_KEY_{}", crate::import::env_name(&id));
-    let bound = raw_keys(&doc)
+    let bound = commands::raw_keys(&doc)
         .get(&id)
         .and_then(|v| v.strip_prefix('$'))
         .unwrap_or(&canonical)
@@ -2309,18 +2202,18 @@ async fn provider_custom(
     let mut next = commands::splice_section(&doc, "custom_providers", &section);
     if !key.is_empty() {
         // Env first: the config write below is the one that publishes it.
-        if let Err(e) = set_env_var(&ctx.env, var, &key) {
+        if let Err(e) = commands::set_env_var(&ctx.env, var, &key) {
             return bad_request(
                 format!("cannot write {}: {e}", ctx.env.display()),
                 "check permissions on the env file",
             );
         }
-        next = match with_key_binding(&next, &id, var) {
+        next = match commands::with_key_binding(&next, &id, var) {
             Ok(next) => next,
             Err(e) => return render_failed(e),
         };
     }
-    if means_the_same(&doc, &next) {
+    if commands::means_the_same(&doc, &next) {
         // The CONFIG is unchanged. The env file may not be: the credential is
         // written there first, because that is what publishes it. So "identical"
         // would be a lie about the write path as a whole, and the note names
@@ -2353,79 +2246,12 @@ fn upsert_custom_rows(
     rows
 }
 
-/// Removes everything one provider wrote to config.yaml — its row (registry
-/// or custom) plus its `keys:` entries, once no surviving row shares them.
-/// Returns `None` when the config names no row for the id: the handler turns
-/// that into a refusal rather than a lying success.
-///
-/// The `ar.env` line is never touched: an unset `$AR_KEY_*` is harmless, and
-/// the same variable may still back a row that stays.
-fn splice_remove_provider(doc: &str, cfg: &Config, id: &str) -> anyhow::Result<Option<String>> {
-    if !cfg.providers.iter().any(|p| p.id == id) && !cfg.custom_providers.iter().any(|c| c.id == id)
-    {
-        return Ok(None);
-    }
-    let providers = crate::import::render_providers_section(
-        &cfg.providers
-            .iter()
-            .filter(|p| p.id != id)
-            .cloned()
-            .collect::<Vec<_>>(),
-    )?;
-    let next = commands::splice_section(doc, "providers", &providers);
-    let kept: BTreeSet<String> = cfg
-        .providers
-        .iter()
-        .filter(|p| p.id != id)
-        .flat_map(|p| p.key_refs().into_iter().map(str::to_owned))
-        .chain(
-            cfg.custom_providers
-                .iter()
-                .filter(|c| c.id != id)
-                .map(|c| c.key_ref.clone()),
-        )
-        .collect();
-    let customs = crate::import::render_custom_section(
-        &cfg.custom_providers
-            .iter()
-            .filter(|c| c.id != id)
-            .cloned()
-            .collect::<Vec<_>>(),
-    )?;
-    let next = commands::splice_section(&next, "custom_providers", &customs);
-    // Keys entries the removed rows alone held: every entry the removed rows
-    // name, minus the entries the surviving rows name. Shared entries survive
-    // by construction, so this is exactly a “no dangling reference” edit.
-    let orphaned: BTreeSet<String> = cfg
-        .providers
-        .iter()
-        .filter(|p| p.id == id)
-        .flat_map(|p| p.key_refs().into_iter().map(str::to_owned))
-        .chain(
-            cfg.custom_providers
-                .iter()
-                .filter(|c| c.id == id)
-                .map(|c| c.key_ref.clone()),
-        )
-        .filter(|name| !kept.contains(name))
-        .collect();
-    if orphaned.is_empty() {
-        return Ok(Some(next));
-    }
-    let keys = raw_keys(doc)
-        .into_iter()
-        .filter(|(name, _)| !orphaned.contains(name))
-        .collect();
-    let section = crate::import::render_keys_section(&keys)?;
-    Ok(Some(commands::splice_section(&next, "keys", &section)))
-}
-
 /// Removes one provider: refuses while any combo still references it, refuses
 /// when the id is configured nowhere, otherwise drops the row and its
 /// orphaned `keys:` entries in one file write that keeps the rest byte-true.
 ///
 /// Body: { "id": "..." }. The `ar.env` line is never touched (see
-/// [`splice_remove_provider`]).
+/// [`crate::commands::splice_remove_provider`]).
 async fn provider_remove(
     State(ctx): State<Arc<Ctx>>,
     body: Result<Json<Value>, JsonRejection>,
@@ -2469,7 +2295,7 @@ async fn provider_remove(
             "delete or repoint those combos first; a dead provider fails loudly, a dangling one fails late",
         );
     }
-    let next = match splice_remove_provider(&doc, &cfg, &id) {
+    let next = match commands::splice_remove_provider(&doc, &cfg, &id) {
         Ok(next) => next,
         Err(e) => return render_failed(e),
     };
@@ -2560,17 +2386,17 @@ mod tests {
         );
         let cfg = Config::parse(doc, resolve_env).expect("fixture must parse");
         assert!(
-            splice_remove_provider(doc, &cfg, "zzz")
+            commands::splice_remove_provider(doc, &cfg, "zzz")
                 .expect("renders")
                 .is_none(),
             "an unknown id is a refusal, not an edit"
         );
 
         // pd alone holds `dkey`, so the row and its binding go together.
-        let next = splice_remove_provider(doc, &cfg, "pd")
+        let next = commands::splice_remove_provider(doc, &cfg, "pd")
             .expect("renders")
             .expect("pd is configured");
-        let keys = raw_keys(&next);
+        let keys = commands::raw_keys(&next);
         assert!(!keys.contains_key("dkey"), "{keys:?}");
         assert!(keys.contains_key("shared"), "{keys:?}");
         let cfg2 = Config::parse(&next, resolve_env).expect("result must still parse");
@@ -2578,11 +2404,11 @@ mod tests {
 
         // pa shares `shared` with pc, so the binding — and therefore the
         // keys section — is untouched.
-        let next2 = splice_remove_provider(&next, &cfg2, "pa")
+        let next2 = commands::splice_remove_provider(&next, &cfg2, "pa")
             .expect("renders")
             .expect("pa is configured");
         assert_eq!(
-            raw_keys(&next2),
+            commands::raw_keys(&next2),
             keys,
             "a shared binding survives a row's removal"
         );
@@ -2594,8 +2420,8 @@ mod tests {
         std::fs::create_dir_all(&dir).ok();
         let path = dir.join("ar.env");
         std::fs::write(&path, "OTHER=1\nAR_KEY_OPENAI=old\n").ok();
-        set_env_var(&path, "AR_KEY_OPENAI", "new").ok();
-        set_env_var(&path, "AR_KEY_NEW", "fresh").ok();
+        commands::set_env_var(&path, "AR_KEY_OPENAI", "new").ok();
+        commands::set_env_var(&path, "AR_KEY_NEW", "fresh").ok();
         let text = std::fs::read_to_string(&path).ok().unwrap_or_default();
         assert_eq!(text, "OTHER=1\nAR_KEY_OPENAI=new\nAR_KEY_NEW=fresh\n");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2883,7 +2709,7 @@ mod http_tests {
              which is what made the old byte comparison useless"
         );
         assert!(
-            means_the_same(&doc, &next),
+            commands::means_the_same(&doc, &next),
             "the two documents must compare EQUAL: they parse to the same config"
         );
 
@@ -2903,7 +2729,7 @@ mod http_tests {
         let after = "keys:\n  k: v\ncombos:\n  - id: c\n    strategy: priority\n    targets: [openai/gpt-5.4-nano]\n";
 
         assert!(
-            !means_the_same(before, after),
+            !commands::means_the_same(before, after),
             "a different target is a different config"
         );
 
@@ -2922,13 +2748,13 @@ mod http_tests {
         let reference = "keys:\n  k: $AR_KEY_OPENAI\ncombos: []\n";
         let literal = "keys:\n  k: sk-the-actual-secret\ncombos: []\n";
         assert!(
-            !means_the_same(reference, literal),
+            !commands::means_the_same(reference, literal),
             "a key reference and the literal it points at are DIFFERENT documents: \
              the operator's edit must not be swallowed"
         );
         // The same reference on both sides is still the same document.
         assert!(
-            means_the_same(reference, reference),
+            commands::means_the_same(reference, reference),
             "the same reference on both sides is the same document"
         );
     }
@@ -2946,7 +2772,7 @@ mod http_tests {
         let before = "keys:\n  k: v\nan_unmodelled_key: 1\ncombos: []\n";
         let after = "keys:\n  k: v\nan_unmodelled_key: 2\ncombos: []\n";
         assert!(
-            means_the_same(before, after),
+            commands::means_the_same(before, after),
             "an unmodelled key is NOT compared - this is the known limit of the \
              semantic comparison, and the test exists so it cannot be forgotten"
         );

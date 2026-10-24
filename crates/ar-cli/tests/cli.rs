@@ -698,6 +698,10 @@ fn empty_dir(name: &str) -> PathBuf {
     std::fs::create_dir_all(&dir).expect("the temp dir is created");
     let _ = std::fs::remove_file(dir.join("config.yaml"));
     let _ = std::fs::remove_file(dir.join("credentials.db"));
+    // `ar.env` too: a write verb that leaves one behind after a FAILED negative
+    // control would otherwise be read by the next run as "the env file exists",
+    // and a test that fails on another test's debris teaches the wrong lesson.
+    let _ = std::fs::remove_file(dir.join("ar.env"));
     dir
 }
 
@@ -1747,4 +1751,273 @@ fn server_set_should_not_swallow_the_comment_block_after_the_section() {
     );
     assert!(after.contains("keys:\n  a: sk-x"), "keys: was eaten: {after}");
     assert!(after.contains("port: 20129"), "the write did not land: {after}");
+}
+
+/// The contract tests Phase 2 of the config-write surface names.
+///
+/// `aroute providers add` is three writes that must land together — the
+/// `providers:` row, the `keys:` reference and the `$AR_KEY_*` value in the env
+/// file the service loads — because a config missing any one of the three is a
+/// config `ar serve` refuses at boot. `remove` is the same set in reverse, with a
+/// reference check standing in front of it.
+///
+/// Every case writes into a scratch directory beside the target's own tmpdir,
+/// so the repo's `config.yaml` and its `ar.env` are never touched, and the
+/// scratch directory is removed at the end of each test.
+///
+/// One `providers add`: the row, the `keys:` reference and the env line.
+#[test]
+fn providers_add_should_write_the_row_the_key_ref_and_the_env_line_together() {
+    let out = empty_dir("providers-add");
+    let held = out.join("config.yaml");
+    std::fs::write(out.join("cred"), "sk-test-credential\n").expect("the credential file writes");
+    std::fs::write(
+        &held,
+        concat!(
+            "providers:\n",
+            "  - id: openai\n",
+            "    key: openai\n",
+            "\n",
+            "# The credentials block: declared names, secrets stay in env.\n",
+            "keys:\n",
+            "  openai: $AR_KEY_OPENAI\n",
+        ),
+    )
+    .expect("the fixture writes");
+
+    let res = ar_in(
+        &out,
+        &[
+            "providers",
+            "add",
+            "anthropic",
+            "--credential-file",
+            "cred",
+        ],
+    );
+    assert_eq!(
+        code(&res),
+        0,
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&res.stdout),
+        stderr(&res)
+    );
+
+    let after = std::fs::read_to_string(&held).expect("readable");
+    assert!(
+        after.contains("  - id: anthropic\n    key: anthropic\n"),
+        "the row was not written: {after}"
+    );
+    assert!(
+        after.contains("  anthropic: $AR_KEY_ANTHROPIC\n"),
+        "the keys: reference was not written: {after}"
+    );
+    assert!(
+        after.contains("  openai: $AR_KEY_OPENAI\n"),
+        "the existing keys: row was lost: {after}"
+    );
+    assert!(
+        after.contains("# The credentials block: declared names, secrets stay in env."),
+        "the comment block was eaten: {after}"
+    );
+
+    // The env file is the third write, and it holds the credential itself.
+    let env = out.join("ar.env");
+    let env_text = std::fs::read_to_string(&env).expect("the env file was written");
+    assert!(
+        env_text.contains("AR_KEY_ANTHROPIC="),
+        "the env line was not written: {env_text}"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&env).expect("stat").permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "a file holding a credential must be owner-only, was {mode:o}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// An id the registry does not know is refused, and nothing is written.
+#[test]
+fn providers_add_should_refuse_an_id_the_registry_does_not_know() {
+    let out = empty_dir("providers-add-unknown");
+    let held = out.join("config.yaml");
+    std::fs::write(out.join("cred"), "sk-test-credential\n").expect("the credential file writes");
+    let before = "providers:\n  - id: openai\n    key: openai\n\nkeys:\n  openai: $AR_KEY_OPENAI\n";
+    std::fs::write(&held, before).expect("the fixture writes");
+
+    let res = ar_in(
+        &out,
+        &[
+            "providers",
+            "add",
+            "definitely-not-a-provider",
+            "--credential-file",
+            "cred",
+        ],
+    );
+    assert_eq!(code(&res), 1, "stdout: {}", stdout(&res));
+    assert!(
+        stdout(&res).contains("unknown provider"),
+        "the refusal must name what was unknown: {}",
+        stdout(&res)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&held).expect("readable"),
+        before,
+        "a refused add leaves the config alone"
+    );
+    assert!(
+        !out.join("ar.env").exists(),
+        "a refused add must not write the env file either"
+    );
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// A combo that still references the provider refuses the removal.
+#[test]
+fn providers_remove_should_refuse_while_a_combo_references_the_provider() {
+    let out = empty_dir("providers-remove-referenced");
+    let held = out.join("config.yaml");
+    let before = concat!(
+        "providers:\n",
+        "  - id: openai\n",
+        "    key: openai\n",
+        "  - id: anthropic\n",
+        "    key: anthropic\n",
+        "\n",
+        "keys:\n",
+        "  openai: $AR_KEY_OPENAI\n",
+        "  anthropic: $AR_KEY_ANTHROPIC\n",
+        "\n",
+        "combos:\n",
+        "  - id: c\n",
+        "    strategy: priority\n",
+        "    targets:\n",
+        "      - openai/gpt-5.4\n",
+    );
+    std::fs::write(&held, before).expect("the fixture writes");
+
+    let res = ar_in(&out, &["providers", "remove", "openai"]);
+    assert_eq!(code(&res), 1, "stdout: {}", stdout(&res));
+    assert!(
+        stdout(&res).contains("still referenced by: c"),
+        "the refusal must name the combo blocking it: {}",
+        stdout(&res)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&held).expect("readable"),
+        before,
+        "a refused remove leaves the config alone"
+    );
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// The entry the removed row alone held goes with it; a shared one stays.
+#[test]
+fn providers_remove_should_drop_the_keys_row_only_it_held() {
+    let out = empty_dir("providers-remove-shared");
+    let held = out.join("config.yaml");
+    let before = concat!(
+        "keys:\n",
+        "  shared: $AR_KEY_SHARED\n",
+        "\n",
+        "providers:\n",
+        "  - id: openai\n",
+        "    key: shared\n",
+        "  - id: anthropic\n",
+        "    key: shared\n",
+    );
+    std::fs::write(&held, before).expect("the fixture writes");
+
+    let res = ar_in(&out, &["providers", "remove", "openai"]);
+    assert_eq!(
+        code(&res),
+        0,
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&res.stdout),
+        stderr(&res)
+    );
+
+    let after = std::fs::read_to_string(&held).expect("readable");
+    assert!(
+        after.contains("  shared: $AR_KEY_SHARED\n"),
+        "a keys: row a surviving provider still uses must stay: {after}"
+    );
+    assert!(
+        after.contains("  - id: anthropic\n    key: shared\n"),
+        "the survivor must stay: {after}"
+    );
+    assert!(
+        !after.contains("  - id: openai\n"),
+        "the removed row must be gone: {after}"
+    );
+    assert!(
+        !after.contains("custom_providers:"),
+        "a writer must not invent a section the operator did not have: {after}"
+    );
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// A writer must be able to open a config whose other keys are not exported.
+///
+/// The proxy expands `$VAR` and refuses to boot on a missing one, so a reader
+/// that expands cannot help the operator who is editing *because* a credential
+/// is missing. The write verbs parse the file without expanding, which is also
+/// the shape the panel uses.
+#[test]
+fn providers_add_should_work_on_a_config_whose_other_keys_are_unexported() {
+    let out = empty_dir("providers-add-unexported");
+    let held = out.join("config.yaml");
+    std::fs::write(out.join("cred"), "sk-test-credential\n").expect("the credential file writes");
+    std::fs::write(
+        &held,
+        concat!(
+            "providers:\n",
+            "  - id: openai\n",
+            "    key: openai\n",
+            "\n",
+            "keys:\n",
+            "  openai: $AR_KEY_OPENAI\n",
+            "  groq: $AR_KEY_GROQ_NOT_SET_ANYWHERE\n",
+        ),
+    )
+    .expect("the fixture writes");
+
+    let res = ar_in(
+        &out,
+        &[
+            "providers",
+            "add",
+            "anthropic",
+            "--credential-file",
+            "cred",
+        ],
+    );
+    assert_eq!(
+        code(&res),
+        0,
+        "a write must open a config with an unexported key: stdout {} stderr {}",
+        String::from_utf8_lossy(&res.stdout),
+        stderr(&res)
+    );
+    let after = std::fs::read_to_string(&held).expect("readable");
+    assert!(
+        after.contains("  anthropic: $AR_KEY_ANTHROPIC\n"),
+        "the new binding landed: {after}"
+    );
+    assert!(
+        after.contains("  groq: $AR_KEY_GROQ_NOT_SET_ANYWHERE\n"),
+        "the untouched row with its unexported reference survived: {after}"
+    );
+
+    let _ = std::fs::remove_dir_all(&out);
 }
