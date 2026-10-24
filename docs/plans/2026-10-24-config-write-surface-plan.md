@@ -20,27 +20,28 @@ column that matters is the last one — **who can write it today**.
 | # | Section | Shapes | Panel writes | CLI writes | Verdict |
 |---|---|---|---|---|---|
 | 1 | `server:` | `host`, `port` | yes — `splice_section(&next, "server", …)` at `webui.rs:1362` | **no** | **GAP** |
-| 2 | `keys:` | `name: $VAR` | no (mint only) | `sync`, `import` (wholesale) | partial, no targeted writer |
+| 2 | `keys:` | `name: $VAR` | yes — upserts a binding via `with_key_binding` (`webui.rs:711`, the `provider-key` route at `:343`) | `sync` (indirect, via `sync_credentials:3178`); `keys arm-gate\|mint` write the store, not the file | partial, no targeted writer |
 | 3 | `providers:` | `id`, `key`, `keys` | yes — the **three-part add** (`webui.rs:1802-1815`: row + `keys:` ref + env value, no-binding refused at `:1795`) | `sync` | **GAP** |
-| 4 | `custom_providers:` | `id`, protocol, `base_url`, headers, `key_ref` | yes (`webui.rs:2198`) | `sync` | **GAP** |
+| 4 | `custom_providers:` | `id`, protocol, `base_url`, `endpoint`, headers, `key_ref` | yes (`webui.rs:2198`) | `sync` | **GAP** |
 | 5 | `combos:` | `id`, strategy, `targets`, `weights`, `pool`, `steps`, `compression`, `judge_model`, `context_length` | yes — **whole-section replace** (`webui.rs:1614`) validated by `check_combos` (`:1655`) | `import` (wholesale) | **GAP** — no single-item writer |
-| 6 | `oauth:` | 12 fields per session (`OAuthSession`, `:818-895`) | **no route at all** | **nothing** | **GAP + data-loss risk** |
+| 6 | `oauth:` | 13 fields per session (`OAuthSession`, `:818-907`) | **no route at all** | **nothing** | **GAP + data-loss risk** |
 | 7 | `continue_on_cut:` | provider id list | no | **nothing** | **GAP** |
 | 8 | `visibility:` | `blocked_providers`, `hide_paid_models`, `model_visibility_allowlist`, `model_visibility_denylist` | no | **nothing** | **GAP** |
 | 9 | `provider_settings:` | `excluded_models` (globs) per provider | no | **nothing** | **GAP** |
-| 10 | `limits:` | rpm, usd_micros, tokens, model, model_tokens, spend_window | yes | **yes** (`limits set`/`clear`) | done, `b546f4c` |
+| 10 | `limits:` | rpm, usd_micros, tokens, refuse_unpriced, model, model_tokens, spend_window | yes | **yes** (`limits set`/`clear`) | done, `b546f4c` |
 
 Two findings that change the shape of this plan:
 
-**A. `import` destroys a config it cannot represent.** `commands.rs:2347` writes
-`config.yaml` wholesale from `render_yaml` (`import/mod.rs:353`), which emits
+**A. `import` destroys a config it cannot represent.** *Fixed by Phase 0 — this
+is the finding as it stood.* `commands.rs:2348` wrote `config.yaml` wholesale
+from `render_yaml` (`import/mod.rs:353`), which emits
 `keys:`, `providers:`, optionally `custom_providers:`, then `combos:` — **and
-never `oauth:`**. There is no existence check at the write. So
+never `oauth:`**. There was no existence check at the write. So
 `aroute import --out-dir <dir>` against a directory whose `config.yaml` carries
 an `oauth:` block **silently deletes that block by construction.** This is the
 same failure class as B-1 (the hyphen-section data loss), on a different writer,
 and it is *live* — `oauth:` is the section with no other writer to restore it.
-**Phase 0 fixes this before any new verb lands**, because a new `oauth add` verb
+**Phase 0 fixed this before any new verb landed**, because a new `oauth add` verb
 makes the loss cheaper to recover from but does not stop `import` deleting it.
 
 **B. Sections 7, 8 and 9 are unwritable *everywhere*.** Not a CLI-vs-panel gap:
@@ -49,6 +50,16 @@ no surface at all — not the panel, not `sync`, not `import`. The catalogue-fol
 `config.yaml`'s own comments say none of them can change what a client sees
 until an operator writes one. **These need a new writer, not a mirror**, so this
 plan invents semantics where none exist — and says so in each phase.
+
+*Both findings were validated 2026-10-24 by machine extraction rather than by
+reading: the ten sections were re-derived from the `Config` struct, and every
+write site in the workspace was enumerated by regex over `splice_section` /
+`remove_section` / `write_file`, panel and CLI separately, test modules
+excluded. That pass corrected the table above — `custom_providers` has an
+`endpoint` field, `Limit` has a `refuse_unpriced` field, `OAuthSession` has 13
+fields not 12, and the panel does write `keys:` where the table said it did
+not — and it confirmed B exactly: no writer for sections 7, 8 or 9 exists
+anywhere in the workspace.*
 
 ## 2. What this plan deliberately does not do
 
@@ -211,9 +222,10 @@ Test contract:
 ### Phase 5 — `aroute oauth list|add|remove` *(the operator's stated goal)*
 
 `docs/36` 8a specified these; the operator's ask makes them the phase the whole
-plan is for. `OAuthSession` has 12 fields, of which only four are commonly
-written. The verb writes **placement only, never a secret** — the block carries
-no secrets by design (`config.yaml:57-85`).
+plan is for. `OAuthSession` has 13 fields (`:818-907`), of which seven are
+documented in `config.yaml:57-85` and commonly written. The verb writes
+**placement only, never a secret** — the block carries no secrets by design
+(`config.yaml:57-85`).
 
 - `aroute oauth list` — one row per session: `provider`, `authorization_url`,
   `token_url`, `client_id`, `redirect_uri`, `refresh_key`, `client_secret_key`.
@@ -274,7 +286,7 @@ semantics prove wrong these inherit the fix rather than the other way round.
 ## 4. Cross-cutting, applies to every phase
 
 1. **One writer module.** `splice_section` + `write_file` already exist
-   (`commands.rs:2977`, `:3365`) and B-1 fixed the predicate. Phase 0 onward adds
+   (`commands.rs:2978`, `:3366`) and B-1 fixed the predicate. Phase 0 onward adds
    `render_*_section` siblings beside `import`'s existing ones; the rule is that
    a new writer reuses `splice_section` rather than open-coding YAML.
 2. **The restart note, every write.** The line `9a8821a` added to `limits set`
@@ -316,5 +328,6 @@ operator chose to lose a section.
   this plan, so the direction is signalled; the sub-decisions (single-item vs
   whole-section writers, whether Phases 6-7 invent semantics or wait for a design)
   are still the operator's to rule.
-- The second half of the `import` half of the Q17 finding: once Phase 0 lands,
-  the CLI can update every section **and no path destroys a section**.
+- The second half of the `import` half of the Q17 finding: Phase 0 has landed,
+  so no path destroys a section any more. What is still open is the first half —
+  the CLI reaching every section, which is what Phases 1-7 build.
