@@ -1592,3 +1592,88 @@ The recommendation of DEC-2 stands as written (ship `commands --json` first);
 the point of this section is that the alternative is now measured rather than
 assumed, and that **shipping it is a one-line `release.yml` edit plus an idle-RAM
 measurement**, not an unknown.
+
+### 9.5 The second live-system pass (2026-10-24, 13:00-14:40) — the operational audit
+
+The morning pass measured the system under load; this pass measures it at rest,
+~14h after the proxy's boot, with the G3/G6/G7 work shipped in between. The
+headline: **the system is healthy and the incident has not recurred**, but three
+real defects surfaced from driving the verbs, all now fixed (`9a8821a`).
+
+#### Resources, measured at rest
+
+| Component | RSS | Peak (VmHWM) | Threads | Swap held | Uptime |
+|---|---|---|---|---|---|
+| aroute proxy (pid 1103) | **46.7 MB** | 164 MB | 26 | 14.5 MB | since 2026-10-23 23:31 |
+| dashboard launcher (pid 2546288) | 2.3 MB | 12.8 MB | 1 | 1.1 MB | 11h |
+| dashboard child `omniroute v16.3.8` (pid 2546332) | **298 MB** | **926 MB** | 12 | **229 MB** | 11h |
+
+The omniroute child is steady-state-lighter than the morning baseline (298 vs
+873 MB RSS) but its peak is the same ~926 MB, and 229 MB of it is currently
+swapped out — the host is under real memory pressure (33 GiB used, 17 GiB swap),
+of which aroute's total share is ~300 MB RSS.
+
+`/healthz` answers in **0.3–0.6 ms** (the incident was 15,427 ms). The dashboard
+serves at `/dash` (307 → the app); `/` is 404 by design.
+
+Disk: the repo is 1.6 GB (the compiled dashboard dist). `~/.config/ar` is
+**3.2 GB**, of which **1.6 GB is `dashboard.stale-20261007.1447`** — a stale
+copy from Oct 7 that nothing references. It is the operator's to delete; flagged
+here because it doubles the install's disk footprint.
+
+#### Journal findings (last 24h)
+
+| Finding | Count | Verdict |
+|---|---|---|
+| `[callLogs] Call-log artifact worker failed` | 54 **before** 05:57, **0 after** | the F15 fix (`229245c`) demonstrably closed it |
+| `[Encryption] STORAGE_ENCRYPTION_KEY is not set` | 4,119 (~352/h) | encrypted dashboard rows cannot decrypt; benign but noisy — needs the env var set in the unit, an operator decision |
+| `api_key_expired` (OpenCode Console) | 26 | a real expired provider key; `aroute doctor` names it |
+| `[OpenRouterCatalog] timeout` | 9 | upstream flake, self-heals to stale cache |
+
+#### The three defects this pass found (all fixed in `9a8821a`)
+
+1. **`aroute run` was broken by its own security gate.** The DNS-rebinding gate
+   (`loopback_only`, `ar-server/src/app.rs:722`) requires a loopback `Host`;
+   the run verb's in-process one-shot request carried none, so the verb has
+   answered 403 `non_loopback_request` since the gate landed. A/B: pre-fix
+   403, post-fix a real upstream 401 + the `decision:` line. Fixed by setting
+   the Host header the gate accepts — the gate is untouched. Negative control
+   run (test fails with the header removed).
+2. **No `enable`/`disable`.** `aroute service` could start/stop but not say
+   "come back after reboot". Now `aroute service enable|disable <unit>`,
+   deliberately without `--now` (enable never starts, disable never stops), and
+   `status` reports `enabled/disabled at boot` beside the live state. Verified
+   live on this host: disable left the dashboard answering while `is-enabled`
+   flipped; re-enabled; state restored.
+3. **`limits set` was silent about the restart contract.** It printed the row
+   but never that the running proxy reads it at boot only — the B-3 gap. It now
+   prints the exact apply command.
+
+#### Token cost, re-measured with the G3 flags (fixture config)
+
+| Call | Bytes | ~Tokens |
+|---|---|---|
+| `models` (default) | 71,974 | 17,993 |
+| `models --routable` | **169** | **42** |
+| `models --fields model` | 109 | 27 |
+| `doctor` | 797 | 199 |
+| `doctor --status fail` | 23 | 5 |
+| `service status` | 215 | 53 |
+| `limits` | 133 | 33 |
+| `cost-report` | 35 | 8 |
+| `keys list` | 157 | 39 |
+| `auth status` | 27 | 6 |
+
+Every agent workflow now has a sub-200-token path: health → `service status`
+(53), discovery → `models --routable` (42), diagnose → `doctor --status fail`
+(5 when clean, loud when not), spend → `cost-report` (8), boot persistence →
+`service status`/`enable`/`disable`.
+
+#### Still open (by design, awaiting the operator)
+
+- **Q17/DEC-1** — no CLI surface for `providers add`, `server set`, or `oauth:`
+  writes: an agent must use the panel or hand-edit for those. This is the
+  largest remaining agent-workflow gap and it is a decision, not an oversight.
+- **Q19/DEC-6** — the `models` default is still the 18k-token catalog dump.
+- The 1.6 GB stale dashboard copy and the `STORAGE_ENCRYPTION_KEY` unit env are
+  operator housekeeping, not code.
