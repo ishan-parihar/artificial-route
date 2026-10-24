@@ -45,6 +45,7 @@ page, this document does not edit it).
 - [6. The test plan](#6-the-test-plan)
 - [7. Open items carried from the recon](#7-open-items-carried-from-the-recon)
 - [8. The single change to make first](#8-the-single-change-to-make-first)
+- [9. The live-system red-team pass (2026-10-24)](#9-the-live-system-red-team-pass-2026-10-24)
 
 ## 0. The goal, restated as a testable contract
 
@@ -1092,6 +1093,19 @@ CLI", and it should be ruled separately. **This decision is cheap to defer
 and expensive to get wrong**: it is the one item in this plan that changes
 what is published.
 
+**Amended 2026-10-24 by the live-system red-team pass (§9.4).** The
+recommendation is unchanged, but the alternative is now *measured* rather than
+assumed: the feature compiles cleanly under `--features mcp`, the default tree
+still contains no `rmcp` (the `docs/06:60` gate survives), `aroute mcp --list`
+prints 13 of 13 tools, and a real stdio `initialize` handshake returns
+`protocolVersion 2024-11-05` with `serverInfo` and the full catalog. So the
+cost of shipping is bounded and known: one `--features mcp` in
+`release.yml:131-135`, the `install.sh` wiring becomes truthful (DR-9), and two
+numbers still owe a release-artifact measurement against the gate — the
+artifact's size and its idle RAM against the +<25 MB cap. `release.yml` was
+deliberately left unchanged by that pass so this decision stays the
+operator's.
+
 ### DEC-3 — What should the spend verb be called?
 
 **Recommendation: `aroute cost-report`.**
@@ -1374,3 +1388,103 @@ It is first because it is the only finding that **destroys data silently**,
 and because it is a precondition for every write path the rest of this plan
 adds — steps 3, 4 and 8 all write through `splice_section`. Fixing it after
 those steps land means the new verbs inherit the bug.
+
+---
+
+## 9. The live-system red-team pass (2026-10-24)
+
+Everything above is read from source at `12dda18`. This section is the same CLI
+audited against the **running** system, which found things a static pass cannot:
+what the commands cost in tokens, what the daemon costs in RAM, and what breaks
+when an agent actually tries to drive it.
+
+### 9.1 What the tokens cost (measured against the live config)
+
+| Verb | Bytes | ~Tokens |
+|---|---|---|
+| `models` | 72,913 | **18,228** |
+| `configure` | 31,660 | 7,915 |
+| `doctor` | 31,446 | 7,861 |
+| `providers` | 6,028 | 1,507 |
+| `combo` | 638 | 159 |
+
+`aroute models` spends **18k tokens** to answer "what can I route?", and D-1's
+fix (step 7) is what makes that cheap. `--fields` already works today and is the
+only live lever: `models --fields model` costs **27 tokens** against that 18,228.
+
+### 9.2 What the daemon costs (measured, two systemd user units)
+
+| Component | RSS | Peak (VmHWM) | Threads |
+|---|---|---|---|
+| aroute proxy (Rust, pid 1103) | 44 MB | 160 MB | 26 |
+| dashboard launcher (Rust) | 4 MB | 6 MB | 1 |
+| dashboard child `omniroute v16.3.8` (Node) | 873 MB | **959 MB** | 13 |
+
+Two things follow. First, the unit comment claims "roughly 500 MB RSS"; the
+measured peak is ~960 MB, so it **understates by ~2x** and should be corrected.
+Second, an agent that has only `aroute` cannot observe or manage any of this —
+there is **no lifecycle verb in the command spine** (§1.1 lists `serve, models,
+providers, combo, doctor, run, configure, auth, keys, limits, import, sync,
+dashboard, donate` and nothing that starts, stops or restarts a service).
+`aroute dashboard` launches a foreground server; it cannot stop the running one.
+So the two operations the red-team pass actually performed are only reachable
+through a second tool:
+
+```sh
+systemctl --user status   aroute-dashboard   # observe
+systemctl --user disable --now aroute-dashboard  # verified: freed ~960 MB of RSS
+systemctl --user enable  --now aroute-dashboard  # restored it, serving in 7 s
+```
+
+This is the two-tool gap DEC-1 touches for config sections but not for
+*processes*, and it should be ruled with it.
+
+### 9.3 The 15.4-second `/healthz` (the finding worth the whole pass)
+
+The dashboard returned **HTTP 200 after 15,427 ms** while its own journal said
+`event loop stalled 45.6s` and `GET /healthz event-loop lag 91738ms (HTTP 200 is
+not healthy; busy != ready)`.
+
+CPU attribution decided it: **99% kernel time** (utime 131 ticks vs stime 65,941)
+and 501,889 major page faults. That is thrash, not a JS hot loop — the host sat
+at ~5.2 GB available while two other tenants ran 12 GB python3 jobs. A
+`disable --now` + `enable --now` cycle restored it to **23 ms**, so the cause was
+host memory pressure, not aroute code.
+
+The agent-facing consequence is the real finding: **`/healthz` returning 200 was
+actively misleading.** An agent polling it would have concluded "healthy" from a
+process that could not serve a request in under a minute. Whatever step 6 ships
+as the machine-readable health surface must report **latency**, not just status,
+or it repeats this failure.
+
+### 9.4 The MCP question, settled by building it (this is what DEC-2 needs)
+
+DEC-2 asks whether to ship the `mcp` feature. The red-team pass built the feature
+and ran the real thing, so the decision no longer has to be made on inference:
+
+| Check | Result |
+|---|---|
+| default `cargo tree -e no-dev` contains `rmcp` | **none** (docs/06:60 gate stays green) |
+| `--features mcp` pulls `rmcp` | **3.5.0**, present |
+| `--features mcp` compiles | **yes** (7m24s, clean) |
+| `aroute mcp --list` | **13 of 13** tools + `next:` hints |
+| real stdio `initialize` handshake | **`protocolVersion 2024-11-05`**, `serverInfo {name: ar, version: 0.1.21}`, full catalog |
+| negative control (installed 0.1.21) | still `error: unrecognized subcommand 'mcp'` |
+
+So the capability is real, it builds, and the accept gate survives it. Two
+numbers still owe a measurement against the gate: the artifact's size and its
+idle RAM footprint (`docs/06:60` caps the latter at +<25 MB). Those are
+release-artifact measurements, not developer-machine ones — which is exactly why
+this pass records the answer without changing `release.yml`.
+
+**Corrections this pass made to its own draft**, all from running the check:
+the catalog is **13** tools, not 12; and the defect is not "the default feature
+should be on" (that would break the gate) but "**no build path in the repo
+enables the feature at all**" — `release.yml` passes no `--features` and
+`install.sh` never invokes cargo, so the `claude mcp add aroute` wiring that
+`install.sh` prints cannot work from any published artifact.
+
+The recommendation of DEC-2 stands as written (ship `commands --json` first);
+the point of this section is that the alternative is now measured rather than
+assumed, and that **shipping it is a one-line `release.yml` edit plus an idle-RAM
+measurement**, not an unknown.
