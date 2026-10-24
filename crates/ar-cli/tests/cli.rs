@@ -833,3 +833,110 @@ fn dashboard_should_name_the_missing_dist_when_path_absent() {
     assert!(text.contains("/nonexistent-ar-dist"), "{text}");
     assert!(text.contains("AR_DASHBOARD_DIR"), "{text}");
 }
+
+// --- keys list, and the arm-gate overwrite guard (docs/36 step 5 / B-5) ---
+//
+// These run as subprocesses, not in-process, for the reason `TEST_MASTER_KEY`
+// gives: a process-global `set_var` is shared state between tests that run at
+// the same time. `Command::env` scopes the credential to one child, so the
+// refusal below can be asserted against a store this test owns alone.
+
+/// A store directory already holding a gate master, which is the state the
+/// guard has to detect.
+fn gate_dir(name: &str) -> PathBuf {
+    let dir = empty_dir(name);
+    std::fs::write(dir.join("config.yaml"), AUTH_SESSION_CONFIG).expect("the fixture writes");
+    let store = dir.join("credentials.db");
+    let _ = std::fs::remove_file(&store);
+    let out = Command::new(BIN)
+        .args(["keys", "arm-gate"])
+        .current_dir(&dir)
+        .env("AR_MASTER_KEY", TEST_MASTER_KEY)
+        .env("AR_CRED_STORE", &store)
+        .output()
+        .expect("the first arming runs");
+    assert_eq!(out.status.code(), Some(0), "the store must start armed: {}", String::from_utf8_lossy(&out.stderr));
+    dir
+}
+
+/// `ar` with a store this test owns, the same shape as [`ar_auth`].
+fn ar_gate(dir: &Path, args: &[&str]) -> Output {
+    Command::new(BIN)
+        .args(args)
+        .current_dir(dir)
+        .env("AR_MASTER_KEY", TEST_MASTER_KEY)
+        .env("AR_CRED_STORE", dir.join("credentials.db"))
+        .output()
+        .expect("the ar binary runs")
+}
+
+#[test]
+fn a_second_arming_is_refused_and_names_the_flag_that_allows_it() {
+    let dir = gate_dir("gate-refusal");
+    let store = std::fs::read(dir.join("credentials.db")).expect("read the store");
+
+    let out = ar_gate(&dir, &["keys", "arm-gate"]);
+
+    assert_eq!(code(&out), 1, "refusing is a failure, not a silent success");
+    let text = format!("{}{}", stdout(&out), stderr(&out));
+    assert!(text.contains("already armed"), "must name the reason: {text}");
+    assert!(text.contains("--force"), "must name the flag: {text}");
+    // The store must be byte-identical: the refusal happened before any secret
+    // was generated or written, which is what makes it safe to run unattended.
+    assert_eq!(
+        std::fs::read(dir.join("credentials.db")).expect("re-read"),
+        store,
+        "a refused arming must leave the store untouched"
+    );
+}
+
+#[test]
+fn forcing_an_arming_overwrites_and_says_what_it_invalidated() {
+    let dir = gate_dir("gate-forced");
+
+    let out = ar_gate(&dir, &["keys", "arm-gate", "--force"]);
+
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("previous master is replaced"),
+        "the overwrite must say what it invalidated: {text}"
+    );
+}
+
+#[test]
+fn keys_list_reports_the_store_and_says_tokens_are_not_recorded() {
+    let dir = gate_dir("keys-list");
+
+    let out = ar_gate(&dir, &["keys", "list"]);
+
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("gate: armed"), "{text}");
+    assert!(text.contains("http-gate"), "the row name must appear: {text}");
+    // The honesty this verb exists for: no token material, and a plain statement
+    // that none is knowable -- an empty table would read as "there are none".
+    assert!(text.contains("minted tokens are not recorded"), "{text}");
+    assert!(!text.contains("eyJ"), "no JWT material may be printed: {text}");
+}
+
+#[test]
+fn keys_list_on_a_host_with_no_store_does_not_invent_one() {
+    let dir = empty_dir("keys-list-absent");
+    std::fs::write(dir.join("config.yaml"), AUTH_SESSION_CONFIG).expect("the fixture writes");
+
+    let out = Command::new(BIN)
+        .args(["keys", "list"])
+        .current_dir(&dir)
+        .env("AR_MASTER_KEY", TEST_MASTER_KEY)
+        .env("AR_CRED_STORE", dir.join("credentials.db"))
+        .output()
+        .expect("the ar binary runs");
+
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("store: absent"), "{}", stdout(&out));
+    assert!(
+        !dir.join("credentials.db").exists(),
+        "a read-only verb must not create the store it reports on"
+    );
+}

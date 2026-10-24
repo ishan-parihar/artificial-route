@@ -305,6 +305,17 @@ pub struct KeysArgs {
 /// Subcommands of `aroute keys`.
 #[derive(Debug, Subcommand)]
 pub enum KeysCommand {
+    /// Report what the credential store actually holds, and what it cannot.
+    ///
+    /// Row names, OAuth sessions, the revocation count and the gate's own
+    /// state. It prints no token material, because the store keeps no table of
+    /// issued tokens — a list would be a fabrication — and it says so.
+    ///
+    /// Examples:
+    ///   aroute keys list
+    #[command(verbatim_doc_comment)]
+    List,
+
     /// Arm the bearer gate: generate a 32-byte master key into the credential
     /// store, then mint and print the first client token.
     ///
@@ -318,6 +329,11 @@ pub enum KeysCommand {
     ///   aroute keys arm-gate
     ///   aroute keys arm-gate --key-id prod-deploy
     ///   aroute keys arm-gate --key $(openssl rand -hex 32)
+    ///   aroute keys arm-gate --force
+    ///
+    /// Re-arming without `--force` is refused: the master is replaced whether
+    /// or not anyone asked, and every token signed by the old one stops
+    /// verifying.
     #[command(verbatim_doc_comment)]
     ArmGate(ArmGateArgs),
 
@@ -379,6 +395,15 @@ pub struct ArmGateArgs {
     /// An explicit 32-byte master key, hex-encoded, instead of a generated one.
     #[arg(long, value_name = "HEX_32")]
     pub key: Option<String>,
+
+    /// Replace an existing gate master.
+    ///
+    /// Without it, arming over a live gate is refused: the old master is
+    /// replaced whether or not anyone asked, and every token signed by it
+    /// stops verifying immediately. Pass this when replacing is the intent, and
+    /// expect the revocation that comes with it.
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// Options for `aroute keys mint`.

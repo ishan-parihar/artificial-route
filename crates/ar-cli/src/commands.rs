@@ -375,13 +375,59 @@ const DEFAULT_TOKEN_TTL_DAYS: u32 = 30;
 /// the first client token, and prints it once with its expiry. The master is
 /// never printed: it lives encrypted in the store, and the token is the thing
 /// a client actually presents.
+///
+/// Refuses to overwrite an existing gate row. `store.insert` replaces
+/// unconditionally, so without this guard a stray arming invalidated every token
+/// signed by the previous master with no warning. Use [`arm_gate_forced`],
+/// the `--force` path, when replacing is the intent.
+pub(crate) fn gate_overwrite_allowed(store: &CredentialStore, replace: bool) -> bool {
+    if !replace && gate_row_exists(store) {
+        return false;
+    }
+    true
+}
+
+/// Whether the store already holds a gate master row.
+///
+/// Read-only and separate from [`arm_gate`] so the refusal is decidable before
+/// any secret is generated: refusing must not be able to leave a new master
+/// half-written, and generating first would do exactly that.
+pub(crate) fn gate_row_exists(store: &CredentialStore) -> bool {
+    matches!(store.get(GATE_ROW), Ok(Some(_)))
+}
+
 pub fn arm_gate(cli: &Cli, key_id: &str, explicit: Option<&str>) -> anyhow::Result<()> {
+    arm_gate_with(cli, key_id, explicit, false)
+}
+
+/// `aroute arm-gate --force` — the same arming, over an existing row.
+pub fn arm_gate_forced(cli: &Cli, key_id: &str, explicit: Option<&str>) -> anyhow::Result<()> {
+    arm_gate_with(cli, key_id, explicit, true)
+}
+
+/// The body of `arm-gate`. `replace` carries the caller's `--force`.
+fn arm_gate_with(
+    cli: &Cli,
+    key_id: &str,
+    explicit: Option<&str>,
+    replace: bool,
+) -> anyhow::Result<()> {
     let Some(store) = credential_store(cli) else {
         return Err(fail(
             "no credential store to hold the gate master",
             "export $AR_MASTER_KEY (from `openssl rand -hex 32`) so a store can be opened, then retry",
         ));
     };
+    // Before generating anything: if this would clobber a live master, say so
+    // and stop. Refusing must leave the store exactly as it was, which is only
+    // true when the check runs before `Secret::generate`.
+    let existed = gate_row_exists(&store);
+    if !gate_overwrite_allowed(&store, replace) {
+        return Err(fail(
+            "the gate is already armed; arming again REPLACES the current master",
+            "pass --force to replace it, knowing every token signed by the current master stops working",
+        ));
+    }
     let master = match explicit {
         None => ar_keys::Secret::generate(),
         Some(hex) => decode_hex(hex)
@@ -404,6 +450,11 @@ pub fn arm_gate(cli: &Cli, key_id: &str, explicit: Option<&str>) -> anyhow::Resu
                 "the store refused the gate row; is the store on a read-only disk?",
             )
         })?;
+    if replace && existed {
+        // Only reachable on the --force path, and it is the whole point of the
+        // flag: the operator has just invalidated every existing token.
+        println!("gate: the previous master is replaced — every token signed by it stops working");
+    }
     let issued = mint_from(&master, key_id)?;
     println!("gate: armed — master stored as credential {GATE_ROW} (never printed)");
     println!("key id: {key_id}");
@@ -500,6 +551,63 @@ fn read_token_file(path: &str) -> anyhow::Result<String> {
         ));
     }
     Ok(token.to_owned())
+}
+
+/// `aroute keys list` — what the credential store holds, read only.
+///
+/// The B-5 find: the `keys` subtree could mint and revoke but not inspect, so
+/// an operator asked "which credentials exist?" had no answer and an agent had
+/// none at all. This reports the four things that are actually knowable — the
+/// row names, the OAuth session count, the revocation count, and the gate's
+/// decrypted state — and states plainly what is NOT knowable.
+///
+/// That last part is the honesty the verb exists for: the store keeps no table
+/// of issued tokens. A token list would be a fabrication, so the output says
+/// "minted tokens are not recorded; a lost token cannot be revoked" rather than
+/// printing an empty table an agent would read as "there are none".
+pub fn keys_list(cli: &Cli) -> anyhow::Result<()> {
+    let store_path = store_path(&cli.config);
+    if !store_path.exists() {
+        println!("store: absent — {} does not exist", store_path.display());
+        println!("note: keys fall back to `keys:` in the config; $AR_KEY_* env vars resolve there");
+        return Ok(());
+    }
+    let Some(store) = credential_store(cli) else {
+        // `credential_store` already said why on stderr; stdout stays the data
+        // channel, and a store that will not open is not "nothing stored".
+        return Ok(());
+    };
+
+    let names = store
+        .list_names()
+        .map_err(|e| fail(e, "the store's row names could not be read"))?;
+    let sessions = store.session_count().unwrap_or(0);
+
+    // The revocation table lives INSIDE the credential store, at the same path
+    // `keys_revoke` opens (`commands.rs:508`) — not a sibling file. Opening it
+    // read-only here matters for the same reason it did in `cost-report`: a
+    // verb that reports on a table must not create one.
+    let revoked = ar_keys::Revocations::open(&store_path, ar_keys::DEFAULT_CAP)
+        .map(|t| t.len().unwrap_or(0))
+        .unwrap_or(0);
+
+    // Three answers, matching `doctor`'s gate check rather than inventing a
+    // fourth: absent, armed-and-decryptable, and present-but-unreadable.
+    let gate = match store.get(GATE_ROW) {
+        Ok(Some(_)) => "armed",
+        Ok(None) => "not armed",
+        Err(_) => "armed but UNREADABLE under the current $AR_MASTER_KEY",
+    };
+
+    println!("store: {}", store_path.display());
+    println!("rows: {} ({})", names.len(), names.join(", "));
+    println!("oauth sessions: {sessions}");
+    println!("revoked tokens: {revoked}");
+    println!("gate: {gate}");
+    println!(
+        "minted tokens are not recorded; a lost token cannot be revoked — mint a new one with `aroute keys mint`"
+    );
+    Ok(())
 }
 
 /// `aroute keys mint` — another client token from the stored gate master.
@@ -946,8 +1054,13 @@ pub fn dispatch(cli: &Cli) -> anyhow::Result<()> {
             Ok(())
         }
         Some(Command::Keys(a)) => match &a.command {
+            crate::cli::KeysCommand::List => keys_list(cli),
             crate::cli::KeysCommand::ArmGate(args) => {
-                arm_gate(cli, &args.key_id, args.key.as_deref())
+                if args.force {
+                    arm_gate_forced(cli, &args.key_id, args.key.as_deref())
+                } else {
+                    arm_gate(cli, &args.key_id, args.key.as_deref())
+                }
             }
             crate::cli::KeysCommand::Mint(args) => keys_mint(cli, &args.key_id, args.ttl_days),
             crate::cli::KeysCommand::Revoke(args) => keys_revoke(cli, &args.token_file),
@@ -1370,7 +1483,7 @@ fn findings(cfg: &Config, path: &str, store: &StoreProbe<'_>) -> Vec<Row> {
                     "fail".to_owned(),
                     format!(
                         "the gate row will not decrypt ({e}); the server is serving UNGATED — \
-                         re-arm with `aroute keys arm-gate --key $AR_HTTP_MASTER_KEY`"
+                         re-arm with `aroute keys arm-gate --force --key $AR_HTTP_MASTER_KEY`"
                     ),
                 ),
             }
@@ -1388,7 +1501,7 @@ fn findings(cfg: &Config, path: &str, store: &StoreProbe<'_>) -> Vec<Row> {
                 "fail".to_owned(),
                 format!(
                     "the gate row will not decrypt ({e}); the server is serving UNGATED — \
-                     re-arm with `aroute keys arm-gate --key $AR_HTTP_MASTER_KEY`"
+                     re-arm with `aroute keys arm-gate --force --key $AR_HTTP_MASTER_KEY`"
                 ),
             ),
         },
@@ -4051,6 +4164,30 @@ mod tests {
             .expect("row stores");
         let read = gate_master(&store).unwrap().expect("row reads back");
         assert_eq!(read.as_bytes(), master.as_bytes());
+    }
+
+    // B-5's second half, at the decision level rather than through the command:
+    // the rule is what the guard function answers, and testing it here avoids
+    // the env-var dance a real store needs. The line-level test that the store
+    // actually refuses is `arm_gate_refuses_a_second_arming_without_force` below.
+    #[test]
+    fn arming_over_a_live_gate_is_refused_without_force_and_allowed_with_it() {
+        let store = ar_keys::CredentialStore::open_in_memory(&ar_keys::Secret::generate())
+            .expect("in-memory store");
+        assert!(gate_overwrite_allowed(&store, false), "a fresh gate may be armed");
+
+        store
+            .insert(GATE_PROVIDER, GATE_ROW, &ar_keys::Secret::generate())
+            .expect("row stores");
+
+        assert!(
+            !gate_overwrite_allowed(&store, false),
+            "re-arming without --force must be refused, or the old master is replaced silently"
+        );
+        assert!(
+            gate_overwrite_allowed(&store, true),
+            "--force is the explicit path, and must still work"
+        );
     }
 
     #[test]
