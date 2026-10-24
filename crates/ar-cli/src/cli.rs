@@ -1027,8 +1027,25 @@ pub enum ProviderCommand {
     ///
     /// Examples:
     ///   aroute providers remove openai
+    ///   aroute providers remove my-endpoint
     #[command(verbatim_doc_comment)]
     Remove(RemoveProviderArgs),
+
+    /// Add an endpoint that is not in the compiled-in registry.
+    ///
+    /// A custom node is how an operator reaches a gateway no rebuild has
+    /// catalogued, so it is the same three-part write as [`ProviderCommand::Add`]
+    /// with the row going to `custom_providers:` instead of `providers:`.
+    /// The id must be fresh: shadowing a catalog entry is refused by
+    /// [`ar_registry::Registry::merge`] rather than resolved, because a catalog
+    /// entry is a fact about a real provider.
+    ///
+    /// Examples:
+    ///   aroute providers add-custom --id relay --base-url https://gw/v1 --protocol openai-compatible
+    ///   aroute providers add-custom --id relay --base-url https://gw/v1 --protocol anthropic-compatible \
+    ///       --endpoint chat/completions2 --header X-Tenant=acme --credential-file -
+    #[command(verbatim_doc_comment)]
+    AddCustom(AddCustomProviderArgs),
 }
 
 /// Options for `aroute providers add`.
@@ -1052,6 +1069,48 @@ pub struct AddProviderArgs {
 pub struct RemoveProviderArgs {
     /// Provider id to unconfigure.
     pub id: String,
+}
+
+/// Options for `aroute providers add-custom`.
+///
+/// The panel's `provider_custom` (`webui.rs:2091`) is the tested semantic and
+/// this carries its whole shape: the id rule, the protocol vocabulary, the
+/// base-url scheme rule, the relative-path rule for `endpoint`, and the
+/// catalog-collision refusal. The one addition is `--credential-file`, because
+/// a credential on a command line is visible in the process table.
+#[derive(Debug, Args)]
+pub struct AddCustomProviderArgs {
+    /// Fresh id, routable as `<id>/<model>`: 1-64 of a-z 0-9 . _ -.
+    ///
+    /// Must not collide with a registry catalog id — shadowing a compiled-in
+    /// entry is refused rather than resolved, because that entry is a fact
+    /// about a real provider.
+    #[arg(long, value_name = "ID")]
+    pub id: String,
+
+    /// Wire dialect: `openai-compatible` or `anthropic-compatible`.
+    #[arg(long, value_name = "PROTOCOL")]
+    pub protocol: String,
+
+    /// Upstream API root, `http://` or `https://`, usually `https://host/v1`.
+    #[arg(long, value_name = "URL")]
+    pub base_url: String,
+
+    /// Relative path posted to instead of the protocol's default, e.g.
+    /// `chat/completions2`. Not an absolute path or a full URL.
+    #[arg(long, value_name = "PATH")]
+    pub endpoint: Option<String>,
+
+    /// Extra outbound header, `Name=value`. Repeatable.
+    #[arg(long = "header", value_name = "K=V")]
+    pub header: Vec<String>,
+
+    /// File holding the credential, or `-` for stdin.
+    ///
+    /// Omit (`--credential-file ''` reads stdin) or pass an empty value to
+    /// re-save a row that already has its binding and no new credential.
+    #[arg(long, value_name = "PATH", default_value = "-")]
+    pub credential_file: String,
 }
 
 /// Options for `aroute server`.

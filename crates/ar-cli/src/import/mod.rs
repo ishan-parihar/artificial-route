@@ -412,25 +412,6 @@ pub(crate) fn emittable_sections() -> &'static [&'static str] {
     &["keys", "providers", "custom_providers", "combos"]
 }
 
-/// Renders the `keys:` section from name -> `$VAR` refs: serde_yaml's own
-/// block style with the header prepended, so the section's spelling has the
-/// same single source as the other renderers here.
-pub(crate) fn render_keys_section(entries: &BTreeMap<String, String>) -> anyhow::Result<String> {
-    if entries.is_empty() {
-        return Ok("keys:\n".to_owned());
-    }
-    // serde_yaml emits a mapping at column 0, so every line is re-indented
-    // under the header: `keys:` followed by column-0 entries is a null key
-    // plus root-level scalars, and every provider's ref goes undeclared.
-    let body = serde_yaml::to_string(entries)?;
-    let indented = body
-        .lines()
-        .map(|line| format!("  {line}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    Ok(format!("keys:\n{indented}\n"))
-}
-
 /// Renders the `providers:` section: each row's `id`, `key`, and the optional
 /// ordered `keys:` extras in the struct's own field order.
 pub(crate) fn render_providers_section(rows: &[ar_config::ProviderCfg]) -> anyhow::Result<String> {

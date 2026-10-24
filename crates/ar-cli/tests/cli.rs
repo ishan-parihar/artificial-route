@@ -2021,3 +2021,455 @@ fn providers_add_should_work_on_a_config_whose_other_keys_are_unexported() {
 
     let _ = std::fs::remove_dir_all(&out);
 }
+
+/// The contract tests Phase 3 of the config-write surface names: an endpoint
+/// the compiled-in registry does not carry, added and removed from the CLI with
+/// the panel's own semantics.
+///
+/// `webui.rs`'s `provider_custom` is the tested shape and every rule asserted
+/// here is that handler's rule — the id's character class, the two-protocol
+/// vocabulary, the base-url scheme, the relative-path rule for `endpoint`, and
+/// the catalog-collision refusal. The two differences the CLI carries are both
+/// about the credential: it cannot be an argument (the process table), and a new
+/// row must carry one because a keyless node fails every request.
+#[test]
+fn providers_add_custom_should_write_the_row_the_key_ref_and_the_env_line() {
+    let out = empty_dir("providers-add-custom");
+    let held = out.join("config.yaml");
+    std::fs::write(out.join("cred"), "sk-gateway-credential\n").expect("the credential file writes");
+    std::fs::write(
+        &held,
+        concat!(
+            "keys:\n",
+            "  openai: $AR_KEY_OPENAI\n",
+            "\n",
+            "combos:\n",
+            "  - id: c\n",
+            "    strategy: priority\n",
+            "    targets:\n",
+            "      - openai/gpt-5.4\n",
+        ),
+    )
+    .expect("the fixture writes");
+
+    let res = ar_in(
+        &out,
+        &[
+            "providers",
+            "add-custom",
+            "--id",
+            "my-gateway",
+            "--protocol",
+            "openai-compatible",
+            "--base-url",
+            "https://gw.example/v1",
+            "--endpoint",
+            "chat/completions2",
+            "--header",
+            "X-Tenant=acme",
+            "--credential-file",
+            "cred",
+        ],
+    );
+    assert_eq!(
+        code(&res),
+        0,
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&res.stdout),
+        stderr(&res)
+    );
+
+    let after = std::fs::read_to_string(&held).expect("readable");
+    // The row is in `custom_providers:`, not `providers:` — which is what makes
+    // it an ad-hoc node rather than a catalog one.
+    assert!(
+        after.contains("custom_providers:\n  - id: my-gateway\n"),
+        "the row was not written: {after}"
+    );
+    assert!(
+        after.contains("protocol: openai-compatible"),
+        "the protocol was not written: {after}"
+    );
+    assert!(
+        after.contains("base_url: https://gw.example/v1"),
+        "the base_url was not written: {after}"
+    );
+    assert!(
+        after.contains("endpoint: chat/completions2"),
+        "the endpoint override was not written: {after}"
+    );
+    assert!(
+        after.contains("X-Tenant:\n      acme") || after.contains("X-Tenant: acme"),
+        "the header was not written: {after}"
+    );
+    assert!(
+        after.contains("  my-gateway: $AR_KEY_MY_GATEWAY\n"),
+        "the keys: reference was not written: {after}"
+    );
+    assert!(
+        after.contains("  openai: $AR_KEY_OPENAI\n"),
+        "the existing keys: row was lost: {after}"
+    );
+    // The `keys:` row the operator wrote by hand keeps its place: the written
+    // order is the section's contract, and a sorted re-render would move it.
+    let keys_line = after
+        .lines()
+        .position(|l| l == "  openai: $AR_KEY_OPENAI")
+        .expect("the original row survives");
+    let new_line = after
+        .lines()
+        .position(|l| l == "  my-gateway: $AR_KEY_MY_GATEWAY")
+        .expect("the new row is appended");
+    assert!(
+        new_line > keys_line,
+        "the new row must be appended after the operator's own: {after}"
+    );
+    // No blank line or comment block that introduced `combos:` was consumed.
+    assert!(
+        after.contains("\n\ncombos:\n"),
+        "the separator before `combos:` was eaten: {after}"
+    );
+
+    let env_text = std::fs::read_to_string(out.join("ar.env")).expect("the env file was written");
+    assert!(
+        env_text.contains("AR_KEY_MY_GATEWAY="),
+        "the env line was not written: {env_text}"
+    );
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// An id the catalog already uses is refused, because `Registry::merge` refuses
+/// to shadow a compiled-in entry and a row written anyway is a row the service
+/// refuses at boot.
+#[test]
+fn providers_add_custom_should_refuse_a_registry_id() {
+    let out = empty_dir("providers-add-custom-collide");
+    let held = out.join("config.yaml");
+    std::fs::write(out.join("cred"), "sk-x\n").expect("the credential file writes");
+    std::fs::write(
+        &held,
+        concat!("keys:\n", "  openai: $AR_KEY_OPENAI\n", "\n", "combos:\n"),
+    )
+    .expect("the fixture writes");
+
+    let res = ar_in(
+        &out,
+        &[
+            "providers",
+            "add-custom",
+            "--id",
+            "openai",
+            "--protocol",
+            "openai-compatible",
+            "--base-url",
+            "https://gw.example/v1",
+            "--credential-file",
+            "cred",
+        ],
+    );
+    assert_eq!(code(&res), 1, "must refuse, not write: {}", stderr(&res));
+    let text = stdout(&res);
+    assert!(
+        text.contains("registry catalog id"),
+        "the refusal names the collision: {text}"
+    );
+    let after = std::fs::read_to_string(&held).expect("readable");
+    assert!(
+        !after.contains("custom_providers:"),
+        "nothing was written on a refusal: {after}"
+    );
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// A custom endpoint is not a chat path by default: `--endpoint` is relative
+/// because it is joined onto the base URL, and an absolute one is a wire that
+/// cannot be reached.
+#[test]
+fn providers_add_custom_should_refuse_an_absolute_endpoint() {
+    let out = empty_dir("providers-add-custom-endpoint");
+    let held = out.join("config.yaml");
+    std::fs::write(out.join("cred"), "sk-x\n").expect("the credential file writes");
+    std::fs::write(&held, "keys:\n  openai: $AR_KEY_OPENAI\n\ncombos:\n")
+        .expect("the fixture writes");
+
+    let res = ar_in(
+        &out,
+        &[
+            "providers",
+            "add-custom",
+            "--id",
+            "my-gateway",
+            "--protocol",
+            "anthropic-compatible",
+            "--base-url",
+            "https://gw.example/v1",
+            "--endpoint",
+            "/v1/messages",
+            "--credential-file",
+            "cred",
+        ],
+    );
+    assert_eq!(
+        code(&res),
+        1,
+        "must refuse an absolute endpoint: {}",
+        stderr(&res)
+    );
+    let text = stdout(&res);
+    assert!(
+        text.contains("relative path"),
+        "the refusal names the rule: {text}"
+    );
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// A new row with no credential is a node every request fails against, so the
+/// refusal is the cheaper answer — the same argument `providers add` makes for
+/// a row with no binding.
+#[test]
+fn providers_add_custom_should_refuse_a_new_row_with_no_credential() {
+    let out = empty_dir("providers-add-custom-nokey");
+    let held = out.join("config.yaml");
+    std::fs::write(&held, "keys:\n  openai: $AR_KEY_OPENAI\n\ncombos:\n")
+        .expect("the fixture writes");
+    std::fs::write(out.join("cred"), "\n").expect("an empty credential file");
+
+    let res = ar_in(
+        &out,
+        &[
+            "providers",
+            "add-custom",
+            "--id",
+            "my-gateway",
+            "--protocol",
+            "openai-compatible",
+            "--base-url",
+            "https://gw.example/v1",
+            "--credential-file",
+            "cred",
+        ],
+    );
+    assert_eq!(code(&res), 1, "must refuse: {}", stderr(&res));
+    let text = stdout(&res);
+    assert!(
+        text.contains("credential"),
+        "the refusal names what is missing: {text}"
+    );
+    let after = std::fs::read_to_string(&held).expect("readable");
+    assert!(
+        !after.contains("custom_providers:"),
+        "nothing was written on a refusal: {after}"
+    );
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// An edit of an existing row keeps its own variable: re-pointing a hand-wired
+/// `$AR_KEY_MINE` to the generated name would silently move where the operator
+/// stores the secret.
+#[test]
+fn providers_add_custom_should_keep_the_binding_the_row_already_names() {
+    let out = empty_dir("providers-add-custom-rebind");
+    let held = out.join("config.yaml");
+    // `my-gateway` is bound to a variable the canonical name would not produce,
+    // so the row's binding must survive the base-url edit unchanged.
+    std::fs::write(
+        &held,
+        concat!(
+            "keys:\n",
+            "  openai: $AR_KEY_OPENAI\n",
+            "  my-gateway: $AR_KEY_MINE\n",
+            "\n",
+            "custom_providers:\n",
+            "  - id: my-gateway\n",
+            "    protocol: openai-compatible\n",
+            "    base_url: https://old.example/v1\n",
+            "    key_ref: my-gateway\n",
+            "\n",
+            "combos:\n",
+        ),
+    )
+    .expect("the fixture writes");
+    std::fs::write(out.join("cred"), "sk-rotated\n").expect("the credential file writes");
+
+    let res = ar_in(
+        &out,
+        &[
+            "providers",
+            "add-custom",
+            "--id",
+            "my-gateway",
+            "--protocol",
+            "openai-compatible",
+            "--base-url",
+            "https://new.example/v1",
+            "--credential-file",
+            "cred",
+        ],
+    );
+    assert_eq!(
+        code(&res),
+        0,
+        "an edit must rotate the credential: stdout {} stderr {}",
+        String::from_utf8_lossy(&res.stdout),
+        stderr(&res)
+    );
+    let after = std::fs::read_to_string(&held).expect("readable");
+    assert!(
+        after.contains("base_url: https://new.example/v1"),
+        "the base_url moved: {after}"
+    );
+    assert!(
+        after.contains("  my-gateway: $AR_KEY_MINE\n"),
+        "the binding the row already names was re-pointed: {after}"
+    );
+    let env_text = std::fs::read_to_string(out.join("ar.env")).expect("the env file was written");
+    assert!(
+        env_text.contains("AR_KEY_MINE="),
+        "the credential went to the variable the row names: {env_text}"
+    );
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// The full round trip on a hand-written config: add an ad-hoc endpoint with
+/// an endpoint override and a header, then remove it, and the file must come
+/// back byte-identical.
+///
+/// This is the test the naive implementations fail. Three separate edits left
+/// residue: a bare `custom_providers:` header when the last row went, a
+/// re-sort of the operator's own `keys:` rows, and a trailing newline the file
+/// never had. Each was found by running the verbs against a copy of the repo's
+/// real `config.yaml` and reading the diff.
+#[test]
+fn custom_providers_round_trip_must_come_back_byte_identical() {
+    let out = empty_dir("custom-round-trip");
+    let held = out.join("config.yaml");
+    // The operator's own order, deliberately non-alphabetical, and no final
+    // newline — both facts a naive writer normalises away.
+    let original = concat!(
+        "keys:\n",
+        "  zzz-last: $AR_KEY_ZZZ\n",
+        "  aaa-first: $AR_KEY_AAA\n",
+        "\n",
+        "combos:\n",
+        "  - id: c\n",
+        "    strategy: priority\n",
+        "    targets:\n",
+        "      - other/model\n",
+    );
+    std::fs::write(&held, original).expect("the fixture writes");
+    std::fs::write(out.join("cred"), "sk-round-trip\n").expect("the credential file writes");
+
+    let res = ar_in(
+        &out,
+        &[
+            "providers",
+            "add-custom",
+            "--id",
+            "relay",
+            "--protocol",
+            "anthropic-compatible",
+            "--base-url",
+            "https://relay.example/anthropic",
+            "--endpoint",
+            "chat/completions2",
+            "--header",
+            "X-Tenant=acme",
+            "--credential-file",
+            "cred",
+        ],
+    );
+    assert_eq!(
+        code(&res),
+        0,
+        "the add must succeed: stdout {} stderr {}",
+        String::from_utf8_lossy(&res.stdout),
+        stderr(&res)
+    );
+    // The row is really there, so the remove below is doing the work.
+    let added = std::fs::read_to_string(&held).expect("readable");
+    assert!(
+        added.contains("  - id: relay\n"),
+        "the row must be written for the round trip to prove anything: {added}"
+    );
+
+    let res = ar_in(&out, &["providers", "remove", "relay"]);
+    assert_eq!(
+        code(&res),
+        0,
+        "the remove must succeed: stdout {} stderr {}",
+        String::from_utf8_lossy(&res.stdout),
+        stderr(&res)
+    );
+
+    let after = std::fs::read_to_string(&held).expect("readable");
+    assert_eq!(
+        after, original,
+        "a round trip must return the file to its exact bytes; leftover: {}",
+        after
+            .lines()
+            .zip(original.lines())
+            .find(|(a, b)| a != b)
+            .map(|(a, b)| format!("{b:?} became {a:?}"))
+            .unwrap_or_else(|| "a length difference only".to_owned())
+    );
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// A `custom_providers:` section that is not there must not appear: the renderer
+/// emits its header even for an empty row list, so an unconditional splice
+/// writes a section the operator never had.
+#[test]
+fn custom_providers_remove_the_last_row_must_take_the_section() {
+    let out = empty_dir("custom-remove-last");
+    let held = out.join("config.yaml");
+    std::fs::write(out.join("cred"), "sk-x\n").expect("the credential file writes");
+    let original = concat!(
+        "keys:\n",
+        "  relay: $AR_KEY_RELAY\n",
+        "\n",
+        "# Providers the compiled-in registry does not carry: a self-hosted\n",
+        "# gateway, a vendor compat shim, a local model server.\n",
+        "custom_providers:\n",
+        "  - id: relay\n",
+        "    protocol: openai-compatible\n",
+        "    base_url: https://relay.example/v1\n",
+        "    key_ref: relay\n",
+        "\n",
+        "combos:\n",
+    );
+    std::fs::write(&held, original).expect("the fixture writes");
+
+    let res = ar_in(&out, &["providers", "remove", "relay"]);
+    assert_eq!(
+        code(&res),
+        0,
+        "the remove must succeed: stdout {} stderr {}",
+        String::from_utf8_lossy(&res.stdout),
+        stderr(&res)
+    );
+    let after = std::fs::read_to_string(&held).expect("readable");
+    assert!(
+        !after.contains("custom_providers:\n  - id:"),
+        "the row must be gone: {after}"
+    );
+    assert!(
+        !after.lines().any(|l| l == "custom_providers:"),
+        "an empty section header must not be left behind: {after}"
+    );
+    // The comment block documenting the section, and everything after it, is
+    // the reason this is not `remove_section`: that helper skips until the next
+    // header and would take 62 lines of documentation with it.
+    assert!(
+        after.contains("# Providers the compiled-in registry does not carry"),
+        "the comment block was eaten: {after}"
+    );
+    assert!(after.contains("combos:\n"), "combos: was eaten: {after}");
+
+    let _ = std::fs::remove_dir_all(&out);
+}

@@ -1207,6 +1207,7 @@ pub fn dispatch(cli: &Cli) -> anyhow::Result<()> {
             Some(crate::cli::ProviderCommand::List(args)) => providers(cli, args),
             Some(crate::cli::ProviderCommand::Add(args)) => providers_add(cli, args),
             Some(crate::cli::ProviderCommand::Remove(args)) => providers_remove(cli, args),
+            Some(crate::cli::ProviderCommand::AddCustom(args)) => providers_add_custom(cli, args),
         },
         Some(Command::Combo(a)) => combo(cli, a),
         Some(Command::Doctor(a)) => doctor(cli, a),
@@ -1616,12 +1617,78 @@ pub(crate) fn raw_keys(doc: &str) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
-/// The raw `keys:` mapping, with one binding upserted.
+/// One `keys:` row, in the order the file writes it.
+///
+/// A `BTreeMap` cannot answer "which order did the operator write?", because a
+/// BTreeMap has one order and it is sorted. [`raw_keys`] returns a `BTreeMap`
+/// for the lookups, and that is right for a lookup; it is wrong for a write,
+/// because re-rendering through it re-sorts a section the operator maintains in
+/// an order that means something to them (grouping, or a comment-free
+/// preference), which shows up in `git diff` as a reordering they never asked
+/// for.
+struct KeyRow {
+    name: String,
+    value: String,
+}
+
+/// The `keys:` mapping as written, in the file's own order.
+fn raw_keys_in_order(doc: &str) -> Vec<KeyRow> {
+    // An `IndexMap` would be the obvious type; serde_yaml maps to its own
+    // `Mapping`, which *is* insertion-ordered, so this walks that instead of
+    // introducing a dependency for one shape.
+    let Some(map) = serde_yaml::from_str::<serde_yaml::Value>(doc)
+        .ok()
+        .and_then(|root| root.get("keys").cloned())
+        .and_then(|v| match v {
+            serde_yaml::Value::Mapping(m) => Some(m),
+            _ => None,
+        })
+    else {
+        return Vec::new();
+    };
+    map.iter()
+        .filter_map(|(k, v)| {
+            let name = k.as_str()?.to_owned();
+            let value = match v {
+                serde_yaml::Value::String(s) => s.clone(),
+                other => serde_yaml::to_string(other).ok()?.trim_end().to_owned(),
+            };
+            Some(KeyRow { name, value })
+        })
+        .collect()
+}
+
+/// The `keys:` mapping with one binding upserted — in the file's own order.
+///
+/// An existing name keeps its position (an edit), a new one is appended (the
+/// file's newest line is its last), and the rest of the section is untouched.
 pub(crate) fn with_key_binding(doc: &str, name: &str, var: &str) -> anyhow::Result<String> {
-    let mut keys = raw_keys(doc);
-    keys.insert(name.to_owned(), format!("${var}"));
-    let section = crate::import::render_keys_section(&keys)?;
+    let mut rows = raw_keys_in_order(doc);
+    let binding = format!("${var}");
+    match rows.iter_mut().find(|r| r.name == name) {
+        Some(existing) => existing.value = binding,
+        None => rows.push(KeyRow {
+            name: name.to_owned(),
+            value: binding,
+        }),
+    }
+    let section = render_keys_rows(&rows)?;
     Ok(splice_section(doc, "keys", &section))
+}
+
+/// Renders `KeyRow`s as the `keys:` section, in the given order.
+///
+/// Same shape as [`crate::import::render_keys_section`] — two-space indent under
+/// the header, one `name: value` per line — but over a slice, because the order
+/// is the point. `serde_yaml` over an ordered `Mapping` would give the same
+/// bytes; building the lines directly keeps the rule visible here rather than
+/// depending on a serialisation order argument.
+fn render_keys_rows(rows: &[KeyRow]) -> anyhow::Result<String> {
+    let mut out: Vec<String> = vec!["keys:".to_owned()];
+    for r in rows {
+        out.push(format!("  {}: {}", r.name, r.value));
+    }
+    Ok(out.join("\n"))
 }
 
 /// Drops one provider's `providers:` row, the `keys:` entries only it held, and
@@ -1651,7 +1718,17 @@ pub(crate) fn splice_remove_provider(
             .cloned()
             .collect::<Vec<_>>(),
     )?;
-    let next = splice_section(doc, "providers", &providers);
+    // The same rule as `custom_providers:` below, on the other section: a
+    // renderer that emits its header for an empty list must not be spliced when
+    // the list is empty, or a remove writes a `providers:` section into a config
+    // that carried none. A splice of a section that is absent **inserts** it, so
+    // this is not idempotence but a new section appearing. Both sections get
+    // the identical guard for the identical reason.
+    let next = if cfg.providers.iter().any(|p| p.id != id) {
+        splice_section(doc, "providers", &providers)
+    } else {
+        doc.to_owned()
+    };
     let kept: BTreeSet<String> = cfg
         .providers
         .iter()
@@ -1671,18 +1748,29 @@ pub(crate) fn splice_remove_provider(
             .cloned()
             .collect::<Vec<_>>(),
     )?;
-    // Only splice a `custom_providers:` section that was already there.
+    // Only rewrite `custom_providers:` when rows survive this edit. When
+    // none do, the section must not survive either — "render nothing" is not
+    // the same as "render an empty section", because the renderer emits the
+    // header even for an empty row list.
     //
-    // The renderer emits `custom_providers:` even for an empty row list, so an
-    // unconditional splice writes a section the operator never had into a file
-    // they asked to change in some other way — the same "a writer touched what
-    // it was not asked to touch" shape as the comment-eating bug Phase 1 found.
-    // A config that already carries ad-hoc nodes has its section rewritten;
-    // one that does not is left without it.
-    let next = if cfg.custom_providers.is_empty() {
-        next
-    } else {
+    // Not [`remove_section`]: that helper skips until the next section header,
+    // and this section is the last one before a trailing block of comments that
+    // document sections *below* it, so it would delete 62 lines of
+    // documentation — the Phase 0 data-loss shape rearmed by a different
+    // caller. The `is_section_header` stop condition is what makes
+    // `remove_section` safe elsewhere and wrong here.
+    //
+    // And not "splice an empty section" either: a bare `custom_providers:`
+    // parses to the same empty list, so it changes nothing an agent or the
+    // loader can see, and leaves one byte the operator never asked to have
+    // added. Drop the header and its rows in one edit, keeping the comment
+    // block that follows — that block is documentation for a section that may
+    // come back, and `add-custom` inserts the new row above it.
+    let surviving_customs = cfg.custom_providers.iter().any(|c| c.id != id);
+    let next = if surviving_customs {
         splice_section(&next, "custom_providers", &customs)
+    } else {
+        empty_custom_section(&next)
     };
     // Keys entries the removed rows alone held: every entry the removed rows
     // name, minus the entries the surviving rows name. Shared entries survive
@@ -1703,12 +1791,54 @@ pub(crate) fn splice_remove_provider(
     if orphaned.is_empty() {
         return Ok(Some(next));
     }
-    let keys = raw_keys(doc)
-        .into_iter()
-        .filter(|(name, _)| !orphaned.contains(name))
-        .collect();
-    let section = crate::import::render_keys_section(&keys)?;
+    let section = render_keys_removed(doc, &orphaned)?;
     Ok(Some(splice_section(&next, "keys", &section)))
+}
+
+/// The `keys:` section with `removed` entries dropped, in the file's order.
+///
+/// Deleting a row is the one edit that cannot change an order, so this walks
+/// the written rows and filters rather than re-rendering a `BTreeMap`: the
+/// surviving rows stay exactly where the operator put them. Same reason as
+/// [`with_key_binding`].
+fn render_keys_removed(doc: &str, removed: &BTreeSet<String>) -> anyhow::Result<String> {
+    let rows: Vec<KeyRow> = raw_keys_in_order(doc)
+        .into_iter()
+        .filter(|r| !removed.contains(&r.name))
+        .collect();
+    render_keys_rows(&rows)
+}
+
+/// The document with the `custom_providers:` section's rows and header gone.
+///
+/// [`splice_section`] replaces a section with a rendered one, and the renderer
+/// emits its header even for an empty row list, so "no rows left" and "an empty
+/// section" are not the same thing — only the second leaves bytes behind. This
+/// drops the header and its rows and keeps everything after them.
+///
+/// The skip mirrors `splice_section`'s own stop conditions: a blank line or a
+/// column-0 comment ends the section, because both are what introduces the
+/// *next* thing in this file, and the comment block under a `custom_providers:`
+/// section documents sections further down. Stopping there is the difference
+/// between deleting six lines and deleting sixty-two.
+fn empty_custom_section(doc: &str) -> String {
+    let header = "custom_providers:";
+    let mut out: Vec<String> = Vec::new();
+    let mut skipping = false;
+    for line in doc.lines() {
+        if line == header {
+            skipping = true;
+            continue;
+        }
+        if skipping && (line.is_empty() || line.starts_with('#') || is_section_header(line)) {
+            skipping = false;
+        }
+        if !skipping {
+            out.push(line.to_owned());
+        }
+    }
+    let ending = if doc.ends_with('\n') { "\n" } else { "" };
+    out.join("\n") + ending
 }
 
 /// Whether a candidate document means the same thing as the current one.
@@ -1863,7 +1993,188 @@ fn providers_add(cli: &Cli, args: &crate::cli::AddProviderArgs) -> anyhow::Resul
     Ok(())
 }
 
-/// Unconfigures a provider, refusing while a combo still references it.
+/// Configures an ad-hoc endpoint: the `custom_providers:` row, the `keys:`
+/// reference and the `$AR_KEY_*` value.
+///
+/// The panel's `provider_custom` (`webui.rs:2091`) is the tested semantic, and
+/// every rule here is that handler's rule rather than a new one: the id shape,
+/// the two-protocol vocabulary, the base-url scheme, the relative-path rule for
+/// `endpoint`, and the catalog-collision refusal (`catalog` merges the config's
+/// custom nodes and surfaces `MergeError::Collides`). Two differences are
+/// deliberate. **The credential is never argv** — the panel takes it from a JSON
+/// body an HTTPS form already carries, and a command line is visible in the
+/// process table, so it is `--credential-file <PATH|->` with the same
+/// convention `keys revoke` uses. **A new row always requires a credential**,
+/// because a custom node with no key is a node every request fails against,
+/// which is a worse answer than an upfront refusal; an edit of an existing row
+/// may omit it, which is how an operator fixes a base URL without re-pasting a
+/// secret they already stored.
+///
+/// The binding keeps whatever variable the existing row names, the same
+/// "an edit never re-points a hand-wired secret" rule `providers_add` holds: a
+/// row bound to `$AR_KEY_MINE` is not silently moved to the canonical
+/// `$AR_KEY_<ID>` just because a base URL changed.
+fn providers_add_custom(cli: &Cli, args: &crate::cli::AddCustomProviderArgs) -> anyhow::Result<()> {
+    let id = args.id.trim();
+    if id.is_empty() {
+        return Err(fail(
+            "the provider id is empty",
+            "pass the id the endpoint is routable as, 1-64 of a-z 0-9 . _ -",
+        ));
+    }
+    if id.len() > 64
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Err(fail(
+            format!("provider id {id:?} is not legal (1-64 of a-z 0-9 . _ -)"),
+            "the id becomes a model prefix clients route through",
+        ));
+    }
+    let protocol = match args.protocol.as_str() {
+        "openai-compatible" => ar_registry::Protocol::OpenaiCompatible,
+        "anthropic-compatible" => ar_registry::Protocol::AnthropicCompatible,
+        other => {
+            return Err(fail(
+                format!("unknown protocol {other:?}"),
+                "protocol is openai-compatible or anthropic-compatible",
+            ));
+        }
+    };
+    let base_url = args.base_url.trim();
+    if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+        return Err(fail(
+            format!("bad base_url {base_url:?}"),
+            "the endpoint the {id}/ prefix joins, usually https://host/v1",
+        ));
+    }
+    let endpoint = args
+        .endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    if endpoint
+        .as_deref()
+        .is_some_and(|e| e.starts_with('/') || e.contains("://"))
+    {
+        return Err(fail(
+            format!("endpoint {:?} is not a relative path", endpoint),
+            "the endpoint overrides the protocol's default path joined to base_url, e.g. chat/completions2",
+        ));
+    }
+    let mut headers = BTreeMap::new();
+    for h in &args.header {
+        let Some((name, value)) = h.split_once('=') else {
+            return Err(fail(
+                format!("header {h:?} is not Name=value"),
+                "send --header X-Tenant=acme, one per header",
+            ));
+        };
+        let name = name.trim();
+        if name.is_empty() || name.contains(' ') {
+            return Err(fail(
+                format!("header name {name:?} is not a legal header name"),
+                "a header name has no spaces, e.g. X-Tenant",
+            ));
+        }
+        headers.insert(name.to_owned(), value.trim().to_owned());
+    }
+    // Read the credential only after every cheap validation has passed: a config
+    // with a bad protocol must not leave the process blocked on stdin.
+    let secret = read_credential(&args.credential_file)?;
+    let doc = read_config_text(cli)?;
+    let mut cfg = load_edit(cli)?;
+    // The collision refusal, from the compiled-in registry and not from
+    // [`catalog`], which merges this config's own `custom_providers` into it —
+    // an existing custom row would then collide with itself and every edit of
+    // one would be refused. What must be refused is a *new* id shadowing a
+    // compiled-in entry, which is what [`ar_registry::Registry::merge`] refuses
+    // for a reason: that entry is a fact about a real provider.
+    let compiled = registry();
+    if compiled.get(id).is_some() {
+        return Err(fail(
+            format!("{id:?} is a registry catalog id"),
+            "custom providers take a fresh name; configure a catalog provider's key with `aroute providers add`",
+        ));
+    }
+
+    let existed = cfg.custom_providers.iter().any(|c| c.id == id);
+    if secret.is_empty() && !existed {
+        return Err(fail(
+            "a new custom provider needs its credential",
+            "pass --credential-file <PATH> or pipe it on stdin with --credential-file -",
+        ));
+    }
+    // The variable the row names, from the file as written rather than from
+    // `cfg.keys`: an unexpanded `$AR_KEY_MINE` and the literal it points at are
+    // the same binding, and only the written one is the operator's choice.
+    let canonical = format!("AR_KEY_{}", import::env_name(id));
+    let bound = raw_keys(&doc)
+        .get(id)
+        .and_then(|v| v.strip_prefix('$'))
+        .unwrap_or(&canonical)
+        .to_owned();
+    if secret.is_empty() && !bound.starts_with("AR_KEY_") {
+        return Err(fail(
+            format!("{id:?} binds to ${bound}, not an AR_KEY_* variable"),
+            "re-point the keys entry by hand, or send the current credential again",
+        ));
+    }
+    let var: &str = if existed && bound.starts_with("AR_KEY_") && bound != canonical {
+        &bound
+    } else {
+        &canonical
+    };
+
+    // The row list, upserted by id and sorted — the order the import renderer
+    // emits, so a splice of an already-sorted section is byte-stable.
+    let mut rows = std::mem::take(&mut cfg.custom_providers);
+    rows.retain(|c| c.id != id);
+    rows.push(ar_registry::CustomProvider {
+        id: id.to_owned(),
+        protocol,
+        base_url: base_url.to_owned(),
+        endpoint,
+        key_ref: id.to_owned(),
+        headers,
+    });
+    rows.sort_by(|a, b| a.id.cmp(&b.id));
+    let section = import::render_custom_section(&rows)?;
+    let mut next = splice_section(&doc, "custom_providers", &section);
+    if !existed {
+        next = with_key_binding(&next, id, var)?;
+    }
+
+    // The env file first, the panel's order and the reason it is the order:
+    // that is the write that publishes the credential, so a config that does
+    // not change is not "nothing was written" and the note says which moved.
+    let env = env_path(&cli.config);
+    if !secret.is_empty() {
+        set_env_var(&env, var, &secret)?;
+    }
+    if !means_the_same(&doc, &next) {
+        write_file(&cli.config, &next)?;
+    }
+    println!("custom_providers: {id} (row, keys: ref, {var})");
+    if secret.is_empty() {
+        println!("note: the credential was not changed");
+    } else {
+        println!("note: the credential was written to {}", env.display());
+    }
+    println!(
+        "note: the running proxy reads its config at boot only — apply with `aroute service restart proxy`"
+    );
+    Ok(())
+}
+
+/// Unconfigures a provider, refusing while any combo still references it.
+///
+/// Both row lists: a registry provider's `providers:` row and an ad-hoc node's
+/// `custom_providers:` row, because `add-custom` writes the second and a verb
+/// pair that cannot undo its own write is not a pair. The splice drops both, the
+/// same way the panel's removal does.
 ///
 /// The reference check covers every place a combo can name a target — `targets`,
 /// `pool`, `steps` and `judge_model` — the same set the panel's removal checks
@@ -1884,7 +2195,12 @@ fn providers_remove(cli: &Cli, args: &crate::cli::RemoveProviderArgs) -> anyhow:
     }
     let doc = read_config_text(cli)?;
     let cfg = load_edit(cli)?;
-    let configured = cfg.providers.iter().any(|p| p.id == id);
+    // Both lists, not just `providers:`: `add-custom` writes into
+    // `custom_providers:`, and a verb that adds a row another verb refuses to
+    // remove is a half-built feature — the row is configured either way, and
+    // `splice_remove_provider` already drops both.
+    let configured = cfg.providers.iter().any(|p| p.id == id)
+        || cfg.custom_providers.iter().any(|c| c.id == id);
     if !configured {
         return Err(fail(
             format!("provider {id:?} is not configured in this file"),
@@ -3553,16 +3869,34 @@ pub(crate) fn splice_section(content: &str, name: &str, rendered: &str) -> Strin
             out.push(line.to_owned());
         }
     }
+    // The trailing newline is the file's, not the writer's.
+    //
+    // `str::lines` drops it, so a document that ends without one rejoins and
+    // gains it — a byte-level change to a file the operator asked to change
+    // somewhere else. This repo's own `config.yaml` ends without one
+    // deliberately. Preserve what was there; a file with no final newline keeps
+    // having none, and one that has one keeps having exactly one.
+    let ending = if content.ends_with('\n') { "\n" } else { "" };
     if replaced {
-        out.join("\n") + "\n"
+        out.join("\n") + ending
     } else {
         let anchor = out.iter().position(|l| l == "combos:");
         match anchor {
             Some(i) => {
-                out.insert(i, rendered.to_owned());
-                out.join("\n") + "\n"
+                // Insert **below** any blank line and comment block that
+                // introduce the next section, so the section being added does
+                // not sit flush against the documentation that belongs to
+                // `combos:`. This repo's config opens `combos:` with eight
+                // comment lines and a blank separator before them, and
+                // inserting at the comment consumed that separator.
+                let mut at = i;
+                while at > 0 && (out[at - 1].is_empty() || out[at - 1].starts_with('#')) {
+                    at -= 1;
+                }
+                out.insert(at, rendered.to_owned());
+                out.join("\n") + ending
             }
-            None => format!("{}\n{}\n", content.trim_end(), rendered),
+            None => format!("{}\n{}{}", content.trim_end(), rendered, ending),
         }
     }
 }
@@ -3697,23 +4031,39 @@ fn sync_credentials(doc: &str, db: &Path) -> anyhow::Result<String> {
     // `keys:` — one ref per numbered credential, merged over the existing
     // names so a hand-set entry survives and a numbered one is overwritten
     // by the connection it names.
-    let mut key_rows: BTreeMap<String, String> = match map.get("keys") {
-        Some(v) => serde_yaml::from_value(v.clone()).map_err(|e| {
+    //
+    // The existing `keys:` block, parsed for its validation error alone:
+    // a `keys:` section that does not parse is refused here with the message
+    // naming the block, rather than silently re-rendered from the ordered walk
+    // below. The ordered walk reads the file directly and never needs this map.
+    if let Some(v) = map.get("keys") {
+        serde_yaml::from_value::<BTreeMap<String, String>>(v.clone()).map_err(|e| {
             fail(
                 e,
                 "the config's `keys:` block did not parse; fix it by hand and re-run sync",
             )
-        })?,
-        None => BTreeMap::new(),
-    };
-    for (provider, names) in &extras {
-        for (i, name) in names.iter().enumerate() {
-            key_rows.insert(
-                name.clone(),
-                format!("$AR_KEY_{}_{}", import::env_name(provider), i + 2),
-            );
-        }
+        })?;
     }
+    // The merge's additions, in the file's order: an existing name keeps its
+    // line, a new one goes last. `extras` iterates a `BTreeMap`, so this is
+    // the provider order the merge already used, minus the re-sort of the
+    // rows the operator had already written.
+    let ordered: Vec<KeyRow> = {
+        let mut rows = raw_keys_in_order(doc);
+        for (provider, names) in &extras {
+            for (i, name) in names.iter().enumerate() {
+                let value = format!("$AR_KEY_{}_{}", import::env_name(provider), i + 2);
+                match rows.iter_mut().find(|r| &r.name == name) {
+                    Some(existing) => existing.value = value,
+                    None => rows.push(KeyRow {
+                        name: name.clone(),
+                        value,
+                    }),
+                }
+            }
+        }
+        rows
+    };
     // `providers:` — the row's `keys:` list, upserted on rows with extras.
     // An absent section binds nothing, so the numbered refs would be dead
     // weight: the doc goes back unchanged rather than half-bridged.
@@ -3734,7 +4084,7 @@ fn sync_credentials(doc: &str, db: &Path) -> anyhow::Result<String> {
             row.keys = Some(names.clone());
         }
     }
-    let mut out = splice_section(doc, "keys", &import::render_keys_section(&key_rows)?);
+    let mut out = splice_section(doc, "keys", &render_keys_rows(&ordered)?);
     out = splice_section(
         &out,
         "providers",
@@ -6010,3 +6360,4 @@ mod write_private_tests {
     }
 
 }
+
