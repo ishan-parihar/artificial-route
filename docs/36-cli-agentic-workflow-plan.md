@@ -1439,6 +1439,29 @@ systemctl --user enable  --now aroute-dashboard  # restored it, serving in 7 s
 This is the two-tool gap DEC-1 touches for config sections but not for
 *processes*, and it should be ruled with it.
 
+### 9.2.1 Two unit comments that are wrong, and one unit defect whose owner is NOT the repo
+
+Three systemd claims were made while auditing; checking them changed two, and one
+of those would have sent a fix at the wrong file:
+
+- **The "roughly 700 MB" comment understates the measured footprint by ~2x.** The
+  dashboard unit's comment (`install.sh:628-630`) says the Node child "holds
+  roughly 700 MB RSS"; the live peak was **959 MB**. This one *is* in the repo
+  and is a fair thing to correct.
+- **The `StartLimitIntervalSec` misplacement is NOT in `install.sh`.**
+  `install.sh:866-891` emits `Restart=on-failure` / `RestartSec=5s` in
+  `[Service]` and contains **no `StartLimit*` key at all**. The installed
+  `~/.config/systemd/user/aroute.service` does carry
+  `StartLimitIntervalSec=300` + `StartLimitBurst=5` inside `[Service]` — both
+  belong in `[Unit]`, which is why systemd logs
+  `Unknown key 'StartLimitIntervalSec' in section 'Service'` on every boot — and
+  it says `Restart=always` with a comment, *"a mission-critical service silently
+  missing while systemd reported success"*, that appears **nowhere in the
+  repository**: no script, workflow or doc contains that string. **That unit was
+  hand-edited on this machine.** So the defect is real, but its owner is a
+  hand-maintained local file, and "fix install.sh" would have edited a file that
+  was never wrong. Recorded so the next pass does not repeat the attribution.
+
 ### 9.3 The 15.4-second `/healthz` (the finding worth the whole pass)
 
 The dashboard returned **HTTP 200 after 15,427 ms** while its own journal said

@@ -50,7 +50,7 @@
 #            SKIP_CTA=1, FORCE_ROOT=1, SKIP_HARNESS=1, ALL_HARNESS=1.
 #
 # Runtime on/off, once installed: the dashboard is its own systemd unit so the
-# ~700 MB Node child is started only on demand —
+# ~960 MB Node child is started only on demand —
 #   systemctl --user start aroute-dashboard   # bring the UI up
 #   systemctl --user stop  aroute-dashboard   # reclaim the RSS
 # and it is deliberately NOT started at install time; the proxy never needs it.
@@ -415,7 +415,7 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
   else
     echo "dashboard: not installed (--with-dashboard installs it from a local build)"
   fi
-  # The dashboard's own unit is the on/off switch for its ~700 MB Node child;
+  # The dashboard's own unit is the on/off switch for its ~960 MB Node child;
   # report it by whichever scope exists.
   DASH_UNIT_CHECK=""
   for unit in "$HOME/.config/systemd/user/${SERVICE_NAME}-dashboard.service" \
@@ -518,7 +518,7 @@ install_dashboard() {
 
 # ----------------------------------------------------- dashboard unit ----
 # On/off for the dashboard, as a service rather than a nohup: `systemctl
-# --user start aroute-dashboard` brings the ~700 MB Next.js child up, `stop`
+# --user start aroute-dashboard` brings the ~960 MB Next.js child up, `stop`
 # reclaims it, and the default after install is *stopped* — the proxy has
 # never needed it, and the operator's box (OOM history) wants the choice.
 # Same discipline as the proxy unit: env file outside the unit, secrets never
@@ -629,15 +629,19 @@ RestartSec=5s
 # 1.5x the heap ceiling the env pins).
 MemoryHigh=1280M
 MemoryMax=1536M
-# The Node child holds roughly 700 MB RSS while the UI is served; stopping
-# this unit is how that is given back.
+# The Node child peaks at ~959 MB RSS while the UI is served (measured
+# 2026-10-24, docs/36 §9.2.1); stopping this unit is how that is given back.
+# An earlier comment here said 700 MB, which understated it by ~2x — an
+# operator sizing MemoryHigh from that number would have set it below the real
+# peak. MemoryHigh=1280M sits above the measured peak, so no guard value
+# changes; only the comment's number does.
 KillSignal=SIGTERM
 TimeoutStopSec=20s
 StandardOutput=journal
 StandardError=journal
 
 [Install]
-# Not enabled at install time — the default is "off" so the ~700 MB Node
+# Not enabled at install time — the default is "off" so the ~960 MB Node
 # child costs nothing until asked for. "systemctl --user enable" flips that
 # per-machine; stop/start reclaims it on demand either way.
 WantedBy=default.target
@@ -646,7 +650,7 @@ DASHEOF
   DASH_UNIT_STATE="installed, not started"
   echo "dashsvc:   wrote $DASH_UNIT (not started)"
   echo "          start:  $DASH_CTL start $SERVICE_NAME-dashboard"
-  echo "          stop:   $DASH_CTL stop $SERVICE_NAME-dashboard   (reclaims ~700 MB RSS)"
+  echo "          stop:   $DASH_CTL stop $SERVICE_NAME-dashboard   (reclaims ~960 MB RSS)"
   echo "          memory: MemoryHigh=1280M MemoryMax=1536M (the proxy is protected)"
 }
 
