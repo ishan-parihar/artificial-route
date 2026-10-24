@@ -397,11 +397,21 @@ pub(crate) fn render_yaml(
     Ok(yaml)
 }
 
-/// The `combos:` section alone, exactly as [`render_yaml`] writes it.
+/// The top-level `config.yaml` sections `render_yaml` *writes*.
 ///
-/// `aroute sync` splices this into a live `config.yaml` without touching any
-/// other section; one renderer in one place is what stops the import and the
-/// sync from disagreeing about what a combo entry looks like.
+/// Derived from the renderer rather than from `Config`'s field list, because
+/// the question this answers is not "what the struct can hold" but "what a
+/// wholesale import can carry across". A section missing from this set is one
+/// an import silently drops (see the `config.yaml` write in the `import` verb),
+/// so its members change only when `render_yaml` itself starts emitting them.
+///
+/// `oauth:` is the live example: the operator's sessions live there and no
+/// other writer restores them, so an import that overwrites the file destroys
+/// them and still exits zero.
+pub(crate) fn emittable_sections() -> &'static [&'static str] {
+    &["keys", "providers", "custom_providers", "combos"]
+}
+
 /// Renders the `keys:` section from name -> `$VAR` refs: serde_yaml's own
 /// block style with the header prepended, so the section's spelling has the
 /// same single source as the other renderers here.

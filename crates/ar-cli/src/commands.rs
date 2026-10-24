@@ -2344,6 +2344,7 @@ fn import_config(args: &ImportArgs) -> anyhow::Result<()> {
         )
     })?;
     let written = out.display().to_string();
+    guard_against_section_loss(&out.join("config.yaml"), args.allow_section_loss.as_deref())?;
     write_file(&out.join("config.yaml"), &result.config_yaml)?;
     write_file(
         &out.join("registry.json"),
@@ -3389,6 +3390,50 @@ fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     staged
+}
+
+/// Refuses a wholesale `config.yaml` write that would drop a section the writer
+/// cannot emit.
+///
+/// `import` replaces the whole file from `render_yaml`, and that renderer emits
+/// only the sections named in [`import::emittable_sections`]. Anything else the
+/// existing file carries — `oauth:` today, whatever `Config` gains next — would
+/// vanish with a zero exit code and no line of output naming the loss. The
+/// operator's live sessions live in `oauth:` and no other writer restores them,
+/// which is what makes this a data-loss bug rather than a cosmetic one.
+///
+/// The refusal is a refusal, not a warning: the operator reads both, and one
+/// answer here is safer than two. The escape hatch names a section explicitly, so
+/// a conscious overwrite stays a conscious overwrite.
+///
+/// # Errors
+///
+/// The existing file carries a top-level section outside the emittable set and
+/// `allow` neither names that section nor is the blanket `all`.
+fn guard_against_section_loss(path: &Path, allow: Option<&str>) -> anyhow::Result<()> {
+    let Ok(existing) = std::fs::read_to_string(path) else {
+        // Nothing to lose on a first import into an empty directory, and an
+        // unreadable one is the write's error to make, not this guard's.
+        return Ok(());
+    };
+    let lost: Vec<String> = existing
+        .lines()
+        .filter(|l| is_section_header(l))
+        .map(|l| l.trim_end_matches(':').to_owned())
+        .filter(|name| !import::emittable_sections().contains(&name.as_str()))
+        .collect();
+    if lost.is_empty() || allow == Some("all") || allow.is_some_and(|a| lost.iter().any(|s| s == a))
+    {
+        return Ok(());
+    }
+    let names = lost.join(", `");
+    Err(fail(
+        format!(
+            "{} already has `{names}:`, which an import cannot write back",
+            path.display()
+        ),
+        "add those sessions to the new file yourself, or re-run with --allow-section-loss all to overwrite it anyway",
+    ))
 }
 
 /// `<name>.1` for `name = /p/config.yaml`, and so on.

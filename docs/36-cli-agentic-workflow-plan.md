@@ -172,11 +172,24 @@ block and writes only to the credential store (`auth.rs:566` →
 operator's "guide the user through login for oauth" half of the goal cannot
 even begin from the CLI, because the CLI cannot create the `oauth:` block the
 login reads. **And a second, sharper consequence:** `aroute import` writes
-`config.yaml` wholesale (`commands.rs:2018`) from a renderer that never emits
+`config.yaml` wholesale (`commands.rs:2348`) from a renderer that never emits
 `oauth:` — so running `aroute import --out-dir <dir>` against a directory
 whose `config.yaml` carries an `oauth:` block **silently deletes that block**,
 by construction. That is the same failure class as B-1 below, on a different
 writer.
+
+**The `import` half is fixed** (2026-10-24, Phase 0 of the
+`docs/plans/2026-10-24-config-write-surface-plan.md`). The wholesale write is
+now preceded by a guard that refuses, with exit 1 and no other file written,
+when the target carries a section outside `import::emittable_sections()`
+(`import/mod.rs:411`, enforced by `guard_against_section_loss` at
+`commands.rs:3413`) — `oauth:` is the live member. Reproduced live before
+and after: the seed's `oauth:` block went 352 bytes -> 222 with exit 0 before
+the guard, and stayed byte-for-byte identical (`cmp` clean) behind it, with
+`--allow-section-loss <name>` / `all` as the conscious overwrite. What remains
+unfixed is the *reachability* half: `render_yaml` still cannot emit `oauth:`, so
+a directory holding sessions cannot carry them across an import — that is
+Phase 5 of the plan, not a gap in the guard.
 
 **GAP 2 — `server:` is reachable only through the panel.** The only splice of
 `server:` in the workspace is `webui.rs:1332`, inside

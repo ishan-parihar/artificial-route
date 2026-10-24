@@ -1350,3 +1350,181 @@ fn run_reaches_the_router_instead_of_being_refused_by_the_loopback_gate() {
         "an upstream answer (even a refusal) proves the gate passed it: {text}"
     );
 }
+
+/// A throwaway directory with `name` guaranteed empty of generated files.
+fn import_dir(name: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    std::fs::create_dir_all(&dir).expect("the temp dir is created");
+    for f in [
+        "config.yaml",
+        "registry.json",
+        "freeBudgets.json",
+        "modelLifecycle.json",
+    ] {
+        let _ = std::fs::remove_file(dir.join(f));
+    }
+    dir
+}
+
+/// A LiteLLM document the importer can read offline.
+fn litellm_source(dir: &Path) -> PathBuf {
+    let src = dir.join("litellm.yaml");
+    std::fs::write(
+        &src,
+        "model_list:\n  - model_name: gpt\n    litellm_params:\n      model: openai/gpt-5.4\n\
+         api_key: os.environ/OPENAI_API_KEY\n",
+    )
+    .expect("the litellm source writes");
+    src
+}
+
+/// An `import` over a target whose `config.yaml` carries an `oauth:` block must
+/// refuse and leave the file alone.
+///
+/// This is the consumer-visible bug: `render_yaml` cannot emit `oauth:`, so the
+/// wholesale write dropped the operator's live sessions with a zero exit code and
+/// no line of output naming the loss. The assertions are on the file's bytes and
+/// the exit code, because both are what an agent saw.
+#[test]
+fn import_should_refuse_when_the_target_config_carries_a_section_it_cannot_emit() {
+    let out = import_dir("import-refuses-section-loss");
+    let src = litellm_source(&out);
+    let held = out.join("config.yaml");
+    std::fs::write(
+        &held,
+        "keys:\n  openai: $AR_KEY_OPENAI\nproviders:\n  - id: openai\n    key: openai\n\
+         combos:\n  - id: default\n    strategy: lkgp\n    targets:\n      - openai/gpt-5.4\n\
+         oauth:\n  - provider: codex\n    refresh_key: codex_refresh\n\
+         client_id: app_abc123\n    token_endpoint: https://auth.openai.com/oauth/token\n",
+    )
+    .expect("the seed config writes");
+    let before = std::fs::read_to_string(&held).expect("the seed is readable");
+
+    let res = Command::new(BIN)
+        .args([
+            "import",
+            "--from",
+            "litellm",
+            "--path",
+            src.to_str().expect("utf-8 source path"),
+            "--out-dir",
+            out.to_str().expect("utf-8 out dir"),
+        ])
+        .output()
+        .expect("the ar binary runs");
+
+    assert_eq!(code(&res), 1, "stderr: {}", stderr(&res));
+    // Errors are data for an agent, so they print on stdout (`docs/06`); stderr
+    // stays for tracing alone.
+    assert!(
+        stdout(&res).contains("oauth:") && stdout(&res).contains("--allow-section-loss"),
+        "the refusal must name the section at risk and its escape hatch: {}",
+        stdout(&res)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&held).expect("the config is still readable"),
+        before,
+        "a refused import must leave the file byte-for-byte intact"
+    );
+    // The refusal precedes every other write, so a second import's outputs are
+    // not half-regenerated either.
+    assert!(
+        !out.join("registry.json").exists(),
+        "a refused import must write nothing else either"
+    );
+}
+
+/// The escape hatch is a conscious decision, so naming the section works and
+/// naming a *different* one does not.
+#[test]
+fn import_should_allow_named_section_loss_only_when_the_name_matches() {
+    let out = import_dir("import-allow-section-loss");
+    let src = litellm_source(&out);
+    let held = out.join("config.yaml");
+
+    let seed = |body: &str| {
+        std::fs::write(&held, body).expect("the seed config writes");
+    };
+    let seeded = "keys:\n  openai: $AR_KEY_OPENAI\nproviders:\n  - id: openai\n    key: openai\n\
+                  combos:\n  - id: default\n    strategy: lkgp\n    targets:\n      - openai/gpt-5.4\n\
+                  oauth:\n  - provider: codex\n    refresh_key: codex_refresh\n";
+
+    let run = |allow: &str| {
+        Command::new(BIN)
+            .args([
+                "import",
+                "--from",
+                "litellm",
+                "--path",
+                src.to_str().expect("utf-8 source path"),
+                "--out-dir",
+                out.to_str().expect("utf-8 out dir"),
+                "--allow-section-loss",
+                allow,
+            ])
+            .output()
+            .expect("the ar binary runs")
+    };
+
+    // A section the file does not carry is not permission to lose the one it does.
+    seed(seeded);
+    let wrong = run("limits");
+    assert_eq!(code(&wrong), 1, "stderr: {}", stderr(&wrong));
+    assert!(
+        std::fs::read_to_string(&held)
+            .expect("readable")
+            .contains("oauth:"),
+        "a mismatched section name must not unlock the loss"
+    );
+
+    // `all` is the blanket the operator reaches for after reading the refusal.
+    seed(seeded);
+    let all = run("all");
+    assert_eq!(code(&all), 0, "stderr: {}", stderr(&all));
+    assert!(
+        !std::fs::read_to_string(&held)
+            .expect("readable")
+            .contains("oauth:"),
+        "the blanket overwrite is a real overwrite, not a second refusal"
+    );
+
+    // Naming the section itself is enough, and is the narrower answer.
+    seed(seeded);
+    let named = run("oauth");
+    assert_eq!(code(&named), 0, "stderr: {}", stderr(&named));
+}
+
+/// A target whose sections are all emittable imports as before: the guard must
+/// not become a wall that refuses every overwrite.
+#[test]
+fn import_should_still_write_a_target_that_carries_no_unemittable_section() {
+    let out = import_dir("import-clean-target");
+    let src = litellm_source(&out);
+    let held = out.join("config.yaml");
+    std::fs::write(
+        &held,
+        "keys:\n  openai: $AR_KEY_OPENAI\nproviders:\n  - id: openai\n    key: openai\n\
+         combos:\n  - id: default\n    strategy: lkgp\n    targets:\n      - openai/gpt-5.4\n",
+    )
+    .expect("the seed config writes");
+
+    let res = Command::new(BIN)
+        .args([
+            "import",
+            "--from",
+            "litellm",
+            "--path",
+            src.to_str().expect("utf-8 source path"),
+            "--out-dir",
+            out.to_str().expect("utf-8 out dir"),
+        ])
+        .output()
+        .expect("the ar binary runs");
+
+    assert_eq!(code(&res), 0, "stderr: {}", stderr(&res));
+    let body = std::fs::read_to_string(&held).expect("the config is readable");
+    assert!(
+        body.contains("# Generated by `aroute import`"),
+        "the import really did rewrite the file: {body}"
+    );
+}

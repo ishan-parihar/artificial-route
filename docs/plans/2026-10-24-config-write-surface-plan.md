@@ -1,10 +1,11 @@
 # The config-write surface: an outline-plan for closing it
 
-Status: **outline-plan, written 2026-10-24 at the operator's request.** No code
-from this document is implemented yet. It supersedes nothing: `docs/36` §4 step 8
-specifies the first three verb groups (8a `oauth:`, 8b `server:`, 8c `providers:`
-add/remove) and this document **extends that spec to the whole `Config` struct**
-— `docs/36` step 8 stops at three sections; the operator asked for the rest.
+Status: **Phase 0 shipped 2026-10-24; Phases 1-7 unbuilt.** Written at the
+operator's request, then Phase 0 (the data-loss fix) was validated and landed
+before any new verb. It supersedes nothing: `docs/36` §4 step 8 specifies the
+first three verb groups (8a `oauth:`, 8b `server:`, 8c `providers:` add/remove)
+and this document **extends that spec to the whole `Config` struct** —
+`docs/36` step 8 stops at three sections; the operator asked for the rest.
 
 Operator ask: *"how we can enable/disable the dashboard using the aroute cli"*
 was answered in `9a8821a` (the `service enable|disable` verbs). This plan is the
@@ -18,11 +19,11 @@ column that matters is the last one — **who can write it today**.
 
 | # | Section | Shapes | Panel writes | CLI writes | Verdict |
 |---|---|---|---|---|---|
-| 1 | `server:` | `host`, `port` | yes (`webui.rs:1305-1335`, host+port only) | **no** | **GAP** |
+| 1 | `server:` | `host`, `port` | yes — `splice_section(&next, "server", …)` at `webui.rs:1362` | **no** | **GAP** |
 | 2 | `keys:` | `name: $VAR` | no (mint only) | `sync`, `import` (wholesale) | partial, no targeted writer |
-| 3 | `providers:` | `id`, `key`, `keys` | yes — the **three-part add** (`webui.rs:1771-1789`) | `sync` | **GAP** |
+| 3 | `providers:` | `id`, `key`, `keys` | yes — the **three-part add** (`webui.rs:1802-1815`: row + `keys:` ref + env value, no-binding refused at `:1795`) | `sync` | **GAP** |
 | 4 | `custom_providers:` | `id`, protocol, `base_url`, headers, `key_ref` | yes (`webui.rs:2198`) | `sync` | **GAP** |
-| 5 | `combos:` | `id`, strategy, `targets`, `weights`, `pool`, `steps`, `compression`, `judge_model`, `context_length` | yes — **whole-section replace** (`webui.rs:1614` + `check_combos:1655`) | `import` (wholesale) | **GAP** — no single-item writer |
+| 5 | `combos:` | `id`, strategy, `targets`, `weights`, `pool`, `steps`, `compression`, `judge_model`, `context_length` | yes — **whole-section replace** (`webui.rs:1614`) validated by `check_combos` (`:1655`) | `import` (wholesale) | **GAP** — no single-item writer |
 | 6 | `oauth:` | 12 fields per session (`OAuthSession`, `:818-895`) | **no route at all** | **nothing** | **GAP + data-loss risk** |
 | 7 | `continue_on_cut:` | provider id list | no | **nothing** | **GAP** |
 | 8 | `visibility:` | `blocked_providers`, `hide_paid_models`, `model_visibility_allowlist`, `model_visibility_denylist` | no | **nothing** | **GAP** |
@@ -73,33 +74,55 @@ by risk, not by section size: the destructive-writer fix first, the destructive
 verbs last, the unwritable-everywhere sections at the end where they can be
 reconsidered without blocking anything.
 
-### Phase 0 — `import` must not delete a section it cannot represent *(data-loss fix, ships first)*
+### Phase 0 — `import` must not delete a section it cannot represent *(data-loss fix)*
 
-The only phase that fixes existing behaviour rather than adding a verb.
+**Shipped 2026-10-24.** The only phase that fixes existing behaviour rather than
+adding a verb, so it landed before Phase 1.
 
-`import` gains one guard and one flag:
+`import` gained one guard and one flag:
 
 - **Guard (default).** Before writing, parse the existing `config.yaml` (if any)
   and compute which top-level sections `render_yaml` **cannot** emit — `oauth:`
   today; anything added to `Config` later. If the existing file carries one, the
   write is **refused** with a message naming the section and the exact command
-  to preserve it. A refusal is exit 1 and writes nothing, per the same law that
-  B-1 established: a write that silently drops a section named by nobody is the
-  failure this project refuses everywhere else.
-- **Escape hatch.** `--allow-section-loss <name>` (or `--force`) proves the
-  operator saw the warning. Without a flag there is no silent path.
+  to preserve it. A refusal is exit 1 and writes nothing: not `registry.json`,
+  not `freeBudgets.json`, not the `.1` backup rotation either. Per the same law
+  that B-1 established: a write that silently drops a section named by nobody is
+  the failure this project refuses everywhere else.
+- **Escape hatch.** `--allow-section-loss <name>` proves the operator saw the
+  warning, and accepts either one section name or the blanket `all`. A name that
+  does not match the section at risk still refuses, so a typo is not a bypass.
 
-Test contract (one per outcome, project naming):
+The emittable set is `emittable_sections()` in `import/mod.rs`, derived from
+`render_yaml` rather than from `Config`'s field list, so it follows the renderer
+instead of drifting from it.
+
+Evidence, all run:
+- the pre-fix bug reproduced live: a seeded `oauth:` block went from present to
+  absent with exit 0 and no warning (352 bytes -> 222, `refresh_key:` gone).
+- the post-fix A/B on the same seed: exit 1, the file byte-for-byte identical
+  (`cmp` clean), and no other output file written.
+- `--allow-section-loss all` and `--allow-section-loss oauth` both overwrite,
+  and `--allow-section-loss limits` refuses.
+- negative control: removing the guard call makes the new tests fail (exit 0
+  where 1 is required), so they detect the bug they claim to.
+
+Tests, all in `crates/ar-cli/tests/cli.rs`:
 - `import_should_refuse_when_the_target_config_carries_a_section_it_cannot_emit`
-  — the consumer-visible bug: `import --out-dir <dir>` over a config with an
-  `oauth:` block leaves that block **byte-for-byte intact**.
-- `import_should_carry_the_oauth_block_over_when_it_can_represent_it` — the
-  follow-up once `render_yaml` can emit it, so the guard is not a permanent wall.
-- negative control: remove the guard, the first test fails on a mutated file.
+  — the consumer-visible bug, asserted on the file's bytes and the exit code.
+- `import_should_allow_named_section_loss_only_when_the_name_matches` — the
+  hatch is a conscious decision, so a mismatched name still refuses.
+- `import_should_still_write_a_target_that_carries_no_unemittable_section` — the
+  guard must not become a wall that refuses every overwrite.
+
+Still deferred from this phase: `render_yaml` cannot emit `oauth:`, so an
+import into a directory that holds sessions still cannot carry them across.
+That is the follow-up below, not a gap in the guard.
 
 ### Phase 1 — `aroute server show|set` *(smallest, unblocks the restart contract)*
 
-Two verbs, two fields, the panel's exact validation (`webui.rs:1305-1335`):
+Two verbs, two fields, the panel's exact validation (`webui.rs:1362`, the only
+`server:` splice in the tree):
 empty host refused, port must be `1..=65535`, and nothing else about the listen
 address is configurable from this surface.
 
@@ -125,15 +148,16 @@ load; the CLI must reproduce that atomically.
   1. the `providers:` row,
   2. the `keys:` row it references,
   3. the `AR_KEY_<NAME>` line in the env file the service loads.
-  A row with no binding is **refused** (`webui.rs:1761-1768`) — a provider with
-  no credential fails at the first request, which is a worse answer than an
-  upfront refusal. `<id>` must name a registry provider (`aroute providers` is
-  how an agent discovers the ids), not a custom endpoint — Phase 3 is where a
-  custom endpoint goes.
+  A row with no binding is **refused** (`webui.rs:1795` — "has no AR_KEY_*
+  binding for its credential", with the exact fix in the same message) — a
+  provider with no credential fails at the first request, which is a worse
+  answer than an upfront refusal. `<id>` must name a registry provider
+  (`aroute providers` is how an agent discovers the ids), not a custom endpoint;
+  Phase 3 is where a custom endpoint goes.
 - `aroute providers remove <id>` — refuses while any combo still references the
-  provider (`webui.rs:2436-2440`, the same set the CLI already computes for
-  `doctor`), and drops the `keys:` entries the removed row alone held
-  (`webui.rs:2366-2390`). A dead provider fails loudly; a dangling one fails
+  provider (`webui.rs:2452` closure, `:2468` conflict; the same set the CLI
+  already computes for `doctor`), and drops the `keys:` entries the removed row
+  alone held. A dead provider fails loudly; a dangling one fails
   late, which is why the refusal exists.
 
 Test contract:

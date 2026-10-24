@@ -920,6 +920,16 @@ pub struct ImportArgs {
     /// Directory the two files are written into. Created if absent.
     #[arg(long, value_name = "DIR", default_value = ".")]
     pub out_dir: PathBuf,
+
+    /// Overwrite a `config.yaml` section this import cannot regenerate.
+    ///
+    /// An import rewrites the whole file, and it can only write back `keys:`,
+    /// `providers:`, `custom_providers:` and `combos:`. An `oauth:` block in the
+    /// target would be dropped with a zero exit code, so the default is a refusal
+    /// naming the section. Pass a section name to keep only that one, or `all`
+    /// to overwrite every one it cannot represent.
+    #[arg(long, value_name = "SECTION|all")]
+    pub allow_section_loss: Option<String>,
 }
 
 /// Options for `aroute sync`.
