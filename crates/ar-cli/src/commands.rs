@@ -19,7 +19,8 @@ use clap::CommandFactory;
 use clap::error::ErrorKind;
 
 use crate::cli::{
-    ClearLimitsArgs, Cli, Command, ConfigureArgs, ImportArgs, ListArgs, SetLimitsArgs, SyncArgs,
+    ClearLimitsArgs, Cli, Command, ConfigureArgs, DoctorArgs, ImportArgs, ListArgs, SetLimitsArgs,
+    SyncArgs,
 };
 use crate::import;
 use crate::import::ImportFrom;
@@ -726,7 +727,7 @@ fn read_config_text(cli: &Cli) -> anyhow::Result<String> {
 /// The `default` row is always first, because it is the row anonymous traffic
 /// and any key without its own get; printing it only when it limits something
 /// would hide the row that governs the rest.
-pub fn limits_view(cli: &Cli) -> anyhow::Result<()> {
+pub fn limits_view(cli: &Cli, json: bool) -> anyhow::Result<()> {
     let cfg = load(cli)?;
     let rows: Vec<Row> = std::iter::once(("default".to_owned(), cfg.limits.default.clone()))
         .chain(
@@ -757,17 +758,29 @@ pub fn limits_view(cli: &Cli) -> anyhow::Result<()> {
             ]
         })
         .collect();
-    print!(
-        "{}",
-        toon::list(
-            "limits",
-            "limits",
-            &LIMIT_COLUMNS,
-            &toon::every_field(&LIMIT_COLUMNS),
-            &rows,
-            false,
-        )
-    );
+    if json {
+        print!(
+            "{}",
+            toon::json(
+                "limits",
+                &LIMIT_COLUMNS,
+                &toon::every_field(&LIMIT_COLUMNS),
+                &rows,
+            )
+        );
+    } else {
+        print!(
+            "{}",
+            toon::list(
+                "limits",
+                "limits",
+                &LIMIT_COLUMNS,
+                &toon::every_field(&LIMIT_COLUMNS),
+                &rows,
+                false,
+            )
+        );
+    }
     Ok(())
 }
 
@@ -1038,7 +1051,7 @@ pub fn dispatch(cli: &Cli) -> anyhow::Result<()> {
         Some(Command::Models(a)) => models(cli, a),
         Some(Command::Providers(a)) => providers(cli, a),
         Some(Command::Combo(a)) => combo(cli, a),
-        Some(Command::Doctor) => doctor(cli),
+        Some(Command::Doctor(a)) => doctor(cli, a),
         Some(Command::Auth(a)) => crate::auth::run(cli, a),
         Some(Command::Run(a)) => block_on(serve::run(cli, a)),
         Some(Command::Configure(a)) => configure(cli, a),
@@ -1066,7 +1079,7 @@ pub fn dispatch(cli: &Cli) -> anyhow::Result<()> {
             crate::cli::KeysCommand::Revoke(args) => keys_revoke(cli, &args.token_file),
         },
         Some(Command::Limits(a)) => match &a.command {
-            None => limits_view(cli),
+            None => limits_view(cli, a.json),
             Some(crate::cli::LimitsCommand::Set(args)) => limits_set(cli, args),
             Some(crate::cli::LimitsCommand::Clear(args)) => limits_clear(cli, args),
         },
@@ -1118,8 +1131,46 @@ fn cost_report(cli: &Cli, args: &crate::cli::CostReportArgs) -> anyhow::Result<(
     if let Some(key) = &args.key {
         report.rows.retain(|r| &r.key_id == key);
     }
-    print!("{}", report.toon());
+    if args.json {
+        // The ledger's own row shape, so a machine gets the same data the
+        // MCP's `ar_cost_report` returns in its JSON half — one source, two
+        // renderings, rather than a CLI-only second shape.
+        println!("{}", cost_report_json(&report));
+    } else {
+        print!("{}", report.toon());
+    }
     Ok(())
+}
+
+/// The same [`ar_tokens::CostReport`] as JSON.
+///
+/// Kept beside the TOON renderer's caller rather than inside `ar-tokens` so
+/// the shared renderer stays the single owner of the *rows* and the CLI owns
+/// only the envelope it prints them in.
+fn cost_report_json(report: &ar_tokens::CostReport) -> String {
+    let rows: Vec<serde_json::Value> = report
+        .rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "key_id": r.key_id,
+                "provider": r.provider,
+                "model": r.model,
+                "tokens": r.total_tokens,
+                "usd_micros": r.cost_usd.micros,
+                "priced": r.priced,
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&serde_json::json!({
+        "count": report.rows.len(),
+        "rows": rows,
+        "totals": {
+            "tokens": report.totals.tokens,
+            "usd_micros": report.totals.usd.micros,
+        },
+    }))
+    .unwrap_or_else(|_| String::from("{}"))
 }
 
 /// Bare `ar`: content-first home view, not a manual (docs/06).
@@ -1174,17 +1225,15 @@ fn models(cli: &Cli, args: &ListArgs) -> anyhow::Result<()> {
         &MODEL_COLUMNS,
         "models",
     )?;
-    print!(
-        "{}",
-        toon::list(
-            "models",
-            "models",
-            &MODEL_COLUMNS,
-            &fields,
-            &model_rows(&cfg, &catalog),
-            args.full
-        )
-    );
+    let rows = model_rows(&cfg, &catalog);
+    if args.json {
+        print!("{}", toon::json("models", &MODEL_COLUMNS, &fields, &rows));
+    } else {
+        print!(
+            "{}",
+            toon::list("models", "models", &MODEL_COLUMNS, &fields, &rows, args.full)
+        );
+    }
     Ok(())
 }
 
@@ -1263,17 +1312,15 @@ fn providers(cli: &Cli, args: &ListArgs) -> anyhow::Result<()> {
         &PROVIDER_COLUMNS,
         "providers",
     )?;
-    print!(
-        "{}",
-        toon::list(
-            "providers",
-            "providers",
-            &PROVIDER_COLUMNS,
-            &fields,
-            &provider_rows(&cfg, &catalog),
-            args.full
-        )
-    );
+    let rows = provider_rows(&cfg, &catalog);
+    if args.json {
+        print!("{}", toon::json("providers", &PROVIDER_COLUMNS, &fields, &rows));
+    } else {
+        print!(
+            "{}",
+            toon::list("providers", "providers", &PROVIDER_COLUMNS, &fields, &rows, args.full)
+        );
+    }
     Ok(())
 }
 
@@ -1326,17 +1373,15 @@ fn combo(cli: &Cli, args: &ListArgs) -> anyhow::Result<()> {
         &COMBO_COLUMNS,
         "combo",
     )?;
-    print!(
-        "{}",
-        toon::list(
-            "combo",
-            "combos",
-            &COMBO_COLUMNS,
-            &fields,
-            &combo_rows(&cfg.combos, &catalog),
-            args.full
-        )
-    );
+    let rows = combo_rows(&cfg.combos, &catalog);
+    if args.json {
+        print!("{}", toon::json("combo", &COMBO_COLUMNS, &fields, &rows));
+    } else {
+        print!(
+            "{}",
+            toon::list("combo", "combos", &COMBO_COLUMNS, &fields, &rows, args.full)
+        );
+    }
     Ok(())
 }
 
@@ -1377,21 +1422,33 @@ fn combo_rows(combos: &[Combo], catalog: &Registry) -> Vec<Row> {
 /// this is safe to paste into a bug report. Getting here already proves every
 /// `$VAR` expanded, because `ar-config` refuses to load otherwise — so a "key"
 /// row reports the binding, not a re-check that can never fail.
-fn doctor(cli: &Cli) -> anyhow::Result<()> {
+fn doctor(cli: &Cli, args: &DoctorArgs) -> anyhow::Result<()> {
     let cfg = load(cli)?;
     let store = StoreProbe::resolve(&cli.config);
     let checks = findings(&cfg, &cli.config.display().to_string(), &store);
-    print!(
-        "{}",
-        toon::list(
-            "checks",
-            "checks",
-            &CHECK_COLUMNS,
-            &toon::every_field(&CHECK_COLUMNS),
-            &checks,
-            false
-        )
-    );
+    if args.json {
+        print!(
+            "{}",
+            toon::json(
+                "checks",
+                &CHECK_COLUMNS,
+                &toon::every_field(&CHECK_COLUMNS),
+                &checks,
+            )
+        );
+    } else {
+        print!(
+            "{}",
+            toon::list(
+                "checks",
+                "checks",
+                &CHECK_COLUMNS,
+                &toon::every_field(&CHECK_COLUMNS),
+                &checks,
+                false
+            )
+        );
+    }
     let failed = checks.iter().filter(|r| r[1] == "fail").count();
     if failed > 0 {
         return Err(fail(
@@ -4774,6 +4831,7 @@ models\":[{\"kind\":\"model\",\"model\":\"nvidia/z-ai/glm-5.3\",\"providerId\":\
             let args = crate::cli::CostReportArgs {
                 limit: 50,
                 key: None,
+                json: false,
             };
             cost_report(&cli, &args).expect("report");
 
@@ -4807,6 +4865,7 @@ models\":[{\"kind\":\"model\",\"model\":\"nvidia/z-ai/glm-5.3\",\"providerId\":\
             let args = crate::cli::CostReportArgs {
                 limit: 50,
                 key: None,
+                json: false,
             };
             cost_report(&cli, &args).expect("report");
 

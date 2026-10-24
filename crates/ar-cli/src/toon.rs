@@ -166,6 +166,68 @@ pub fn fields_or_default(raw: Option<&str>) -> Vec<String> {
     }
 }
 
+/// The same projected rows as a JSON object, one renderer call beside
+/// [`list`] so a caller cannot get two shapes for one dataset.
+///
+/// This is the machine-readable opt-in `docs/06`'s CLI contract gains: TOON
+/// stays the default for humans, and `--json` emits the *same* rows rather
+/// than a second query that could drift from the first.
+///
+/// Shape:
+///
+/// ```json
+/// { "count": 2, "total": 2, "name": "providers",
+///   "columns": ["id", "provider", "status"],
+///   "rows": [{"id": "openai", "provider": "openai", "status": "ok"}] }
+/// ```
+///
+/// Two deliberate differences from the TOON rendering, both about cost:
+///
+/// * **No truncation.** The ceiling exists to keep a human table narrow; a
+///   machine that asked for JSON can parse a long value, so clipping here
+///   would silently destroy data the caller wanted. `--full`'s meaning is
+///   "no clipping", which JSON already is.
+/// * **`count` and `total` stay.** They are what an agent branches on to know
+///   whether it saw everything, and `count: N of TOTAL` has the same job in
+///   the text form.
+///
+/// A cell containing a comma needs no quoting here: JSON escapes it. That is
+/// the other reason the shape is worth having — the `--json` path cannot have
+/// the column-shift class of bug `clip` guards against.
+pub fn json(
+    name: &str,
+    all: &[&str],
+    fields: &[String],
+    rows: &[Vec<String>],
+) -> String {
+    let picked: Vec<usize> = fields
+        .iter()
+        .filter_map(|f| all.iter().position(|a| a == f))
+        .collect();
+
+    let objects: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            let mut obj = serde_json::Map::with_capacity(picked.len());
+            for i in &picked {
+                let key = all[*i];
+                let value = row.get(*i).map_or("", String::as_str);
+                obj.insert(key.to_owned(), serde_json::Value::String(value.to_owned()));
+            }
+            serde_json::Value::Object(obj)
+        })
+        .collect();
+
+    serde_json::to_string_pretty(&serde_json::json!({
+        "name": name,
+        "count": objects.len(),
+        "total": rows.len(),
+        "columns": fields,
+        "rows": objects,
+    }))
+    .unwrap_or_else(|_| String::from("{}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,4 +352,54 @@ mod tests {
         assert_eq!(cell, "gpt-4o-mini");
         assert!(!cell.contains('"'));
     }
+    #[test]
+    fn json_emits_the_same_rows_the_toon_table_carries() {
+        // The claim `--json` exists to make: one dataset, two renderings, so a
+        // caller can switch formats without learning a second shape. Asserts
+        // against the row count and one cell rather than a byte comparison,
+        // because the whole point is that the SHAPES differ while the DATA does
+        // not.
+        let rows = vec![
+            vec!["openai".to_owned(), "openai".to_owned(), "ok".to_owned()],
+            vec!["anthropic".to_owned(), "anthropic".to_owned(), "ok".to_owned()],
+        ];
+        let out = json("providers", &["id", "provider", "status", "base_url", "key"], &["id".to_owned(), "provider".to_owned(), "status".to_owned()], &rows);
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(parsed["count"], 2, "{out}");
+        assert_eq!(parsed["total"], 2, "{out}");
+        assert_eq!(parsed["rows"][0]["id"], "openai", "{out}");
+        assert_eq!(parsed["rows"][1]["provider"], "anthropic", "{out}");
+    }
+
+    #[test]
+    fn json_carries_a_comma_inside_a_value_without_widening_the_row() {
+        // The bug `clip` guards in TOON cannot happen here: JSON escapes the
+        // delimiter, so a comma in a value stays inside that value. This is the
+        // concrete reason the --json path is worth having alongside TOON.
+        let rows = vec![vec![
+            "config".to_owned(),
+            "ok".to_owned(),
+            "/path/with, comma/config.yaml".to_owned(),
+        ]];
+        let out = json("checks", &["check", "status", "detail"], &["check".to_owned(), "status".to_owned(), "detail".to_owned()], &rows);
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(parsed["rows"].as_array().unwrap().len(), 1, "{out}");
+        assert_eq!(
+            parsed["rows"][0]["detail"], "/path/with, comma/config.yaml",
+            "the comma must stay inside the string: {out}"
+        );
+    }
+
+    #[test]
+    fn json_projects_only_the_requested_columns() {
+        let rows = vec![vec!["openai".to_owned(), "https://api.openai.com/v1".to_owned()]];
+        let out = json("providers", &["id", "provider", "status", "base_url", "key"], &["id".to_owned()], &rows);
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(parsed["rows"][0]["id"], "openai", "{out}");
+        assert!(
+            parsed["rows"][0].get("base_url").is_none(),
+            "an unrequested column must not appear: {out}"
+        );
+    }
 }
+

@@ -72,9 +72,9 @@ pub enum Command {
     ///
     /// Examples:
     ///   aroute doctor
-    ///   aroute doctor --config ./config.yaml
+    ///   aroute doctor --json
     #[command(verbatim_doc_comment)]
-    Doctor,
+    Doctor(DoctorArgs),
 
     /// One completion through the real router, printed to stdout.
     ///
@@ -256,6 +256,33 @@ pub struct ListArgs {
     /// Print values in full instead of cutting them at the truncation ceiling.
     #[arg(long)]
     pub full: bool,
+
+    /// Emit the same rows as JSON instead of TOON.
+    ///
+    /// One query, two renderings: `--json` is the machine opt-in and TOON
+    /// stays the default for humans (`docs/06`, "TOON on stdout, JSON inside" —
+    /// this widens that to a CLI machine mode). The rows are identical, so a
+    /// caller can switch formats without learning a second shape.
+    ///
+    /// A JSON value is never truncated: the ceiling exists to keep a
+    /// human-readable table narrow, and a machine that needs a long value can
+    /// parse it.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Options for `aroute doctor`.
+///
+/// Separate from [`ListArgs`] because `doctor` has no `--fields`: its three
+/// columns are the answer, not a projection of one.
+#[derive(Debug, Args)]
+pub struct DoctorArgs {
+    /// Emit the same checks as JSON instead of TOON.
+    ///
+    /// One query, two renderings, the same rule as the list verbs: TOON stays
+    /// the default for humans and `--json` is the machine opt-in.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Options for `aroute run`.
@@ -428,6 +455,13 @@ pub struct MintArgs {
 pub struct LimitsCliArgs {
     #[command(subcommand)]
     pub command: Option<LimitsCommand>,
+
+    /// Emit the same rows as JSON instead of TOON.
+    ///
+    /// One query, two renderings: TOON stays the default for humans and this is
+    /// the machine opt-in, the same rule as the list verbs.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Options for `aroute cost-report`.
@@ -445,6 +479,13 @@ pub struct CostReportArgs {
     /// Only rows written under this key id.
     #[arg(long, value_name = "KEY")]
     pub key: Option<String>,
+
+    /// Emit the same report as JSON instead of TOON.
+    ///
+    /// The rows are the ones `ar_cost_report` returns; the format is the CLI's
+    /// choice, and JSON is the machine-readable one.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Subcommands of `aroute limits`. `None` prints the block.
