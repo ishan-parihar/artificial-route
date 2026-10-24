@@ -131,14 +131,14 @@ The seven top-level sections are `server`, `keys`, `providers`,
 
 **The write-surface evidence.** Every config write in the workspace goes
 through one of two helpers, `splice_section`
-(`crates/ar-cli/src/commands.rs:2243-2274`) and `remove_section`
-(`crates/ar-cli/src/commands.rs:2221-2238`). The complete list of call sites:
+(`crates/ar-cli/src/commands.rs:3097`) and `remove_section`. The complete list of
+call sites:
 
-- **CLI** — `commands.rs:808` (`limits set`), `commands.rs:903`, `:905`,
-  `:911` (`limits clear`), `commands.rs:2098` (`sync` → `combos:`),
-  `commands.rs:2100` (`sync` → `custom_providers:`), `commands.rs:2150`
-  (`sync` → `limits:`), `commands.rs:2418` (`sync` → `keys:`),
-  `commands.rs:2419` (`sync` → `providers:`).
+- **CLI** — `commands.rs:938` (`limits set`), `commands.rs:1153`
+  (`limits clear`), `commands.rs:2941` (`sync` → `combos:`),
+  `commands.rs:2993` (`sync` → `limits:`), `commands.rs:3310` (`sync` →
+  `keys:`), `commands.rs:3311` (`sync` → `providers:`), **`commands.rs:1055`
+  (`server set` → `server:`)** — the last added in Phase 1 (2026-10-24).
 - **Panel** — `webui.rs:685` (`keys:`), `:1332` (`server:`), `:1348`
   (`limits:` default), `:1606` (`combos:`), `:1785` (`providers:`),
   `:2144` (`limits:`), `:2279` (`custom_providers:`), `:2345` + `:2365` +
@@ -152,10 +152,10 @@ through one of two helpers, `splice_section`
 |---|---|---|---|
 | `keys:` | `limits`/`import`/`sync` (whole-section rewrite). No targeted add/remove of one key row. | `POST /ui/api/provider-key`, `POST /ui/api/provider-custom` (`webui.rs:685`) | targeted key-row verb missing |
 | `providers:` | **add a row: no CLI verb.** `sync` can only attach a `keys:` list to a row that already exists (`commands.rs:2410-2412` returns early when the block is empty; an unmatched dashboard provider is ignored). `import` writes a whole new file with one row per registry provider (`import/mod.rs:379-387`). **remove a row: no CLI verb.** | `POST /ui/api/provider-key` adds a row (`webui.rs:1771-1789`); `POST /ui/api/provider-remove` removes one (`webui.rs:2399`) | **GAP 3** |
-| `custom_providers:` | `import` (when the source has ad-hoc nodes); `sync` (only if the dashboard has such rows, `commands.rs:2099-2106`) | `POST /ui/api/provider-custom` (`webui.rs:2279`) | targeted add missing from the CLI |
-| `combos:` | `import` (whole file); `sync` (**whole-section replace** from the dashboard DB, `commands.rs:2098`) | `POST /ui/api/combos` (whole-section replace, `webui.rs:1606`) | no targeted single-combo edit anywhere |
-| `limits:` | `aroute limits set` (`commands.rs:808`), `aroute limits clear` (`commands.rs:903`/`:905`/`:911`), `sync` (**rpm arm only**, `commands.rs:2150` via `import/limits::read_rpm`) | `POST /ui/api/limits` (`webui.rs:2144`), `POST /ui/api/settings` (default row only, `webui.rs:1348`) | — |
-| `server:` | **no CLI verb.** `aroute serve --port` overrides at runtime and persists nothing. | `POST /ui/api/settings` (host + port only, `webui.rs:1305-1335`) | **GAP 2** |
+| `custom_providers:` | `import` (when the source has ad-hoc nodes); `sync` (only if the dashboard has such rows) | `POST /ui/api/provider-custom` (`webui.rs:2279`) | targeted add missing from the CLI |
+| `combos:` | `import` (whole file); `sync` (**whole-section replace** from the dashboard DB, `commands.rs:2941`) | `POST /ui/api/combos` (whole-section replace, `webui.rs:1606`) | no targeted single-combo edit anywhere |
+| `limits:` | `aroute limits set` (`commands.rs:938`), `aroute limits clear` (`commands.rs:1153`), `sync` (**rpm arm only**, `commands.rs:2993` via `import/limits::read_rpm`) | `POST /ui/api/limits` (`webui.rs:2144`), `POST /ui/api/settings` (default row only, `webui.rs:1348`) | — |
+| `server:` | **`aroute server show` (read-only) and `aroute server set` (host + port only, `commands.rs:1055`), per-field merge.** `aroute serve --port` overrides at runtime and persists nothing. | `POST /ui/api/settings` (host + port only, `webui.rs:1305-1335`) | **closed 2026-10-24** (Phase 1) |
 | `oauth:` | **no CLI verb and no panel endpoint.** | none | **GAP 1** |
 
 ### 1.3 The three gaps, stated precisely
@@ -203,12 +203,28 @@ should reach for `sync` or a writer verb. The refusal names every section at
 risk, each quoted, and `--allow-section-loss <name>` / `all` is the conscious
 overwrite.
 
-**GAP 2 — `server:` is reachable only through the panel.** The only splice of
-`server:` in the workspace is `webui.rs:1332`, inside
+**GAP 2 — `server:` is reachable only through the panel.** *(The CLI half
+is fixed 2026-10-24, Phase 1 of the plan — `9c46ff5`.)* The only splice of
+`server:` in the workspace was `webui.rs:1332`, inside
 `POST /ui/api/settings`, which writes `server:` host + port only
 (`webui.rs:1305-1335`; an empty host or a port of `0`/out-of-range is refused
-before the file is touched, `:1312-1325`). No CLI command writes it. An agent
-that must move the listen address has to drive a browser form or hand-edit.
+before the file is touched, `:1312-1325`). No CLI command wrote it, so an agent
+that had to move the listen address drove a browser form or hand-edited.
+
+`aroute server show|set` now owns the read and the write from the CLI, with the
+panel's exact validation (`webui.rs:1343` for the empty host, `:1351` for the
+port range) and the restart note `limits set` prints. `set` merges per field, so
+`set --port 20129` leaves the host alone; `--port` is typed `u16` so the upper
+bound is clap's and needs no hand-written check. `show` compares against
+`Server::default()` rather than a literal pair.
+
+Two defects in shared code surfaced while building it and are fixed with it:
+`splice_section` consumed the blank line and column-0 comment block that follow
+a replaced section, which silently deleted the comments introducing the *next*
+section — this repo's own `config.yaml` carries them, so a `server:` splice
+destroyed the two introducing `keys:`; and the host was written through
+`serde_json::Value`, which quoted it (`127.0.0.1` as `"127.0.0.1"`). Both
+fixes are covered by command-driven tests with negative controls.
 
 **GAP 3 — a `providers:` row can be ADDED only by the panel.** The surgical
 add is `webui.rs:1771-1789`: the row, the `keys:` reference and the

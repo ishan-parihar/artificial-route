@@ -1,6 +1,7 @@
 # The config-write surface: an outline-plan for closing it
 
-Status: **Phase 0 shipped 2026-10-24; Phases 1-7 unbuilt.** Written at the
+Status: **Phase 0 shipped 2026-10-24; Phase 1 shipped 2026-10-24; Phases
+2-7 unbuilt.** Written at the
 operator's request, then Phase 0 (the data-loss fix) was validated and landed
 before any new verb. It supersedes nothing: `docs/36` §4 step 8 specifies the
 first three verb groups (8a `oauth:`, 8b `server:`, 8c `providers:` add/remove)
@@ -152,24 +153,51 @@ Still deferred from this phase: `render_yaml` cannot emit `oauth:`, so an
 import into a directory that holds sessions still cannot carry them across.
 That is the follow-up below, not a gap in the guard.
 
-### Phase 1 — `aroute server show|set` *(smallest, unblocks the restart contract)*
+### Phase 1 — `aroute server show|set` — **SHIPPED 2026-10-24** (`9c46ff5`) *(smallest, unblocks the restart contract)
 
-Two verbs, two fields, the panel's exact validation (`webui.rs:1362`, the only
-`server:` splice in the tree):
+Two verbs, two fields, the panel's exact validation (`webui.rs:1343`, `:1351`;
+the only `server:` splice in the tree is `webui.rs:1362`):
 empty host refused, port must be `1..=65535`, and nothing else about the listen
-address is configurable from this surface.
+address is configurable from this surface. `--port` is typed `u16`, so the upper
+bound is clap's job and needs no hand-written check.
 
 - `aroute server show` — one row: host, port, and whether either differs from
   the default (`127.0.0.1:20128`), because "is this the default?" is the next
-  question every caller asks.
-- `aroute server set --host H --port P` — `splice_section(doc, "server", …)`,
-  byte-identical elsewhere, plus the restart note (the listen address is read at
-  boot).
+  question every caller asks. Two `*_changed` columns rather than one
+  `is_default` cell: which field moved is a different question from whether
+  either did, and collapsing them hides the answer. Compared against
+  `Server::default()`, so the default is derived from its one owner.
+- `aroute server set --host H --port P` — per-field merge, so a flag not passed
+  keeps what the file already carries and `set --port 20129` cannot quietly
+  change the host. `splice_section(doc, "server", …)`, byte-identical
+  elsewhere, plus the B-3 restart note.
 
-Test contract:
+Two defects in shared code, both found by running the verb rather than reading
+the code, and both fixed in Phase 1:
+
+- **`splice_section` ate the comment block after a replaced section.** A blank
+  line or a column-0 comment is not a section header, so nothing stopped the
+  skip, and the block documenting the *next* section was destroyed. This
+  repo's own `config.yaml` carries those blocks, so a `server:` splice silently
+  deleted the two comments introducing `keys:`. Indentation cannot distinguish
+  them (YAML allows column-0 comments anywhere), so the skip now ends at a
+  blank line or a `#`.
+- **The host was written quoted.** The panel writes it through
+  `serde_json::Value`, which is a JSON serializer: `127.0.0.1` came back as
+  `"127.0.0.1"`. Now written raw. The loader parses both, but the written form
+  is the one the operator reads back.
+
+Test contract, all four shipped:
 - `server_show_should_print_the_effective_listen_address`
 - `server_set_should_write_the_listen_address_and_leave_the_rest_byte_identical`
 - `server_set_should_refuse_an_empty_host_and_name_the_fix`
+- `server_set_should_not_swallow_the_comment_block_after_the_section` (added
+  after the comment-eating bug; its negative control reverted the fix and
+  failed with "the comment block documenting the next section was eaten")
+
+Negative controls run and confirmed to fail: the comment-preservation fix, the
+empty-host refusal, the port-0 refusal, the no-field-given refusal, and the
+merge-not-replace behaviour.
 
 ### Phase 2 — `aroute providers add|remove` *(the three-part write, the panel's semantics)*
 

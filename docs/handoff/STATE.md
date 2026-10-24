@@ -3,6 +3,40 @@
 Current snapshot only (no history: that is the worklog). The first `## ` block is
 what `genome wake` shows.
 
+## State — 2026-10-24
+
+Date: 2026-10-24. Branch `main` @ `9c46ff5` (the latest commit is Phase 1 of the
+config-write surface). **65 commits after `v0.1.20` are unreleased, and 32 of them
+are unpushed** (`git rev-list --count v0.1.20..HEAD` = 65;
+`git rev-list --count origin/main..HEAD` = 32 — measure with those two). The tree
+is at `0.1.21` in `Cargo.toml`, unreleased as a tag. **The 2026-10-21 block below
+is kept as history, not as a snapshot**: its "19 commits, none unpushed" line is
+superseded by the counts above, and `docs/plans/2026-10-24-config-write-surface-plan.md`
+is now the plan of record for the CLI surface.
+
+**The live services were not restarted in this session.** Local `aroute.service`
+is active, PID **1091**, up since **23:17:12 IST**, `GET /healthz` → **200**
+against `127.0.0.1:20128`. `aroute-dashboard.service` PID 1089 likewise.
+Every check against them was read-only; all config writes went to scratch
+directories outside the repo and were removed. The repo's own `config.yaml` is
+unchanged (`git diff --stat` shows nothing for it).
+
+**Where the CLI surface stands.** Phase 0 (`96cf513`) and Phase 1 (`9c46ff5`) of
+`docs/plans/2026-10-24-config-write-surface-plan.md` are shipped: `aroute import`
+now refuses a wholesale write that would drop a section it cannot represent, and
+`aroute server show|set` owns the listen address. Building Phase 1 exposed two
+defects in shared code — `splice_section` eating the comment block after a
+replaced section, and the host written quoted through `serde_json::Value` — both
+fixed and covered by command-driven tests with negative controls. Phases 2-7 are
+unbuilt; `oauth:` remains the gap the operator singled out. Full state:
+`docs/36-cli-agentic-workflow-plan.md` §1.3, `docs/28-gap-ledger.md` D13.
+
+**Gates as of `9c46ff5`.** 2358 tests green, clippy clean, `genome lint` 0 errors
+(the 14 W014 ask-age warnings are pre-existing), `docs-check` in warn mode — the
+known pre-existing README rubric finding stands. `cargo fmt --all` is **dangerous
+in this repo**: it was not rustfmt-clean at HEAD (14 pre-existing diff blocks,
+measured against HEAD directly), so a blanket run reformats 300+ unrelated lines.
+
 ## State — 2026-10-21
 
 Date: 2026-10-21. Branch `feat/per-model-token-budgets` @ `15f027c` (local `main` is
