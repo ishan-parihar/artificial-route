@@ -90,6 +90,14 @@ reconsidered without blocking anything.
 **Shipped 2026-10-24.** The only phase that fixes existing behaviour rather than
 adding a verb, so it landed before Phase 1.
 
+*One ruling this phase needs from the operator, flagged rather than assumed:* the
+guard's stance that **an in-place import is not a supported operation at all**.
+Refusing on `server:` and `limits:` — not just the unrecoverable `oauth:` — is
+what makes that stance real, and it is a change to behaviour an operator may
+currently be relying on. The escape hatch makes it reversible either way, but the
+stance itself was a judgement call made to ship, not a decision the operator has
+ruled.
+
 `import` gained one guard and one flag:
 
 - **Guard (default).** Before writing, parse the existing `config.yaml` (if any)
