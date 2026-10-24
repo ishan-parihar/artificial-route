@@ -157,3 +157,84 @@ if (fs.readFileSync(out, "utf8").match(/^\/\/ \S*\//m)) {
   console.error("[calllog-worker] FATAL: the bundle still carries an absolute-path banner");
   process.exit(1);
 }
+
+// ── Robustness of the worker we ship ────────────────────────────────────────
+// Two upstream defects live in this worker, and this packager is what puts it
+// in front of users, so they are patched here in the artifact we control.
+//
+// (1) THE ONE THAT MATTERS. `applyWriteEnvironment(request.environment)` is
+//     called unguarded, and it reads properties of `environment` directly. A
+//     message with no `environment` throws a TypeError, which the outer
+//     catch turns into `result = null`. On the parent side a null result is
+//     recovered from, but the FIRST error already closed the writer's queue
+//     (`u()` runs on the error path and the parent logs
+//     "Call-log artifact worker failed"), and a closed queue returns null for
+//     every subsequent write and logs "queue unavailable; detail omitted".
+//     So one malformed message silently ends artifact capture for the life of
+//     the process — the same silent-drop class as the original F15 bug.
+//     Verified against the upstream source.
+//
+// (2) A postMessage inside the reply path can itself throw (an unclonable
+//     payload). Its catch retries postMessage with null, which would throw
+//     again and kill the worker. The parent's `exit` handler resolves the
+//     pending write and respawns, so this costs ONE write rather than hanging
+//     — minor, but the retry is itself unguarded, so it is wrapped too.
+//
+// Both patches are anchored to the exact compiled identifiers and are
+// idempotent (re-running the packager must not accumulate braces).
+function hardenWorkerBundle(file) {
+  let code = fs.readFileSync(file, "utf8");
+  const before = code;
+
+  // (1) Guard the CALL SITE only. The compiled bundle contains both the
+  //     definition `function applyWriteEnvironment(environment)` and the call
+  //     `applyWriteEnvironment(request.environment)`; patching the definition
+  //     too would produce invalid syntax (`function f(environment ?? {})`), so
+  //     the pattern is anchored on an argument that is a member expression.
+  //     A bare identifier argument (the definition's parameter) is skipped.
+  code = code.replace(
+    /(\bapplyWriteEnvironment\()([A-Za-z_$][\w$]*\.[A-Za-z_$][\w$]*)*(\))/g,
+    (m, head, arg, tail) => (arg === undefined ? m : `${head}${arg} ?? {}${tail}`),
+  );
+
+  // (2) Make the fallback retry safe. The compiled text is
+  //     `import_node_worker_threads.parentPort?.postMessage({ id: X, result: null });`
+  //     Wrapping the whole statement keeps it valid whatever prefix precedes
+  //     `parentPort`, and the trailing `;` is consumed so no empty statement
+  //     remains. Anchored on `result: null` so the FIRST postMessage (the one
+  //     carrying the real result) is never touched.
+  code = code.replace(
+    /[A-Za-z_$.]*parentPort\?\.postMessage\(\{ id: [A-Za-z_$][\w$]*\.id, result: null \}\);/g,
+    (m) => `try { ${m} } catch {}`,
+  );
+
+  if (code !== before) {
+    fs.writeFileSync(file, code);
+    return true;
+  }
+  return false;
+}
+
+// If neither pattern matched, upstream has drifted and the worker's shape is no
+// longer what this packager was verified against. Failing loudly is the only
+// safe response: silently shipping an unhardened worker would reintroduce the
+// exact class of bug this fix exists to remove, and a future upsteram fix may
+// make both replacements apply to nothing at all.
+if (hardenWorkerBundle(out)) {
+  process.stdout.write("[calllog-worker] hardened the worker (environment guard + safe reply)\n");
+}
+// Verify AFTER patching: the guards must read the file that was just written,
+// not the pre-patch contents, or they would report MISSING on every build.
+const hardenedCode = fs.readFileSync(out, "utf8");
+const envGuard = /applyWriteEnvironment\([^)]*\?\?\s*\{\}/.test(hardenedCode);
+const replyGuard = /try \{ [A-Za-z_$.]*parentPort\?\.postMessage\(\{ id: [A-Za-z_$][\w$]*\.id, result: null \}\); \} catch \{\}/.test(hardenedCode);
+if (!envGuard || !replyGuard) {
+  console.error(
+    "[calllog-worker] FATAL: the worker hardening did not take effect" +
+    ` (environment guard: ${envGuard ? "ok" : "MISSING"}, reply guard: ${replyGuard ? "ok" : "MISSING"}).\n` +
+    "  Upstream's callLogArtifactWorker.ts has drifted from the shape this\n" +
+    "  packager was verified against; update the anchored patterns in\n" +
+    "  dashboard/build-calllog-worker.mjs rather than shipping an unhardened worker.",
+  );
+  process.exit(1);
+}
