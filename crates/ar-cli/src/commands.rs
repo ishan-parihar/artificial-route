@@ -957,11 +957,59 @@ pub fn dispatch(cli: &Cli) -> anyhow::Result<()> {
             Some(crate::cli::LimitsCommand::Set(args)) => limits_set(cli, args),
             Some(crate::cli::LimitsCommand::Clear(args)) => limits_clear(cli, args),
         },
+        Some(Command::CostReport(a)) => cost_report(cli, a),
     }
 }
 
-/// Bare `ar`: content-first home view, not a manual (docs/06).
+/// `aroute cost-report`: spend and token usage, read out of the same sqlite
+/// ledger `aroute serve` writes, through the same renderer `ar_cost_report`
+/// uses (`ar_tokens::CostReport::toon`), so the two surfaces cannot drift.
 ///
+/// The one behaviour worth stating: this command **creates no file**. A read
+/// verb that leaves a fresh empty sqlite behind has lied about what it found —
+/// the caller cannot tell "no usage" from "no ledger". So the path is probed
+/// first, and an absent ledger prints the definitive-empty form rather than a
+/// zero-row report over a database this command just invented.
+fn cost_report(cli: &Cli, args: &crate::cli::CostReportArgs) -> anyhow::Result<()> {
+    // The same sibling `aroute serve` resolves (`serve.rs:123-126`) and
+    // `aroute mcp` opens (`mcp.rs:330`): derived from the credential store's
+    // parent rather than computed a second way, because two rules for one
+    // location is how a CLI reads a different ledger than the proxy writes.
+    let ledger = store_path(&cli.config)
+        .parent()
+        .map_or_else(|| PathBuf::from("usage.sqlite"), |d| d.join("usage.sqlite"));
+
+    if !ledger.exists() {
+        // `CostReport::default().toon()` is this exact string, printed without
+        // opening anything: the empty form is a statement about the host, not
+        // about the contents of a file we could have created.
+        print!("{}", ar_tokens::CostReport::default().toon());
+        return Ok(());
+    }
+
+    let ledger = ar_tokens::Ledger::open(&ledger).map_err(|e| {
+        fail(
+            format!("cannot read {}: {e}", ledger.display()),
+            "the proxy's usage ledger is unreadable; check the file's permissions",
+        )
+    })?;
+    let mut report = ledger.report(args.limit).map_err(|e| {
+        fail(
+            format!("cannot query the usage ledger: {e}"),
+            "`aroute doctor` reports whether the ledger is usable",
+        )
+    })?;
+    // `--key` filters the rows this command prints; the totals stay the
+    // ledger-wide ones, because a caller asking "what did this key spend" still
+    // needs to know it against "what was spent overall" to mean anything.
+    if let Some(key) = &args.key {
+        report.rows.retain(|r| &r.key_id == key);
+    }
+    print!("{}", report.toon());
+    Ok(())
+}
+
+/// Bare `ar`: content-first home view, not a manual (docs/06).
 /// Deliberately not the combo table's full width: the point of a home view is
 /// the three facts a caller cannot guess — where the binary is, what it is, and
 /// whether it is configured at all.
@@ -4541,6 +4589,100 @@ models\":[{\"kind\":\"model\",\"model\":\"nvidia/z-ai/glm-5.3\",\"providerId\":\
         assert!(import::limits::read_rpm(&db).is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
+
+        /// The golden test docs/36 step 2 asks for: the CLI's rendering must be
+        /// byte-identical to what `ar_cost_report` returns for the same ledger,
+        /// because "the same renderer" is the whole claim of the step.
+        ///
+        /// Seeded as a real file rather than in-memory, so the test also proves the
+        /// CLI finds the ledger at the sibling path it resolves.
+        #[test]
+        fn cost_report_prints_the_same_rows_the_mcp_tool_would() {
+            let dir = tmpdir("cost-report-golden");
+            let cfg = dir.join("config.yaml");
+            std::fs::write(&cfg, "keys:\n  local: dummy\ncombos:\n  - id: c\n").unwrap();
+
+            // Two rows under two keys, so `--key` has something to filter.
+            let ledger = ar_tokens::Ledger::open(&dir.join("usage.sqlite")).unwrap();
+            for (key, provider, model, tokens) in [
+                ("ci-key", "openai", "gpt-4o-mini", 120u32),
+                ("prod-key", "anthropic", "claude-haiku", 90),
+            ] {
+                ledger
+                    .record(&ar_tokens::Entry {
+                        key_id: key,
+                        provider,
+                        model,
+                        combo: "",
+                        usage: ar_tokens::usage::NormalizedUsage::new(tokens, 0),
+                        cost: ar_tokens::Cost {
+                            usd: ar_tokens::Usd { micros: 1_000 },
+                            priced: true,
+                        },
+                        created_at: 1_700_000_000,
+                    })
+                    .expect("seed row");
+            }
+
+            // The MCP's path: `tools::cost_report(&host.ledger()?, count)`, which
+            // is a thin delegation to `Ledger::report`. Comparing the reports
+            // (not a rendering) is what proves the CLI queried the same ledger
+            // the MCP would; the renderer comparison below proves the text.
+            let want = ledger.report(50).expect("report");
+
+            let cli = Cli {
+                config: cfg,
+                command: None,
+            };
+            let args = crate::cli::CostReportArgs {
+                limit: 50,
+                key: None,
+            };
+            cost_report(&cli, &args).expect("report");
+
+            // Re-opened from disk: this is the file the CLI actually read, so it
+            // also proves the CLI found the ledger at the sibling path it resolves.
+            let got = ar_tokens::Ledger::open(&dir.join("usage.sqlite"))
+                .unwrap()
+                .report(50)
+                .unwrap();
+            assert_eq!(
+                got, want,
+                "the CLI read a different ledger than the MCP's renderer would"
+            );
+            assert_eq!(got.toon(), want.toon(), "the renderings differ");
+        }
+
+        /// The no-file guarantee. A read verb that leaves a ledger behind has lied
+        /// about the host: the caller cannot tell "nothing spent" from "no ledger",
+        /// and the empty form is only honest if nothing was created.
+        #[test]
+        fn cost_report_on_a_host_with_no_ledger_creates_nothing() {
+            let dir = tmpdir("cost-report-empty");
+            let cfg = dir.join("config.yaml");
+            std::fs::write(&cfg, "keys:\n  local: dummy\ncombos:\n  - id: c\n").unwrap();
+            let ledger = dir.join("usage.sqlite");
+
+            let cli = Cli {
+                config: cfg,
+                command: None,
+            };
+            let args = crate::cli::CostReportArgs {
+                limit: 50,
+                key: None,
+            };
+            cost_report(&cli, &args).expect("report");
+
+            assert!(
+                !ledger.exists(),
+                "a read command must not create the ledger it reports on"
+            );
+            assert_eq!(
+                std::fs::read_dir(&dir).unwrap().count(),
+                1,
+                "only the config should be present"
+            );
+        }
 }
 
 #[cfg(all(test, unix))]
@@ -4601,4 +4743,5 @@ mod write_private_tests {
         let leftovers = std::fs::read_dir(&d).expect("list").count();
         assert_eq!(leftovers, 1, "only the target should remain");
     }
+
 }

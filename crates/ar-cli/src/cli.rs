@@ -139,6 +139,21 @@ pub enum Command {
     #[command(verbatim_doc_comment)]
     Limits(LimitsCliArgs),
 
+    /// Spend and token usage since the ledger's last reset, most recent first.
+    ///
+    /// Reads the same sqlite ledger `aroute serve` writes (`usage.sqlite` beside
+    /// the credential store), through the same renderer the MCP's
+    /// `ar_cost_report` uses, so the two surfaces cannot drift. It creates no
+    /// file: a host with no ledger prints the definitive-empty form rather than
+    /// a new empty sqlite that claims "0 rows" means "nothing spent".
+    ///
+    /// Examples:
+    ///   aroute cost-report
+    ///   aroute cost-report --limit 100
+    ///   aroute cost-report --key prod-deploy
+    #[command(verbatim_doc_comment)]
+    CostReport(CostReportArgs),
+
     /// Convert another tool's provider/model list into config.yaml + registry.json.
     ///
     /// Writes no credential: keys stay `$VAR` references. `omniroute` reads a
@@ -388,6 +403,23 @@ pub struct MintArgs {
 pub struct LimitsCliArgs {
     #[command(subcommand)]
     pub command: Option<LimitsCommand>,
+}
+
+/// Options for `aroute cost-report`.
+///
+/// The defaults are the ones the MCP uses (`ar-mcp/src/transport.rs:549`), so a
+/// `cost-report` on the CLI and an `ar_cost_report` over MCP return the same
+/// rows unless the caller narrows one of them.
+#[derive(Debug, Args)]
+pub struct CostReportArgs {
+    /// Most recent rows to print. Rows beyond the limit still count in the
+    /// totals, which are computed across the whole ledger.
+    #[arg(long, default_value_t = 50, value_name = "N")]
+    pub limit: usize,
+
+    /// Only rows written under this key id.
+    #[arg(long, value_name = "KEY")]
+    pub key: Option<String>,
 }
 
 /// Subcommands of `aroute limits`. `None` prints the block.
