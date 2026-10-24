@@ -191,6 +191,18 @@ unfixed is the *reachability* half: `render_yaml` still cannot emit `oauth:`, so
 a directory holding sessions cannot carry them across an import — that is
 Phase 5 of the plan, not a gap in the guard.
 
+One consequence the first fix understated, corrected 2026-10-24: the guard does
+not grade, so it refuses on the *whole* unemittable set — `server:`, `limits:`,
+`continue_on_cut:`, `visibility:` and `provider_settings:` as well as `oauth:`.
+Only `oauth:` is unrecoverable, but this repo's own `config.yaml` carries a
+`server:` block, so an import aimed at this working tree is refused by default.
+That is intended and consistent with `docs/12-import-parity-audit.md` §5.1
+("It writes four files unconditionally"): import generates a fresh configuration
+rather than updating one in place, and an operator wanting an in-place change
+should reach for `sync` or a writer verb. The refusal names every section at
+risk, each quoted, and `--allow-section-loss <name>` / `all` is the conscious
+overwrite.
+
 **GAP 2 — `server:` is reachable only through the panel.** The only splice of
 `server:` in the workspace is `webui.rs:1332`, inside
 `POST /ui/api/settings`, which writes `server:` host + port only

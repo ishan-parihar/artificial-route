@@ -928,6 +928,12 @@ pub struct ImportArgs {
     /// target would be dropped with a zero exit code, so the default is a refusal
     /// naming the section. Pass a section name to keep only that one, or `all`
     /// to overwrite every one it cannot represent.
+    ///
+    /// The refusal is not only about secrets: `server:` and `limits:` are equally
+    /// unrepresentable, and both are recoverable only by hand or from the `.1`
+    /// backup, so an import over a working config is refused by default too.
+    /// That is intended — import generates a fresh configuration rather than
+    /// updating one in place — and the flag is how an operator says they know.
     #[arg(long, value_name = "SECTION|all")]
     pub allow_section_loss: Option<String>,
 }

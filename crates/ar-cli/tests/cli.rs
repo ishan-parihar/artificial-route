@@ -1528,3 +1528,55 @@ fn import_should_still_write_a_target_that_carries_no_unemittable_section() {
         "the import really did rewrite the file: {body}"
     );
 }
+
+/// The refusal message must name **every** section at risk, each quoted, or an
+/// agent reading it learns about one loss and not the other.
+///
+/// The join was originally `", `"`, which produced `` `server, `limits:` `` — one
+/// name quoted after the comma and the other not. A malformed message is worse
+/// than no message here, because the operator's next question ("what else did I
+/// lose?") has no answer in the output.
+#[test]
+fn import_should_name_every_unemittable_section_with_each_one_quoted() {
+    let out = import_dir("import-message-quotes-every-section");
+    let src = litellm_source(&out);
+    let held = out.join("config.yaml");
+    std::fs::write(
+        &held,
+        "server:\n  host: 127.0.0.1\n  port: 20128\n\nkeys:\n  openai: $AR_KEY_OPENAI\n\
+         combos:\n  - id: default\n    strategy: lkgp\n    targets:\n      - openai/gpt-5.4\n\
+         limits:\n  default:\n    rpm: 60\n\noauth:\n  - provider: codex\n    refresh_key: cr\n",
+    )
+    .expect("the seed config writes");
+
+    let res = Command::new(BIN)
+        .args([
+            "import",
+            "--from",
+            "litellm",
+            "--path",
+            src.to_str().expect("utf-8 source path"),
+            "--out-dir",
+            out.to_str().expect("utf-8 out dir"),
+        ])
+        .output()
+        .expect("the ar binary runs");
+
+    assert_eq!(code(&res), 1, "stderr: {}", stderr(&res));
+    let text = stdout(&res);
+    for section in ["`server:`", "`limits:`", "`oauth:`"] {
+        assert!(
+            text.contains(section),
+            "the refusal must quote {section} so the operator sees the whole loss: {text}"
+        );
+    }
+    // The malformed form: an opening backtick with no close before the next name.
+    assert!(
+        !text.contains("`server, `"),
+        "a backtick must not leak before the separator: {text}"
+    );
+    assert!(
+        !text.contains("which an import cannot write back`"),
+        "the sentence must not end inside a quote: {text}"
+    );
+}

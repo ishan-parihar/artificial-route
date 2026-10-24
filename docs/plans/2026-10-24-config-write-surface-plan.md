@@ -100,6 +100,16 @@ adding a verb, so it landed before Phase 1.
   not `freeBudgets.json`, not the `.1` backup rotation either. Per the same law
   that B-1 established: a write that silently drops a section named by nobody is
   the failure this project refuses everywhere else.
+
+  **Scope, measured 2026-10-24:** the unemittable set is `oauth:` *plus*
+  `server:`, `limits:`, `continue_on_cut:`, `visibility:` and
+  `provider_settings:`. Only `oauth:` is unrecoverable, but the guard does not
+  grade — it refuses on all of them, and the repo's own `config.yaml` carries a
+  `server:` block, so an import aimed at this working tree is refused by default.
+  That is intended, and it follows `docs/12` §5.1: import "writes four files
+  unconditionally" — it generates a fresh configuration rather than updating one
+  in place, so an operator who wants an in-place change is pointing the wrong
+  verb at it. The flag is how an operator says they know.
 - **Escape hatch.** `--allow-section-loss <name>` proves the operator saw the
   warning, and accepts either one section name or the blanket `all`. A name that
   does not match the section at risk still refuses, so a typo is not a bypass.
@@ -125,6 +135,10 @@ Tests, all in `crates/ar-cli/tests/cli.rs`:
   hatch is a conscious decision, so a mismatched name still refuses.
 - `import_should_still_write_a_target_that_carries_no_unemittable_section` — the
   guard must not become a wall that refuses every overwrite.
+- `import_should_name_every_unemittable_section_with_each_one_quoted` — a
+  three-section config must quote all three. The first join was `", `"`, which
+  printed `` `server, `limits:` `` and left one name unquoted; the test's negative
+  control is reverting that join.
 
 Still deferred from this phase: `render_yaml` cannot emit `oauth:`, so an
 import into a directory that holds sessions still cannot carry them across.

@@ -3426,13 +3426,17 @@ fn guard_against_section_loss(path: &Path, allow: Option<&str>) -> anyhow::Resul
     {
         return Ok(());
     }
-    let names = lost.join(", `");
+    let names = lost
+        .iter()
+        .map(|s| format!("`{s}:`"))
+        .collect::<Vec<_>>()
+        .join(", ");
     Err(fail(
         format!(
-            "{} already has `{names}:`, which an import cannot write back",
+            "{} already has {names}, which an import cannot write back",
             path.display()
         ),
-        "add those sessions to the new file yourself, or re-run with --allow-section-loss all to overwrite it anyway",
+        "add those sections to the new file yourself, or re-run with --allow-section-loss all to overwrite them anyway",
     ))
 }
 
