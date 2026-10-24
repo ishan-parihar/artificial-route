@@ -482,6 +482,30 @@ pub enum ServiceAction {
         #[arg(value_enum)]
         unit: ServiceUnit,
     },
+    /// Enable a unit so it starts at boot, without starting it now.
+    ///
+    /// Deliberately NOT `--now`: `enable` answers "will it come back after a
+    /// reboot", a different question from "is it running", and conflating
+    /// them is how a read-looking command changes live state. `aroute service
+    /// enable dashboard && aroute service start dashboard` is two honest
+    /// steps. `status` reports the enabled state alongside the live one so the
+    /// distinction is visible without remembering it.
+    Enable {
+        /// Which unit.
+        #[arg(value_enum)]
+        unit: ServiceUnit,
+    },
+    /// Disable boot persistence for a unit, without stopping it now.
+    ///
+    /// The mirror of `enable`: a disabled unit that is running keeps running
+    /// until stopped or rebooted. This is the safe way to say "the dashboard
+    /// should not come back after reboot" without interrupting a session that
+    /// is using it right now.
+    Disable {
+        /// Which unit.
+        #[arg(value_enum)]
+        unit: ServiceUnit,
+    },
 }
 
 /// Options for `aroute run`.

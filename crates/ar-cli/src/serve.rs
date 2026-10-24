@@ -502,6 +502,14 @@ pub async fn run(cli: &Cli, args: &RunArgs) -> anyhow::Result<()> {
     let request = axum::http::Request::builder()
         .method(axum::http::Method::POST)
         .uri("/v1/chat/completions")
+        // The one-shot request never crosses a socket, but the router cannot
+        // know that: `loopback_only` judges every request by its `Host` and
+        // this one had none, so the DNS-rebinding gate — correct for the
+        // network path — rejected `aroute run` with 403 since the day it
+        // landed (`crates/ar-server/src/app.rs:722`). Setting the header the
+        // gate looks for, to the loopback authority the gate accepts, is the
+        // whole fix: the gate stays exactly as strict for every real request.
+        .header(axum::http::header::HOST, "127.0.0.1:20128")
         .header(axum::http::header::CONTENT_TYPE, "application/json")
         .body(axum::body::Body::from(payload.to_string()))
         .map_err(|e| {

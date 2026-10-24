@@ -1230,3 +1230,123 @@ fn service_rejects_a_unit_that_does_not_exist_by_name() {
         "the valid units are named inline: {text}"
     );
 }
+
+#[test]
+fn service_enable_disable_change_boot_state_only_not_the_running_state() {
+    // `enable`/`disable` answer "will it come back after a reboot", which is a
+    // different question from "is it running". The A/B that proved the split:
+    // `disable dashboard` left the unit `active` and answering on its port
+    // while `is-enabled` flipped to `disabled` — the two states are
+    // independent and both must stay observable in `status`.
+    //
+    // This test drives the real binary against the real user systemd, then
+    // restores the state it found, so it is safe to run on the operator's
+    // host: the only mutation is the one `systemctl enable/disable` makes,
+    // and that is the behaviour under test.
+    let before = std::process::Command::new("systemctl")
+        .args(["--user", "is-enabled", "aroute-dashboard.service"])
+        .output()
+        .expect("systemctl runs");
+    let was_enabled = before.status.success();
+
+    let out = ar(&["service", "disable", "dashboard"]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("disabled at boot"),
+        "the verb says what it changed: {text}"
+    );
+    assert!(
+        text.contains("boot persistence only"),
+        "the note names the exact scope of the change: {text}"
+    );
+
+    // The running state must be untouched by the disable.
+    let active = std::process::Command::new("systemctl")
+        .args(["--user", "is-active", "aroute-dashboard.service"])
+        .output()
+        .expect("systemctl runs");
+    assert_eq!(
+        String::from_utf8_lossy(&active.stdout).trim(),
+        "active",
+        "disable must not stop a running unit"
+    );
+
+    // `status` now shows both states, which is how an agent sees the split.
+    let status = ar(&["service", "status", "dashboard"]);
+    let st = stdout(&status);
+    assert!(
+        st.contains("disabled at boot"),
+        "status reports the boot state: {st}"
+    );
+
+    // Restore whatever we found, then confirm the restore took.
+    let restore = if was_enabled { "enable" } else { "disable" };
+    let out = ar(&["service", restore, "dashboard"]);
+    assert_eq!(code(&out), 0, "restore failed: {}", stderr(&out));
+    let after = std::process::Command::new("systemctl")
+        .args(["--user", "is-enabled", "aroute-dashboard.service"])
+        .output()
+        .expect("systemctl runs");
+    assert_eq!(
+        after.status.success(),
+        was_enabled,
+        "the original boot state is restored"
+    );
+}
+
+#[test]
+fn service_enable_is_idempotent_and_reports_it() {
+    // Boot persistence is a state, not an action: `enable` on an enabled unit
+    // is the same outcome, not an error. An agent that cannot tell whether its
+    // `enable` was needed would have to check first, which is a second call
+    // the verb can absorb by just succeeding.
+    let out = ar(&["service", "enable", "proxy"]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("enabled at boot"), "{}", stdout(&out));
+    // The unit was enabled before this test and still is.
+    let check = std::process::Command::new("systemctl")
+        .args(["--user", "is-enabled", "aroute.service"])
+        .output()
+        .expect("systemctl runs");
+    assert!(check.status.success());
+}
+
+#[test]
+fn run_reaches_the_router_instead_of_being_refused_by_the_loopback_gate() {
+    // The DNS-rebinding gate (`loopback_only`, ar-server/src/app.rs:722) judges
+    // every request by its Host header. `aroute run` builds an in-process
+    // one-shot request that had NO Host header, so the gate — correct for the
+    // network path — rejected `aroute run` itself with 403 non_loopback_request
+    // since the day it landed. The fix sets the loopback Host header the gate
+    // accepts; the gate stays exactly as strict for every real request.
+    //
+    // This test pins the consumer-visible half: the error an agent sees must be
+    // an UPSTREAM answer (auth, connection, timeout), never the gate's 403.
+    // A fake key means the only network call is an auth refusal — no spend.
+    let dir = empty_dir("run-loopback-gate");
+    std::fs::write(
+        dir.join("config.yaml"),
+        "keys:\n  local: sk-test-aroute\nproviders:\n  - id: openai\n    key: local\ncombos:\n  \
+         - id: t\n    strategy: priority\n    targets:\n      - openai/gpt-5.4\n",
+    )
+    .expect("the fixture writes");
+
+    let out = Command::new(BIN)
+        .args(["run", "--prompt", "hi"])
+        .current_dir(&dir)
+        .output()
+        .expect("the ar binary runs");
+
+    let text = format!("{}{}", stdout(&out), stderr(&out));
+    assert!(
+        !text.contains("non_loopback_request"),
+        "the loopback gate must not refuse aroute run's own in-process request: {text}"
+    );
+    // The decision line is the proof the request reached the router's
+    // failover machinery rather than dying in middleware.
+    assert!(
+        text.contains("decision:") || text.contains("error:"),
+        "an upstream answer (even a refusal) proves the gate passed it: {text}"
+    );
+}

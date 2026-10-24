@@ -945,6 +945,15 @@ pub fn limits_set(cli: &Cli, args: &SetLimitsArgs) -> anyhow::Result<()> {
             targets.join(",")
         }
     );
+    // The running proxy builds its policy at boot, so a written ceiling is
+    // inert until a restart. Saying so is the B-3 contract (`docs/36` step 3):
+    // a write that does not name the one step that makes it live lets an
+    // operator believe a ceiling is protecting them when it is not. Printing
+    // the exact command — rather than restarting — keeps the write and the
+    // state change two decisions, the same split `service enable` makes.
+    println!(
+        "note: the running proxy reads this at boot only — apply with `aroute service restart proxy`"
+    );
     Ok(())
 }
 
@@ -2508,6 +2517,8 @@ fn service(cli: &Cli, args: &ServiceArgs) -> anyhow::Result<()> {
         Some(ServiceAction::Start { unit }) => change(scope, "start", unit),
         Some(ServiceAction::Stop { unit }) => change(scope, "stop", unit),
         Some(ServiceAction::Restart { unit }) => change(scope, "restart", unit),
+        Some(ServiceAction::Enable { unit }) => persist(scope, "enable", unit),
+        Some(ServiceAction::Disable { unit }) => persist(scope, "disable", unit),
     }
 }
 
@@ -2533,6 +2544,17 @@ fn status_of(scope: [&str; 2], units: &[ServiceUnit]) -> anyhow::Result<()> {
             .ok()
             .and_then(|o| String::from_utf8(o.stdout).ok())
             .is_some_and(|s| s.contains(name));
+
+        // Boot persistence alongside the live state, because they answer two
+        // different questions and conflating them is how a "disabled but
+        // running" unit surprises someone after a reboot.
+        let enabled = installed
+            && std::process::Command::new("systemctl")
+                .args(scope)
+                .args(["is-enabled", name])
+                .output()
+                .ok()
+                .is_some_and(|o| o.status.success());
 
         let active = std::process::Command::new("systemctl")
             .args(scope)
@@ -2564,13 +2586,22 @@ fn status_of(scope: [&str; 2], units: &[ServiceUnit]) -> anyhow::Result<()> {
         };
         let detail = match (installed, active.as_str(), probe) {
             (false, _, _) => "not installed — `install.sh --service user` writes it".to_owned(),
-            (true, "active", ProbeResult::Ok) => format!("active, port {} answers", unit.port()),
-            (true, "active", ProbeResult::NoAnswer) => {
-                format!("active but port {} does not answer", unit.port())
-            }
-            (true, "active", ProbeResult::NotApplicable) => "active".to_owned(),
+            (true, "active", ProbeResult::Ok) => format!(
+                "active, port {} answers, {}",
+                unit.port(),
+                boot_word(enabled)
+            ),
+            (true, "active", ProbeResult::NoAnswer) => format!(
+                "active but port {} does not answer, {}",
+                unit.port(),
+                boot_word(enabled)
+            ),
+            (true, "active", ProbeResult::NotApplicable) => format!(
+                "active, {}",
+                boot_word(enabled)
+            ),
             (true, other, _) => {
-                format!("{other} — start it with `aroute service start {}", unit.slug())
+                format!("{other}, {} — start it with `aroute service start {}", boot_word(enabled), unit.slug())
             }
         };
         // Down means systemd is not running it OR it is not answering. An
@@ -2635,6 +2666,62 @@ impl ProbeResult {
             ProbeResult::NoAnswer => "no-answer",
             ProbeResult::NotApplicable => "n/a",
         }
+    }
+}
+
+/// The boot-persistence word for a status row, kept short because it rides in
+/// the detail sentence.
+fn boot_word(enabled: bool) -> &'static str {
+    if enabled {
+        "enabled at boot"
+    } else {
+        "disabled at boot"
+    }
+}
+
+/// Runs `systemctl enable`/`disable` — the boot-persistence verbs, which are
+/// NOT the state verbs.
+///
+/// Deliberately no `--now`, so `enable` never starts a service and `disable`
+/// never stops one. A caller who wants both states changed says so twice, and
+/// the two claims stay independently observable in `status`. This is the same
+/// separation `systemctl` itself makes, carried into the CLI that an agent
+/// drives: a surprising side effect is only surprising when it is invisible.
+///
+/// Idempotent by construction: `enable` on an enabled unit and `disable` on a
+/// disabled one both report success, the same way `systemctl` does.
+fn persist(scope: [&str; 2], verb: &str, unit: ServiceUnit) -> anyhow::Result<()> {
+    let name = unit.unit_name();
+    match std::process::Command::new("systemctl")
+        .args(scope)
+        .arg(verb)
+        .arg(name)
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            let state = if verb == "enable" {
+                "enabled at boot"
+            } else {
+                "disabled at boot"
+            };
+            println!("service: {name} {state}");
+            println!(
+                "note: this changes boot persistence only — the running state is unchanged; `aroute service status` shows both"
+            );
+            Ok(())
+        }
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            let first = err.lines().next().unwrap_or("no output from systemctl");
+            Err(fail(
+                format!("could not {verb} {name}"),
+                format!("{first}; or run it by hand: systemctl {verb} {name}"),
+            ))
+        }
+        Err(e) => Err(fail(
+            format!("systemctl not available: {e}"),
+            format!("run it by hand: systemctl {verb} {name}"),
+        )),
     }
 }
 
