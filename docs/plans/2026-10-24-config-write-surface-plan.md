@@ -1,7 +1,7 @@
 # The config-write surface: an outline-plan for closing it
 
-Status: **Phase 0, 1 and 2 shipped 2026-10-24 (`96cf513`, `9c46ff5`, `a34cd94`);
-Phases 3-7 unbuilt.** Written at the
+Status: **Phase 0, 1, 2 and 3 shipped 2026-10-24 (`96cf513`, `9c46ff5`,
+`a34cd94`, `5e0a874`); Phases 4-7 unbuilt.** Written at the
 operator's request, then Phase 0 (the data-loss fix) was validated and landed
 before any new verb. It supersedes nothing: `docs/36` §4 step 8 specifies the
 first three verb groups (8a `oauth:`, 8b `server:`, 8c `providers:` add/remove)
@@ -263,20 +263,68 @@ Negative controls run and confirmed to fail: the registry check, the combo
 reference check, the `load_edit` (expanding) parse, the `custom_providers`
 guard, and the blank-line trim.
 
-### Phase 3 — `aroute custom-providers add|remove` *(an endpoint that is not in the registry)*
+### Phase 3 — `aroute custom-providers add|remove` — **SHIPPED 2026-10-24** (`5e0a874`) *(an endpoint that is not in the registry)*
 
-Mirrors `provider_custom` (`webui.rs:2198`). A custom node is the operator's
-way to add an endpoint without a rebuild, so an agent needs it as much as a
-registry provider.
+Mirrors `provider_custom` (`webui.rs:2091`, not `:2198` as first written — the
+handler's line moved). A custom node is the operator's way to add an endpoint
+without a rebuild, so an agent needs it as much as a registry provider.
 
-- `add --id X --protocol P --base-url U [--header K=V]… [--key-ref name]` —
-  writes the `custom_providers:` row and its `AR_KEY_*` env line. `--key-ref`
-  names the `keys:` row it resolves against, the same way `import` renders one
-  (`import/mod.rs:370-377`).
-- `remove --id X` — same reference check as Phase 2, same shared-`keys:` rule.
+- **Shipped as `aroute providers add-custom`, not a new verb.** A separate
+  `custom-providers` command would be a second place to learn the same
+  semantics, and the row already goes to `custom_providers:` in the file the
+  `providers` verbs own; `aroute providers remove` already reaches it, which is
+  the sentence that decided it. `--id X --protocol P --base-url U
+  [--endpoint E] [--header K=V]… [--credential-file PATH|-]` writes the row, the
+  `keys:` reference and the `$AR_KEY_*` env line, in the panel's order.
+- `--credential-file` rather than `--key <SECRET>`, the Phase 2 rule: an
+  argument is visible in the process table and the shell's history. A **new**
+  row must carry one (a keyless node fails every request); an **edit** of an
+  existing row may omit it, which is how an operator moves a base URL without
+  re-pasting a secret they already store.
 - Collision with a compiled-in catalog id is refused by
-  `ar_registry::Registry::merge`; the verb surfaces that refusal rather than
-  writing a row `ar serve` will reject at boot.
+  `ar_registry::Registry::merge`, and the verb checks `registry()` directly
+  rather than `catalog`, which merges the config's own custom rows — checking
+  the merged catalog makes an existing custom row collide with itself and
+  refuses every edit of one.
+
+Four defects found by the round trip, all in shared code:
+
+- **`providers remove` refused a row `add-custom` had just written.** It
+  checked only `providers:`, so an ad-hoc node was unremovable from the CLI.
+- **The remove left an empty `custom_providers:` header behind.** The renderer
+  emits the header for an empty row list, so "no rows left" and "an empty
+  section" are not the same thing. `empty_custom_section` drops the header and
+  its rows and keeps the comment block below; `remove_section` skips to the
+  next header and would eat **62 lines** of documentation (proven by negative
+  control: 63 lines deleted) — the Phase 0 data-loss shape rearmed by a new
+  caller.
+- **The remove wrote a `providers:` section into a config that carried none.**
+  A splice of an absent section *inserts* it, so the guard is the same one, on
+  the other list.
+- **Every `keys:` write re-sorted the operator's own rows.**
+  `with_key_binding` rendered through a `BTreeMap`; `raw_keys_in_order` walks
+  serde_yaml's insertion-ordered `Mapping` instead. `sync` and the removal's
+  orphan-drop use the same walk, and `import::render_keys_section` — the sorted
+  spelling, never right for a write — is gone.
+
+Two `splice_section` invariants restored while testing, both pre-existing: the
+trailing newline is the file's, not the writer's (the repo's config deliberately
+has none, so every write reported a whole-file diff), and an inserted section
+goes **below** the blank line and comment block that introduce the next one,
+rather than flush against them.
+
+Test contract, all shipped:
+- `providers_add_custom_should_write_the_row_the_key_ref_and_the_env_line`
+- `providers_add_custom_should_refuse_a_registry_id`
+- `providers_add_custom_should_refuse_an_absolute_endpoint`
+- `providers_add_custom_should_refuse_a_new_row_with_no_credential`
+- `providers_add_custom_should_keep_the_binding_the_row_already_names`
+- `custom_providers_round_trip_must_come_back_byte_identical`
+- `custom_providers_remove_the_last_row_must_take_the_section`
+
+Negative controls run and confirmed to fail: the `providers:` check, the empty
+section, `remove_section` in its place (63 lines), and the unguarded
+`providers:` splice.
 
 ### Phase 4 — `aroute combo` single-item writers *(the routing table, one row at a time)*
 

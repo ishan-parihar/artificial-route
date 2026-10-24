@@ -150,9 +150,9 @@ call sites:
 
 | Config section | CLI verb that can reach it | Panel endpoint | Gap |
 |---|---|---|---|
-| `keys:` | `aroute providers add|remove` (writes or drops the row a provider references, `a34cd94`); `limits`/`import`/`sync` (whole-section rewrite). No targeted add/remove of one **standalone** key row. | `POST /ui/api/provider-key`, `POST /ui/api/provider-custom` (`webui.rs:685`) | a standalone `keys:` row verb is missing |
+| `keys:` | `aroute providers add|remove|add-custom` (writes or drops the rows a provider references, `a34cd94`, `5e0a874`); `limits`/`import`/`sync` (whole-section rewrite). No targeted add/remove of one **standalone** key row. | `POST /ui/api/provider-key`, `POST /ui/api/provider-custom` (`webui.rs:685`) | a standalone `keys:` row verb is missing |
 | `providers:` | **add and remove: `aroute providers add|remove`** (`a34cd94`), adopting the panel's three-part semantics: the row, the `keys:` reference and the `$AR_KEY_*` line in `ar.env` land together, and a removal refuses while a combo still names the provider. `sync` can still only attach a `keys:` list to a row that already exists, and `import` writes a whole new file with one row per registry provider (`import/mod.rs:379-387`). No CLI verb yet writes the `keys:` row *on its own*, or removes one without removing its provider. | `POST /ui/api/provider-key` adds a row (`webui.rs:1771-1789`); `POST /ui/api/provider-remove` removes one (`webui.rs:2399`) | **GAP 3 — closed 2026-10-24** (Phase 2). What remains: a targeted `keys:` row editor. |
-| `custom_providers:` | `import` (when the source has ad-hoc nodes); `sync` (only if the dashboard has such rows) | `POST /ui/api/provider-custom` (`webui.rs:2279`) | targeted add missing from the CLI |
+| `custom_providers:` | **add and remove: `aroute providers add-custom` / `remove`** (`5e0a874`), carrying the panel's whole shape — the id rule, the two-protocol vocabulary, the base-url scheme, the relative-path rule for `endpoint`, and the catalog-collision refusal from `Registry::merge`. `import` (when the source has ad-hoc nodes); `sync` (only if the dashboard has such rows) | `POST /ui/api/provider-custom` (`webui.rs:2279`; the add handler itself is at `webui.rs:2091`) | — |
 | `combos:` | `import` (whole file); `sync` (**whole-section replace** from the dashboard DB, `commands.rs:2941`) | `POST /ui/api/combos` (whole-section replace, `webui.rs:1606`) | no targeted single-combo edit anywhere |
 | `limits:` | `aroute limits set` (`commands.rs:938`), `aroute limits clear` (`commands.rs:1153`), `sync` (**rpm arm only**, `commands.rs:2993` via `import/limits::read_rpm`) | `POST /ui/api/limits` (`webui.rs:2144`), `POST /ui/api/settings` (default row only, `webui.rs:1348`) | — |
 | `server:` | **`aroute server show` (read-only) and `aroute server set` (host + port only, `commands.rs:1055`), per-field merge.** `aroute serve --port` overrides at runtime and persists nothing. | `POST /ui/api/settings` (host + port only, `webui.rs:1305-1335`) | **closed 2026-10-24** (Phase 1) |
@@ -241,11 +241,15 @@ backs two providers, and only the removed rows alone held should go).
 through the CLI without manually configuring the config files" was false in
 three places, and one of them (`oauth:`) is the exact half of the goal the
 operator singled out ("guide the user through steps like login for oauth").
-**Two of the three are now closed for the sections an agent most often needs**:
-`server:` (Phase 1) and `providers:` (Phase 2) are reachable from the CLI with
-the panel's own semantics. `oauth:` remains, and it is not a gap in a writer so
-much as the missing half of the goal — Phase 5 of the plan builds the verb and
-the login flow together.
+**The `server:`, `providers:` and `custom_providers:` sections the CLI could not
+reach are now writable from it, with the panel's own semantics** (`server set` in
+Phase 1, `providers add|remove` in Phase 2, `providers add-custom` in Phase 3), so
+the goal's mechanical half is closed for those three and what is left of GAP 3 is
+a *standalone* `keys:` row editor rather than a provider add. `oauth:` remains,
+and it is not a gap in a writer so much as the missing half of the goal — Phase 5
+of the plan builds the verb and the login flow together, and `docs/36` 8a is
+explicit that it comes after step 4 (the resumable login) for that reason: a
+block the CLI cannot read is not worth creating programmatically.
 
 ---
 

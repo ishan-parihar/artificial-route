@@ -5,10 +5,10 @@ what `genome wake` shows.
 
 ## State — 2026-10-24
 
-Date: 2026-10-24. Branch `main` @ `a34cd94` (the latest commit is Phase 2 of the
-config-write surface). **67 commits after `v0.1.20` are unreleased, and 34 of them
-are unpushed** (`git rev-list --count v0.1.20..HEAD` = 67;
-`git rev-list --count origin/main..HEAD` = 34 — measure with those two). The tree
+Date: 2026-10-24. Branch `main` @ `5e0a874` (the latest commit is Phase 3 of the
+config-write surface). **70 commits after `v0.1.20` are unreleased, and 37 of them
+are unpushed** (`git rev-list --count v0.1.20..HEAD` = 70;
+`git rev-list --count origin/main..HEAD` = 37 — measure with those two). The tree
 is at `0.1.21` in `Cargo.toml`, unreleased as a tag. **The 2026-10-21 block below
 is kept as history, not as a snapshot**: its "19 commits, none unpushed" line is
 superseded by the counts above, and `docs/plans/2026-10-24-config-write-surface-plan.md`
@@ -21,31 +21,35 @@ Every check against them was read-only; all config writes went to scratch
 directories outside the repo and were removed. The repo's own `config.yaml` is
 unchanged (`git diff --stat` shows nothing for it).
 
-**Where the CLI surface stands.** Phase 0 (`96cf513`), Phase 1 (`9c46ff5`) and
-Phase 2 (`a34cd94`) of
+**Where the CLI surface stands.** Phase 0 (`96cf513`), Phase 1 (`9c46ff5`),
+Phase 2 (`a34cd94`) and Phase 3 (`5e0a874`) of
 `docs/plans/2026-10-24-config-write-surface-plan.md` are shipped: `aroute import`
 now refuses a wholesale write that would drop a section it cannot represent,
-`aroute server show|set` owns the listen address, and `aroute providers add|remove`
+`aroute server show|set` owns the listen address, `aroute providers add|remove`
 writes a provider as three rows in one command — the row, the `keys:` reference
-and the `$AR_KEY_*` line in `ar.env` — in the panel's own order, and refuses a
-removal while a combo still names the provider. Building Phases 1 and 2 exposed
-four defects in shared code: `splice_section` eating the comment block after a
-replaced section, the host written quoted through `serde_json::Value`, the same
-`splice_section` leaving a blank line after every replaced section, and the
-expanding reader refusing a config whose other keys were unexported. Each is
-fixed and each is covered by a command-driven test with a negative control.
-Phases 3-7 are unbuilt; `oauth:` remains the gap the operator singled out.
-Full state: `docs/36-cli-agentic-workflow-plan.md` §1.3, `docs/28-gap-ledger.md`
-D13.
+and the `$AR_KEY_*` line in `ar.env` — in the panel's own order, and
+`aroute providers add-custom` writes an endpoint the compiled-in registry does
+not carry, with the panel's whole shape. Phases 1-3 exposed **seven** defects
+in shared code, all fixed with a negative control each: `splice_section` eating
+the comment block after a replaced section, the host written quoted through
+`serde_json::Value`, the same `splice_section` leaving a blank line after every
+replaced section, the expanding reader refusing a config whose other keys were
+unexported, the remove leaving an empty `custom_providers:` header, the remove
+writing a `providers:` section into a config that carried none, and every
+`keys:` write re-sorting the operator's own rows. The last four were found by
+**round-tripping against a copy of the repo's real `config.yaml` and reading the
+diff**, not by reading the source. Phases 4-7 are unbuilt; `oauth:` remains the
+gap the operator singled out. Full state:
+`docs/36-cli-agentic-workflow-plan.md` §1.3, `docs/28-gap-ledger.md` D13.
 
-**Gates as of `a34cd94`.** 2364 tests green on the default profile (2424 with
-`--all-features`), clippy clean, `genome lint` 0 errors
+**Gates as of `5e0a874`.** 2371 tests green, clippy clean, `genome lint` 0 errors
 (the 14 W014 ask-age warnings are pre-existing), `docs-check` in warn mode — the
 known pre-existing README rubric finding stands. `cargo fmt --all` is **dangerous
 in this repo**: it was not rustfmt-clean at HEAD, so a blanket run reformats
 unrelated lines. Measured per file against the HEAD version instead: 13
 pre-existing diff blocks, and **zero** new ones added by this session's work
-(the last one of mine was the splice-test comment).
+(the last one of mine was fixed by hand, not by rustfmt, so the pre-existing
+blocks stay untouched).
 
 ## State — 2026-10-21
 
