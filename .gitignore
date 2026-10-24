@@ -7,6 +7,11 @@
 *.swp
 .DS_Store
 
+# Serena (the oraios LSP agent tool) — a local coding aid, not part of the build.
+# Serena writes its own .gitignore inside for its cache/memories; this covers the
+# rest so `git status` stays clean when it is activated here.
+/.serena/
+
 # Local secrets — never commit
 .env
 *.pem
