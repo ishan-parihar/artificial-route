@@ -39,7 +39,7 @@ pub const TRUNCATE_CHARS: usize = 1000;
 /// let rows = vec![vec!["openai".to_string(), "openai".to_string(), "configured".to_string()]];
 /// let fields: Vec<String> = ["id", "status"].iter().map(|s| s.to_string()).collect();
 /// assert_eq!(
-///     toon::list("providers", "providers", &toon::DEFAULT_FIELDS, &fields, &rows, false),
+///     list("providers", "providers", &toon::DEFAULT_FIELDS, &fields, &rows, false),
 ///     "count: 1 of 1 total\nproviders[1]{id,status}:\n  openai,configured\n",
 /// );
 /// ```
@@ -81,6 +81,36 @@ pub fn list(
     }
     if clipped && !full {
         let _ = writeln!(out, "{HINT}");
+    }
+    out
+}
+
+/// [`list`] for a caller that paginated the rows.
+///
+/// The one difference is `TOTAL`: this names the full row count, while `list`
+/// can only say the page size because it does not know any more. The comment
+/// on `list` promised the shape would not change when pagination lands — this
+/// is that landing, and `docs/06`'s `count: N of TOTAL` becomes true rather
+/// than `N of N`.
+///
+/// `total` is passed rather than derived so a page can be a slice of rows the
+/// caller filtered first: `TOTAL` must be "how many there are", not "how many
+/// this page has".
+pub fn list_paged(
+    name: &str,
+    noun: &str,
+    all: &[&str],
+    fields: &[String],
+    rows: &[Vec<String>],
+    full: bool,
+    total: usize,
+) -> String {
+    let mut out = list(name, noun, all, fields, rows, full);
+    // `list` wrote `count: N of N total` as its first line; rewrite it to carry
+    // the real total rather than duplicating the renderer for one digit.
+    if let Some(rest) = out.strip_prefix(&format!("count: {} of {} total\n", rows.len(), rows.len()))
+    {
+        out = format!("count: {} of {total} total\n{rest}", rows.len());
     }
     out
 }
@@ -194,11 +224,23 @@ pub fn fields_or_default(raw: Option<&str>) -> Vec<String> {
 /// A cell containing a comma needs no quoting here: JSON escapes it. That is
 /// the other reason the shape is worth having — the `--json` path cannot have
 /// the column-shift class of bug `clip` guards against.
-pub fn json(
+pub fn json(name: &str, all: &[&str], fields: &[String], rows: &[Vec<String>]) -> String {
+    json_paged(name, all, fields, rows, rows.len())
+}
+
+/// [`json`] for a caller that paginated or pre-filtered the rows.
+///
+/// The envelope already carries `count` and `total`, so the shape does not
+/// change; only what `total` MEANS does. With `json` it was `rows.len()` —
+/// always equal to `count`, so it said nothing. Here it is the full row count,
+/// which is the number an agent needs to know whether to run the same query
+/// again with `--offset`.
+pub fn json_paged(
     name: &str,
     all: &[&str],
     fields: &[String],
     rows: &[Vec<String>],
+    total: usize,
 ) -> String {
     let picked: Vec<usize> = fields
         .iter()
@@ -221,7 +263,7 @@ pub fn json(
     serde_json::to_string_pretty(&serde_json::json!({
         "name": name,
         "count": objects.len(),
-        "total": rows.len(),
+        "total": total,
         "columns": fields,
         "rows": objects,
     }))
@@ -402,4 +444,3 @@ mod tests {
         );
     }
 }
-

@@ -1097,7 +1097,8 @@ what is published.
 recommendation is unchanged, but the alternative is now *measured* rather than
 assumed: the feature compiles cleanly under `--features mcp`, the default tree
 still contains no `rmcp` (the `docs/06:60` gate survives), `aroute mcp --list`
-prints 13 of 13 tools, and a real stdio `initialize` handshake returns
+prints the 12 registered tools plus `ar_tool_search` (13 rows), and a real stdio
+`initialize` handshake returns
 `protocolVersion 2024-11-05` with `serverInfo` and the full catalog. So the
 cost of shipping is bounded and known: one `--features mcp` in
 `release.yml:131-135`, the `install.sh` wiring becomes truthful (DR-9), and two
@@ -1412,6 +1413,45 @@ when an agent actually tries to drive it.
 fix (step 7) is what makes that cheap. `--fields` already works today and is the
 only live lever: `models --fields model` costs **27 tokens** against that 18,228.
 
+G3 is now the second lever, and it is the one that does not lose information.
+Measured on the repo fixture (the operator's live config is not reachable from
+CI, so these are the reproducible numbers; the shape of the win is the same
+one, since the 18k is almost entirely catalog rows `--routable` deletes):
+
+| Call | Bytes | What it returns |
+|---|---|---|
+| `models` | 71,974 | all 1,563 rows, catalog included |
+| `models --routable` | **169** | the 3 this config routes |
+| `models --combo default` | 131 | one combo's targets |
+| `models --provider openai` | 715 | one provider's models |
+| `doctor --limit 3` | 280 | 3 of 12 checks, `TOTAL` still 12 |
+
+So `models --routable` is **~425x smaller** than the default, against the
+18,228-token baseline above. The catalogue rows are the cost, and
+`--routable` is the filter that removes exactly them.
+
+`--limit`/`--offset` are on every list verb, and `--status` on `doctor`. Two
+corrections came out of running these rather than reasoning about them, and
+both are load-bearing:
+
+1. **`--routable` must not filter on `status == "routable"`.** That string means
+   "provider AND model are both in the compiled-in registry". A config whose
+   providers are all custom filters to **0 models** — measured — which is the
+   worst possible answer, because it reads as "nothing routes". A combo target
+   that cannot currently route is listed with the status that says why. The
+   structural test is "does this row have an owning combo", i.e. column 3 is
+   not `-`.
+2. **`--status` is a `ValueEnum`, not a `String`.** A free string that matched
+   nothing would print `0 checks` and look like a clean config. A typo now
+   exits **2** naming `ok, skip, fail`, the same contract as `--fields bogus`.
+
+And the invariant the filters must never break: **the exit code is computed
+before any filter**. `aroute doctor --status ok` on a config with failures
+exits **1** and still prints `N check(s) failed` — proven by hand against a
+build that counted the printed rows, which exits **0** and launders a broken
+config through a build gate. All three G3 tests have negative controls; the
+table of injected bugs is in the commit.
+
 ### 9.2 What the daemon costs (measured, two systemd user units)
 
 | Component | RSS | Peak (VmHWM) | Threads |
@@ -1490,7 +1530,7 @@ and ran the real thing, so the decision no longer has to be made on inference:
 | default `cargo tree -e no-dev` contains `rmcp` | **none** (docs/06:60 gate stays green) |
 | `--features mcp` pulls `rmcp` | **3.5.0**, present |
 | `--features mcp` compiles | **yes** (7m24s, clean) |
-| `aroute mcp --list` | **13 of 13** tools + `next:` hints |
+| `aroute mcp --list` | **12 registered tools + `ar_tool_search`** (13 rows printed) + `next:` hints |
 | real stdio `initialize` handshake | **`protocolVersion 2024-11-05`**, `serverInfo {name: ar, version: 0.1.21}`, full catalog |
 | negative control (installed 0.1.21) | still `error: unrecognized subcommand 'mcp'` |
 

@@ -701,6 +701,23 @@ fn empty_dir(name: &str) -> PathBuf {
     dir
 }
 
+/// Parses `count: N of TOTAL` out of a rendered list.
+///
+/// Reads the printed header rather than the command's own internals, because
+/// what an agent consumes is this line. A paging test asserts on this so it
+/// fails if paging starts printing rows without fixing the count.
+fn first_row_count(text: &str) -> usize {
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("count:"))
+        .unwrap_or_else(|| panic!("no count line in: {text}"));
+    line.split("count:")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("unparseable count line: {line}"))
+}
+
 /// Writes rows into a store the way a completed login would, so `status` and
 /// `logout` can be observed against a populated one.
 ///
@@ -938,5 +955,190 @@ fn keys_list_on_a_host_with_no_store_does_not_invent_one() {
     assert!(
         !dir.join("credentials.db").exists(),
         "a read-only verb must not create the store it reports on"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// G3: the query is narrowed on the server side, not by the caller grepping
+// stdout. Every case below spawns the real binary against the fixture config
+// and asserts the row set, because the filter's contract is which rows survive.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn models_routable_lists_the_configs_targets_not_the_registry() {
+    // 1563 compiled-in catalog rows collapse to the 3 this fixture routes.
+    // Before this flag an agent had to fetch all 1563 and grep client-side,
+    // which is the 18k-token wall docs/36 measures.
+    let out = ar(&["models", "--routable"]);
+
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert_eq!(
+        first_row_count(&text),
+        3,
+        "the fixture has exactly 3 distinct targets: {text}"
+    );
+    assert!(
+        text.contains("count: 3 of 3 total"),
+        "TOTAL is the full row count of the filtered set: {text}"
+    );
+    // A catalog row the fixture does not route must not appear: that is the
+    // whole point of the filter.
+    assert!(
+        !text.contains("openai/gpt-4o-mini") || text.contains("-"),
+        "no unroutable catalog row: {text}"
+    );
+}
+
+#[test]
+fn models_routable_keeps_targets_whose_status_is_not_routable() {
+    // The first implementation filtered on `status == "routable"`, which
+    // requires provider AND model to be in the compiled-in registry. A combo
+    // target that cannot currently route is exactly the row an agent needs
+    // ("why is my route failing?"), so it must survive with the status that
+    // says why. This is the regression test for that: with the status-string
+    // filter, this config's own targets all disappear.
+    let dir = empty_dir("g3-custom-targets");
+    // A custom provider is not in the compiled-in registry, so its target's
+    // status is `unknown-provider` while still being a combo target.
+    std::fs::write(
+        dir.join("config.yaml"),
+        "keys:\n  k: sk-test\ncombos:\n  - id: only\n    strategy: priority\n    \
+         targets:\n      - ghost/mystery-model\n",
+    )
+    .expect("the fixture writes");
+
+    let out = Command::new(BIN)
+        .args(["models", "--routable"])
+        .current_dir(&dir)
+        .output()
+        .expect("the ar binary runs");
+
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("ghost/mystery-model"),
+        "a target of a configured combo is routable in substance, whatever its status: {text}"
+    );
+    assert!(
+        text.contains("unknown-provider"),
+        "the status must still name the half that failed: {text}"
+    );
+}
+
+#[test]
+fn models_limit_pages_and_total_names_the_unpaged_count() {
+    // `count: N of TOTAL` was literally `N of N` before G3, so the field an
+    // agent branches on said nothing. The contract: TOTAL is the count BEFORE
+    // paging, so a caller can decide whether to run the query again.
+    let out = ar(&["models", "--routable", "--limit", "1"]);
+
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert_eq!(
+        first_row_count(&text),
+        1,
+        "one row is printed: {text}"
+    );
+    assert!(
+        text.contains("count: 1 of 3 total"),
+        "TOTAL stays 3 so the caller knows there is more: {text}"
+    );
+}
+
+#[test]
+fn models_offset_past_the_end_is_definitely_empty_and_says_so() {
+    // An empty list must be a definite "0 of 3", never a blank table an agent
+    // could read as "there are none" or as a broken call.
+    let out = ar(&["models", "--routable", "--offset", "99"]);
+
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("0 models found"),
+        "definitively empty, with the count: {text}"
+    );
+}
+
+#[test]
+fn doctor_limit_pages_and_a_status_filter_cannot_launder_a_failure() {
+    let out = ar(&["doctor", "--limit", "3"]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert_eq!(
+        first_row_count(&text),
+        3,
+        "three checks print: {text}"
+    );
+    assert!(
+        text.contains("count: 3 of 12 total"),
+        "the fixture has 12 checks; TOTAL must be the full count: {text}"
+    );
+
+    // The exit code is the invariant. Two directions, because the
+    // laundering bug is directional:
+    //
+    // (a) `--status ok` on a config that DOES fail must still exit 1. This is
+    //     the actual bug — proven by hand against a build where `failed` was
+    //     computed from the filtered rows: it exits **0** and prints only
+    //     passing checks, so a broken config sails through a build gate.
+    // (b) `--status fail` on a clean config must exit 0. A filter must not be
+    //     able to invent a failure either.
+    //
+    // An assertion on `--status fail` alone proves neither: it always matches
+    // when there is a failure, so it cannot detect which set was counted.
+    let bad = empty_dir("g3-doctor-fail");
+    std::fs::write(
+        bad.join("config.yaml"),
+        "combos:\n  - id: only\n    strategy: priority\n    targets:\n      - openai/nope-not-real\n",
+    )
+    .expect("the fixture writes");
+
+    let ok_out = Command::new(BIN)
+        .args(["doctor", "--status", "ok"])
+        .current_dir(&bad)
+        .output()
+        .expect("the ar binary runs");
+
+    assert_eq!(
+        code(&ok_out),
+        1,
+        "filtering to the passing rows must not launder a failure into exit 0: {}",
+        stdout(&ok_out)
+    );
+    let filtered = stdout(&ok_out);
+    assert!(
+        filtered.contains("check(s) failed"),
+        "the failure is still reported even though only `ok` rows print: {filtered}"
+    );
+
+    // And the same filter on the clean fixture exits 0.
+    let clean = ar(&["doctor", "--status", "fail"]);
+    assert_eq!(
+        code(&clean),
+        0,
+        "a clean config with no `fail` rows passes: {}",
+        stdout(&clean)
+    );
+}
+
+#[test]
+fn doctor_unknown_status_names_the_valid_ones() {
+    // `--status` is a `ValueEnum`, not a free `String`, so a typo exits 2 with
+    // the valid set — the same contract as `--fields bogus`. The alternative,
+    // a free string matching nothing, would print `0 checks` and look like a
+    // clean config: the failure mode this whole CLI is built to refuse.
+    let out = ar(&["doctor", "--status", "sucess"]);
+
+    assert_eq!(
+        code(&out),
+        2,
+        "a bad --status value is a usage error like every other bad flag value: {}",
+        stderr(&out)
+    );
+    let text = format!("{}{}", stdout(&out), stderr(&out));
+    assert!(
+        text.contains("possible values") && text.contains("ok") && text.contains("fail"),
+        "clap names the valid statuses inline: {text}"
     );
 }

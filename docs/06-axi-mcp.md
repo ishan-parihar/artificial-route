@@ -7,7 +7,7 @@ Source: `~/.agents/skills/axi` (TOON spec). Applies from P0. CI must enforce.
 
 ## CLI output (TOON on stdout, JSON inside)
 
-* `TOON` at boundary (~40% savings). Lists default 3-4 fields `id,provider,status` + `count: N of TOTAL`. Detail via `--fields`, bodies truncated 500-1500 chars with `(truncated, TOTAL chars)` + `--full` hatch only when truncated.
+* `TOON` at boundary (~40% savings). Lists default 3-4 fields `id,provider,status` + `count: N of TOTAL`. Detail via `--fields`, bodies truncated 500-1500 chars with `(truncated, TOTAL chars)` + `--full` hatch only when truncated. **Measured (DR-5, 2026-10-24): in a LIST row the 1,000-char cell ceiling is not lifted by `--full`** — a clipped cell renders 1029 chars with `full` both true and false, so `--full` on a list only suppresses the hint, while `--full` on a standalone `--fields` body does return the whole value. The 1,000-char cap is deliberate (`toon.rs:19-23`, mid-range of the 500-1500 `docs/06` allows) and the marker already says how much was cut. The hatch that returns a whole oversized cell is `--json`.
 * Aggregates to kill follow-ups: `checks, comments, quota%left, p95` where cheap. Empty definitive: `0 closed tasks in X`, never blank.
 * `stdout` = data+errors+suggestions. `stderr` = progress/diagnostics. Exit `0` success+no-op (already-closed), `1` error, `2` usage.
 * Errors structured on stdout with `help: <exact fix command>`, translated (no stack/API leak). No interactive prompts — missing flag fails with usage. Fail loud on unknown flag: name it, list valid flags inline (or `--help` block), per-subcommand sets, `--status renamed; use --state` hints. `--help` always passes.

@@ -269,6 +269,64 @@ pub struct ListArgs {
     /// parse it.
     #[arg(long)]
     pub json: bool,
+
+    /// Print at most this many rows. `TOTAL` stays the full row count, so
+    /// `count: N of TOTAL` tells the caller whether it saw everything.
+    #[arg(long, value_name = "N")]
+    pub limit: Option<usize>,
+
+    /// Skip this many rows before printing. With `--limit` it pages.
+    #[arg(long, value_name = "N")]
+    pub offset: Option<usize>,
+
+    /// Only models of this provider, e.g. `--provider openai`. Matches the
+    /// model's own provider (`openai/gpt-4o-mini` -> `openai`), not the
+    /// registry's wire dialect.
+    #[arg(long, value_name = "ID")]
+    pub provider: Option<String>,
+
+    /// Only models this config routes — its combo targets.
+    ///
+    /// The complement of the 72 KB registry dump. `--routable` does NOT mean
+    /// `status == routable`: that string requires both provider and model to be
+    /// in the compiled-in registry, and filtering on it hid every target of a
+    /// config whose providers were all custom. A target that cannot currently
+    /// route is still listed, with the status that says why.
+    #[arg(long)]
+    pub routable: bool,
+
+    /// Only models owned by this combo.
+    #[arg(long, value_name = "ID")]
+    pub combo: Option<String>,
+}
+
+/// The status vocabulary a check row can carry, as the CLI names it.
+///
+/// A `ValueEnum` so `--status bogus` is a clap usage error (exit 2) that lists
+/// the valid values, exactly like `--fields bogus`. It is not merely a nicety:
+/// without it a misspelling would filter to zero rows and print an empty table,
+/// which an agent cannot distinguish from "this config is clean".
+///
+/// `skip` is a real state, not "ok": a check that could not run is not a
+/// check that passed, and letting a caller filter on `ok` alone and trust the
+/// exit code is the point of the enum being exhaustive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum CheckStatusArg {
+    Ok,
+    Skip,
+    Fail,
+}
+
+impl CheckStatusArg {
+    /// The string `findings()` writes in column 2, so the filter and the
+    /// renderer share one spelling each instead of two.
+    pub fn as_row_value(self) -> &'static str {
+        match self {
+            CheckStatusArg::Ok => "ok",
+            CheckStatusArg::Skip => "skip",
+            CheckStatusArg::Fail => "fail",
+        }
+    }
 }
 
 /// Options for `aroute doctor`.
@@ -283,6 +341,30 @@ pub struct DoctorArgs {
     /// the default for humans and `--json` is the machine opt-in.
     #[arg(long)]
     pub json: bool,
+
+    /// Print only rows of this status, e.g. `--status fail`.
+    ///
+    /// A `ValueEnum`, not a `String`: an unrecognised value exits **2** with
+    /// clap naming the valid ones inline, which is the same behaviour
+    /// `--fields bogus` and `--limit abc` already have. Baking the vocabulary in
+    /// also keeps the filter honest — the three values are exactly what
+    /// `findings()` emits, so a typo cannot silently match nothing.
+    ///
+    /// The filter is over the PRINTED rows, never over the exit code: `doctor`
+    /// still exits 1 when anything failed, whether or not the row was printed.
+    /// A filter that also hid the failure would make `aroute doctor --status
+    /// ok` look like a passing build, which is the exact class of silent
+    /// success this CLI refuses everywhere else.
+    #[arg(long, value_enum)]
+    pub status: Option<CheckStatusArg>,
+
+    /// Print at most this many rows. `TOTAL` stays the full check count.
+    #[arg(long, value_name = "N")]
+    pub limit: Option<usize>,
+
+    /// Skip this many rows before printing. With `--limit` it pages.
+    #[arg(long, value_name = "N")]
+    pub offset: Option<usize>,
 }
 
 /// Options for `aroute run`.

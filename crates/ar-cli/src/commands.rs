@@ -1225,16 +1225,76 @@ fn models(cli: &Cli, args: &ListArgs) -> anyhow::Result<()> {
         &MODEL_COLUMNS,
         "models",
     )?;
-    let rows = model_rows(&cfg, &catalog);
+
+    // Row-superset filters, applied after the one query so there is still a
+    // single source of truth for what a model IS (docs/36 G3).
+    //
+    // `--provider` matches the model's own provider (`openai/gpt-4o` ->
+    // `openai`), which is column 1, not the registry's dialect.
+    let mut rows = model_rows(&cfg, &catalog);
+    if let Some(provider) = &args.provider {
+        rows.retain(|r| r.get(1).is_some_and(|p| p == provider));
+    }
+    if args.combo.is_some() {
+        let combo = args.combo.as_deref().unwrap_or_default();
+        rows.retain(|r| {
+            r.get(3)
+                .is_some_and(|owned| owned.split('+').any(|name| name == combo))
+        });
+    }
+    // `--routable` keeps only what this config actually routes — a combo
+    // target.
+    //
+    // NOT `status == "routable"`. That string means "provider AND model are
+    // both in the registry", which silently drops the rows an agent most needs:
+    // `anthropic/claude-sonnet-4` IS a combo target, and its `unknown-model`
+    // status is the answer to "why does my route fail", not a reason to hide
+    // it. Measured: filtering on the status string returned `0 models` for a
+    // config whose every target was a real combo, because none of its providers
+    // were in the compiled-in registry. The structural test is column 3 (the
+    // owning combo): a catalog row carries `-`, a combo target carries a combo
+    // id. So a target that cannot currently route is still listed, and its
+    // status says why — the same split `model_rows` makes.
+    //
+    // The complement is what an agent usually wants and what the 72 KB default
+    // makes it sift for, so the name is `--routable` and the filter is the
+    // route set, not a status judgement.
+    if args.routable {
+        rows.retain(|r| r.get(3).is_some_and(|owned| owned != "-"));
+    }
+    let total = rows.len();
+    let rows = page(&rows, args.offset.unwrap_or(0), args.limit);
+
     if args.json {
-        print!("{}", toon::json("models", &MODEL_COLUMNS, &fields, &rows));
+        print!(
+            "{}",
+            toon::json_paged("models", &MODEL_COLUMNS, &fields, &rows, total)
+        );
     } else {
         print!(
             "{}",
-            toon::list("models", "models", &MODEL_COLUMNS, &fields, &rows, args.full)
+            toon::list_paged(
+                "models", "models", &MODEL_COLUMNS, &fields, &rows, args.full, total
+            )
         );
     }
     Ok(())
+}
+
+/// Applies `--offset`/`--limit` to a row set, reporting `count: N of TOTAL`
+/// against the pre-page total.
+///
+/// In `toon::list` as a step rather than inside it: every list verb needs the
+/// same arithmetic, and keeping it here means one place to get `TOTAL` right.
+/// An offset past the end is not an error — the empty result says so, with
+/// `TOTAL` naming how many there really were.
+fn page(rows: &[Row], offset: usize, limit: Option<usize>) -> Vec<Row> {
+    let start = offset.min(rows.len());
+    let window = &rows[start..];
+    match limit {
+        Some(n) => window.iter().take(n).cloned().collect(),
+        None => window.to_vec(),
+    }
 }
 
 /// Routable models: every combo target, plus anything the catalog declares.
@@ -1313,12 +1373,25 @@ fn providers(cli: &Cli, args: &ListArgs) -> anyhow::Result<()> {
         "providers",
     )?;
     let rows = provider_rows(&cfg, &catalog);
+    let total = rows.len();
+    let rows = page(&rows, args.offset.unwrap_or(0), args.limit);
     if args.json {
-        print!("{}", toon::json("providers", &PROVIDER_COLUMNS, &fields, &rows));
+        print!(
+            "{}",
+            toon::json_paged("providers", &PROVIDER_COLUMNS, &fields, &rows, total)
+        );
     } else {
         print!(
             "{}",
-            toon::list("providers", "providers", &PROVIDER_COLUMNS, &fields, &rows, args.full)
+            toon::list_paged(
+                "providers",
+                "providers",
+                &PROVIDER_COLUMNS,
+                &fields,
+                &rows,
+                args.full,
+                total
+            )
         );
     }
     Ok(())
@@ -1374,12 +1447,19 @@ fn combo(cli: &Cli, args: &ListArgs) -> anyhow::Result<()> {
         "combo",
     )?;
     let rows = combo_rows(&cfg.combos, &catalog);
+    let total = rows.len();
+    let rows = page(&rows, args.offset.unwrap_or(0), args.limit);
     if args.json {
-        print!("{}", toon::json("combo", &COMBO_COLUMNS, &fields, &rows));
+        print!(
+            "{}",
+            toon::json_paged("combo", &COMBO_COLUMNS, &fields, &rows, total)
+        );
     } else {
         print!(
             "{}",
-            toon::list("combo", "combos", &COMBO_COLUMNS, &fields, &rows, args.full)
+            toon::list_paged(
+                "combo", "combos", &COMBO_COLUMNS, &fields, &rows, args.full, total
+            )
         );
     }
     Ok(())
@@ -1426,34 +1506,52 @@ fn doctor(cli: &Cli, args: &DoctorArgs) -> anyhow::Result<()> {
     let cfg = load(cli)?;
     let store = StoreProbe::resolve(&cli.config);
     let checks = findings(&cfg, &cli.config.display().to_string(), &store);
+    // Exit status is decided over the unfiltered set, before any filter: see
+    // `DoctorArgs::status`. A filter must never be able to launder a failure
+    // into an exit 0.
+    let failed = checks.iter().filter(|r| r[1] == "fail").count();
+    let total = checks.len();
+    let mut rows = checks;
+    if let Some(status) = args.status {
+        // Typed by `CheckStatusArg`, so the value is already one of the three.
+        // A no-match is still printed as `0 of TOTAL`, which is definite: the
+        // enum removed the typo case, and an unused value is a legitimate
+        // answer ("nothing failed") rather than an error.
+        let want = status.as_row_value();
+        rows.retain(|r| r[1] == want);
+    }
+    let rows = page(&rows, args.offset.unwrap_or(0), args.limit);
+
     if args.json {
         print!(
             "{}",
-            toon::json(
+            toon::json_paged(
                 "checks",
                 &CHECK_COLUMNS,
                 &toon::every_field(&CHECK_COLUMNS),
-                &checks,
+                &rows,
+                total
             )
         );
     } else {
         print!(
             "{}",
-            toon::list(
+            toon::list_paged(
                 "checks",
                 "checks",
                 &CHECK_COLUMNS,
                 &toon::every_field(&CHECK_COLUMNS),
-                &checks,
-                false
+                &rows,
+                false,
+                total
             )
         );
     }
-    let failed = checks.iter().filter(|r| r[1] == "fail").count();
+
     if failed > 0 {
         return Err(fail(
             format!("{failed} check(s) failed"),
-            "fix the `fail` rows above; `aroute configure --check` prints the resolved settings",
+            "fix the `fail` rows; `aroute doctor --status fail` prints just those",
         ));
     }
     Ok(())
