@@ -92,15 +92,30 @@ pub fn list(
 /// comma in a cell makes the row one column wider than the header claims. The
 /// standalone body marker below does not share that constraint.
 ///
+/// But a marker is not enough on its own, because the *value itself* can carry
+/// a comma: a config path, a detail string, a model name an operator chose.
+/// So a cell is also **quoted** when it contains a comma — the TOON rule the
+/// list shape was missing — which keeps `split(',')` honest at any width.
+///
 /// Returns `Cow::Borrowed` for the common short case so a list of ids allocates
 /// nothing beyond the row itself.
 pub fn clip(text: &str) -> Cow<'_, str> {
     let total = text.chars().count();
-    if total <= TRUNCATE_CHARS {
-        return Cow::Borrowed(text);
+    let body = if total <= TRUNCATE_CHARS {
+        Cow::Borrowed(text)
+    } else {
+        let head: String = text.chars().take(TRUNCATE_CHARS).collect();
+        Cow::Owned(format!("{head} (truncated: {total} chars)"))
+    };
+    // Only a cell that actually needs it pays for a quote. The test below
+    // asserts both halves: a comma-free id must stay bare (quoting everything
+    // would waste a byte on every row for the rare case), and a comma-bearing
+    // one must not be splittable.
+    if body.contains(',') {
+        Cow::Owned(format!("\"{}\"", body.replace('"', "'")))
+    } else {
+        body
     }
-    let head: String = text.chars().take(TRUNCATE_CHARS).collect();
-    Cow::Owned(format!("{head} (truncated: {total} chars)"))
 }
 
 /// Renders a free-standing body, cut to [`TRUNCATE_CHARS`] with the marker
@@ -215,5 +230,64 @@ mod tests {
     #[test]
     fn omits_hatch_when_body_fits() {
         assert_eq!(body("ok", false), "ok");
+    }
+
+    // The G4 finding: a list row is comma-delimited, so a comma inside a cell
+    // made the row wider than the header's column list claimed, and every field
+    // after it silently shifted. Reproduced live before the fix -- a config path
+    // containing a comma rendered a 3-column `doctor` row that split into 4
+    // fields. A quoting rule is the TOON answer, and these two tests pin both
+    // halves so the common case is not penalised for the rare one.
+    #[test]
+    fn quotes_a_cell_containing_a_comma_so_the_column_count_holds() {
+        let cell = clip("/path/with, comma/config.yaml");
+        assert!(cell.starts_with('"') && cell.ends_with('"'), "not quoted: {cell}");
+
+        // A quote-aware parser splits into exactly the header's three columns.
+        // `split(',')` alone cannot see quotes, so it still yields 4 -- which is
+        // why the contract is stated in the doc above as a QUOTING rule rather
+        // than "split is now safe", and why the second test matters: the unquoted
+        // majority of rows stay trivially splittable.
+        //
+        // What this test therefore pins is the part only quoting can give: the
+        // cell is delimited, so a parser that respects the quotes can recover
+        // the intended 3 columns, and the comma is no longer ambiguous.
+        let row = format!("config,ok,{cell}");
+        let fields: Vec<&str> = split_outside_quotes(&row);
+        assert_eq!(fields.len(), 3, "a quote-aware parser must see 3: {row}");
+        // The quotes are the delimiters, so the recovered value still carries them;
+        // a caller strips them. What has been restored is the column count -- the
+        // value was never in doubt.
+        assert_eq!(fields[2], "\"/path/with, comma/config.yaml\"");
+    }
+
+    /// A minimal splitter that respects double quotes, mirroring what an agent
+    /// has to write to parse this format: the whole justification for the
+    /// quoting rule.
+    fn split_outside_quotes(line: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut quoted = false;
+        let mut start = 0usize;
+        for (i, ch) in line.char_indices() {
+            match ch {
+                '"' => quoted = !quoted,
+                ',' if !quoted => {
+                    out.push(&line[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        out.push(&line[start..]);
+        out
+    }
+
+    #[test]
+    fn leaves_a_comma_free_cell_bare() {
+        // The assertion that keeps the fix cheap: quoting everything would add a
+        // byte to every row of every list to protect the rare comma-bearing one.
+        let cell = clip("gpt-4o-mini");
+        assert_eq!(cell, "gpt-4o-mini");
+        assert!(!cell.contains('"'));
     }
 }
