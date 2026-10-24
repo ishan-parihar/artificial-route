@@ -19,8 +19,8 @@ use clap::CommandFactory;
 use clap::error::ErrorKind;
 
 use crate::cli::{
-    ClearLimitsArgs, Cli, Command, ConfigureArgs, DoctorArgs, ImportArgs, ListArgs, SetLimitsArgs,
-    SyncArgs,
+    ClearLimitsArgs, Cli, Command, ConfigureArgs, DoctorArgs, ImportArgs, ListArgs, ServiceArgs,
+    ServiceAction, ServiceUnit, SetLimitsArgs, SyncArgs,
 };
 use crate::import;
 use crate::import::ImportFrom;
@@ -37,6 +37,9 @@ type Row = Vec<String>;
 const PROVIDER_COLUMNS: [&str; 5] = ["id", "provider", "status", "base_url", "key"];
 /// Columns available from `aroute models`.
 const MODEL_COLUMNS: [&str; 4] = ["id", "provider", "status", "combo"];
+/// Columns available from `aroute service`: systemd's own verdict, this
+/// process's live probe, and the sentence that says which it is.
+const SERVICE_COLUMNS: [&str; 4] = ["unit", "systemd", "probe", "detail"];
 /// Columns available from `aroute combo`. `provider` is the combo's distinct
 /// provider set: a combo is not owned by one provider, but that set is the fact
 /// an agent asks for next.
@@ -1084,6 +1087,7 @@ pub fn dispatch(cli: &Cli) -> anyhow::Result<()> {
             Some(crate::cli::LimitsCommand::Clear(args)) => limits_clear(cli, args),
         },
         Some(Command::CostReport(a)) => cost_report(cli, a),
+        Some(Command::Service(a)) => service(cli, a),
     }
 }
 
@@ -2478,6 +2482,221 @@ fn print_line_diff(before: &str, after: &str) {
     }
 }
 
+/// `aroute service` — the lifecycle verb the CLI was missing.
+///
+/// "Is the thing I am about to route to actually running?" had no answer
+/// short of shelling out to systemctl by hand, and an agent cannot do that
+/// cheaply. `sync_config` below already knew how to restart the proxy; this is
+/// that capability as a verb, plus the read that makes it safe to reach for.
+///
+/// The read is the important half: `status` reports systemd's verdict AND a
+/// live probe of the port, because those are two different claims. The
+/// incident in `docs/25` was a service systemd called active while `/healthz`
+/// took 15,427 ms — "active" alone would have answered the wrong question.
+fn service(cli: &Cli, args: &ServiceArgs) -> anyhow::Result<()> {
+    let scope: [&str; 2] = if cli.system {
+        ["--system", "--no-pager"]
+    } else {
+        ["--user", "--no-pager"]
+    };
+
+    match args.action {
+        None | Some(ServiceAction::Status { unit: None }) => {
+            status_of(scope, &[ServiceUnit::Proxy, ServiceUnit::Dashboard])
+        }
+        Some(ServiceAction::Status { unit: Some(u) }) => status_of(scope, &[u]),
+        Some(ServiceAction::Start { unit }) => change(scope, "start", unit),
+        Some(ServiceAction::Stop { unit }) => change(scope, "stop", unit),
+        Some(ServiceAction::Restart { unit }) => change(scope, "restart", unit),
+    }
+}
+
+/// Reports systemd's verdict and a live reachability probe for each unit.
+///
+/// Exits 1 when a unit is not serving. That is deliberate: an agent asking
+/// "is the proxy up?" before sending traffic needs a machine-readable answer,
+/// and a `status` that always exited 0 would force every caller to parse prose.
+/// It is the same rule `doctor` follows — the verb's exit code is its verdict.
+///
+/// A unit that is simply not installed is NOT a failure. `docs/plans/2026-10-19`
+/// documents a CLI-only host that keeps the binary and drops the daemon, and
+/// alarming on that machine would make `aroute service status` useless in CI.
+fn status_of(scope: [&str; 2], units: &[ServiceUnit]) -> anyhow::Result<()> {
+    let mut any_down = false;
+    let mut rows: Vec<Row> = Vec::with_capacity(units.len());
+    for unit in units {
+        let name = unit.unit_name();
+        let installed = std::process::Command::new("systemctl")
+            .args(scope)
+            .args(["list-unit-files", name])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .is_some_and(|s| s.contains(name));
+
+        let active = std::process::Command::new("systemctl")
+            .args(scope)
+            .args(["show", name, "--property=ActiveState", "--value"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_owned())
+            .unwrap_or_else(|| "unknown".to_owned());
+
+        // The probe: what a caller needs is whether the port answers, not what
+        // systemd last recorded. `is-active` and a TCP probe disagree exactly
+        // when something is wrong, which is when it matters.
+        //
+        // But a probe is scope-blind: it connects to 127.0.0.1:20128 whether
+        // the listener there came from the user unit or the system one. On a
+        // box where the user unit runs and the caller asked about `--system`,
+        // a scope-blind probe reported `ok` over two rows whose `detail`
+        // said "not installed" — an answer that contradicts itself in the
+        // same row. So the probe is reported as `not-applicable` when systemd
+        // cannot have started this unit: it is the honest answer, and a real
+        // `ok` in that column then means something.
+        let probe = if !installed {
+            ProbeResult::NotApplicable
+        } else if probe_port(unit.port()) {
+            ProbeResult::Ok
+        } else {
+            ProbeResult::NoAnswer
+        };
+        let detail = match (installed, active.as_str(), probe) {
+            (false, _, _) => "not installed — `install.sh --service user` writes it".to_owned(),
+            (true, "active", ProbeResult::Ok) => format!("active, port {} answers", unit.port()),
+            (true, "active", ProbeResult::NoAnswer) => {
+                format!("active but port {} does not answer", unit.port())
+            }
+            (true, "active", ProbeResult::NotApplicable) => "active".to_owned(),
+            (true, other, _) => {
+                format!("{other} — start it with `aroute service start {}", unit.slug())
+            }
+        };
+        // Down means systemd is not running it OR it is not answering. An
+        // uninstalled unit is not down: it is absent, which is a legitimate
+        // state on a CLI-only host and must not fail the verb.
+        if installed && (active != "active" || probe == ProbeResult::NoAnswer) {
+            any_down = true;
+        }
+        rows.push(vec![
+            name.to_owned(),
+            active,
+            probe.label().to_owned(),
+            detail,
+        ]);
+    }
+
+    print!(
+        "{}",
+        toon::list_paged(
+            "service",
+            "services",
+            &SERVICE_COLUMNS,
+            &toon::every_field(&SERVICE_COLUMNS),
+            &rows,
+            false,
+            rows.len()
+        )
+    );
+    if any_down {
+        return Err(fail(
+            "a service is not serving",
+            "start it with `aroute service start proxy`, or run `aroute serve` for the foreground",
+        ));
+    }
+    Ok(())
+}
+
+/// What the live probe found, as a third state beyond "yes" and "no".
+///
+/// `NotApplicable` is the state a scope-blind probe cannot have: it means
+/// "there is no unit here for anything to be listening for". Reporting it as
+/// `ok` was the bug — a row whose `detail` said "not installed" while its
+/// `probe` said the port answered contradicted itself, and a caller reading
+/// only the probe column would have believed a service was serving.
+///
+/// Deriving `PartialEq` so the caller can match on it; this is a verdict, not
+/// just a label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeResult {
+    /// The port accepted a connection.
+    Ok,
+    /// Installed and (per systemd) running, but nothing answered on the port.
+    NoAnswer,
+    /// There is no unit, so the question has no answer.
+    NotApplicable,
+}
+
+impl ProbeResult {
+    fn label(self) -> &'static str {
+        match self {
+            ProbeResult::Ok => "ok",
+            ProbeResult::NoAnswer => "no-answer",
+            ProbeResult::NotApplicable => "n/a",
+        }
+    }
+}
+
+/// One TCP connect to the unit's port.
+///
+/// A connect, not an HTTP GET: the proxy has `/healthz`, the dashboard does not
+/// necessarily share that contract, and "the port accepts" is the claim this
+/// verb needs. A real request would couple this verb to one unit's route table
+/// for no gain in the answer.
+///
+/// 400 ms, because a wedged-but-accepting listener must not hang the verb: the
+/// whole point is a fast answer to "can I send traffic?".
+fn probe_port(port: u16) -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let Ok(mut addrs) = ("127.0.0.1", port).to_socket_addrs() else {
+        return false;
+    };
+    let Some(addr) = addrs.next() else {
+        return false;
+    };
+    TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400)).is_ok()
+}
+
+/// Runs one state-changing `systemctl` verb and reports what happened.
+///
+/// Separate from [`status_of`] because the failure mode is different in kind:
+/// a failed `start` is an operator problem — permissions, a bad unit file — and
+/// must not be smoothed into a success. The message names the exact command to
+/// run by hand, per `docs/06`'s "help: <exact fix command>" rule.
+fn change(scope: [&str; 2], verb: &str, unit: ServiceUnit) -> anyhow::Result<()> {
+    let name = unit.unit_name();
+    match std::process::Command::new("systemctl")
+        .args(scope)
+        .arg(verb)
+        .arg(name)
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            let serving = if probe_port(unit.port()) {
+                "still serving"
+            } else {
+                "not answering yet on its port"
+            };
+            println!("service: {name} {verb}ed — {serving}");
+            Ok(())
+        }
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            let first = err.lines().next().unwrap_or("no output from systemctl");
+            Err(fail(
+                format!("could not {verb} {name}"),
+                format!("{first}; or run it by hand: systemctl {verb} {name}"),
+            ))
+        }
+        Err(e) => Err(fail(
+            format!("systemctl not available: {e}"),
+            format!("run it by hand: systemctl {verb} {name}"),
+        )),
+    }
+}
+
+
 /// `aroute sync` — the dashboard's integrated DB is the config surface; this
 /// verb is the bridge onto the routing engine.
 ///
@@ -3282,6 +3501,7 @@ mod tests {
         let cli = Cli {
             config: config.clone(),
             command: None,
+            system: false,
         };
         sync_config(
             &cli,
@@ -3402,6 +3622,7 @@ mod tests {
         let cli = Cli {
             config: config.clone(),
             command: None,
+            system: false,
         };
         sync_config(
             &cli,
@@ -3456,6 +3677,7 @@ mod tests {
         let cli = Cli {
             config,
             command: None,
+            system: false,
         };
         // `systemctl` is not on the test PATH-controlled command list; if the
         // dry run ever tried to restart the service this would fail or be
@@ -4434,6 +4656,7 @@ mod tests {
         Cli {
             config,
             command: None,
+            system: false,
         }
     }
 
@@ -4835,6 +5058,7 @@ models\":[{\"kind\":\"model\",\"model\":\"nvidia/z-ai/glm-5.3\",\"providerId\":\
         let cli = Cli {
             config: config.clone(),
             command: None,
+            system: false,
         };
         sync_config(
             &cli,
@@ -4925,6 +5149,7 @@ models\":[{\"kind\":\"model\",\"model\":\"nvidia/z-ai/glm-5.3\",\"providerId\":\
             let cli = Cli {
                 config: cfg,
                 command: None,
+                system: false,
             };
             let args = crate::cli::CostReportArgs {
                 limit: 50,
@@ -4959,6 +5184,7 @@ models\":[{\"kind\":\"model\",\"model\":\"nvidia/z-ai/glm-5.3\",\"providerId\":\
             let cli = Cli {
                 config: cfg,
                 command: None,
+                system: false,
             };
             let args = crate::cli::CostReportArgs {
                 limit: 50,

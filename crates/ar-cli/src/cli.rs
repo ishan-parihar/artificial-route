@@ -28,6 +28,15 @@ pub struct Cli {
     #[arg(long, short = 'c', global = true, value_name = "PATH", default_value = DEFAULT_CONFIG)]
     pub config: PathBuf,
 
+    /// Talk to the system (not user) systemd scope.
+    ///
+    /// Global, and therefore position-independent like `--config`:
+    /// `aroute service --system status` and `aroute service status --system`
+    /// must not be two different commands. `install.sh` writes the user scope
+    /// by default, so `user` is the default here too.
+    #[arg(long, global = true)]
+    pub system: bool,
+
     /// Subcommand. Omit for the home view.
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -153,6 +162,23 @@ pub enum Command {
     ///   aroute cost-report --key prod-deploy
     #[command(verbatim_doc_comment)]
     CostReport(CostReportArgs),
+
+    /// Manage the `aroute.service` / `aroute-dashboard.service` systemd
+    /// units: status, start, stop, restart.
+    ///
+    /// The one lifecycle verb the CLI was missing (`docs/36` G6). `aroute sync`
+    /// already knew how to restart the proxy, so the machinery existed; what
+    /// did not was a way to ask, from an agent, whether the thing I am about
+    /// to send traffic to is running — or to bring it back when it is not.
+    ///
+    /// `status` is the default and is read-only: two `systemctl show` reads,
+    /// no mutation. The three changing verbs require naming the unit
+    /// explicitly (`aroute service restart proxy`, not `aroute service
+    /// restart`), because a CLI that can stop a production listener on a
+    /// guess is a foot-gun. `--user` is the default scope, matching how
+    /// `install.sh` writes the units; `--system` is accepted because the
+    /// same units can be installed system-wide.
+    Service(ServiceArgs),
 
     /// Convert another tool's provider/model list into config.yaml + registry.json.
     ///
@@ -365,6 +391,97 @@ pub struct DoctorArgs {
     /// Skip this many rows before printing. With `--limit` it pages.
     #[arg(long, value_name = "N")]
     pub offset: Option<usize>,
+}
+
+/// The two units `install.sh` writes, named the way an operator names them.
+///
+/// A closed enum rather than a free unit string: a typo'd unit name would make
+/// `systemctl` fail with its own message, and worse, a caller who typed a
+/// different service's name would get a confusing "not found" for something
+/// that has nothing to do with aroute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ServiceUnit {
+    /// The proxy and its `/v1` API — what every other verb talks to.
+    Proxy,
+    /// The bundled web dashboard.
+    Dashboard,
+}
+
+impl ServiceUnit {
+    /// The unit name as systemd knows it.
+    pub fn unit_name(self) -> &'static str {
+        match self {
+            ServiceUnit::Proxy => "aroute.service",
+            ServiceUnit::Dashboard => "aroute-dashboard.service",
+        }
+    }
+
+    /// The port this unit serves.
+    ///
+    /// Reported by `status` because "active" and "answering" are not the same
+    /// claim: the incident `docs/25` records was a service systemd called active
+    /// while `/healthz` took 15,427 ms.
+    pub fn port(self) -> u16 {
+        match self {
+            ServiceUnit::Proxy => 20128,
+            ServiceUnit::Dashboard => 20149,
+        }
+    }
+
+    /// The name as it is typed on the command line.
+    ///
+    /// Used in the `help:` sentence so the command printed is one the caller
+    /// can paste, rather than the systemd unit name they would have to know.
+    pub fn slug(self) -> &'static str {
+        match self {
+            ServiceUnit::Proxy => "proxy",
+            ServiceUnit::Dashboard => "dashboard",
+        }
+    }
+}
+
+/// Options for `aroute service`.
+///
+/// The changing verbs take a positional unit, not a flag: `aroute service
+/// restart proxy` reads as an instruction, and it means no invocation can stop
+/// a listener without the caller having named which one.
+#[derive(Debug, Args)]
+pub struct ServiceArgs {
+    /// What to do.
+    ///
+    /// `status` is the default and the only one that mutates nothing, so
+    /// `aroute service` is safe to run for anyone at any time.
+    #[command(subcommand)]
+    pub action: Option<ServiceAction>,
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum ServiceAction {
+    /// Report whether the units are running, and whether they answer.
+    Status {
+        /// Restrict to one unit; both are reported when omitted.
+        #[arg(value_enum)]
+        unit: Option<ServiceUnit>,
+    },
+    /// Start a unit. Reports a no-op when it is already running.
+    Start {
+        /// Which unit — required here, so no invocation starts something
+        /// without naming it.
+        #[arg(value_enum)]
+        unit: ServiceUnit,
+    },
+    /// Stop a unit.
+    Stop {
+        /// Which unit — required for the same reason as `start`.
+        #[arg(value_enum)]
+        unit: ServiceUnit,
+    },
+    /// Restart a unit.
+    Restart {
+        /// Which unit — required for the same reason as `start`.
+        #[arg(value_enum)]
+        unit: ServiceUnit,
+    },
 }
 
 /// Options for `aroute run`.

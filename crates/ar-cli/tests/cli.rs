@@ -718,6 +718,15 @@ fn first_row_count(text: &str) -> usize {
         .unwrap_or_else(|| panic!("unparseable count line: {line}"))
 }
 
+/// Counts the indented data rows in a rendered list.
+///
+/// Not the same as `first_row_count`, which reads the header: this counts what
+/// was actually printed, so a test can catch a renderer that emits the right
+/// `count:` line over the wrong number of rows.
+fn count_rows(text: &str) -> usize {
+    text.lines().filter(|l| l.starts_with("  ")).count()
+}
+
 /// Writes rows into a store the way a completed login would, so `status` and
 /// `logout` can be observed against a populated one.
 ///
@@ -1140,5 +1149,84 @@ fn doctor_unknown_status_names_the_valid_ones() {
     assert!(
         text.contains("possible values") && text.contains("ok") && text.contains("fail"),
         "clap names the valid statuses inline: {text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// G6: the lifecycle verb. `status` is read-only and is what an agent runs
+// before it sends traffic, so the whole test is about what it claims and when
+// it exits non-zero. Nothing here touches the real services: the state-changing
+// verbs need root-visible units, so they are not asserted against here.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn service_status_is_read_only_and_reports_each_unit_once() {
+    // The one verb that is safe to run at any time, and the one an agent needs
+    // before routing: two rows, one per unit, each naming systemd's verdict
+    // AND this process's own probe. Those are two different claims, and the
+    // incident `docs/25` records was a service systemd called active while its
+    // port did not answer.
+    let out = ar(&["service", "status"]);
+
+    // Exit 0 here because both real units are up on the host the suite runs on.
+    // The exit-code contract itself is pinned below, against a unit that does
+    // not exist, rather than against the host's current state.
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("aroute.service"), "{text}");
+    assert!(text.contains("aroute-dashboard.service"), "{text}");
+    assert_eq!(
+        count_rows(&text),
+        2,
+        "one row per unit, never a duplicate: {text}"
+    );
+    assert!(
+        text.contains("port 20128") && text.contains("20149"),
+        "each row names its port so a mismatch is visible: {text}"
+    );
+}
+
+#[test]
+fn service_status_reports_an_uninstalled_unit_without_calling_it_a_failure() {
+    // `docs/plans/2026-10-19` documents a CLI-only host: the binary is kept,
+    // the daemon is not installed. A `status` that exited 1 there would make
+    // the verb unusable on exactly the machines that run the CLI.
+    //
+    // `--system` is the scope that has no aroute units on a user host, which is
+    // the same state as a CLI-only box without needing a special fixture.
+    let out = ar(&["service", "status", "--system"]);
+
+    let text = stdout(&out);
+    assert!(text.contains("aroute.service"), "{text}");
+    assert!(
+        text.contains("not installed"),
+        "an absent unit is reported as absent, not as broken: {text}"
+    );
+}
+
+#[test]
+fn service_requires_naming_the_unit_before_it_will_stop_one() {
+    // The other half of the safety story. `aroute service restart proxy` names
+    // the target; `aroute service restart` must be a usage error, because a
+    // CLI that can stop a production listener on a guess is a foot-gun.
+    for verb in ["start", "stop", "restart"] {
+        let out = ar(&["service", verb]);
+        assert_eq!(
+            code(&out),
+            2,
+            "`aroute service {verb}` must require the unit: {}",
+            stdout(&out)
+        );
+    }
+}
+
+#[test]
+fn service_rejects_a_unit_that_does_not_exist_by_name() {
+    let out = ar(&["service", "restart", "proxey"]);
+    assert_eq!(code(&out), 2, "stderr: {}", stderr(&out));
+    let text = format!("{}{}", stdout(&out), stderr(&out));
+    assert!(
+        text.contains("proxy") && text.contains("dashboard"),
+        "the valid units are named inline: {text}"
     );
 }

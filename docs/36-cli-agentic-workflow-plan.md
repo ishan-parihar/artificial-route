@@ -1266,14 +1266,20 @@ deleted a section I did not name".
 | `an_unknown_subcommand_should_print_a_line_on_stdout` | `main.rs` tests | stdout is not empty for an unknown subcommand |
 | `json_should_render_the_same_rows_as_toon` | `commands.rs` tests | the two renderings carry the same data |
 
-### Step 7
+### Step 7 — SHIPPED (2026-10-24, commit `ed9635d`)
 
 | Test | Where | Asserts |
 |---|---|---|
-| `models_should_default_to_the_routable_rows` | `commands.rs` tests | the default is a subset of `--all` |
-| `models_all_should_reach_the_whole_registry` | `commands.rs` tests | `--all` has every registry row |
-| `doctor_should_print_only_the_failing_rows_when_status_is_fail` | `commands.rs` tests | the filtered table has the `fail` rows and no others |
-| `list_should_report_a_total_larger_than_the_page` | `toon.rs` tests | `count: N of TOTAL` has `TOTAL != N` under `--limit` |
+| `models_should_default_to_the_routable_rows` | — | **NOT SHIPPED**: DEC-6 leaves the default alone until the operator rules |
+| `models_all_should_reach_the_whole_registry` | — | **NOT SHIPPED**: `--all` was never built, because it does not exist without a default change |
+| `doctor_should_print_only_the_failing_rows_when_status_is_fail` | `tests/cli.rs` | the filtered table has the `fail` rows and no others |
+| `list_should_report_a_total_larger_than_the_page` | `tests/cli.rs` | `count: 2 of 3 total` under `--limit 2` |
+
+The shipped flags are `--combo`, `--provider`, `--routable`, `--limit`,
+`--offset` on `models`; `--limit`/`--offset` on `providers` and `combo`; and
+`--status`/`--limit`/`--offset` on `doctor`. `--routable` is NOT a default
+change, so DEC-6 is untouched and the 18,228-token default stands until the
+operator rules otherwise.
 
 ### Step 8
 
@@ -1284,6 +1290,41 @@ deleted a section I did not name".
 | `server_set_should_write_the_listen_address` | `commands.rs` tests | `server:` carries the host and port |
 | `providers_add_should_write_the_row_the_key_ref_and_the_env_line_together` | `commands.rs` tests | the three-part write the panel performs |
 | `providers_remove_should_refuse_while_a_combo_references_the_provider` | `commands.rs` tests | the refusal matches the panel's |
+
+### Step 9 — G6, the service lifecycle verbs (`aroute service`, my own finding, not in the plan's 8) — SHIPPED (2026-10-24)
+
+`sync` already knew how to restart the proxy, so the machinery existed; what
+was missing was the READ that makes it safe to reach for. `status` is the
+default and is read-only: it reports systemd's verdict **and** an independent
+port probe, because those are two different claims, and the `docs/25` incident
+was a service systemd called active while `/healthz` took 15,427 ms.
+
+| Test | Where | Asserts |
+|---|---|---|
+| `service_status_is_read_only_and_reports_each_unit_once` | `tests/cli.rs` | two rows, one per unit, each naming its port |
+| `service_status_reports_an_uninstalled_unit_without_calling_it_a_failure` | `tests/cli.rs` | an absent unit reports `not installed` and exits 0 — a CLI-only host is not a broken host |
+| `service_requires_naming_the_unit_before_it_will_stop_one` | `tests/cli.rs` | `aroute service restart` with no unit is a usage error (exit 2) for all three changing verbs |
+| `service_rejects_a_unit_that_does_not_exist_by_name` | `tests/cli.rs` | a typo'd unit names the valid ones |
+| `does_not_hatch_full_for_a_cell_that_was_merely_quoted` | `toon.rs` tests | a comma-bearing cell does NOT print the `--full` hatch; a truncated one still does |
+
+Two bugs came out of running this rather than reasoning about it:
+
+1. **The port probe was scope-blind.** `--system status` on a host whose *user*
+   unit runs reported `probe: ok` for two rows whose `detail` said "not
+   installed" — a row that contradicted itself. A caller reading the probe
+   column alone would have believed a service was serving. The probe is now a
+   three-state `ProbeResult` (`ok` / `no-answer` / `n-a`), and `n-a` is the
+   honest answer when there is no unit in that scope to be listening.
+2. **`toon::list` used "was any cell rebuilt?" as "was anything truncated?"**
+   `clip` returns an owned string when it *quotes* a comma, so every
+   comma-bearing row printed the `--full` hatch — under `aroute service`, which
+   has no `--full` flag at all. Fixed to test the length, which is the only
+   thing `--full` can change.
+
+The safety rule is enforced by the parser, not by prose: the three changing
+verbs take the unit as a **required positional**, so `aroute service restart`
+cannot stop a production listener on a guess.
+
 
 ---
 

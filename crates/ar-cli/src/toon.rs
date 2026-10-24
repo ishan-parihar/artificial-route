@@ -67,18 +67,26 @@ pub fn list(
     let _ = writeln!(out, "count: {} of {} total", rows.len(), rows.len());
     let _ = writeln!(out, "{name}[{}]{{{}}}:", rows.len(), fields.join(","));
 
-    let mut clipped = false;
     for row in rows {
         let mut cells: Vec<Cow<'_, str>> = Vec::with_capacity(picked.len());
         for i in &picked {
             let cell = row.get(*i).map_or("", String::as_str);
-            let clipped_cell = clip(cell);
-            clipped |= matches!(clipped_cell, Cow::Owned(_));
-            cells.push(clipped_cell);
+            cells.push(clip(cell));
         }
         let joined: Vec<&str> = cells.iter().map(Cow::as_ref).collect();
         let _ = writeln!(out, "  {}", joined.join(","));
     }
+    // Whether anything was TRUNCATED, which is the only thing `--full` can
+    // fix. Not "whether any cell was rebuilt": `clip` also returns an owned
+    // string merely to quote a comma, and a quoted cell is not a truncated
+    // one. Asserting on `Cow::Owned` printed the hatch under `aroute service
+    // status` — a verb with no `--full` flag — for a row that was merely
+    // comma-bearing. The hint is about a flag that would change nothing,
+    // which is exactly the noise the flag's own doc says to avoid.
+    let clipped = rows
+        .iter()
+        .flatten()
+        .any(|cell| cell.chars().count() > TRUNCATE_CHARS);
     if clipped && !full {
         let _ = writeln!(out, "{HINT}");
     }
@@ -441,6 +449,59 @@ mod tests {
         assert!(
             parsed["rows"][0].get("base_url").is_none(),
             "an unrequested column must not appear: {out}"
+        );
+    }
+
+    #[test]
+    fn does_not_hatch_full_for_a_cell_that_was_merely_quoted() {
+        // A real bug, found by running `aroute service status`: `list` decided
+        // "was anything clipped?" by "did any cell come back owned?", and
+        // `clip` returns an owned string when it QUOTES a comma — not only
+        // when it truncates. So a short comma-bearing cell printed the
+        // `--full` hint, naming a flag that would change nothing, on a verb
+        // (`service`) that has no `--full` at all.
+        //
+        // The contract: the hatch means "a value was cut". Quoting keeps a
+        // value whole, so it must never trigger it.
+        let cols = ["unit", "systemd", "probe", "detail"];
+        let comma_row = vec![
+            "aroute.service".to_owned(),
+            "active".to_owned(),
+            "ok".to_owned(),
+            "active, port 20128 answers".to_owned(),
+        ];
+        let fields: Vec<String> = cols.iter().map(|s| s.to_string()).collect();
+        let out = list(
+            "service",
+            "services",
+            &cols,
+            &fields,
+            &[comma_row],
+            false,
+        );
+        assert!(
+            out.contains("\"active, port 20128 answers\""),
+            "the comma-bearing cell is quoted: {out}"
+        );
+        assert!(
+            !out.contains("--full"),
+            "a quoted cell is not a truncated one, so the hatch must stay silent: {out}"
+        );
+
+        // And the truncation case still hatches, so this is not a blanket
+        // suppression: negative control for the fix itself.
+        let long = "x".repeat(TRUNCATE_CHARS + 200);
+        let out = list(
+            "service",
+            "services",
+            &cols,
+            &fields,
+            &[vec!["aroute.service".to_owned(), "active".to_owned(), "ok".to_owned(), long]],
+            false,
+        );
+        assert!(
+            out.contains("--full"),
+            "a genuinely truncated cell must still name the hatch: {out}"
         );
     }
 }
