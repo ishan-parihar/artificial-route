@@ -20,6 +20,14 @@ workspace = true
 # `cargo tree -e no-dev` must contain no `rmcp` (docs/06 accept gate), and this is
 # what keeps that true: `ar-mcp` itself compiles SDK-free, and only its `mcp`
 # feature pulls the tree in.
+#
+# `default` stays EMPTY on purpose — that is the documented accept gate, not an
+# oversight, and flipping it would publish the protocol SDK to every consumer
+# for a feature most do not use. The release artifact is built WITH the feature
+# (`.github/workflows/release.yml` passes `--features mcp`, and `install.sh`'s
+# from-source path does the same), so the `aroute mcp` surface that
+# `install.sh` advertises to `claude mcp add` / `codex mcp add` actually exists
+# in what users download. Developers and CI still get the SDK-free default.
 [features]
 default = []
 mcp = ["dep:ar-mcp", "ar-mcp/mcp"]
