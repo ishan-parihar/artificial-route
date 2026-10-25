@@ -555,6 +555,17 @@ the prose is only the map.
 3. **`--json` on every read.** `models`/`providers`/`doctor`/… already have it;
    `server show`, `oauth list`, `visibility show` and the rest are reads and take
    it from the start, per `docs/06`'s machine-readable rule.
+
+   **Amended closing the phase** (`1e7f90c`). The rule was satisfied on paper and
+   broken in practice: the flag was declared on each verb's own args struct,
+   which clap reads only *before* the subcommand, so `aroute providers list
+   --json` — the spelling this plan's own examples use — answered `unrecognized
+   argument '--json'` on `server`, `providers`, `combo`, `visibility` and both
+   Phase 7 reads. Three of the six shipped in earlier phases. The field existed
+   and a read of the struct said it worked, which is exactly why no test caught
+   it. The rule now reads: **`--json` is `global` on the parent, so it parses on
+   either side of the subcommand, and a parse test covers every read in both
+   positions.**
 4. **Round-trip tests everywhere.** Each writer: apply → the target section is
    spliced and **every other section is byte-identical** → reverse → the file is
    back to its original bytes. That assertion is the one that catches a
