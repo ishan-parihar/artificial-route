@@ -2267,7 +2267,26 @@ fn append_nested_list_entry(
                     content, section, owner, list, &value, base,
                 ));
             }
+            // The section ended *with* a list in it, and the entry belongs at
+            // the end of that list, so it is written here — the last line of
+            // the section, before whatever header ended it. Writing it after
+            // this reset cannot work, and not writing it at all is how a
+            // second `openai:` block ended up appended beside the first.
+            if in_list {
+                out.insert(
+                    list_end(&out),
+                    format!("{}- {value}", " ".repeat(entry_depth)),
+                );
+                inserted = true;
+            }
             in_section = false;
+            // The owner's key is a line *of the section*: the section ending
+            // ends the owner too. Leaving `in_owner` standing makes the walk
+            // read the next section's `excluded_models:` as the same list
+            // again and write a second block beside the first, which is a
+            // duplicate-key config the loader resolves by order of appearance.
+            in_owner = false;
+            in_list = false;
         }
         if in_section
             && owner.is_some()
@@ -2280,19 +2299,10 @@ fn append_nested_list_entry(
             i += 1;
             continue;
         }
-        if in_owner && is_section_header(line) {
-            // The provider's key ended before its list appeared: the list is
-            // added under that key, not at the end of the section.
-            if in_list {
-                out.insert(
-                    list_end(&out),
-                    format!("{}- {value}", " ".repeat(entry_depth)),
-                );
-                return Some(rejoin(content, out));
-            }
-            in_section = false;
-            in_owner = false;
-        }
+        // The provider's key is a line of the section, so the arm above ends
+        // the owner with the section. An owner that outlives its section is
+        // what made this write append a second block beside the first, and
+        // what made it drop the file's tail on the way out.
         if in_owner && !in_list && is_list_key(line, list, base + 4) {
             in_list = true;
             out.push(line.to_owned());
@@ -2342,8 +2352,19 @@ fn nested_list_has_entry(
     list: &str,
     entry: &str,
 ) -> bool {
-    remove_nested_list_entry(content, section, owner, list, entry).is_some()
-        || scan_nested_entry(content, section, owner, list, entry)
+    // The scan, not the remove writer.
+    //
+    // Remove answers a different question: it returns `Some` when it removed
+    // an entry *and* when it removed nothing but recognised the shape, so
+    // `.is_some()` on it is not "is it there". Reading it as though it were
+    // meant a caller that asked before writing got yes for any glob it typed.
+    //
+    // No behaviour differs today — the `_ => Err` refusal arm in the caller
+    // catches the shapes where the two disagree — so this removes a trap, not
+    // a bug. That is worth the change because the trap is invisible: the two
+    // answer the same question by accident of the current control flow, and a
+    // future change to either one lands silently.
+    scan_nested_entry(content, section, owner, list, entry)
 }
 
 /// Reads the nested list for `entry` without rewriting anything.
@@ -2512,10 +2533,19 @@ fn prune_empty_key(lines: &[String], base: usize, owner: &str) -> Vec<String> {
     let Some(at) = lines.iter().position(|l| l.trim_end() == header) else {
         return lines.to_vec();
     };
+    // The body is everything *deeper* than the key. `indent_of` returns
+    // None for a column-zero line, which is every section header, and None read
+    // as "deeper" swallows the next section's header and its whole body into
+    // this key's block — `provider_settings:` then losing `mcp:` below it.
+    // A line at the key's own depth or shallower is the end of the body,
+    // whatever it is.
     let body: Vec<&String> = lines
         .iter()
         .skip(at + 1)
-        .take_while(|l| indent_of(l).is_none_or(|d| d > owner_depth))
+        .take_while(|l| match indent_of(l) {
+            Some(d) => d > owner_depth,
+            None => false,
+        })
         .collect();
     let has_list = body.iter().any(|l| is_key_at(l, owner_depth + 2));
     if has_list {
@@ -10435,6 +10465,106 @@ models\":[{\"kind\":\"model\",\"model\":\"nvidia/z-ai/glm-5.3\",\"providerId\":\
         assert_eq!(out, None, "a flow list is not a shape this writer edits");
         // Mutation control: loosen the reader to accept any `-` at any depth and
         // this starts returning Some, silently dropping the notation.
+    }
+
+    /// Every existing test starts from `P7_BASE`, which has no
+    /// `provider_settings:` — so the *append into an existing section* path was
+    /// never run, and it was the one that ate the file's tail.
+    const PS_EXISTING: &str = "keys:\n  openai: $AR_KEY_OPENAI\nproviders:\n  - id: openai\n    key: openai\nprovider_settings:\n  openai:\n    excluded_models:\n      - gpt-4o\nmcp:\n  port: 9000\n";
+
+    #[test]
+    fn appending_to_a_section_that_exists_keeps_the_section_that_follows() {
+        let out =
+            append_nested_list_entry(PS_EXISTING, PS_SECTION, Some("openai"), PS_LIST, "gpt-5*")
+                .expect("write");
+        assert!(
+            out.contains("      - gpt-4o\n      - gpt-5*\n"),
+            "the entry lands at the end of the list that was already there: {out:?}"
+        );
+        // The tail is the whole finding. The append used to return as soon as it
+        // had inserted, so `mcp:` and its body were dropped and the config
+        // silently shrank — it still parsed, so nothing else caught it.
+        assert!(
+            out.contains("mcp:\n  port: 9000"),
+            "the section that follows survives: {out:?}"
+        );
+        assert!(
+            out.ends_with("mcp:\n  port: 9000\n"),
+            "and it is the file's tail, in order: {out:?}"
+        );
+
+        let back = remove_nested_list_entry(&out, PS_SECTION, Some("openai"), PS_LIST, "gpt-5*")
+            .expect("write");
+        assert_eq!(
+            back, PS_EXISTING,
+            "add then remove restores the file byte for byte"
+        );
+    }
+
+    #[test]
+    fn removing_the_last_glob_from_a_section_that_exists_keeps_the_tail() {
+        // The same shape, but the remove leaves the section empty: the section
+        // and its key both go, and the file after them is not the writer's to
+        // take.
+        let out =
+            remove_nested_list_entry(PS_EXISTING, PS_SECTION, Some("openai"), PS_LIST, "gpt-4o")
+                .expect("write");
+        assert!(
+            !out.contains("provider_settings"),
+            "the section went with its last entry: {out:?}"
+        );
+        assert!(
+            out.contains("mcp:\n  port: 9000\n"),
+            "the following section and its body are intact: {out:?}"
+        );
+        assert_eq!(
+            out,
+            "keys:\n  openai: $AR_KEY_OPENAI\nproviders:\n  - id: openai\n    key: openai\nmcp:\n  port: 9000\n",
+            "and the difference is only the section that was removed: {out:?}"
+        );
+    }
+
+    /// A provider whose key carries nothing but the list, sitting under a
+    /// section that is followed by another section.
+    #[test]
+    fn a_provider_key_alone_does_not_eat_the_section_after_it() {
+        // `prune_empty_key` read `indent_of`'s `None` — every section header —
+        // as "deeper than the key", so the key's body ran to the end of the
+        // file and the next section went with it.
+        let doc = "provider_settings:\n  openai:\nmcp:\n  port: 9000\n";
+        let out = prune_empty_key(
+            &doc.lines().map(str::to_owned).collect::<Vec<_>>(),
+            0,
+            "openai",
+        );
+        assert_eq!(
+            out,
+            vec!["provider_settings:", "mcp:", "  port: 9000"],
+            "{out:?}"
+        );
+        // Mutation control: restore `is_none_or(|d| d > owner_depth)` and this
+        // becomes `[provider_settings:, port: 9000]` — the header gone, its body
+        // orphaned under the wrong section.
+    }
+
+    /// The reader answers "is this glob already excluded" from the file.
+    /// The remove writer cannot, though it looks like it can: remove returns
+    /// `Some` both when it removed an entry and when it recognised the shape
+    /// and removed nothing, so `.is_some()` on it is not "it is there".
+    #[test]
+    fn the_duplicate_reader_reads_the_file_not_the_remove_writer() {
+        assert!(
+            nested_list_has_entry(PS_EXISTING, PS_SECTION, Some("openai"), PS_LIST, "gpt-4o"),
+            "the glob that is written is reported as written"
+        );
+        assert!(
+            !nested_list_has_entry(PS_EXISTING, PS_SECTION, Some("openai"), PS_LIST, "o3-mini"),
+            "and the glob that is not written is not"
+        );
+        assert!(
+            !nested_list_has_entry(P7_BASE, PS_SECTION, Some("openai"), PS_LIST, "*-mini"),
+            "and a block that does not exist yet holds no glob"
+        );
     }
 
     #[test]
