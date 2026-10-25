@@ -1,7 +1,9 @@
 # The config-write surface: an outline-plan for closing it
 
-Status: **Phase 0, 1, 2 and 3 shipped 2026-10-24 (`96cf513`, `9c46ff5`,
-`a34cd94`, `5e0a874`); Phases 4-7 unbuilt.** Written at the
+Status: **Phases 0-7 shipped 2026-10-24 through 2026-10-25** (`96cf513`, `9c46ff5`,
+`a34cd94`, `5e0a874`, `16d7cf1`, `218cb00`, `fadff81`). Phase 5 (`oauth add`)
+remains blocked on resumable login: `persist_token` refuses a session with no
+`refresh_key`, and `AuthLoginArgs` carries no resume state. Written at the
 operator's request, then Phase 0 (the data-loss fix) was validated and landed
 before any new verb. It supersedes nothing: `docs/36` §4 step 8 specifies the
 first three verb groups (8a `oauth:`, 8b `server:`, 8c `providers:` add/remove)
@@ -506,6 +508,28 @@ changing nothing, is refused. Recorded rather than implemented as written.
 Both are tiny writers over one field each, and both are the same shape as
 Phases 6's verbs — so this phase is small, and it is last because if Phases 6's
 semantics prove wrong these inherit the fix rather than the other way round.
+
+**Shipped, `fadff81`.** The prediction held: Phase 6's `owner`-shaped writers
+carried over, and this phase found six more defects that reading the code would
+not have caught. All six run through the same fact — a flat list has no key
+line, so every arithmetic derived from one is wrong — and all six are now
+pinned by tests whose mutation controls have actually been run:
+
+| what broke | what the writer did |
+|---|---|
+| the entry's indent was derived from a list key that does not exist | a flat list's entry sat four under its header, not two |
+| `scan_nested_entry` never opened the list for `owner = None` | a second `add` wrote a duplicate instead of reporting `unchanged` |
+| the section-drop predicate counted only keys | removing one of two entries read the survivor as empty and dropped the section, with the `mcp:` after it |
+| `append_nested_list_entry` had no flat-list arm | an entry was pushed onto the next section's header and swallowed it |
+| `create_nested_list` skipped `yaml_entry` | a leading-`*` glob reached the file unquoted and the loader refused it as an unknown anchor |
+| the new section's separator took the file's own terminator | a file with no trailing newline got `port: 9000continue_on_cut:`, which is not YAML |
+
+The amendment to the cross-cutting rules below is the same one Phase 6 made:
+the rule "a writer that touches one row uses a row-level edit" now has a
+second half that only running the verb produced — **a flat list under a
+section is the `owner = None` case, and every depth in that path must be
+derived from the section, never from a key**. The tests are the enforcement;
+the prose is only the map.
 
 ## 4. Cross-cutting, applies to every phase
 
