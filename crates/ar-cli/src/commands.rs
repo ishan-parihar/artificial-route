@@ -9231,6 +9231,72 @@ models\":[{\"kind\":\"model\",\"model\":\"nvidia/z-ai/glm-5.3\",\"providerId\":\
         // of `scan_nested_entry` and both assertions above fail.
     }
 
+    // ---- the `--json` surface, and the flag position it must accept ----
+
+    /// Every read the plan names, spelled the way its own examples spell it.
+    ///
+    /// The plan's cross-cutting rule 3 requires `--json` on every read, and
+    /// the examples put it *after* the subcommand: `aroute providers list
+    /// --json`. The flag was declared on each verb's own args struct, which
+    /// clap reads only before the subcommand, so every one of these verbs
+    /// answered `unrecognized argument '--json'` while the struct field sat
+    /// right there. Six verb families were broken at once and nothing caught
+    /// it, because the field exists and a read of the struct says it works.
+    const JSON_READS: [&[&str]; 6] = [
+        &["server", "show", "--json"],
+        &["providers", "list", "--json"],
+        &["combo", "list", "--json"],
+        &["visibility", "show", "--json"],
+        &["provider-settings", "show", "--json"],
+        &["continue-on-cut", "show", "--json"],
+    ];
+
+    #[test]
+    fn every_read_accepts_json_after_its_subcommand() {
+        use clap::Parser as _;
+        for argv in JSON_READS {
+            let full = ["ar", "--config", "c.yaml"]
+                .iter()
+                .copied()
+                .chain(argv.iter().copied())
+                .collect::<Vec<_>>();
+            crate::cli::Cli::try_parse_from(&full)
+                .unwrap_or_else(|e| panic!("{} must parse: {e}", argv.join(" ")));
+        }
+        // Mutation control: drop `global = true` from any one of the six
+        // `json` declarations and this fails with that verb named.
+    }
+
+    #[test]
+    fn every_read_accepts_json_before_its_subcommand() {
+        use clap::Parser as _;
+        for argv in JSON_READS {
+            let mut full = vec!["ar", "--config", "c.yaml"];
+            // `--json` goes first, then the verb and its subcommand: the other
+            // spelling a caller reaches for, which a non-global flag rejects.
+            full.extend([argv[0], "--json"]);
+            full.extend(&argv[1..2]);
+            crate::cli::Cli::try_parse_from(&full)
+                .unwrap_or_else(|e| panic!("{} must parse: {e}", full.join(" ")));
+        }
+    }
+
+    #[test]
+    fn removing_a_trailing_newline_survives_a_phase_seven_write() {
+        // The file's own terminator is carried across, so the round trip is
+        // byte-identical even for the config that deliberately omits it.
+        let base = "server:\n  host: 127.0.0.1\nmcp:\n  port: 9000";
+        let written = append_nested_list_entry(base, CUT_SECTION, None, CUT_SECTION, "openai")
+            .expect("the entry is written");
+        assert!(
+            written.contains("continue_on_cut:\n  - openai"),
+            "the entry is present: {written:?}"
+        );
+        assert!(
+            !written.ends_with('\n'),
+            "and no terminator was invented: {written:?}"
+        );
+    }
     #[test]
     fn removing_a_provider_that_is_not_listed_writes_nothing() {
         let out = remove_nested_list_entry(P7_BASE, CUT_SECTION, None, CUT_SECTION, "openai");

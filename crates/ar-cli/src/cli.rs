@@ -994,7 +994,11 @@ pub struct ProvidersArgs {
     pub full: bool,
 
     /// Emit the same rows as JSON instead of TOON.
-    #[arg(long)]
+    /// Global so it parses on either side of the subcommand: `aroute
+    /// providers show --json` is how the plan's examples spell it, and a
+    /// flag that only parses before the verb is one every agent must be
+    /// told about.
+    #[arg(long, global = true)]
     pub json: bool,
 
     /// Rows to skip from the newest end: the page after the last one shown.
@@ -1176,7 +1180,11 @@ pub struct ComboArgs {
     pub full: bool,
 
     /// Emit the same rows as JSON instead of TOON.
-    #[arg(long)]
+    /// Global so it parses on either side of the subcommand: `aroute
+    /// providers show --json` is how the plan's examples spell it, and a
+    /// flag that only parses before the verb is one every agent must be
+    /// told about.
+    #[arg(long, global = true)]
     pub json: bool,
 
     /// Rows to skip from the newest end: the page after the last one shown.
@@ -1320,7 +1328,11 @@ pub struct VisibilityArgs {
     pub command: Option<VisibilityCommand>,
 
     /// Emit the same row as JSON instead of TOON.
-    #[arg(long)]
+    /// Global so it parses on either side of the subcommand: `aroute
+    /// providers show --json` is how the plan's examples spell it, and a
+    /// flag that only parses before the verb is one every agent must be
+    /// told about.
+    #[arg(long, global = true)]
     pub json: bool,
 }
 
@@ -1418,7 +1430,11 @@ pub struct ProviderSettingsArgs {
     pub command: Option<ProviderSettingsCommand>,
 
     /// Emit the same rows as JSON instead of TOON.
-    #[arg(long)]
+    /// Global so it parses on either side of the subcommand: `aroute
+    /// providers show --json` is how the plan's examples spell it, and a
+    /// flag that only parses before the verb is one every agent must be
+    /// told about.
+    #[arg(long, global = true)]
     pub json: bool,
 }
 
@@ -1469,7 +1485,11 @@ pub struct ContinueOnCutArgs {
     pub command: Option<ContinueOnCutCommand>,
 
     /// Emit the same rows as JSON instead of TOON.
-    #[arg(long)]
+    /// Global so it parses on either side of the subcommand: `aroute
+    /// providers show --json` is how the plan's examples spell it, and a
+    /// flag that only parses before the verb is one every agent must be
+    /// told about.
+    #[arg(long, global = true)]
     pub json: bool,
 }
 
@@ -1517,7 +1537,11 @@ pub struct ServerArgs {
     ///
     /// One query, two renderings: TOON stays the default for humans and this is
     /// the machine opt-in, the same rule as the list verbs.
-    #[arg(long)]
+    /// Global so it parses on either side of the subcommand: `aroute
+    /// providers show --json` is how the plan's examples spell it, and a
+    /// flag that only parses before the verb is one every agent must be
+    /// told about.
+    #[arg(long, global = true)]
     pub json: bool,
 }
 
