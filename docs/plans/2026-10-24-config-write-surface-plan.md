@@ -326,29 +326,65 @@ Negative controls run and confirmed to fail: the `providers:` check, the empty
 section, `remove_section` in its place (63 lines), and the unguarded
 `providers:` splice.
 
-### Phase 4 — `aroute combo` single-item writers *(the routing table, one row at a time)*
+### Phase 4 — `aroute combo` single-item writers — **SHIPPED 2026-10-25** (`7a87077`) *(the routing table, one row at a time)*
 
-`check_combos` (`webui.rs:1655`) is the validation both surfaces must share —
-id legal (1-64 of `a-z0-9._-`, unique), every target's provider known (registry
-or `custom_providers:`), every strategy one this build routes **or one already
-in the file** (a save must round-trip a config it did not write). The plan
-extracts it into `ar-cli` so the panel and the CLI call one function; two copies
-is how they drift.
+`check_combos` (measured at `webui.rs:1564`, not the `:1655` the draft said) is
+the validation both surfaces must share — id legal (1-64 of `a-z0-9._-`,
+unique), every target's provider known (registry or `custom_providers:`), every
+strategy one this build routes **or one already in the file** (a save must
+round-trip a config it did not write). Extracted into `commands.rs` (not
+`ar-cli` at large) so the panel re-exports it and the CLI writes call one
+function; two copies is how they drift.
 
-- `aroute combo add --id X --strategy S --targets a,b,c` — validates, then
-  splices one row into `combos:`. Duplicate id refused.
-- `aroute combo remove --id X` — refused while the id is referenced as another
-  combo's step or judge (the same late-failure argument as Phase 2).
-- `aroute combo target add|remove --combo X --target T` — the surgical edit:
-  repointing one combo rather than rewriting the section, validating the target
-  the same way.
+- `aroute combo add <id> --strategy S --targets a,b,c` — validates, then
+  appends one row. `a@2` declares a weight, and the map form is what is
+  written. Duplicate id refused.
+- `aroute combo remove <id>` — refused while the id is referenced as another
+  combo's target, pool entry, step or judge (a wider set than the draft's
+  "step or judge": `combo_names` covers every place a combo can name one).
+- `aroute combo target add|remove --combo X --target T` — the surgical edit.
 
-Test contract:
-- `combo_add_should_reject_a_target_the_catalog_does_not_know`
-- `combo_target_add_should_splice_one_row_and_leave_the_section_byte_identical`
-- `combo_remove_should_refuse_while_another_combo_steps_through_it`
-- `check_combos_should_accept_a_round_trip_of_the_fixture` — already exists at
-  `webui.rs:2618`; it must keep passing after the extraction.
+**What changed from this draft, and why.** The draft says "splices one row into
+`combos:`". A splice cannot. Round-tripping the repo's real `config.yaml`
+against a whole-section splice produced two defects that reading the source
+could not:
+
+1. **The operator's own notes moved.** The repo's `combos:` carries a blank
+   separator and a four-line comment introducing its second row. Rendering the
+   section from the parsed config emitted both in canonical order, so the
+   comment that documents `cheap` ended up *below* it. The panel's wholesale
+   save does this (`webui.rs:1522`) and it is acceptable there; a verb asked to
+   add one row has no business reflowing the other two. The writers are
+   therefore row-level: `append_combo_row` / `remove_combo_row` place or drop a
+   row's own lines and copy every other byte, and
+   `add_target_line` / `remove_target_line` do the same for one target.
+   `import::render_combo_block` is the one owner of a row's shape, used by the
+   wholesale renderer and the row writers alike.
+2. **`splice_section` duplicated rows.** It ended its skip at the first blank
+   line or column-0 comment, reasoning that both are unindented and so belong
+   to the next section. The repo's `combos:` carries a blank separator *inside*
+   the section, so every splice stopped there and the rows after it survived
+   below the rendered block: a three-row table read six. Now a look-ahead
+   (`rest_is_another_section`), which ends the skip only where the next line of
+   substance is column-0 — so a note that introduces the *next* section still
+   survives, and the existing blank-line test still pins that.
+
+Test contract, all six written against the repo's own `config.yaml` through
+`include_str!`:
+- `combo_add_then_remove_is_a_byte_identical_round_trip`
+- `combo_target_add_then_remove_is_a_byte_identical_round_trip`
+- `combo_writers_preserve_the_files_own_trailing_newline` (the Phase 3 contract,
+  restated: `combo add` is the third writer to reach this file)
+- `splice_consumes_a_section_body_that_carries_a_blank_separator` (defect 2)
+- `splice_consumes_a_column_zero_comment_between_two_rows` (defect 2's other
+  half, and the record of why the row writers exist)
+- `check_combos_accepts_the_repos_own_config` (the extraction's own proof)
+
+Verified: add/remove, target add/remove and the weighted map form are each
+byte-identical round trips whose diff is the new row and nothing else; five
+refusals fire with their own messages and none writes a file; the repo's
+`config.yaml` was never opened for writing and the running services were never
+restarted.
 
 ### Phase 5 — `aroute oauth list|add|remove` *(the operator's stated goal)*
 
@@ -420,6 +456,18 @@ semantics prove wrong these inherit the fix rather than the other way round.
    (`commands.rs:2978`, `:3366`) and B-1 fixed the predicate. Phase 0 onward adds
    `render_*_section` siblings beside `import`'s existing ones; the rule is that
    a new writer reuses `splice_section` rather than open-coding YAML.
+
+   **Amended by Phase 4.** `splice_section` owns a *whole section*, and a
+   whole-section write cannot represent a section it did not parse: the
+   operator's own blank separators and inline notes are not in the config
+   model, so re-rendering moves them. For `combos:` — a list of rows, where the
+   operator's notes live *between* the rows — the writers are therefore
+   row-level (`append_combo_row`, `remove_combo_row`, `add_target_line`,
+   `remove_target_line`) and the section-level splice is reserved for the panel's
+   wholesale form save. The rule is now: a writer that touches one row uses a
+   row-level edit; a writer that replaces a table may splice. `visibility:` and
+   `provider-settings:` (Phases 6-7) are single-value sections, so the splice
+   stays right for them.
 2. **The restart note, every write.** The line `9a8821a` added to `limits set`
    is the contract; each new write prints it. A write that does not name the step
    that makes it live is the B-3 failure.
