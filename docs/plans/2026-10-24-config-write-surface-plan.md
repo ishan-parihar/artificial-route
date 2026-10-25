@@ -473,13 +473,30 @@ step 4 first, and it names the one field the new verb must not let pass.
 - `oauth_add_should_require_a_refresh_key_when_the_provider_renews` — new, from
   the `persist_token` finding above.
 
-### Phase 6 — `aroute visibility` *(the section nothing writes, part 1)* — **SHIPPED 2026-10-25**
+### Phase 6 — `aroute visibility` *(the section nothing wrote, part 1)* — **SHIPPED 2026-10-25**
 
 Four fields in `ModelVisibility`. None has a writer anywhere, so the semantics
 are this plan's to choose — and the choice is **list-shaped and reversible**,
 because the field's own doc says the block is the reason nothing is
 irreversible: a blocked provider stays in `registry.json`, it is the *listing*
 that drops it, so there is nothing to re-add.
+
+**Amended by the post-ship validation pass** (`de6bd63`). Driving every write
+verb through its own round trip instead of trusting the phase's tests found that
+`hide-paid` had never been editable at all. Two defects, both in the direction
+nobody had exercised, and both invisible to the phase's own tests because every
+test called the writer on a section whose key was already in the shape being
+written:
+
+| what broke | what the writer did |
+|---|---|
+| the key was matched against a bare `key:` header | a key the operator wrote *with a value* was never found, so every write appended a second copy beside the first — a duplicate-key config the loader refuses |
+| `false` was written as the word | `ModelVisibility` serialises `false` as the key's absence (`skip_serializing_if = "Not::not"`), so spelling it left a byte the operator never put there, and the round trip that should restore the file could not |
+
+The generalisation the other phases now inherit: **a writer's tests must run the
+verb in both directions on a file that starts in the *other* state.** A test
+that starts from the shape being written tests the writer's assumption, not its
+behaviour.
 
 - `aroute visibility show` — the four fields as one row, with `default` for the
   unset ones so a caller cannot confuse "unset" with "empty on purpose".
