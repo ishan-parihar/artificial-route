@@ -530,6 +530,27 @@ behaviour.
   compiling the glob once so an illegal pattern is refused here rather than at
   the first `/v1/models`.
 
+**Amended again 2026-10-25 by the same pass, run on the *remove* direction.**
+Two findings, one recorded and one spec'd:
+
+1. **The remove-then-add round trip is not byte-stable.** `hide-paid false`
+   removes the key — correctly, because absence *is* the canonical spelling of
+   false — and `hide-paid true` then re-adds it at the tail of the section
+   rather than the position it held. `unblock` then `block` does the same for
+   `blocked_providers:`. The config reads identically in both cases; only the
+   key's position moved. The plan's rule is *add-then-remove* restores the file
+   byte-for-byte, and that holds for every verb measured — so this is not a
+   violation of the stated contract, but it is the same class of residual as
+   Phase 7's `continue-on-cut`, and the three are now one finding rather than
+   three. It is put to the operator in `docs/kb/ASKS.md` rather than fixed here,
+   because the fix changes placement behaviour in nine writers at once.
+2. **The two glob lists have no removal verb.** `allow` and `deny` are
+   add-only: there is no `unallow`/`undeny`, so a glob written by mistake has
+   no CLI path out and must be removed by hand. The plan's own spec line reads
+   "the two glob lists, validated by compiling the glob once" and says nothing
+   about removal, so this is a gap in the spec rather than a regression in the
+   code — recorded so the next reader does not have to rediscover it.
+
 **What the plan said, and what measured differently.**
 
 `visibility:` is a map of lists, not a list of rows, so the Phase 4 row writers
