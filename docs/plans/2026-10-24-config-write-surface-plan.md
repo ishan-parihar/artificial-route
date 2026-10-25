@@ -425,7 +425,7 @@ step 4 first, and it names the one field the new verb must not let pass.
 - `oauth_add_should_require_a_refresh_key_when_the_provider_renews` — new, from
   the `persist_token` finding above.
 
-### Phase 6 — `aroute visibility` *(the section nothing writes, part 1)*
+### Phase 6 — `aroute visibility` *(the section nothing writes, part 1)* — **SHIPPED 2026-10-25**
 
 Four fields in `ModelVisibility`. None has a writer anywhere, so the semantics
 are this plan's to choose — and the choice is **list-shaped and reversible**,
@@ -435,6 +435,7 @@ that drops it, so there is nothing to re-add.
 
 - `aroute visibility show` — the four fields as one row, with `default` for the
   unset ones so a caller cannot confuse "unset" with "empty on purpose".
+  Spelled `visibility` with no verb too, the way `aroute server` reads.
 - `aroute visibility block --provider X` / `unblock` — `blocked_providers` add
   or remove, idempotent, both reporting **no-op** rather than an error when the
   state already matches (the `keys list` convention).
@@ -443,6 +444,54 @@ that drops it, so there is nothing to re-add.
 - `aroute visibility allow|deny --glob G` — the two glob lists, validated by
   compiling the glob once so an illegal pattern is refused here rather than at
   the first `/v1/models`.
+
+**What the plan said, and what measured differently.**
+
+`visibility:` is a map of lists, not a list of rows, so the Phase 4 row writers
+do not reach it and two new ones are added beside them: `append_list_entry` and
+`remove_list_entry`. Same discipline, other shape — one entry is placed at the
+end of the list that exists and every other byte is copied, so `block` then
+`unblock` restores the file byte-for-byte. Measured on the repo's `config.yaml`
+(no trailing newline) and on the `oauth:`/`visibility:`/`mcp:` fixture the
+Phase 4 invariant test uses, where the other sections survive untouched.
+
+Four defects the round trip found that reading did not, each pinned by a control
+that fails without its fix:
+
+1. **`section_depth` never matched a section.** It compared a bare name against a
+   header line that carries its colon, so the first `block` on any config added a
+   *second* `visibility:` header and the file failed to load with a duplicate
+   key. The scan's own predicates were right, which is why the headless tests
+   were needed to see it.
+2. **A new key landed in the last section, not its own.** The tail path appended
+   to the end of the document, so an allow-list written into a config whose last
+   section was `mcp:` ended up under `mcp:`. The fix is `section_tail`, and it is
+   the same rule `splice_section` already uses for a missing section.
+3. **A leading-`*` glob breaks the file.** `- *-search` is a YAML *alias*, so the
+   config failed to load with "unknown anchor" — the matcher's glob syntax and
+   YAML's scalar syntax collide exactly there, and the writer is the only place
+   that can see it. `yaml_entry` quotes the values that need quoting and leaves
+   the rest plain.
+4. **`hide-paid` was a flag, not a value.** The plan spells `hide-paid
+   true|false`; clap parses a bare `bool` positional as a toggle, so the arity
+   and the action are named explicitly.
+
+The plan's glob rule was, read literally, unenforceable: the matcher compiles
+anything, so there is no illegal pattern to catch. What is actually checkable is
+narrower and the verb does that — an all-whitespace entry, which
+`normalized()` drops at serve time and would therefore look written while
+changing nothing, is refused. Recorded rather than implemented as written.
+
+**Test contract, as written plus the four above:**
+
+- `block_creates_the_section_when_none_exists`
+- `block_appends_inside_the_existing_list`
+- `blocking_the_same_provider_twice_is_a_no_op_that_says_so`
+- `a_list_entry_write_leaves_the_rest_of_the_document_alone`
+- `a_flow_list_is_refused_rather_than_rewritten`
+- `a_new_key_lands_inside_its_own_section_not_the_last_one`
+- `a_leading_star_glob_is_quoted_so_the_config_still_loads`
+- `a_value_that_needs_no_quoting_is_written_plain`
 
 ### Phase 7 — `aroute provider-settings` + `aroute continue-on-cut` *(the section nothing writes, part 2)*
 
