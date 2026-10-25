@@ -35,7 +35,7 @@ column that matters is the last one — **who can write it today**.
 | 7 | `continue_on_cut:` | provider id list | no | **nothing** | **GAP** |
 | 8 | `visibility:` | `blocked_providers`, `hide_paid_models`, `model_visibility_allowlist`, `model_visibility_denylist` | no | **nothing** | **GAP** |
 | 9 | `provider_settings:` | `excluded_models` (globs) per provider | no | **nothing** | **GAP** |
-| 10 | `limits:` | rpm, usd_micros, tokens, refuse_unpriced, model, model_tokens, spend_window | yes | **yes** (`limits set`/`clear`) | done, `b546f4c` |
+| 10 | `limits:` | rpm, usd_micros, tokens, refuse_unpriced, model, model_tokens, spend_window | yes | **yes** (`limits set`/`clear`) | done, `b546f4c` — **amended by `912941f`: `--key default` wrote a key, not the field** |
 
 Two findings that change the shape of this plan:
 
@@ -67,6 +67,25 @@ excluded. That pass corrected the table above — `custom_providers` has an
 fields not 12, and the panel does write `keys:` where the table said it did
 not — and it confirmed B exactly: no writer for sections 7, 8 or 9 exists
 anywhere in the workspace.*
+
+**C. A shipped writer can be untested in its only user-facing direction.**
+*Found by the post-ship validation pass, 2026-10-25 — the pass that drives every
+write verb through its own round trip rather than re-reading the phase's tests.*
+The defect counts above are per phase and are large; this finding is about a
+*class* that survives inside a phase whose own tests are all green. Two writers
+so far were only ever called on a file already in the shape being written, so the
+direction nobody ran was the one the operator would type:
+
+| verb | what the passing tests could not see |
+|---|---|
+| `visibility hide-paid` | a key the operator wrote **with a value** was never matched, so each write appended a duplicate; and `false` was spelled as the word, though `ModelVisibility`'s canonical form for it is absence |
+| `limits set --key default` | `default` is a field of `limits:`, not an entry in `keys:`, so the named write appended a second row and the ceiling landed on neither |
+
+**The rule this earns, and the phases already shipped now inherit it:** a writer's
+test must start from the *other* state and run both directions. A test that
+starts from the shape being written tests the writer's assumption about its
+input, not its behaviour — and that is precisely where a shipped defect can sit
+while every test in the module is green.
 
 ## 2. What this plan deliberately does not do
 
