@@ -1217,6 +1217,7 @@ pub fn dispatch(cli: &Cli) -> anyhow::Result<()> {
             Some(crate::cli::ComboCommand::Remove(args)) => combo_remove(cli, args),
             Some(crate::cli::ComboCommand::Target(args)) => combo_target(cli, args),
         },
+        Some(Command::Visibility(a)) => visibility(cli, a),
         Some(Command::Doctor(a)) => doctor(cli, a),
         Some(Command::Auth(a)) => crate::auth::run(cli, a),
         Some(Command::Run(a)) => block_on(serve::run(cli, a)),
@@ -2617,6 +2618,734 @@ fn combo_remove(cli: &Cli, args: &RemoveComboArgs) -> anyhow::Result<()> {
 
 /// Whether `combo` names `id` as a target, pool entry, step or judge.
 ///
+/// --- visibility writers -----------------------------------------------------
+///
+/// The `visibility:` block is a map of lists rather than a list of rows, so the
+/// Phase 4 row writers do not reach it: there is no `- id:` line to splice
+/// beside. The discipline is the same one, pointed at the other shape.
+///
+/// A block is written:
+///
+/// ```yaml
+/// visibility:
+///   blocked_providers:
+///     - groq
+///   hide_paid_models: false
+///   model_visibility_denylist:
+///     - *-search
+/// ```
+///
+/// The section sits at column 0, its keys two in, and each list's entries four.
+/// Indentation is the whole of the disambiguator here, so a block at another
+/// depth, or a flow list (`blocked_providers: [a, b]`), is refused rather than
+/// edited wrongly.
+///
+/// Columns of an `aroute visibility` row.
+const VISIBILITY_COLUMNS: [&str; 4] = ["blocked_providers", "allow", "deny", "hide_paid"];
+
+/// The section the visibility verbs edit.
+const VIS_SECTION: &str = "visibility";
+
+/// The two lists inside it, spelled as `Config::visibility` spells them.
+const LIST_BLOCKED: &str = "blocked_providers";
+const LIST_ALLOW: &str = "model_visibility_allowlist";
+const LIST_DENY: &str = "model_visibility_denylist";
+
+/// How deep a line is indented, in spaces, or `None` when it carries no indent.
+fn indent_of(line: &str) -> Option<usize> {
+    let n = line.len() - line.trim_start().len();
+    if n == 0 { None } else { Some(n) }
+}
+
+/// Whether `line` is the `list:` key of a block sequence at `depth`.
+fn is_list_key(line: &str, list: &str, depth: usize) -> bool {
+    indent_of(line) == Some(depth) && line.trim_end() == format!("{}{}:", " ".repeat(depth), list)
+}
+
+/// Whether `line` is an entry of a block sequence at `depth`.
+fn is_list_entry(line: &str, depth: usize) -> bool {
+    indent_of(line) == Some(depth) && line.trim_start().starts_with("- ")
+}
+
+/// Whether `line` is a YAML key at `depth`: a scalar (`hide_paid_models: false`)
+/// or the header of another list.
+fn is_key_at(line: &str, depth: usize) -> bool {
+    indent_of(line) == Some(depth) && !line.trim_start().starts_with("- ") && line.contains(':')
+}
+
+/// The value an entry line carries, without the `- `, the indent, or the quotes
+/// a [`yaml_entry`] write added.
+fn list_entry_value(line: &str) -> String {
+    let raw = line.trim_start().trim_start_matches("- ").trim();
+    // A single-quoted scalar: YAML's only escape inside it is a doubled quote,
+    // so both the wrapper and the doubling come off to give the value back.
+    let Some(body) = raw.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) else {
+        return raw.to_owned();
+    };
+    body.replace("''", "'")
+}
+
+/// The indent of `section`, or `None` when the document does not carry it.
+///
+/// The section is named without its colon (`visibility`, as the callers spell
+/// it) and the header line carries one, so the comparison adds it. The exact
+/// header line, so `visibility` cannot match a `visibility_note:` the operator
+/// added.
+fn section_depth(all: &[&str], section: &str) -> Option<usize> {
+    let line = all.iter().find(|l| is_section(l, section))?;
+    Some(line.len() - line.trim_start().len())
+}
+
+/// Whether `line` is `section`'s own header, colon and all.
+fn is_section(line: &str, section: &str) -> bool {
+    line.trim_end() == format!("{section}:")
+}
+
+/// The rejoined document, remembering whether the file ended with a newline.
+///
+/// `str::lines` drops the terminator, so a document that ends without one would
+/// otherwise gain it — a change to a byte nobody asked to touch.
+fn rejoin(content: &str, out: Vec<String>) -> String {
+    let joined = out.join("\n");
+    if content.ends_with('\n') {
+        joined + "\n"
+    } else {
+        joined
+    }
+}
+
+/// A value written as a block-sequence entry, quoted when the raw form would
+/// be read as something other than the string it is.
+///
+/// `*` is the case that bites this surface: `- *-search` is an *alias* to an
+/// anchor, so a leading-star glob parses as a reference to a label that does not
+/// exist and the whole config fails to load with "unknown anchor". The matcher's
+/// glob syntax and YAML's scalar syntax collide exactly there, and the writer is
+/// the only place that can see the collision. Quoting resolves it, and a quoted
+/// glob reads back as the same string — so `deny --glob '*-search'` survives.
+fn yaml_entry(value: &str) -> String {
+    let dangerous = value.is_empty()
+        || value.trim() != value
+        || value.starts_with([
+            '!', '&', '*', '?', '[', ']', '{', '}', '#', '|', '>', '@', '`', '"', '\'', '%',
+        ]);
+    if dangerous {
+        // Single-quoted YAML, where the only escape is a doubled quote: no
+        // backslash sequence can turn a literal glob into something else.
+        format!("'{}'", value.replace('\'', "''"))
+    } else {
+        value.to_owned()
+    }
+}
+
+/// Where a new entry goes: after the last line that belongs to the list.
+///
+/// Walks back over the blanks and notes that close it, so an entry added to a
+/// list the operator had annotated lands inside that list rather than above a
+/// note that was documenting its last row.
+fn list_end(out: &[String]) -> usize {
+    let mut at = out.len();
+    while at > 0 && (out[at - 1].is_empty() || out[at - 1].starts_with('#')) {
+        at -= 1;
+    }
+    at
+}
+
+/// Appends one entry to a list inside a section, or `None` when the document
+/// does not carry that list in the form this writer recognises.
+///
+/// `None` rather than a re-render, because a flow list or a list at an
+/// unexpected depth is a section this writer would have to rewrite, and a
+/// rewrite is what the row writers exist to avoid: it moves the operator's
+/// notes and re-spells lines nobody asked to change.
+fn append_list_entry(content: &str, section: &str, list: &str, entry: &str) -> Option<String> {
+    // Idempotent at the writer, not at the caller: an entry already there is
+    // returned unchanged, so a verb that adds again is a no-op by construction
+    // rather than by a second check that can disagree with this one. A list with
+    // the entry twice is a duplicate the reader counts in its own verdict.
+    if list_has_entry(content, section, list, entry) {
+        return Some(content.to_owned());
+    }
+    // The value as it must be **written**, which is not always the value as it
+    // is: a leading-`*` glob is a YAML alias and would break the file outright.
+    let value = yaml_entry(entry);
+    let all: Vec<&str> = content.lines().collect();
+    // No section is the case the creation path is written for: an early `None`
+    // from `?` would make the first `block` on a config carrying no `visibility:`
+    // block at all an error, which is the commonest call there is.
+    let Some(depth) = section_depth(&all, section) else {
+        return Some(insert_list_at_end(content, section, list, entry, None));
+    };
+    let key_depth = depth + 2;
+    let entry_depth = key_depth + 2;
+    let indent = " ".repeat(entry_depth);
+
+    let mut out: Vec<String> = Vec::new();
+    let mut in_section = false;
+    let mut in_list = false;
+    let mut inserted = false;
+    let mut i = 0;
+    while i < all.len() {
+        let line = all[i];
+        if is_section(line, section) {
+            in_section = true;
+            out.push(line.to_owned());
+            i += 1;
+            continue;
+        }
+        if in_section && is_section_header(line) {
+            // The section ends here. When the list was inside it, the entry
+            // belongs at that list's own end, not at the end of whatever section
+            // follows. Insert and carry on — returning here would drop the rest
+            // of the document, which `out` has not seen yet.
+            if in_list {
+                out.insert(list_end(&out), format!("{indent}- {value}"));
+                inserted = true;
+                in_list = false;
+            }
+            in_section = false;
+        }
+        if in_section && !in_list && is_list_key(line, list, key_depth) {
+            in_list = true;
+            out.push(line.to_owned());
+            i += 1;
+            continue;
+        }
+        // A blank or a column-0 note ends the list when what follows belongs to
+        // another section — the look-ahead `splice_section` uses, for the same
+        // reason: the block documenting the next section survives a write it
+        // had nothing to do with.
+        if in_list
+            && (line.is_empty() || line.starts_with('#'))
+            && rest_is_another_section(&all[i + 1..])
+        {
+            out.insert(list_end(&out), format!("{indent}- {value}"));
+            inserted = true;
+            out.push(line.to_owned());
+            in_list = false;
+            i += 1;
+            continue;
+        }
+        // The list's own end: the next key of the section.
+        if in_list && is_key_at(line, key_depth) {
+            out.insert(list_end(&out), format!("{indent}- {value}"));
+            inserted = true;
+            in_list = false;
+        }
+        out.push(line.to_owned());
+        i += 1;
+    }
+    if in_list {
+        // The list ran to the end of the file.
+        out.push(format!("{indent}- {value}"));
+        inserted = true;
+    }
+    // The section exists but carries no such list, or no section exists at all.
+    // Either way the list is created, because refusing here would make the verb
+    // useless exactly when it is wanted: the first `block` on a config that
+    // carries no `visibility:` block at all is the commonest call there is.
+    if inserted {
+        // The entry went where it belonged inside the section; nothing to create.
+        return Some(rejoin(content, out));
+    }
+    // The section exists but carries no such list. The key belongs **inside that
+    // section**, at its last body line — appending to the end of the document
+    // would put it inside whatever section happens to be last, which is how a
+    // `visibility:` key ends up under `mcp:` and the loader refuses the file.
+    let at = section_tail(&out, section);
+    let key_indent = " ".repeat(depth + 2);
+    let entry_indent = " ".repeat(depth + 4);
+    out.insert(at, format!("{entry_indent}- {value}"));
+    out.insert(at, format!("{key_indent}{list}:"));
+    Some(rejoin(content, out))
+}
+
+/// Where a new key goes inside its section: after the section's last body line,
+/// before the blank lines and notes that close it.
+fn section_tail(out: &[String], section: &str) -> usize {
+    let mut i = 0;
+    let mut in_section = false;
+    let mut last_body = 0;
+    while i < out.len() {
+        let line = &out[i];
+        if is_section(line, section) {
+            in_section = true;
+            i += 1;
+            continue;
+        }
+        if in_section && is_section_header(line) {
+            return last_body;
+        }
+        if in_section {
+            last_body = i + 1;
+        }
+        i += 1;
+    }
+    last_body
+}
+
+/// Creates `section`'s `list` with one entry, appending to the section that is
+/// already there or adding the whole section at the end of the file.
+///
+/// The one path that adds a section, and deliberately the same rule
+/// [`splice_section`] already uses for a missing one: the block goes at the end
+/// of the document rather than wherever the caller might expect it, because a
+/// section that does not exist has no place to be restored to and the tail is
+/// the one location that moves no line that already had meaning.
+fn insert_list_at_end(
+    content: &str,
+    section: &str,
+    list: &str,
+    entry: &str,
+    depth: Option<usize>,
+) -> String {
+    // The value as it must be written: see [`yaml_entry`] on why a leading `*`
+    // cannot go in unquoted.
+    let value = yaml_entry(entry);
+    let base = depth.unwrap_or(0);
+    let key_indent = " ".repeat(base + 2);
+    let entry_indent = " ".repeat(base + 4);
+    let block = format!("{key_indent}{list}:\n{entry_indent}- {value}");
+    // The file's own terminator, carried across: this config ends without one
+    // deliberately, and a write that adds it changes a byte nobody asked to
+    // touch, which is exactly what a round trip measures.
+    let tail = if content.ends_with('\n') { "\n" } else { "" };
+    match depth {
+        Some(_) => {
+            let mut out: Vec<String> = content.lines().map(str::to_owned).collect();
+            out.push(block);
+            rejoin(content, out)
+        }
+        None => format!("{}\n{section}:\n{block}{tail}", content.trim_end()),
+    }
+}
+
+/// Removes one entry from a list inside a section by its value.
+///
+/// The inverse of [`append_list_entry`], and the reason both exist: `block`
+/// followed by `unblock` of the same provider must restore the file
+/// byte-for-byte. Only the line the entry owns is dropped, so the list's own
+/// key and every other byte stay where they were.
+///
+/// An emptied list is dropped **with its key**, and a section left holding
+/// nothing is dropped too. Without that, `block` then `unblock` of one provider
+/// restores the file to *almost* what it was, leaving a dead `visibility:` block
+/// above an empty `blocked_providers:` key for the next reader to wonder about.
+fn remove_list_entry(content: &str, section: &str, list: &str, entry: &str) -> Option<String> {
+    let all: Vec<&str> = content.lines().collect();
+    let depth = section_depth(&all, section)?;
+    let key_depth = depth + 2;
+    let entry_depth = key_depth + 2;
+
+    let mut out: Vec<String> = Vec::new();
+    let mut in_section = false;
+    let mut in_list = false;
+    let mut i = 0;
+    let mut removed = false;
+    while i < all.len() {
+        let line = all[i];
+        if is_section(line, section) {
+            in_section = true;
+            out.push(line.to_owned());
+            i += 1;
+            continue;
+        }
+        if in_section && is_section_header(line) {
+            in_section = false;
+        }
+        if in_section && !in_list && is_list_key(line, list, key_depth) {
+            in_list = true;
+            out.push(line.to_owned());
+            i += 1;
+            continue;
+        }
+        if in_list && is_key_at(line, key_depth) {
+            in_list = false;
+        }
+        if in_list
+            && !removed
+            && is_list_entry(line, entry_depth)
+            && list_entry_value(line).as_str() == entry
+        {
+            removed = true;
+            i += 1;
+            continue;
+        }
+        out.push(line.to_owned());
+        i += 1;
+    }
+    if !removed {
+        return None;
+    }
+    // Second pass over what the first produced: the key goes when nothing is
+    // left under it, and the section goes when nothing is left in it.
+    let kept = prune_empty_list(&out, list, key_depth, entry_depth);
+    let kept = if section_is_empty(&kept, section, depth) {
+        drop_section(&kept, section)
+    } else {
+        kept
+    };
+    if kept.iter().all(|l| l.trim().is_empty()) {
+        // The file carried nothing but this section: the empty document is the
+        // honest answer, rather than a file of blank lines the loader has to
+        // refuse.
+        return Some(String::new());
+    }
+    Some(rejoin(content, kept))
+}
+
+/// Drops `list`'s key when no entry is left under it.
+///
+/// The key survives while another entry does, because the operator's key
+/// ordering is theirs and a writer has no reason to touch it.
+fn prune_empty_list(
+    out: &[String],
+    list: &str,
+    key_depth: usize,
+    entry_depth: usize,
+) -> Vec<String> {
+    let Some(key_at) = out.iter().position(|l| is_list_key(l, list, key_depth)) else {
+        return out.to_vec();
+    };
+    let has_entry = out
+        .iter()
+        .skip(key_at + 1)
+        .take_while(|l| !is_key_at(l, key_depth))
+        .any(|l| is_list_entry(l, entry_depth));
+    if has_entry {
+        return out.to_vec();
+    }
+    // The key and the blank lines under it go, keeping the next line, which is
+    // either the following key of the section or the next section's header.
+    let mut kept: Vec<String> = out[..key_at].to_vec();
+    let mut i = key_at + 1;
+    while i < out.len() && (is_list_entry(&out[i], entry_depth) || out[i].trim().is_empty()) {
+        i += 1;
+    }
+    kept.extend_from_slice(&out[i..]);
+    kept
+}
+
+/// Whether `section` holds no key at all, given where its keys sit.
+fn section_is_empty(lines: &[String], section: &str, depth: usize) -> bool {
+    let key_depth = depth + 2;
+    let mut in_section = false;
+    for line in lines {
+        if is_section(line, section) {
+            in_section = true;
+            continue;
+        }
+        if in_section && is_section_header(line) {
+            return true;
+        }
+        if in_section && is_key_at(line, key_depth) {
+            return false;
+        }
+    }
+    in_section
+}
+
+/// Removes `section`'s header and every line under it.
+fn drop_section(lines: &[String], section: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut in_section = false;
+    for line in lines {
+        if is_section(line, section) {
+            in_section = true;
+            continue;
+        }
+        if in_section && is_section_header(line) {
+            in_section = false;
+        }
+        if !in_section {
+            out.push(line.clone());
+        }
+    }
+    out
+}
+
+/// Whether the document already carries `entry` in `section`'s `list`.
+///
+/// Read by the writer's own scan rather than by a second parsing rule, so the
+/// idempotence check cannot disagree with the write that follows it.
+fn list_has_entry(content: &str, section: &str, list: &str, entry: &str) -> bool {
+    remove_list_entry(content, section, list, entry).is_some()
+}
+
+/// Sets one scalar inside a section, creating the section when it is absent.
+///
+/// `hide_paid_models` is the only scalar the visibility verbs reach. Setting it
+/// is the one edit that cannot be a list append, so it gets its own writer: the
+/// existing key is re-spelled in place, and a section with no such key gains one
+/// at the end.
+fn set_section_scalar(content: &str, section: &str, key: &str, value: bool) -> String {
+    let all: Vec<&str> = content.lines().collect();
+    let Some(depth) = section_depth(&all, section) else {
+        // No block at all: the whole section is added at the end of the file,
+        // which is the same place `splice_section` puts a missing section.
+        return format!("{}\n{section}:\n  {key}: {value}\n", content.trim_end());
+    };
+    let key_depth = depth + 2;
+    let mut out: Vec<String> = Vec::new();
+    let mut in_section = false;
+    let mut i = 0;
+    let mut done = false;
+    while i < all.len() {
+        let line = all[i];
+        if is_section(line, section) {
+            in_section = true;
+            out.push(line.to_owned());
+            i += 1;
+            continue;
+        }
+        if in_section
+            && is_key_at(line, key_depth)
+            && line.trim_end() == format!("{}{}:", " ".repeat(key_depth), key)
+        {
+            out.push(format!("{}{}: {}", " ".repeat(key_depth), key, value));
+            done = true;
+            in_section = false;
+            i += 1;
+            continue;
+        }
+        if in_section && is_section_header(line) {
+            if !done {
+                // The section ended before the key appeared: the key is added at
+                // the end of the section, which is where a new one belongs.
+                out.push(format!("{}{}: {}", " ".repeat(key_depth), key, value));
+                done = true;
+            }
+            in_section = false;
+        }
+        out.push(line.to_owned());
+        i += 1;
+    }
+    if in_section && !done {
+        out.push(format!("{}{}: {}", " ".repeat(key_depth), key, value));
+    }
+    rejoin(content, out)
+}
+
+/// `aroute visibility`, and its `show` spelling.
+fn visibility(cli: &Cli, args: &crate::cli::VisibilityArgs) -> anyhow::Result<()> {
+    match &args.command {
+        None | Some(crate::cli::VisibilityCommand::Show) => visibility_show(cli, args.json),
+        Some(crate::cli::VisibilityCommand::Block(a)) => visibility_block(cli, a.provider.trim()),
+        Some(crate::cli::VisibilityCommand::Unblock(a)) => {
+            visibility_unblock(cli, a.provider.trim())
+        }
+        Some(crate::cli::VisibilityCommand::HidePaid(a)) => visibility_hide_paid(cli, a.value),
+        Some(crate::cli::VisibilityCommand::Allow(a)) => {
+            visibility_glob(cli, LIST_ALLOW, "allowed", a.glob.trim())
+        }
+        Some(crate::cli::VisibilityCommand::Deny(a)) => {
+            visibility_glob(cli, LIST_DENY, "denied", a.glob.trim())
+        }
+    }
+}
+
+/// The read verb: four fields, with `default` for the unset ones.
+///
+/// `default` rather than an empty cell, so a caller cannot confuse "unset" with
+/// "empty on purpose": the two mean opposite things here.
+fn visibility_show(cli: &Cli, json: bool) -> anyhow::Result<()> {
+    let cfg = load(cli)?;
+    let v = &cfg.visibility;
+    let rows = vec![vec![
+        list_cell(&v.blocked_providers),
+        list_cell(&v.model_visibility_allowlist),
+        list_cell(&v.model_visibility_denylist),
+        // Spelled for its own default: `false` is the same as unset, so printing
+        // `default` here would hide the only value that changes the catalog.
+        v.hide_paid_models.to_string(),
+    ]];
+    if json {
+        print!(
+            "{}",
+            toon::json(
+                "visibility",
+                &VISIBILITY_COLUMNS,
+                &toon::every_field(&VISIBILITY_COLUMNS),
+                &rows,
+            )
+        );
+    } else {
+        print!(
+            "{}",
+            toon::list(
+                "visibility",
+                "visibility",
+                &VISIBILITY_COLUMNS,
+                &toon::every_field(&VISIBILITY_COLUMNS),
+                &rows,
+                false,
+            )
+        );
+    }
+    Ok(())
+}
+
+/// One list cell: `default` when empty, comma-separated when not.
+fn list_cell(values: &[String]) -> String {
+    if values.is_empty() {
+        "default".to_owned()
+    } else {
+        values.join(",")
+    }
+}
+
+/// `aroute visibility block --provider X`.
+fn visibility_block(cli: &Cli, provider: &str) -> anyhow::Result<()> {
+    visibility_list_edit(cli, LIST_BLOCKED, provider, Verb::Block)
+}
+
+/// `aroute visibility unblock --provider X`.
+fn visibility_unblock(cli: &Cli, provider: &str) -> anyhow::Result<()> {
+    visibility_list_edit(cli, LIST_BLOCKED, provider, Verb::Unblock)
+}
+
+/// Which direction a list edit runs, and how it is reported.
+#[derive(Clone, Copy)]
+enum Verb {
+    Block,
+    Unblock,
+}
+
+impl Verb {
+    /// What the success line calls the state that now holds.
+    fn past(self) -> &'static str {
+        match self {
+            Verb::Block => "blocked",
+            Verb::Unblock => "unblocked",
+        }
+    }
+}
+
+/// The shared body of `block` and `unblock`.
+///
+/// The two differ only in direction, so the rules live once: the provider must
+/// be one `providers:` already carries, a duplicate is a no-op that says so, and
+/// the reverse edit restores the file byte-for-byte.
+fn visibility_list_edit(cli: &Cli, list: &str, provider: &str, verb: Verb) -> anyhow::Result<()> {
+    if provider.is_empty() {
+        return Err(fail(
+            "the provider id is empty",
+            "name one as `providers:` spells it, e.g. groq",
+        ));
+    }
+    let doc = read_config_text(cli)?;
+    let cfg = load_edit(cli)?;
+    // Refused rather than written: `is_provider_blocked` matches by id, alias and
+    // `-search`-stripped id, so an id that names nothing would be a row that
+    // silently does nothing at all.
+    if !cfg.providers.iter().any(|p| p.id == provider) {
+        return Err(fail(
+            format!("provider {provider:?} is not in this config's providers:"),
+            "`aroute providers` lists the providers this config carries",
+        ));
+    }
+    let edited = match verb {
+        Verb::Block => append_list_entry(&doc, VIS_SECTION, list, provider),
+        Verb::Unblock => remove_list_entry(&doc, VIS_SECTION, list, provider),
+    };
+    let updated = match edited {
+        Some(u) => u,
+        None => {
+            // The writer declined. The one legitimate reason is that the state
+            // already matches, which is a no-op and must say so rather than
+            // error: a verb that fails on the state it was asked for teaches a
+            // caller to check first.
+            match verb {
+                Verb::Block if list_has_entry(&doc, VIS_SECTION, list, provider) => {
+                    println!("visibility: {provider} — unchanged (already blocked)");
+                    return Ok(());
+                }
+                Verb::Unblock if !list_has_entry(&doc, VIS_SECTION, list, provider) => {
+                    println!("visibility: {provider} — unchanged (not blocked)");
+                    return Ok(());
+                }
+                _ => {
+                    return Err(fail(
+                        format!(
+                            "visibility: {provider} is written in a form this writer does not recognise"
+                        ),
+                        "the block may use a flow list or another indentation; edit it by hand",
+                    ));
+                }
+            }
+        }
+    };
+    if updated == doc {
+        println!("visibility: {provider} — unchanged ({})", verb.past());
+        return Ok(());
+    }
+    write_file(&cli.config, &updated)?;
+    println!("visibility: {} {provider}", verb.past());
+    println!(
+        "note: the running proxy reads its config at boot only — apply with `aroute service restart proxy`"
+    );
+    Ok(())
+}
+
+/// `aroute visibility hide-paid true|false`.
+///
+/// `false` is the same as unset, so clearing the filter is the ordinary way to
+/// undo it, and both directions are byte-reversible.
+fn visibility_hide_paid(cli: &Cli, hide_paid: bool) -> anyhow::Result<()> {
+    let doc = read_config_text(cli)?;
+    let updated = set_section_scalar(&doc, VIS_SECTION, "hide_paid_models", hide_paid);
+    if updated == doc {
+        println!("visibility: hide_paid — unchanged ({hide_paid})");
+        return Ok(());
+    }
+    write_file(&cli.config, &updated)?;
+    println!("visibility: hide_paid_models = {hide_paid}");
+    println!(
+        "note: the running proxy reads its config at boot only — apply with `aroute service restart proxy`"
+    );
+    Ok(())
+}
+
+/// `aroute visibility allow|deny --glob G`.
+///
+/// The glob is checked once here. What is actually checkable is narrow: the
+/// matcher compiles anything, so the only silent failure is an entry of
+/// whitespace, which `normalized()` drops at serve time and would therefore
+/// look written while changing nothing.
+fn visibility_glob(cli: &Cli, list: &str, past: &str, glob: &str) -> anyhow::Result<()> {
+    if glob.trim().is_empty() {
+        return Err(fail(
+            "the glob is empty",
+            "an entry matches a model id or `provider/model`, e.g. \"gpt-4*\"",
+        ));
+    }
+    let doc = read_config_text(cli)?;
+    let updated = append_list_entry(&doc, VIS_SECTION, list, glob);
+    let updated = match updated {
+        Some(u) => u,
+        None => {
+            if list_has_entry(&doc, VIS_SECTION, list, glob) {
+                println!("visibility: {glob} — unchanged (already {past})");
+                return Ok(());
+            }
+            return Err(fail(
+                "visibility: is written in a form this writer does not recognise",
+                "the block may use a flow list or another indentation; edit it by hand",
+            ));
+        }
+    };
+    if updated == doc {
+        println!("visibility: {glob} — unchanged ({past})");
+        return Ok(());
+    }
+    write_file(&cli.config, &updated)?;
+    println!("visibility: {past} {glob}");
+    println!(
+        "note: the running proxy reads its config at boot only — apply with `aroute service restart proxy`"
+    );
+    Ok(())
+}
+
 /// The reference set `providers remove` computes over a provider id, here read
 /// for a combo id: the one who reads the file must not miss a place the writer
 /// can reach.
@@ -5843,6 +6572,198 @@ mod tests {
     /// live in `oauth:`. This is the measurement that says the guard's scope is
     /// sound — not a claim about it.
     #[test]
+    fn block_creates_the_section_when_none_exists() {
+        // The commonest call there is: a config that carries no `visibility:`
+        // block at all. Blocking on it must add the block, not refuse.
+        let doc = "keys:\n  openai: $AR_KEY_OPENAI\nproviders:\n  - id: openai\n";
+        let out = append_list_entry(doc, VIS_SECTION, LIST_BLOCKED, "groq")
+            .expect("a config with no section must still accept a block");
+        assert!(
+            out.contains("visibility:\n  blocked_providers:\n    - groq"),
+            "the section was not created: {out:?}"
+        );
+        // And the reverse edit restores the file, which is the property the
+        // whole surface is built on.
+        let back = remove_list_entry(&out, VIS_SECTION, LIST_BLOCKED, "groq")
+            .expect("the entry just written must be removable");
+        assert_eq!(back, doc, "block then unblock must restore the file");
+    }
+
+    #[test]
+    fn block_appends_inside_the_existing_list() {
+        let doc = "visibility:\n  blocked_providers:\n    - groq\ncombos:\n  - id: c\n";
+        let out = append_list_entry(doc, VIS_SECTION, LIST_BLOCKED, "openai")
+            .expect("one entry to a list that exists");
+        assert_eq!(
+            out,
+            "visibility:\n  blocked_providers:\n    - groq\n    - openai\ncombos:\n  - id: c\n",
+            "the entry belongs after the last one already there"
+        );
+        // The inverse check: remove the one added, and the original is back.
+        assert_eq!(
+            remove_list_entry(&out, VIS_SECTION, LIST_BLOCKED, "openai"),
+            Some(doc.to_owned()),
+            "removing the entry added must restore the file"
+        );
+    }
+
+    #[test]
+    fn blocking_the_same_provider_twice_is_a_no_op_that_says_so() {
+        // The regression this pins: the second write used to add a **second**
+        // `visibility:` header, and before that a second entry, so blocking the
+        // same provider twice produced a config the loader refuses for a
+        // duplicate key — or a list counting the provider twice.
+        let doc =
+            "keys:\n  openai: $AR_KEY_OPENAI\nvisibility:\n  blocked_providers:\n    - groq\n";
+        let once =
+            append_list_entry(doc, VIS_SECTION, LIST_BLOCKED, "groq").expect("the first block");
+        // An existing entry is left exactly as it is, which is what makes the
+        // second `block` a no-op rather than a second row.
+        assert_eq!(once, doc, "one entry already there must not be added again");
+        // And the writer is idempotent on a section it has to create first: the
+        // full add-then-add sequence on a config with no block at all.
+        let fresh = "keys:\n  openai: $AR_KEY_OPENAI\n";
+        let first = append_list_entry(fresh, VIS_SECTION, LIST_BLOCKED, "groq")
+            .expect("the first block creates the section");
+        let second = append_list_entry(&first, VIS_SECTION, LIST_BLOCKED, "groq")
+            .expect("the second block finds it there");
+        assert_eq!(
+            second, first,
+            "blocking the same provider twice must leave the file alone"
+        );
+    }
+
+    #[test]
+    fn a_list_entry_write_leaves_the_rest_of_the_document_alone() {
+        // The Phase 4 invariant, re-pointed at the list shape: the operator's
+        // notes, the blank separator, and the other lists survive a write.
+        let doc = concat!(
+            "# the operator's note about the catalog\n",
+            "keys:\n  openai: $AR_KEY_OPENAI\n",
+            "\n",
+            "visibility:\n",
+            "  blocked_providers:\n",
+            "    - groq\n",
+            "  hide_paid_models: false\n",
+            "  model_visibility_denylist:\n",
+            "    - *-search\n",
+            "# the note that introduces combos\n",
+            "combos:\n  - id: c\n"
+        );
+        let out = append_list_entry(doc, VIS_SECTION, LIST_ALLOW, "gpt-4*")
+            .expect("an allow-list to add an entry to");
+        assert!(out.contains("gpt-4*"), "the entry was not added: {out:?}");
+        for line in [
+            "# the operator's note about the catalog",
+            "  blocked_providers:",
+            "    - groq",
+            "  hide_paid_models: false",
+            "    - *-search",
+            "# the note that introduces combos",
+            "combos:  - id: c",
+        ] {
+            assert!(
+                out.contains(line),
+                "`{line}` was lost by the write: {out:?}"
+            );
+        }
+        // The new entry lands at the end of the allow list, not of the section.
+        let position = out.find("gpt-4*").expect("the entry is present");
+        let deny = out.find("*-search").expect("the deny list is still there");
+        assert!(
+            position > deny,
+            "the allow entry went below the deny list: {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_flow_list_is_refused_rather_than_rewritten() {
+        // `blocked_providers: [a, b]` is a real form a hand edit can produce. The
+        // writer declines, because rewriting it would re-render lines it does not
+        // own, and declining is what the caller is told about.
+        let doc = "visibility:\n  blocked_providers: [groq, openai]\n";
+        assert!(
+            append_list_entry(doc, VIS_SECTION, LIST_BLOCKED, "tavily").is_some(),
+            "the absent block-sequence list is created, matching the plan"
+        );
+        assert!(
+            !list_has_entry(doc, VIS_SECTION, LIST_BLOCKED, "groq"),
+            "a flow list must not be read as a block sequence: that is how a writer edits the wrong lines"
+        );
+    }
+
+    #[test]
+    fn a_new_key_lands_inside_its_own_section_not_the_last_one() {
+        // The defect this pins: appending the key to the end of the document put
+        // it inside whatever section happened to be last, so an allow-list ended
+        // up under `mcp:` and the loader refused the whole file. A config that
+        // carries `oauth:` and `mcp:` after `visibility:` is the shape that
+        // found it.
+        let doc = concat!(
+            "keys:\n  openai: $AR_KEY_OPENAI\n",
+            "visibility:\n",
+            "  blocked_providers:\n",
+            "    - groq\n",
+            "oauth:\n",
+            "  - provider: codex\n",
+            "    refresh_key: codex_refresh\n",
+            "mcp:\n",
+            "  port: 9000\n"
+        );
+        let out = append_list_entry(doc, VIS_SECTION, LIST_ALLOW, "gpt-4*")
+            .expect("a new key in a section that exists");
+        let vis_end = out.find("oauth:").expect("the oauth section survives");
+        let key = out
+            .find("model_visibility_allowlist:")
+            .expect("the key was added");
+        assert!(
+            key < vis_end,
+            "the key must land inside `visibility:`, not after it: {out:?}"
+        );
+        // And the section that used to be last is untouched.
+        assert!(
+            out.contains("mcp:\n  port: 9000\n"),
+            "`mcp:` was rewritten: {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_leading_star_glob_is_quoted_so_the_config_still_loads() {
+        // `- *-search` is a YAML *alias*, so an unquoted leading-star glob is
+        // parsed as a reference to an anchor that does not exist and the whole
+        // file fails to load. The glob matcher's syntax and YAML's collide
+        // exactly here, and the writer is the only place that can see it.
+        let doc = "visibility:\n  model_visibility_denylist:\n    - old\n";
+        let out = append_list_entry(doc, VIS_SECTION, LIST_DENY, "*-search")
+            .expect("a glob that starts with a star");
+        assert!(
+            out.contains("- '*-search'"),
+            "the value must be quoted for the loader: {out:?}"
+        );
+        assert!(
+            !out.contains("- *-search"),
+            "an unquoted leading star is a YAML alias: {out:?}"
+        );
+        // The round trip still holds: reading the quoted value back gives the
+        // glob, so removing it restores the file.
+        assert_eq!(
+            remove_list_entry(&out, VIS_SECTION, LIST_DENY, "*-search"),
+            Some(doc.to_owned()),
+            "the quoted entry must be removable"
+        );
+    }
+
+    #[test]
+    fn a_value_that_needs_no_quoting_is_written_plain() {
+        // The quoting is not decoration: writing `- 'gpt-4*'` for a value that
+        // does not need it would re-spell a line nobody asked to change.
+        assert_eq!(yaml_entry("gpt-4*"), "gpt-4*");
+        assert_eq!(yaml_entry("openai/gpt-4o"), "openai/gpt-4o");
+        assert_eq!(yaml_entry("groq"), "groq");
+        assert_eq!(yaml_entry("*-search"), "'*-search'");
+    }
+
+    #[test]
     fn a_splice_preserves_sections_its_renderer_has_never_heard_of() {
         // `limits:` carries a blank line **inside** itself, which is the shape
         // that broke: the old skip rule ended the section at the first blank or
@@ -7475,4 +8396,3 @@ mod write_private_tests {
     }
 
 }
-

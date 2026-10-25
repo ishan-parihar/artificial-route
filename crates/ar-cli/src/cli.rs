@@ -90,6 +90,23 @@ pub enum Command {
     #[command(verbatim_doc_comment)]
     Combo(ComboArgs),
 
+    /// Read and write the catalog-visibility block: the section nothing wrote.
+    ///
+    /// The block is the reason nothing here is irreversible — a blocked
+    /// provider stays in `registry.json` and in `providers:`, it is the listing
+    /// that drops it, so there is nothing to re-add. Every verb is therefore
+    /// reversible by construction, and `add` then `remove` of the same value
+    /// restores the file byte-for-byte.
+    ///
+    /// Examples:
+    ///   aroute visibility
+    ///   aroute visibility block --provider groq
+    ///   aroute visibility unblock --provider groq
+    ///   aroute visibility hide-paid true
+    ///   aroute visibility allow --glob "gpt-4*"
+    #[command(verbatim_doc_comment)]
+    Visibility(VisibilityArgs),
+
     /// Check config, credentials and registry; exits 1 on any failure.
     ///
     /// Examples:
@@ -1265,6 +1282,105 @@ pub struct ComboTargetArgs2 {
     /// `provider/model` target to add or remove.
     #[arg(long, value_name = "TARGET")]
     pub target: String,
+}
+
+/// Options for `aroute visibility`. `None` shows the block, exactly as
+/// `aroute server` does, so `aroute visibility` is the read verb with no flags.
+#[derive(Debug, Args)]
+pub struct VisibilityArgs {
+    #[command(subcommand)]
+    pub command: Option<VisibilityCommand>,
+
+    /// Emit the same row as JSON instead of TOON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Subcommands of `aroute visibility`.
+#[derive(Debug, Subcommand)]
+pub enum VisibilityCommand {
+    /// Print the four fields, with `default` for the unset ones.
+    ///
+    /// `default` rather than an empty cell, so a caller cannot confuse "unset"
+    /// with "empty on purpose": the two mean opposite things here.
+    ///
+    /// Examples:
+    ///   aroute visibility show
+    ///   aroute visibility show --json
+    #[command(verbatim_doc_comment)]
+    Show,
+
+    /// Drop a provider from the catalog listing by id.
+    ///
+    /// Idempotent: blocking a provider already blocked reports `unchanged`
+    /// rather than an error, the `keys list` convention.
+    ///
+    /// Examples:
+    ///   aroute visibility block --provider groq
+    #[command(verbatim_doc_comment)]
+    Block(VisibilityProviderArgs),
+
+    /// Restore a provider to the catalog listing.
+    ///
+    /// Examples:
+    ///   aroute visibility unblock --provider groq
+    #[command(verbatim_doc_comment)]
+    Unblock(VisibilityProviderArgs),
+
+    /// Set or clear the paid-model filter.
+    ///
+    /// `false` is the same as unset, which is the unfiltered catalog.
+    ///
+    /// Examples:
+    ///   aroute visibility hide-paid true
+    ///   aroute visibility hide-paid false
+    #[command(verbatim_doc_comment)]
+    HidePaid(HidePaidArgs),
+
+    /// Add one glob to the expose list.
+    ///
+    /// A glob is validated by compiling it once here, so an illegal pattern is
+    /// refused by this verb rather than at the first `/v1/models`.
+    ///
+    /// Examples:
+    ///   aroute visibility allow --glob "gpt-4*"
+    #[command(verbatim_doc_comment)]
+    Allow(VisibilityGlobArgs),
+
+    /// Add one glob to the hide list. A deny wins an overlapping allow.
+    ///
+    /// Examples:
+    ///   aroute visibility deny --glob "*-search"
+    #[command(verbatim_doc_comment)]
+    Deny(VisibilityGlobArgs),
+}
+
+/// The provider id the `block` / `unblock` verbs name.
+#[derive(Debug, Args)]
+pub struct VisibilityProviderArgs {
+    /// Provider id to block or unblock, as `providers:` spells it.
+    #[arg(long, value_name = "ID")]
+    pub provider: String,
+}
+
+/// The boolean `hide-paid` takes.
+#[derive(Debug, Args)]
+pub struct HidePaidArgs {
+    /// `true` hides models with no documented free tier.
+    ///
+    /// Positional, as the plan spells it (`hide-paid true|false`). A `bool`
+    /// positional is a flag by clap's default, which would make `true` a toggle
+    /// and `false` an error, so the parser and the arity are named explicitly.
+    #[arg(value_name = "BOOL", num_args = 1, action = clap::ArgAction::Set)]
+    pub value: bool,
+}
+
+/// The glob the `allow` / `deny` verbs name.
+#[derive(Debug, Args)]
+pub struct VisibilityGlobArgs {
+    /// Glob to add, matched against `model` and `provider/model`.
+    #[arg(long, value_name = "GLOB")]
+    pub glob: String,
 }
 
 /// Options for `aroute server`.
