@@ -5828,6 +5828,64 @@ mod tests {
         );
     }
 
+    /// The invariant Phase 0's guard depends on, stated as a test so a future
+    /// writer cannot quietly break it.
+    ///
+    /// `guard_against_section_loss` covers `import` alone, which is only safe
+    /// because `import` is the **only** path that regenerates a whole
+    /// `config.yaml`. Every other writer splices one section or edits one row,
+    /// and both copy every line they do not own — so an `oauth:`, `visibility:`
+    /// or `mcp:` block survives a write it was never part of.
+    ///
+    /// The property is worth pinning precisely because it is invisible: a
+    /// whole-document writer added later would drop those blocks with a zero
+    /// exit code and no line naming the loss, and the operator's live sessions
+    /// live in `oauth:`. This is the measurement that says the guard's scope is
+    /// sound — not a claim about it.
+    #[test]
+    fn a_splice_preserves_sections_its_renderer_has_never_heard_of() {
+        // `limits:` carries a blank line **inside** itself, which is the shape
+        // that broke: the old skip rule ended the section at the first blank or
+        // column-0 comment, so a body separator looked like the next section's
+        // boundary.
+        let doc = "server:\n  host: 127.0.0.1\n  port: 20128\nkeys:\n  openai: $AR_KEY_OPENAI\nlimits:\n  default:\n    rpm: 10\n\n  # the nano tier\n  nano:\n    rpm: 5\noauth:\n  - provider: codex\n    refresh_key: codex_refresh\nvisibility:\n  defaults:\n    admin: true\nmcp:\n  port: 9000\n";
+
+        // A `limits:` splice, whose renderer knows nothing of the rest.
+        let out = splice_section(doc, "limits", "limits:\n  default:\n    rpm: 20\n");
+        for section in ["server:", "keys:", "oauth:", "visibility:", "mcp:"] {
+            assert!(
+                out.contains(section),
+                "`{section}` survived a splice: {out:?}"
+            );
+        }
+        // And the edit itself landed, rather than being dropped as a no-op.
+        assert!(out.contains("rpm: 20"), "the edit must be present: {out:?}");
+        assert!(
+            !out.contains("rpm: 10\n"),
+            "the old value must be gone: {out:?}"
+        );
+        // The replaced section's own tail must go **with** it. The old rule ended
+        // the skip at the blank line, so the operator's `nano:` rows survived
+        // below the spliced block and the limits were half-replaced: the
+        // rendered section claimed `rpm: 20` and the operator's own tier was
+        // still in the file underneath. That is a *duplicated* body, not a lost
+        // one, which is why a section-preservation check alone would miss it.
+        assert!(
+            !out.contains("# the nano tier"),
+            "the replaced section's tail must not survive below it: {out:?}"
+        );
+        assert!(
+            !out.contains("nano:\n    rpm: 5"),
+            "the replaced section's tail must not survive below it: {out:?}"
+        );
+        // The block that documents the *next* section stays above it, which is
+        // the look-ahead's other half.
+        assert!(
+            out.contains("oauth:\n  - provider: codex\n    refresh_key: codex_refresh\n"),
+            "the session row must be intact: {out:?}"
+        );
+    }
+
     #[test]
     fn splice_inserts_a_missing_section_before_combos() {
         let doc = "keys:\n  a: $AR_KEY_A\ncombos:\n  - id: c\n";
