@@ -1218,6 +1218,8 @@ pub fn dispatch(cli: &Cli) -> anyhow::Result<()> {
             Some(crate::cli::ComboCommand::Target(args)) => combo_target(cli, args),
         },
         Some(Command::Visibility(a)) => visibility(cli, a),
+        Some(Command::ProviderSettings(a)) => provider_settings(cli, a),
+        Some(Command::ContinueOnCut(a)) => continue_on_cut(cli, a),
         Some(Command::Doctor(a)) => doctor(cli, a),
         Some(Command::Auth(a)) => crate::auth::run(cli, a),
         Some(Command::Run(a)) => block_on(serve::run(cli, a)),
@@ -1446,7 +1448,13 @@ fn models(cli: &Cli, args: &ListArgs) -> anyhow::Result<()> {
         print!(
             "{}",
             toon::list_paged(
-                "models", "models", &MODEL_COLUMNS, &fields, &rows, args.full, total
+                "models",
+                "models",
+                &MODEL_COLUMNS,
+                &fields,
+                &rows,
+                args.full,
+                total
             )
         );
     }
@@ -2128,6 +2136,779 @@ fn providers_add(cli: &Cli, args: &crate::cli::AddProviderArgs) -> anyhow::Resul
     Ok(())
 }
 
+/// --- provider-settings and continue-on-cut writers ---------------------------
+///
+/// Two shapes Phase 6 did not need, and the reason this phase came last.
+///
+/// `continue_on_cut:` is a flat list of provider ids at the top level, which
+/// [`append_list_entry`] already covers.
+///
+/// `provider_settings:` is a map of maps: a key per provider id, each holding
+/// that provider's own `excluded_models` list. A key-per-id outer layer means
+/// the list's depth depends on which provider is being edited, so the writers
+/// below carry a base depth rather than assuming the section is the base:
+///
+/// ```yaml
+/// provider_settings:
+///   openai:
+///     excluded_models:
+///       - *-search
+/// ```
+///
+/// The section sits at 0, a provider's key at 2, its list at 4, and the list's
+/// entries at 6.
+///
+/// The section name the provider-settings verbs edit.
+const PS_SECTION: &str = "provider_settings";
+
+/// The only list inside a provider's own rules today.
+const PS_LIST: &str = "excluded_models";
+
+/// Appends one entry to a list nested inside a named key of a section.
+///
+/// `section` is the outer block, `owner` the key inside it whose list is
+/// edited — the provider id for `provider_settings`, or `None` when the list
+/// belongs to the section itself (`continue_on_cut`, whose entries sit directly
+/// under the header).
+///
+/// The depths are derived rather than assumed, so the section's own indentation
+/// is honoured and a block written at another depth is refused rather than
+/// edited wrongly.
+fn append_nested_list_entry(
+    content: &str,
+    section: &str,
+    owner: Option<&str>,
+    list: &str,
+    entry: &str,
+) -> Option<String> {
+    if nested_list_has_entry(content, section, owner, list, entry) {
+        return Some(content.to_owned());
+    }
+    let all: Vec<&str> = content.lines().collect();
+    // One binding for the section's indent, so the derived depths below read as
+    // arithmetic rather than as a chain of fallbacks.
+    let base = section_depth(&all, section).unwrap_or(0);
+    // The entry's depth moves with whether there is an owner at all: a list under
+    // a provider key sits two deeper than one directly under the section.
+    let entry_depth = base + if owner.is_some() { 6 } else { 2 };
+    let value = yaml_entry(entry);
+    // The section does not exist yet: it is created whole, at the end of the
+    // document, and `create_nested_list` owns the shape.
+    if !all.iter().any(|l| is_section(l, section)) {
+        return Some(create_nested_list(
+            content, section, owner, list, entry, base,
+        ));
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let mut in_section = false;
+    let mut in_owner = false;
+    let mut in_list = false;
+    let mut inserted = false;
+    let mut i = 0;
+    while i < all.len() {
+        let line = all[i];
+        if is_section(line, section) {
+            in_section = true;
+            out.push(line.to_owned());
+            i += 1;
+            continue;
+        }
+        if in_section && owner.is_none() {
+            // A flat list has no key line, so its entries are the section's own
+            // body. Whether this line is one decides between keeping it and
+            // ending the list. The write happens once, at the end, so returning
+            // here would drop the rest of the document.
+            if is_list_entry(line, base + 2) {
+                in_list = true;
+                out.push(line.to_owned());
+                i += 1;
+                continue;
+            }
+            if in_list {
+                out.insert(
+                    list_end(&out),
+                    format!("{}- {value}", " ".repeat(entry_depth)),
+                );
+                inserted = true;
+                in_list = false;
+            }
+        }
+        if in_section && is_section_header(line) {
+            // The section ended without a list in it: `create_nested_list`
+            // puts one at the section's tail, wherever that now sits.
+            if owner.is_none() {
+                return Some(create_nested_list(
+                    content, section, owner, list, &value, base,
+                ));
+            }
+            in_section = false;
+        }
+        if in_section
+            && owner.is_some()
+            && !in_owner
+            && is_key_at(line, base + 2)
+            && line.trim_end() == format!("{}{}:", " ".repeat(base + 2), owner.unwrap())
+        {
+            in_owner = true;
+            out.push(line.to_owned());
+            i += 1;
+            continue;
+        }
+        if in_owner && is_section_header(line) {
+            // The provider's key ended before its list appeared: the list is
+            // added under that key, not at the end of the section.
+            if in_list {
+                out.insert(
+                    list_end(&out),
+                    format!("{}- {value}", " ".repeat(entry_depth)),
+                );
+                return Some(rejoin(content, out));
+            }
+            in_section = false;
+            in_owner = false;
+        }
+        if in_owner && !in_list && is_list_key(line, list, base + 4) {
+            in_list = true;
+            out.push(line.to_owned());
+            i += 1;
+            continue;
+        }
+        if in_list
+            && (line.is_empty() || line.starts_with('#'))
+            && rest_is_another_section(&all[i + 1..])
+        {
+            out.insert(
+                list_end(&out),
+                format!("{}- {value}", " ".repeat(entry_depth)),
+            );
+            return Some(rejoin(content, out));
+        }
+        if in_list && is_key_at(line, base + 4) {
+            out.insert(
+                list_end(&out),
+                format!("{}- {value}", " ".repeat(entry_depth)),
+            );
+            in_list = false;
+        }
+        out.push(line.to_owned());
+        i += 1;
+    }
+    if inserted {
+        return Some(rejoin(content, out));
+    }
+    if in_list {
+        // The list ran to the end of the file: the entry goes after it.
+        out.push(format!("{}- {value}", " ".repeat(entry_depth)));
+        return Some(rejoin(content, out));
+    }
+    // The list is not written yet: the provider's key, the list, and the entry
+    // are all created, each in the place it belongs.
+    Some(create_nested_list(
+        content, section, owner, list, &value, base,
+    ))
+}
+
+/// Whether the nested list already carries `entry`.
+fn nested_list_has_entry(
+    content: &str,
+    section: &str,
+    owner: Option<&str>,
+    list: &str,
+    entry: &str,
+) -> bool {
+    remove_nested_list_entry(content, section, owner, list, entry).is_some()
+        || scan_nested_entry(content, section, owner, list, entry)
+}
+
+/// Reads the nested list for `entry` without rewriting anything.
+fn scan_nested_entry(
+    content: &str,
+    section: &str,
+    owner: Option<&str>,
+    list: &str,
+    entry: &str,
+) -> bool {
+    let all: Vec<&str> = content.lines().collect();
+    let Some(base) = section_depth(&all, section) else {
+        return false;
+    };
+    // A list under a provider key sits two deeper than one directly under the
+    // section, so the entry's depth moves with whether there is an owner at all.
+    let list_depth = base + if owner.is_some() { 4 } else { 2 };
+    let entry_depth = base + if owner.is_some() { 6 } else { 2 };
+    let mut in_section = false;
+    let mut in_owner = false;
+    let mut in_list = false;
+    for line in &all {
+        if is_section(line, section) {
+            in_section = true;
+            continue;
+        }
+        if in_section && is_section_header(line) {
+            in_section = false;
+        }
+        if in_section
+            && owner.is_some()
+            && !in_owner
+            && line.trim_end() == format!("{}{}:", " ".repeat(base + 2), owner.unwrap_or_default())
+        {
+            in_owner = true;
+            continue;
+        }
+        if in_section && owner.is_none() {
+            in_owner = true;
+            // With no provider key the section's own body is the list, so it
+            // opens the moment the section does rather than on a key line.
+            in_list = true;
+        }
+        if in_owner && !in_list && is_list_key(line, list, list_depth) {
+            in_list = true;
+            continue;
+        }
+        if in_list && is_key_at(line, list_depth) {
+            in_list = false;
+        }
+        if in_list && is_list_entry(line, entry_depth) && list_entry_value(line) == entry {
+            return true;
+        }
+    }
+    false
+}
+
+/// Removes one entry from the nested list, keeping every other byte.
+fn remove_nested_list_entry(
+    content: &str,
+    section: &str,
+    owner: Option<&str>,
+    list: &str,
+    entry: &str,
+) -> Option<String> {
+    let all: Vec<&str> = content.lines().collect();
+    let base = section_depth(&all, section)?;
+    let owner_depth = base + 2;
+    // A list under a provider key sits two deeper than one directly under the
+    // section, so the entry's depth moves with whether there is an owner at all.
+    let list_depth = base + if owner.is_some() { 4 } else { 2 };
+    let entry_depth = base + if owner.is_some() { 6 } else { 2 };
+
+    let mut out: Vec<String> = Vec::new();
+    let mut in_section = false;
+    let mut in_owner = false;
+    let mut in_list = false;
+    let mut i = 0;
+    let mut removed = false;
+    while i < all.len() {
+        let line = all[i];
+        if is_section(line, section) {
+            in_section = true;
+            out.push(line.to_owned());
+            i += 1;
+            continue;
+        }
+        if in_section && is_section_header(line) {
+            in_section = false;
+        }
+        if in_section
+            && owner.is_some()
+            && !in_owner
+            && line.trim_end()
+                == format!("{}{}:", " ".repeat(owner_depth), owner.unwrap_or_default())
+        {
+            in_owner = true;
+            out.push(line.to_owned());
+            i += 1;
+            continue;
+        }
+        if in_section && owner.is_none() {
+            in_owner = true;
+            // With no provider key the section's own body is the list, so it
+            // opens the moment the section does rather than on a key line.
+            in_list = true;
+        }
+        if in_owner && !in_list && is_list_key(line, list, list_depth) {
+            in_list = true;
+            out.push(line.to_owned());
+            i += 1;
+            continue;
+        }
+        if in_list && is_key_at(line, list_depth) {
+            in_list = false;
+        }
+        if in_list
+            && !removed
+            && is_list_entry(line, entry_depth)
+            && list_entry_value(line) == entry
+        {
+            removed = true;
+            i += 1;
+            continue;
+        }
+        out.push(line.to_owned());
+        i += 1;
+    }
+    if !removed {
+        return None;
+    }
+    // Second pass over what the first produced: the list key goes when no entry
+    // is left under it, the provider's key goes when no list is left under that,
+    // and the section goes when no key is left in it. Without this, `exclude`
+    // then `include` of one glob restores the file to *almost* what it was, with
+    // a dead `provider_settings:` block the next reader has to wonder about.
+    let mut kept = prune_empty_list(&out, list, list_depth, entry_depth);
+    // Then the provider's own key: with the list gone it holds nothing, so it
+    // goes too. Pruning only the list leaves `openai:` standing under an empty
+    // section, which is the other half of what a round trip must not leave.
+    if let Some(owner_key) = owner {
+        kept = prune_empty_key(&kept, base, owner_key);
+    }
+    let section_body = kept.iter().skip_while(|l| !is_section(l, section)).skip(1);
+    // Whether the section still holds anything. A flat list has no key under
+    // it, so its entries are the content and counting only keys would read a
+    // surviving entry as an empty section and drop it with the last entry gone.
+    let body_entry_depth = base + if owner.is_some() { 6 } else { 2 };
+    if section_body
+        .clone()
+        .take_while(|l| !is_section_header(l))
+        .all(|l| !is_key_at(l, base + 2) && !is_list_entry(l, body_entry_depth))
+    {
+        kept = drop_section(&kept, section);
+    }
+    Some(rejoin(content, kept))
+}
+
+/// Drops `owner`'s key when no list is left under it.
+///
+/// Only the key and what sits under it go: the section is the caller's call, and
+/// another provider's block is nobody else's business here.
+fn prune_empty_key(lines: &[String], base: usize, owner: &str) -> Vec<String> {
+    let owner_depth = base + 2;
+    let header = format!("{}{}:", " ".repeat(owner_depth), owner);
+    let Some(at) = lines.iter().position(|l| l.trim_end() == header) else {
+        return lines.to_vec();
+    };
+    let body: Vec<&String> = lines
+        .iter()
+        .skip(at + 1)
+        .take_while(|l| indent_of(l).is_none_or(|d| d > owner_depth))
+        .collect();
+    let has_list = body.iter().any(|l| is_key_at(l, owner_depth + 2));
+    if has_list {
+        return lines.to_vec();
+    }
+    let mut kept = lines[..at].to_vec();
+    let mut i = at + 1 + body.len();
+    // A blank the key was separated by goes with it, so the next provider's
+    // block is not left with a stray separator above it.
+    while i < lines.len() && lines[i].trim().is_empty() {
+        i += 1;
+    }
+    kept.extend_from_slice(&lines[i..]);
+    kept
+}
+
+/// Creates the list, its owner key, and the section, whichever are missing.
+fn create_nested_list(
+    content: &str,
+    section: &str,
+    owner: Option<&str>,
+    list: &str,
+    value: &str,
+    base: usize,
+) -> String {
+    let base_indent = base;
+    // A list under a provider key sits two deeper than one directly under the
+    // section, and its entries one deeper again. With no owner there is no
+    // intervening key line, so the entry's own indent is the list's.
+    let list_indent = base_indent + if owner.is_some() { 4 } else { 2 };
+    let entry_indent = base_indent + if owner.is_some() { 6 } else { 2 };
+    // Quoted here as it is on every other path: the value a caller passes is the
+    // glob, and the form written is YAML's, and those two only coincide until a
+    // leading `*` shows up.
+    let entry_line = format!("{}- {}", " ".repeat(entry_indent), yaml_entry(value));
+    match (
+        owner,
+        section_depth(&content.lines().collect::<Vec<_>>(), section),
+    ) {
+        (Some(id), Some(_)) => {
+            // The section exists; the provider's key and its list are added at
+            // that section's own tail, the same rule `section_tail` applies.
+            let mut out: Vec<String> = content.lines().map(str::to_owned).collect();
+            let at = section_tail(&out, section);
+            out.insert(at, format!("{}{}:", " ".repeat(base_indent + 2), id));
+            out.insert(at + 1, format!("{}{}:", " ".repeat(list_indent), list));
+            out.insert(at + 2, entry_line);
+            rejoin(content, out)
+        }
+        (None, Some(_)) => {
+            // A list directly under the section: the entries go in, with no
+            // intervening key line. Writing the list's own name here is what
+            // produced `continue_on_cut:` under a `continue_on_cut:` section,
+            // which is a map the loader refuses.
+            let mut out: Vec<String> = content.lines().map(str::to_owned).collect();
+            let at = section_tail(&out, section);
+            out.insert(at, entry_line);
+            rejoin(content, out)
+        }
+        (_, None) => {
+            // No section at all: the whole block is added at the end, which is
+            // where `splice_section` puts a missing section.
+            let mut body = String::new();
+            if let Some(id) = owner {
+                body.push_str(&format!("{}{}:\n", " ".repeat(base_indent + 2), id));
+                body.push_str(&format!("{}{}:\n", " ".repeat(list_indent), list));
+            }
+            body.push_str(&entry_line);
+            // The file's own terminator, carried across: this config
+            // ends without one deliberately, and a write that adds one
+            // changes a byte nobody asked to touch, which is what a round
+            // trip measures. The separator before the new section is always
+            // a newline, though -- a section glued onto the last line of the
+            // previous one is a YAML error, and the file would not load at all.
+            let tail = if content.ends_with('\n') { "\n" } else { "" };
+            format!("{}\n{section}:\n{body}{tail}", content.trim_end())
+        }
+    }
+}
+
+/// `aroute provider-settings`, and its `show` spelling.
+fn provider_settings(cli: &Cli, args: &crate::cli::ProviderSettingsArgs) -> anyhow::Result<()> {
+    match &args.command {
+        None | Some(crate::cli::ProviderSettingsCommand::Show) => {
+            provider_settings_show(cli, args.json)
+        }
+        Some(crate::cli::ProviderSettingsCommand::Exclude(a)) => {
+            provider_settings_glob(cli, &a.provider, &a.glob, ExcludeVerb::Exclude)
+        }
+        Some(crate::cli::ProviderSettingsCommand::Include(a)) => {
+            provider_settings_glob(cli, &a.provider, &a.glob, ExcludeVerb::Include)
+        }
+    }
+}
+
+/// The read verb: one row per provider, with `default` for the unset ones.
+fn provider_settings_show(cli: &Cli, json: bool) -> anyhow::Result<()> {
+    let cfg = load(cli)?;
+    // One row per provider the config carries, whether or not it has rules, so a
+    // provider the block does not name reads as "advertising everything" rather
+    // than as absent.
+    let mut rows: Vec<Vec<String>> = cfg
+        .providers
+        .iter()
+        .map(|p| {
+            let excluded = cfg
+                .provider_settings
+                .get(&p.id)
+                .map(|s| s.excluded_models.clone())
+                .unwrap_or_default();
+            vec![p.id.clone(), list_cell(&excluded)]
+        })
+        .collect();
+    rows.sort();
+    if json {
+        print!(
+            "{}",
+            toon::json(
+                "provider_settings",
+                &PS_COLUMNS,
+                &toon::every_field(&PS_COLUMNS),
+                &rows,
+            )
+        );
+    } else {
+        print!(
+            "{}",
+            toon::list(
+                "provider_settings",
+                "provider_settings",
+                &PS_COLUMNS,
+                &toon::every_field(&PS_COLUMNS),
+                &rows,
+                false,
+            )
+        );
+    }
+    Ok(())
+}
+
+/// Columns of an `aroute provider-settings` row.
+const PS_COLUMNS: [&str; 2] = ["provider", "excluded_models"];
+
+/// Which direction one provider's list edit runs.
+#[derive(Clone, Copy)]
+enum ExcludeVerb {
+    Exclude,
+    Include,
+}
+
+impl ExcludeVerb {
+    /// What the success line calls the state that now holds.
+    fn past(self) -> &'static str {
+        match self {
+            ExcludeVerb::Exclude => "excluded",
+            ExcludeVerb::Include => "included",
+        }
+    }
+}
+
+/// The shared body of `exclude` and `include`: one glob, one provider, and the
+/// whole list printed afterwards so a caller can read the state back.
+fn provider_settings_glob(
+    cli: &Cli,
+    provider: &str,
+    glob: &str,
+    verb: ExcludeVerb,
+) -> anyhow::Result<()> {
+    let provider = provider.trim();
+    if provider.is_empty() {
+        return Err(fail(
+            "the provider id is empty",
+            "name one as `providers:` spells it, e.g. openai",
+        ));
+    }
+    if glob.trim().is_empty() {
+        return Err(fail(
+            "the glob is empty",
+            "an entry matches a model id or `provider/model`, e.g. \"gpt-4*\"",
+        ));
+    }
+    let doc = read_config_text(cli)?;
+    let cfg = load_edit(cli)?;
+    if !cfg.providers.iter().any(|p| p.id == provider) {
+        return Err(fail(
+            format!("provider {provider:?} is not in this config's providers:"),
+            "`aroute providers` lists the providers this config carries",
+        ));
+    }
+    let owner = Some(provider);
+    let edited = match verb {
+        ExcludeVerb::Exclude => {
+            append_nested_list_entry(&doc, PS_SECTION, owner, PS_LIST, glob.trim())
+        }
+        ExcludeVerb::Include => {
+            remove_nested_list_entry(&doc, PS_SECTION, owner, PS_LIST, glob.trim())
+        }
+    };
+    let updated = match edited {
+        Some(u) => u,
+        None => match verb {
+            ExcludeVerb::Exclude
+                if nested_list_has_entry(&doc, PS_SECTION, owner, PS_LIST, glob.trim()) =>
+            {
+                println!("provider_settings: {provider} {glob} — unchanged (already excluded)");
+                return Ok(());
+            }
+            ExcludeVerb::Include
+                if !nested_list_has_entry(&doc, PS_SECTION, owner, PS_LIST, glob.trim()) =>
+            {
+                println!("provider_settings: {provider} {glob} — unchanged (not excluded)");
+                return Ok(());
+            }
+            _ => {
+                return Err(fail(
+                    format!(
+                        "provider_settings: {provider} is written in a form this writer does not recognise"
+                    ),
+                    "the block may use a flow list or another indentation; edit it by hand",
+                ));
+            }
+        },
+    };
+    if updated == doc {
+        println!(
+            "provider_settings: {provider} {glob} — unchanged ({})",
+            verb.past()
+        );
+        return Ok(());
+    }
+    write_file(&cli.config, &updated)?;
+    println!("provider_settings: {} {glob} for {provider}", verb.past());
+    print_list_after_edit(&updated, provider);
+    println!(
+        "note: the running proxy reads its config at boot only — apply with `aroute service restart proxy`"
+    );
+    Ok(())
+}
+
+/// Prints the provider's list as it stands after the edit.
+fn print_list_after_edit(doc: &str, provider: &str) {
+    let all: Vec<&str> = doc.lines().collect();
+    let Some(base) = section_depth(&all, PS_SECTION) else {
+        println!("  excluded_models: default");
+        return;
+    };
+    let owner_depth = base + 2;
+    let list_depth = base + 4;
+    // Only ever a provider's list: the owner is the argument, never the None
+    // case the writers accept for a list that sits directly under the section.
+    let entry_depth = base + 6;
+    let mut in_section = false;
+    let mut in_owner = false;
+    let mut in_list = false;
+    let mut entries: Vec<String> = Vec::new();
+    for line in &all {
+        if is_section(line, PS_SECTION) {
+            in_section = true;
+            continue;
+        }
+        if in_section && is_section_header(line) {
+            in_section = false;
+        }
+        if in_section
+            && !in_owner
+            && line.trim_end() == format!("{}{}:", " ".repeat(owner_depth), provider)
+        {
+            in_owner = true;
+            continue;
+        }
+        if in_owner && !in_list && is_list_key(line, PS_LIST, list_depth) {
+            in_list = true;
+            continue;
+        }
+        if in_list && is_key_at(line, list_depth) {
+            in_list = false;
+        }
+        if in_list && is_list_entry(line, entry_depth) {
+            entries.push(list_entry_value(line));
+        }
+    }
+    if entries.is_empty() {
+        println!("  excluded_models: default");
+    } else {
+        println!("  excluded_models: {}", entries.join(","));
+    }
+}
+
+/// `aroute continue-on-cut`, and its `show` spelling.
+fn continue_on_cut(cli: &Cli, args: &crate::cli::ContinueOnCutArgs) -> anyhow::Result<()> {
+    match &args.command {
+        None | Some(crate::cli::ContinueOnCutCommand::Show) => continue_on_cut_show(cli, args.json),
+        Some(crate::cli::ContinueOnCutCommand::Add(a)) => {
+            continue_on_cut_edit(cli, a.provider.trim(), ListVerb::Add)
+        }
+        Some(crate::cli::ContinueOnCutCommand::Remove(a)) => {
+            continue_on_cut_edit(cli, a.provider.trim(), ListVerb::Remove)
+        }
+    }
+}
+
+/// Which direction the flat-list edit runs. Separate from [`Verb`] because the
+/// past-tense words differ and one enum cannot serve two vocabularies.
+#[derive(Clone, Copy)]
+enum ListVerb {
+    Add,
+    Remove,
+}
+
+impl ListVerb {
+    fn past(self) -> &'static str {
+        match self {
+            ListVerb::Add => "added",
+            ListVerb::Remove => "removed",
+        }
+    }
+}
+
+/// The read verb: the whole list, with `default` for the empty one.
+fn continue_on_cut_show(cli: &Cli, json: bool) -> anyhow::Result<()> {
+    let cfg = load(cli)?;
+    let rows = vec![vec![list_cell(&cfg.continue_on_cut)]];
+    if json {
+        print!(
+            "{}",
+            toon::json(
+                "continue_on_cut",
+                &CUT_COLUMNS,
+                &toon::every_field(&CUT_COLUMNS),
+                &rows,
+            )
+        );
+    } else {
+        print!(
+            "{}",
+            toon::list(
+                "continue_on_cut",
+                "continue_on_cut",
+                &CUT_COLUMNS,
+                &toon::every_field(&CUT_COLUMNS),
+                &rows,
+                false,
+            )
+        );
+    }
+    Ok(())
+}
+
+/// Columns of an `aroute continue-on-cut` row.
+const CUT_COLUMNS: [&str; 1] = ["providers"];
+
+/// The section name the continue-on-cut verbs edit.
+const CUT_SECTION: &str = "continue_on_cut";
+
+/// The shared body of `add` and `remove`: one provider id, and the whole list
+/// printed afterwards, because empty means "no continuation anywhere" and a
+/// caller who cannot read the list cannot reason about what it does.
+fn continue_on_cut_edit(cli: &Cli, provider: &str, verb: ListVerb) -> anyhow::Result<()> {
+    if provider.is_empty() {
+        return Err(fail(
+            "the provider id is empty",
+            "name one as `providers:` spells it, e.g. openai",
+        ));
+    }
+    let doc = read_config_text(cli)?;
+    let cfg = load_edit(cli)?;
+    if !cfg.providers.iter().any(|p| p.id == provider) {
+        return Err(fail(
+            format!("provider {provider:?} is not in this config's providers:"),
+            "`aroute providers` lists the providers this config carries",
+        ));
+    }
+    // `continue_on_cut:` is a flat list directly under its own header, so it is
+    // the `owner = None` case: the entries sit two under the section, not four.
+    let edited = match verb {
+        ListVerb::Add => append_nested_list_entry(&doc, CUT_SECTION, None, CUT_SECTION, provider),
+        ListVerb::Remove => {
+            remove_nested_list_entry(&doc, CUT_SECTION, None, CUT_SECTION, provider)
+        }
+    };
+    let updated = match edited {
+        Some(u) => u,
+        None => {
+            let listed = nested_list_has_entry(&doc, CUT_SECTION, None, CUT_SECTION, provider);
+            match verb {
+                ListVerb::Add if listed => {
+                    println!("continue_on_cut: {provider} — unchanged (already listed)");
+                    return Ok(());
+                }
+                ListVerb::Remove if !listed => {
+                    println!("continue_on_cut: {provider} — unchanged (not listed)");
+                    return Ok(());
+                }
+                _ => {
+                    return Err(fail(
+                        format!(
+                            "continue_on_cut: {provider} is written in a form this writer does not recognise"
+                        ),
+                        "the block may use a flow list or another indentation; edit it by hand",
+                    ));
+                }
+            }
+        }
+    };
+    if updated == doc {
+        println!("continue_on_cut: {provider} — unchanged ({})", verb.past());
+        return Ok(());
+    }
+    write_file(&cli.config, &updated)?;
+    println!("continue_on_cut: {} {provider}", verb.past());
+    let cfg = load_edit(cli)?;
+    println!("  providers: {}", list_cell(&cfg.continue_on_cut));
+    println!(
+        "note: the running proxy reads its config at boot only — apply with `aroute service restart proxy`"
+    );
+    Ok(())
+}
+
 /// Configures an ad-hoc endpoint: the `custom_providers:` row, the `keys:`
 /// reference and the `$AR_KEY_*` value.
 ///
@@ -2334,8 +3115,8 @@ fn providers_remove(cli: &Cli, args: &crate::cli::RemoveProviderArgs) -> anyhow:
     // `custom_providers:`, and a verb that adds a row another verb refuses to
     // remove is a half-built feature — the row is configured either way, and
     // `splice_remove_provider` already drops both.
-    let configured = cfg.providers.iter().any(|p| p.id == id)
-        || cfg.custom_providers.iter().any(|c| c.id == id);
+    let configured =
+        cfg.providers.iter().any(|p| p.id == id) || cfg.custom_providers.iter().any(|c| c.id == id);
     if !configured {
         return Err(fail(
             format!("provider {id:?} is not configured in this file"),
@@ -2468,7 +3249,13 @@ fn combo(cli: &Cli, args: &ListArgs) -> anyhow::Result<()> {
         print!(
             "{}",
             toon::list_paged(
-                "combo", "combos", &COMBO_COLUMNS, &fields, &rows, args.full, total
+                "combo",
+                "combos",
+                &COMBO_COLUMNS,
+                &fields,
+                &rows,
+                args.full,
+                total
             )
         );
     }
@@ -2814,11 +3601,11 @@ fn append_list_entry(content: &str, section: &str, list: &str, entry: &str) -> O
         // A blank or a column-0 note ends the list when what follows belongs to
         // another section — the look-ahead `splice_section` uses, for the same
         // reason: the block documenting the next section survives a write it
-        // had nothing to do with.
-        if in_list
-            && (line.is_empty() || line.starts_with('#'))
-            && rest_is_another_section(&all[i + 1..])
-        {
+        // had nothing to do with. A note immediately after this list is the
+        // same situation from the other side: it is the *rest of the section's*
+        // trailing matter, so the entry goes in above it rather than below it,
+        // where it would read as part of the block the note introduces.
+        if in_list && (line.is_empty() || line.starts_with('#')) {
             out.insert(list_end(&out), format!("{indent}- {value}"));
             inserted = true;
             out.push(line.to_owned());
@@ -4667,12 +5454,15 @@ fn status_of(scope: [&str; 2], units: &[ServiceUnit]) -> anyhow::Result<()> {
                 unit.port(),
                 boot_word(enabled)
             ),
-            (true, "active", ProbeResult::NotApplicable) => format!(
-                "active, {}",
-                boot_word(enabled)
-            ),
+            (true, "active", ProbeResult::NotApplicable) => {
+                format!("active, {}", boot_word(enabled))
+            }
             (true, other, _) => {
-                format!("{other}, {} — start it with `aroute service start {}", boot_word(enabled), unit.slug())
+                format!(
+                    "{other}, {} — start it with `aroute service start {}",
+                    boot_word(enabled),
+                    unit.slug()
+                )
             }
         };
         // Down means systemd is not running it OR it is not answering. An
@@ -4853,7 +5643,6 @@ fn change(scope: [&str; 2], verb: &str, unit: ServiceUnit) -> anyhow::Result<()>
         )),
     }
 }
-
 
 /// `aroute sync` — the dashboard's integrated DB is the config surface; this
 /// verb is the bridge onto the routing engine.
@@ -5620,12 +6409,7 @@ fn sync_credentials(doc: &str, db: &Path) -> anyhow::Result<String> {
     Ok(out)
 }
 
-fn sync_env_file(
-    env_path: &Path,
-    db: &Path,
-    doc: &str,
-    dry_run: bool,
-) -> anyhow::Result<EnvPlan> {
+fn sync_env_file(env_path: &Path, db: &Path, doc: &str, dry_run: bool) -> anyhow::Result<EnvPlan> {
     let conn = rusqlite::Connection::open_with_flags(
         db,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
@@ -6515,7 +7299,11 @@ mod tests {
             drop(conn);
         }
         let config = dir.join("config.yaml");
-        std::fs::write(&config, "keys:\n  groq: $AR_KEY_GROQ\nproviders:\n  - id: groq\n    key: groq\n").unwrap();
+        std::fs::write(
+            &config,
+            "keys:\n  groq: $AR_KEY_GROQ\nproviders:\n  - id: groq\n    key: groq\n",
+        )
+        .unwrap();
         let env = dir.join("ar.env");
         // The live value differs, so the env has a pending change to report.
         std::fs::write(&env, "AR_KEY_GROQ=stale\n").unwrap();
@@ -6660,7 +7448,9 @@ mod tests {
             "  hide_paid_models: false",
             "    - *-search",
             "# the note that introduces combos",
-            "combos:  - id: c",
+            // Spelled with its newline: the note must stay directly above the
+            // `combos:` header it introduces, not above the entry a write added.
+            "combos:\n  - id: c",
         ] {
             assert!(
                 out.contains(line),
@@ -6825,26 +7615,37 @@ mod tests {
     // asked to remove.
     #[test]
     fn remove_section_does_not_swallow_a_hyphenated_section_after_it() {
-        let doc = "limits:\n  default:\n    rpm: 10\napi-keys:\n  a: $AR_KEY_A\ncombos:\n  - id: c\n";
+        let doc =
+            "limits:\n  default:\n    rpm: 10\napi-keys:\n  a: $AR_KEY_A\ncombos:\n  - id: c\n";
         let out = remove_section(doc, "limits");
-        assert!(!out.contains("rpm: 10"), "the named section survived:\n{out}");
+        assert!(
+            !out.contains("rpm: 10"),
+            "the named section survived:\n{out}"
+        );
         assert!(
             out.contains("api-keys:\n  a: $AR_KEY_A"),
             "the hyphenated section BEHIND the named one was eaten:\n{out}"
         );
-        assert!(out.contains("combos:\n  - id: c"), "combos was eaten:\n{out}");
+        assert!(
+            out.contains("combos:\n  - id: c"),
+            "combos was eaten:\n{out}"
+        );
     }
 
     #[test]
     fn splice_section_does_not_swallow_a_hyphenated_section_after_it() {
-        let doc = "limits:\n  default:\n    rpm: 10\napi-keys:\n  a: $AR_KEY_A\ncombos:\n  - id: c\n";
+        let doc =
+            "limits:\n  default:\n    rpm: 10\napi-keys:\n  a: $AR_KEY_A\ncombos:\n  - id: c\n";
         let out = splice_section(doc, "limits", "limits:\n  default:\n    rpm: 20\n");
         assert!(out.contains("rpm: 20"), "not spliced:\n{out}");
         assert!(
             out.contains("api-keys:\n  a: $AR_KEY_A"),
             "the hyphenated section BEHIND the named one was eaten:\n{out}"
         );
-        assert!(out.contains("combos:\n  - id: c"), "combos was eaten:\n{out}");
+        assert!(
+            out.contains("combos:\n  - id: c"),
+            "combos was eaten:\n{out}"
+        );
     }
 
     // A blank line between the replaced section and what follows it must
@@ -7682,7 +8483,10 @@ mod tests {
     fn arming_over_a_live_gate_is_refused_without_force_and_allowed_with_it() {
         let store = ar_keys::CredentialStore::open_in_memory(&ar_keys::Secret::generate())
             .expect("in-memory store");
-        assert!(gate_overwrite_allowed(&store, false), "a fresh gate may be armed");
+        assert!(
+            gate_overwrite_allowed(&store, false),
+            "a fresh gate may be armed"
+        );
 
         store
             .insert(GATE_PROVIDER, GATE_ROW, &ar_keys::Secret::generate())
@@ -8237,103 +9041,345 @@ models\":[{\"kind\":\"model\",\"model\":\"nvidia/z-ai/glm-5.3\",\"providerId\":\
         std::fs::remove_dir_all(&dir).ok();
     }
 
-        /// The golden test docs/36 step 2 asks for: the CLI's rendering must be
-        /// byte-identical to what `ar_cost_report` returns for the same ledger,
-        /// because "the same renderer" is the whole claim of the step.
-        ///
-        /// Seeded as a real file rather than in-memory, so the test also proves the
-        /// CLI finds the ledger at the sibling path it resolves.
-        #[test]
-        fn cost_report_prints_the_same_rows_the_mcp_tool_would() {
-            let dir = tmpdir("cost-report-golden");
-            let cfg = dir.join("config.yaml");
-            std::fs::write(&cfg, "keys:\n  local: dummy\ncombos:\n  - id: c\n").unwrap();
+    /// The golden test docs/36 step 2 asks for: the CLI's rendering must be
+    /// byte-identical to what `ar_cost_report` returns for the same ledger,
+    /// because "the same renderer" is the whole claim of the step.
+    ///
+    /// Seeded as a real file rather than in-memory, so the test also proves the
+    /// CLI finds the ledger at the sibling path it resolves.
+    #[test]
+    fn cost_report_prints_the_same_rows_the_mcp_tool_would() {
+        let dir = tmpdir("cost-report-golden");
+        let cfg = dir.join("config.yaml");
+        std::fs::write(&cfg, "keys:\n  local: dummy\ncombos:\n  - id: c\n").unwrap();
 
-            // Two rows under two keys, so `--key` has something to filter.
-            let ledger = ar_tokens::Ledger::open(&dir.join("usage.sqlite")).unwrap();
-            for (key, provider, model, tokens) in [
-                ("ci-key", "openai", "gpt-4o-mini", 120u32),
-                ("prod-key", "anthropic", "claude-haiku", 90),
-            ] {
-                ledger
-                    .record(&ar_tokens::Entry {
-                        key_id: key,
-                        provider,
-                        model,
-                        combo: "",
-                        usage: ar_tokens::usage::NormalizedUsage::new(tokens, 0),
-                        cost: ar_tokens::Cost {
-                            usd: ar_tokens::Usd { micros: 1_000 },
-                            priced: true,
-                        },
-                        created_at: 1_700_000_000,
-                    })
-                    .expect("seed row");
-            }
-
-            // The MCP's path: `tools::cost_report(&host.ledger()?, count)`, which
-            // is a thin delegation to `Ledger::report`. Comparing the reports
-            // (not a rendering) is what proves the CLI queried the same ledger
-            // the MCP would; the renderer comparison below proves the text.
-            let want = ledger.report(50).expect("report");
-
-            let cli = Cli {
-                config: cfg,
-                command: None,
-                system: false,
-            };
-            let args = crate::cli::CostReportArgs {
-                limit: 50,
-                key: None,
-                json: false,
-            };
-            cost_report(&cli, &args).expect("report");
-
-            // Re-opened from disk: this is the file the CLI actually read, so it
-            // also proves the CLI found the ledger at the sibling path it resolves.
-            let got = ar_tokens::Ledger::open(&dir.join("usage.sqlite"))
-                .unwrap()
-                .report(50)
-                .unwrap();
-            assert_eq!(
-                got, want,
-                "the CLI read a different ledger than the MCP's renderer would"
-            );
-            assert_eq!(got.toon(), want.toon(), "the renderings differ");
+        // Two rows under two keys, so `--key` has something to filter.
+        let ledger = ar_tokens::Ledger::open(&dir.join("usage.sqlite")).unwrap();
+        for (key, provider, model, tokens) in [
+            ("ci-key", "openai", "gpt-4o-mini", 120u32),
+            ("prod-key", "anthropic", "claude-haiku", 90),
+        ] {
+            ledger
+                .record(&ar_tokens::Entry {
+                    key_id: key,
+                    provider,
+                    model,
+                    combo: "",
+                    usage: ar_tokens::usage::NormalizedUsage::new(tokens, 0),
+                    cost: ar_tokens::Cost {
+                        usd: ar_tokens::Usd { micros: 1_000 },
+                        priced: true,
+                    },
+                    created_at: 1_700_000_000,
+                })
+                .expect("seed row");
         }
 
-        /// The no-file guarantee. A read verb that leaves a ledger behind has lied
-        /// about the host: the caller cannot tell "nothing spent" from "no ledger",
-        /// and the empty form is only honest if nothing was created.
-        #[test]
-        fn cost_report_on_a_host_with_no_ledger_creates_nothing() {
-            let dir = tmpdir("cost-report-empty");
-            let cfg = dir.join("config.yaml");
-            std::fs::write(&cfg, "keys:\n  local: dummy\ncombos:\n  - id: c\n").unwrap();
-            let ledger = dir.join("usage.sqlite");
+        // The MCP's path: `tools::cost_report(&host.ledger()?, count)`, which
+        // is a thin delegation to `Ledger::report`. Comparing the reports
+        // (not a rendering) is what proves the CLI queried the same ledger
+        // the MCP would; the renderer comparison below proves the text.
+        let want = ledger.report(50).expect("report");
 
-            let cli = Cli {
-                config: cfg,
-                command: None,
-                system: false,
-            };
-            let args = crate::cli::CostReportArgs {
-                limit: 50,
-                key: None,
-                json: false,
-            };
-            cost_report(&cli, &args).expect("report");
+        let cli = Cli {
+            config: cfg,
+            command: None,
+            system: false,
+        };
+        let args = crate::cli::CostReportArgs {
+            limit: 50,
+            key: None,
+            json: false,
+        };
+        cost_report(&cli, &args).expect("report");
 
-            assert!(
-                !ledger.exists(),
-                "a read command must not create the ledger it reports on"
-            );
-            assert_eq!(
-                std::fs::read_dir(&dir).unwrap().count(),
-                1,
-                "only the config should be present"
-            );
-        }
+        // Re-opened from disk: this is the file the CLI actually read, so it
+        // also proves the CLI found the ledger at the sibling path it resolves.
+        let got = ar_tokens::Ledger::open(&dir.join("usage.sqlite"))
+            .unwrap()
+            .report(50)
+            .unwrap();
+        assert_eq!(
+            got, want,
+            "the CLI read a different ledger than the MCP's renderer would"
+        );
+        assert_eq!(got.toon(), want.toon(), "the renderings differ");
+    }
+
+    /// The no-file guarantee. A read verb that leaves a ledger behind has lied
+    /// about the host: the caller cannot tell "nothing spent" from "no ledger",
+    /// and the empty form is only honest if nothing was created.
+    #[test]
+    fn cost_report_on_a_host_with_no_ledger_creates_nothing() {
+        let dir = tmpdir("cost-report-empty");
+        let cfg = dir.join("config.yaml");
+        std::fs::write(&cfg, "keys:\n  local: dummy\ncombos:\n  - id: c\n").unwrap();
+        let ledger = dir.join("usage.sqlite");
+
+        let cli = Cli {
+            config: cfg,
+            command: None,
+            system: false,
+        };
+        let args = crate::cli::CostReportArgs {
+            limit: 50,
+            key: None,
+            json: false,
+        };
+        cost_report(&cli, &args).expect("report");
+
+        assert!(
+            !ledger.exists(),
+            "a read command must not create the ledger it reports on"
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "only the config should be present"
+        );
+    }
+
+    // ---- Phase 7: `provider-settings` and `continue-on-cut` -------------
+    //
+    // Both verbs are the `owner`-shaped writer family: a flat list directly
+    // under its section (`continue_on_cut:`) versus a keyed list under a
+    // provider key (`provider_settings:` -> `openai:` -> `excluded_models:`).
+    // The two shapes differ by exactly one key line, so the depth derivations
+    // are the whole of the phase's logic and every test below pins one of
+    // them. Each has a named mutation control in its comment.
+
+    const P7_BASE: &str = "server:\n  host: 127.0.0.1\n  port: 20128\nkeys:\n  openai: $AR_KEY_OPENAI\n  groq: $AR_KEY_GROQ\nproviders:\n  - id: openai\n    key: openai\n  - id: groq\n    key: groq\noauth:\n  - provider: codex\n    refresh_key: codex_refresh\nmcp:\n  port: 9000\n";
+
+    /// Includes the entry, checking the indent is two under the header.
+    fn flat_cut_entry(doc: &str, provider: &str) -> bool {
+        doc.contains(&format!("continue_on_cut:\n  - {provider}\n"))
+    }
+
+    #[test]
+    fn a_flat_list_entry_sits_two_under_its_header_not_four() {
+        let out = append_nested_list_entry(P7_BASE, CUT_SECTION, None, CUT_SECTION, "openai")
+            .expect("write");
+        assert!(
+            flat_cut_entry(&out, "openai"),
+            "an entry directly under its header is two deep, not four: {out:?}"
+        );
+        assert!(
+            !out.contains("continue_on_cut:\n    - openai"),
+            "four spaces would be a value under a key that is not there: {out:?}"
+        );
+        // Mutation control: change `{ 2 }` to `{ 4 }` in `create_nested_list` and
+        // this fails with the second assertion while the first still passes.
+    }
+
+    #[test]
+    fn continuing_two_providers_then_removing_one_leaves_the_other() {
+        let one = append_nested_list_entry(P7_BASE, CUT_SECTION, None, CUT_SECTION, "openai")
+            .expect("first write");
+        let two = append_nested_list_entry(&one, CUT_SECTION, None, CUT_SECTION, "groq")
+            .expect("second write");
+        assert!(
+            two.contains("continue_on_cut:\n  - openai\n  - groq\n"),
+            "both entries, both at their own depth: {two:?}"
+        );
+        // The control for the drop rule: removing one entry must read the
+        // surviving entry as the section's content, because a flat section's
+        // content *is* its entries. Only keys were counted before, so this
+        // remove dropped the whole section instead of one entry.
+        let back = remove_nested_list_entry(&two, CUT_SECTION, None, CUT_SECTION, "groq")
+            .expect("third write");
+        assert!(
+            flat_cut_entry(&back, "openai"),
+            "the surviving entry must keep its section: {back:?}"
+        );
+        assert!(
+            !back.contains("  - groq"),
+            "the removed entry must be gone from the list: {back:?}"
+        );
+        assert!(
+            back.contains("  - id: groq"),
+            "but groq is still a provider in this config: {back:?}"
+        );
+        let gone = remove_nested_list_entry(&back, CUT_SECTION, None, CUT_SECTION, "openai")
+            .expect("fourth write");
+        assert_eq!(
+            gone, P7_BASE,
+            "the last entry out restores the file byte for byte, section included"
+        );
+        // Mutation control: revert the section-drop predicate to keys only and
+        // the `back` assertion fails while `gone` still passes.
+    }
+
+    #[test]
+    fn a_second_add_of_the_same_provider_is_reported_not_written() {
+        let one = append_nested_list_entry(P7_BASE, CUT_SECTION, None, CUT_SECTION, "openai")
+            .expect("write");
+        assert!(
+            nested_list_has_entry(&one, CUT_SECTION, None, CUT_SECTION, "openai"),
+            "the reader must see the entry the writer just made"
+        );
+        let twice = append_nested_list_entry(&one, CUT_SECTION, None, CUT_SECTION, "openai")
+            .expect("second write");
+        assert_eq!(
+            twice, one,
+            "a second add of the same provider writes nothing at all"
+        );
+        assert!(
+            scan_nested_entry(&one, CUT_SECTION, None, CUT_SECTION, "openai"),
+            "the scan, not only the remove path, must find it"
+        );
+        // Mutation control: break `in_list = true` for the `owner.is_none()` arm
+        // of `scan_nested_entry` and both assertions above fail.
+    }
+
+    #[test]
+    fn removing_a_provider_that_is_not_listed_writes_nothing() {
+        let out = remove_nested_list_entry(P7_BASE, CUT_SECTION, None, CUT_SECTION, "openai");
+        assert_eq!(
+            out, None,
+            "nothing listed, nothing removed, so the verb says so"
+        );
+        assert!(
+            !nested_list_has_entry(P7_BASE, CUT_SECTION, None, CUT_SECTION, "openai"),
+            "and the reader agrees the entry was never there"
+        );
+        assert_eq!(
+            remove_nested_list_entry(P7_BASE, PS_SECTION, Some("openai"), PS_LIST, "*-mini"),
+            None,
+            "the same holds for a provider whose block does not exist yet"
+        );
+    }
+
+    #[test]
+    fn an_excluded_glob_is_quoted_only_when_it_needs_to_be() {
+        let out = append_nested_list_entry(P7_BASE, PS_SECTION, Some("openai"), PS_LIST, "*-mini")
+            .expect("write");
+        assert!(
+            out.contains("      - '*-mini'"),
+            "a leading `*` is a YAML alias unless it is quoted: {out:?}"
+        );
+        let plain = append_nested_list_entry(&out, PS_SECTION, Some("openai"), PS_LIST, "gpt-4o")
+            .expect("write");
+        assert!(
+            plain.contains("      - gpt-4o"),
+            "a value that needs no quoting gets none: {plain:?}"
+        );
+        // Mutation control: drop the quote branch of `yaml_entry` and the first
+        // assertion fails; make it quote unconditionally and the second fails.
+    }
+
+    #[test]
+    fn a_per_provider_list_sits_under_its_own_key_and_the_section_survives() {
+        let out = append_nested_list_entry(P7_BASE, PS_SECTION, Some("openai"), PS_LIST, "*-mini")
+            .expect("write");
+        assert!(
+            out.contains(&format!(
+                "{PS_SECTION}:\n  openai:\n    {PS_LIST}:\n      - '*-mini'\n"
+            )),
+            "provider, then list, then entry, each two deeper: {out:?}"
+        );
+        assert!(
+            out.starts_with(P7_BASE.trim_end()),
+            "every byte that was there stays there, unchanged and in order: {out:?}"
+        );
+        assert!(
+            out.ends_with(&format!(
+                "{PS_SECTION}:\n  openai:\n    {PS_LIST}:\n      - '*-mini'\n"
+            )),
+            "the new block is the file's last thing: {out:?}"
+        );
+        let back = remove_nested_list_entry(&out, PS_SECTION, Some("openai"), PS_LIST, "*-mini")
+            .expect("write");
+        assert_eq!(back, P7_BASE, "the section goes with its last entry");
+        // Mutation control: shift any one of the three depths by two and the
+        // first assertion fails; drop `prune_empty_key` and `back` fails.
+    }
+
+    #[test]
+    fn two_providers_exclusions_are_independent_and_come_back_cleanly() {
+        let a = append_nested_list_entry(P7_BASE, PS_SECTION, Some("openai"), PS_LIST, "*-mini")
+            .expect("write");
+        let b = append_nested_list_entry(&a, PS_SECTION, Some("groq"), PS_LIST, "gpt-4*")
+            .expect("write");
+        assert!(
+            b.contains(&format!("  openai:\n    {PS_LIST}:\n      - '*-mini'\n")),
+            "the first provider's block is untouched by the second write: {b:?}"
+        );
+        assert!(
+            b.contains(&format!("  groq:\n    {PS_LIST}:\n      - gpt-4*\n")),
+            "the second provider gets its own key and list: {b:?}"
+        );
+        let one_gone = remove_nested_list_entry(&b, PS_SECTION, Some("openai"), PS_LIST, "*-mini")
+            .expect("write");
+        assert!(
+            one_gone.contains(&format!("  groq:\n    {PS_LIST}:\n      - gpt-4*\n")),
+            "removing one provider leaves the other's block standing: {one_gone:?}"
+        );
+        let gone = remove_nested_list_entry(&one_gone, PS_SECTION, Some("groq"), PS_LIST, "gpt-4*")
+            .expect("write");
+        assert_eq!(
+            gone, P7_BASE,
+            "the last block out restores the file byte for byte"
+        );
+        // Mutation control: make `prune_empty_key` scope-blind (drop any key
+        // with that name at any depth) and the middle assertion fails, because
+        // the surviving provider's block goes with the removed one's.
+    }
+
+    #[test]
+    fn a_write_that_touches_only_its_own_section_leaves_the_rest_alone() {
+        let out = append_nested_list_entry(P7_BASE, PS_SECTION, Some("openai"), PS_LIST, "*-mini")
+            .expect("write");
+        let untouched = out
+            .split_once(&format!("{PS_SECTION}:"))
+            .expect("section inserted");
+        assert!(
+            untouched
+                .1
+                .ends_with(&format!("  openai:\n    {PS_LIST}:\n      - '*-mini'\n")),
+            "what follows the section header is exactly the block the write made: {:?}",
+            untouched.1
+        );
+        assert!(
+            untouched.0.starts_with("server:\n  host: 127.0.0.1\n"),
+            "every byte before it is the original head: {:?}",
+            untouched.0
+        );
+        // Mutation control: point `create_nested_list`'s tail path at the end of
+        // the document instead of the section's tail and the first assertion
+        // fails: an entry appended under `mcp:` reads as valid YAML, so nothing
+        // else catches it.
+    }
+
+    #[test]
+    fn an_unrecognised_flat_list_is_refused_rather_than_rewritten() {
+        // The operator's own indentation is what the writers read; a shape they
+        // do not model is a refusal, not a guess.
+        let hand = "mcp:\n  port: 9000\ncontinue_on_cut: [openai]\n";
+        let out = remove_nested_list_entry(hand, CUT_SECTION, None, CUT_SECTION, "openai");
+        assert_eq!(out, None, "a flow list is not a shape this writer edits");
+        // Mutation control: loosen the reader to accept any `-` at any depth and
+        // this starts returning Some, silently dropping the notation.
+    }
+
+    #[test]
+    fn a_missing_trailing_newline_survives_a_phase_seven_write() {
+        let doc = P7_BASE.trim_end();
+        let out =
+            append_nested_list_entry(doc, CUT_SECTION, None, CUT_SECTION, "openai").expect("write");
+        assert!(
+            out.starts_with(P7_BASE.trim_end()),
+            "the original document is the write's untouched prefix: {out:?}"
+        );
+        assert!(
+            !out.ends_with('\n'),
+            "the file's own last byte stays its own: {out:?}"
+        );
+        assert!(
+            out.ends_with("continue_on_cut:\n  - openai"),
+            "and the entry is still written: {out:?}"
+        );
+        // Mutation control: append a newline unconditionally and this fails.
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -8394,5 +9440,4 @@ mod write_private_tests {
         let leftovers = std::fs::read_dir(&d).expect("list").count();
         assert_eq!(leftovers, 1, "only the target should remain");
     }
-
 }

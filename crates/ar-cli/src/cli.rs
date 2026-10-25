@@ -107,6 +107,34 @@ pub enum Command {
     #[command(verbatim_doc_comment)]
     Visibility(VisibilityArgs),
 
+    /// Read and write the per-provider catalog rules: `provider_settings`.
+    ///
+    /// One provider's `excluded_models`, the per-provider counterpart to the
+    /// catalog-wide visibility lists. A provider not named by this block keeps
+    /// advertising everything it serves, so the verbs are additive and each is
+    /// reversible on its own.
+    ///
+    /// Examples:
+    ///   aroute provider-settings
+    ///   aroute provider-settings exclude --provider openai --glob "*-search"
+    ///   aroute provider-settings include --provider openai --glob "*-search"
+    #[command(verbatim_doc_comment)]
+    ProviderSettings(ProviderSettingsArgs),
+
+    /// Read and write the `continue_on_cut` list: which providers may take over
+    /// a cut streamed reply.
+    ///
+    /// Empty means no continuation anywhere, which is the default, so every edit
+    /// prints the whole list afterwards: a list an agent cannot read back is one
+    /// it cannot reason about.
+    ///
+    /// Examples:
+    ///   aroute continue-on-cut
+    ///   aroute continue-on-cut add --provider openai
+    ///   aroute continue-on-cut remove --provider openai
+    #[command(verbatim_doc_comment)]
+    ContinueOnCut(ContinueOnCutArgs),
+
     /// Check config, credentials and registry; exits 1 on any failure.
     ///
     /// Examples:
@@ -1381,6 +1409,102 @@ pub struct VisibilityGlobArgs {
     /// Glob to add, matched against `model` and `provider/model`.
     #[arg(long, value_name = "GLOB")]
     pub glob: String,
+}
+
+/// Options for `aroute provider-settings`. `None` shows every provider's rules.
+#[derive(Debug, Args)]
+pub struct ProviderSettingsArgs {
+    #[command(subcommand)]
+    pub command: Option<ProviderSettingsCommand>,
+
+    /// Emit the same rows as JSON instead of TOON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Subcommands of `aroute provider-settings`.
+#[derive(Debug, Subcommand)]
+pub enum ProviderSettingsCommand {
+    /// Print every provider's rules, with `default` for the unset ones.
+    ///
+    /// Examples:
+    ///   aroute provider-settings show
+    ///   aroute provider-settings show --json
+    #[command(verbatim_doc_comment)]
+    Show,
+
+    /// Add one glob to one provider's `excluded_models`.
+    ///
+    /// Idempotent, and it says so: the same entry again reports `unchanged`.
+    ///
+    /// Examples:
+    ///   aroute provider-settings exclude --provider openai --glob "*-search"
+    #[command(verbatim_doc_comment)]
+    Exclude(ExcludeGlobArgs),
+
+    /// Remove one glob from one provider's `excluded_models`.
+    ///
+    /// Examples:
+    ///   aroute provider-settings include --provider openai --glob "*-search"
+    #[command(verbatim_doc_comment)]
+    Include(ExcludeGlobArgs),
+}
+
+/// The `--provider` / `--glob` pair the exclude and include verbs take.
+#[derive(Debug, Args)]
+pub struct ExcludeGlobArgs {
+    /// Provider id whose rules are edited, as `providers:` spells it.
+    #[arg(long, value_name = "ID")]
+    pub provider: String,
+
+    /// Glob to add or remove, matched against `model` and `provider/model`.
+    #[arg(long, value_name = "GLOB")]
+    pub glob: String,
+}
+
+/// Options for `aroute continue-on-cut`. `None` prints the whole list.
+#[derive(Debug, Args)]
+pub struct ContinueOnCutArgs {
+    #[command(subcommand)]
+    pub command: Option<ContinueOnCutCommand>,
+
+    /// Emit the same rows as JSON instead of TOON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Subcommands of `aroute continue-on-cut`.
+#[derive(Debug, Subcommand)]
+pub enum ContinueOnCutCommand {
+    /// Print the list, with `default` for the empty one.
+    ///
+    /// Examples:
+    ///   aroute continue-on-cut show
+    ///   aroute continue-on-cut show --json
+    #[command(verbatim_doc_comment)]
+    Show,
+
+    /// Add one provider to the list, idempotently.
+    ///
+    /// Examples:
+    ///   aroute continue-on-cut add --provider openai
+    #[command(verbatim_doc_comment)]
+    Add(ContinueOnCutProviderArgs),
+
+    /// Remove one provider from the list.
+    ///
+    /// Examples:
+    ///   aroute continue-on-cut remove --provider openai
+    #[command(verbatim_doc_comment)]
+    Remove(ContinueOnCutProviderArgs),
+}
+
+/// The provider id `continue-on-cut add|remove` names.
+#[derive(Debug, Args)]
+pub struct ContinueOnCutProviderArgs {
+    /// Provider id to add or remove, as `providers:` spells it.
+    #[arg(long, value_name = "ID")]
+    pub provider: String,
 }
 
 /// Options for `aroute server`.
