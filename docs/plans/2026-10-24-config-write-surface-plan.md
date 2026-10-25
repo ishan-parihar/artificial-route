@@ -72,14 +72,15 @@ anywhere in the workspace.*
 *Found by the post-ship validation pass, 2026-10-25 — the pass that drives every
 write verb through its own round trip rather than re-reading the phase's tests.*
 The defect counts above are per phase and are large; this finding is about a
-*class* that survives inside a phase whose own tests are all green. Two writers
-so far were only ever called on a file already in the shape being written, so the
-direction nobody ran was the one the operator would type:
+*class* that survives inside a phase whose own tests are all green. Three
+writers so far were only ever called on a file already in the shape being
+written, so the direction nobody ran was the one the operator would type:
 
 | verb | what the passing tests could not see |
 |---|---|
 | `visibility hide-paid` | a key the operator wrote **with a value** was never matched, so each write appended a duplicate; and `false` was spelled as the word, though `ModelVisibility`'s canonical form for it is absence |
 | `limits set --key default` | `default` is a field of `limits:`, not an entry in `keys:`, so the named write appended a second row and the ceiling landed on neither |
+| `provider-settings exclude` | the phase's every test used a base file with no `provider_settings:`, so the append-into-an-existing-section path never ran, and it destroyed the rest of the config |
 
 **The rule this earns, and the phases already shipped now inherit it:** a writer's
 test must start from the *other* state and run both directions. A test that
@@ -612,6 +613,32 @@ second half that only running the verb produced — **a flat list under a
 section is the `owner = None` case, and every depth in that path must be
 derived from the section, never from a key**. The tests are the enforcement;
 the prose is only the map.
+
+**Amended again by the post-ship validation pass** (`3531f53`). Running
+`provider-settings` in the direction no test covered — against a
+`provider_settings:` section that *already existed* — found that the phase's
+tests were all built on a base file with no such section, so the
+append-into-an-existing-section path had never once executed. It destroyed the
+rest of the config: the next section's header and its whole body were dropped,
+and in one variant `port: 9000` was reattached to `provider_settings:`, which
+is a config that does not load. Three defects in that one path:
+
+| what broke | what the writer did |
+|---|---|
+| the append returned the moment it had inserted | the lines after the section were never pushed |
+| `prune_empty_key` read `indent_of`'s `None` as "deeper" | `None` is every section header, so the key's body ran to the end of the file and the following section went with it |
+| the section-end arm reset `in_section` only | the owner and list flags survived, the walk re-read the section's own list, and a second `openai:` block was written beside the first — a duplicate-key config |
+
+The rule this phase now inherits from finding C: **the precondition of a test
+is part of the test**. Every one of these would have been caught by a single
+test whose base file contained the section being written, which is the state a
+caller is *most* likely to find on a second run.
+
+One residual, recorded rather than fixed: `continue-on-cut remove` then `add`
+places the section at the end of the file rather than where it was. The config
+is still valid and reads identically, and add-then-remove is byte-identical as
+the rule requires — but a diff-minded operator sees a section move it did not
+ask for.
 
 ## 4. Cross-cutting, applies to every phase
 
