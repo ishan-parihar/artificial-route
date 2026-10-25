@@ -2,8 +2,10 @@
 
 Status: **Phases 0-7 shipped 2026-10-24 through 2026-10-25** (`96cf513`, `9c46ff5`,
 `a34cd94`, `5e0a874`, `16d7cf1`, `218cb00`, `fadff81`). Phase 5 (`oauth add`)
-remains blocked on resumable login: `persist_token` refuses a session with no
-`refresh_key`, and `AuthLoginArgs` carries no resume state. Written at the
+was recorded here as blocked and the claim did not survive re-derivation: it
+is shippable now, and what it needs is a ruling on two shape questions, not a
+code dependency — the amendment in that phase's section says which. Written at
+the
 operator's request, then Phase 0 (the data-loss fix) was validated and landed
 before any new verb. It supersedes nothing: `docs/36` §4 step 8 specifies the
 first three verb groups (8a `oauth:`, 8b `server:`, 8c `providers:` add/remove)
@@ -405,6 +407,34 @@ secret** — the block carries no secrets by design.
   session cannot renew and `ar doctor` says so; a `client_secret_key` names a
   third row; a `redirect_uri`, when given, must be `https` or a loopback `http`.
 - `remove --provider X` — one session per provider id, so the key is the id.
+
+**Amended 2026-10-25, after measuring: the phase is NOT blocked, and the
+paragraph below mis-read its own evidence.** Re-derived from the tree before
+amending, because the claim it replaces was carried through three summaries
+without being re-checked:
+
+- `session_for` (`auth.rs:123-134`) **refuses** a login whose config has no
+  `oauth:` block for the provider, so `auth login` needs an `oauth:` row
+  *already written* before it can run. `oauth add` is login's prerequisite,
+  not its dependent: the dependency runs the opposite way from what the
+  paragraph below says.
+- `refresh_key` is a **declaration the operator supplies** in that row —
+  `client_secret_key` and `token_url` are declared the same way — and
+  `persist_token` reads it from the parsed config, never from the token. The
+  refusal it raises is correct for a session that declares no name and gets a
+  refresh token back, and it is a *validation* rule the new verb must apply
+  (one of the plan's own test contracts), not a blocker.
+- `auth.rs` writes no config file at all. Nothing in the login flow persists a
+  row, so no "resumable login" work is a precondition for a writer that
+  appends one.
+
+So the phase is **shippable now**, and what it needs from the operator is a
+ruling on two shape questions rather than a code dependency: whether
+`oauth add` may write a row with no `refresh_key` when the provider renews
+(the plan's own test contract says refuse), and whether `client_id` is
+required or left to the operator's own judgement.
+
+--- The original measurement, superseded by the paragraph above ---
 
 **Why it is blocked, measured rather than assumed.** The plan's own ordering note
 says this comes after step 4, the resumable OAuth login. `auth.rs` has no
