@@ -440,55 +440,68 @@ pub(crate) fn render_providers_section(rows: &[ar_config::ProviderCfg]) -> anyho
 pub(crate) fn render_combos_section(combos: &[Combo]) -> anyhow::Result<String> {
     let mut out: Vec<String> = vec!["combos:".to_owned()];
     for c in combos {
-        out.push(format!(
-            "  - id: {}\n    strategy: {}\n    targets:",
-            c.id,
-            c.strategy.as_str()
-        ));
-        // A weighted target is written in the map form, which is the only
-        // `targets:` entry shape that carries a share (`ar-config`'s
-        // `TargetEntry`). Emitting a plain list and dropping the weights would
-        // turn an operator's weighted combo into a first-wins chain.
-        for t in &c.targets {
-            match c.weights.get(t) {
-                Some(w) => out.push(format!("      - target: {t}\n        weight: {w}")),
-                None => out.push(format!("      - {t}")),
-            }
+        let block = render_combo_block(c)?;
+        out.push(block);
+    }
+    Ok(out.join("\n"))
+}
+
+/// One combo's own lines, without the `combos:` header above them.
+///
+/// The one owner of a row's shape, used by [`render_combos_section`] for a
+/// wholesale table write and by `aroute combo add` / `combo target add` to
+/// render exactly one row inside a section it otherwise leaves alone. Two
+/// copies of this is how the two writers would drift into disagreeing about
+/// what a combo looks like on disk.
+pub(crate) fn render_combo_block(c: &Combo) -> anyhow::Result<String> {
+    let mut out: Vec<String> = vec![format!(
+        "  - id: {}\n    strategy: {}\n    targets:",
+        c.id,
+        c.strategy.as_str()
+    )];
+    // A weighted target is written in the map form, which is the only
+    // `targets:` entry shape that carries a share (`ar-config`'s
+    // `TargetEntry`). Emitting a plain list and dropping the weights would
+    // turn an operator's weighted combo into a first-wins chain.
+    for t in &c.targets {
+        match c.weights.get(t) {
+            Some(w) => out.push(format!("      - target: {t}\n        weight: {w}")),
+            None => out.push(format!("      - {t}")),
         }
-        // A step record is emitted only when the importer actually saw one, so a
-        // hand-written config that never names prompts, tags, connection ids, or
-        // quota-exhaustion fallbacks stays byte-for-byte what it was.
-        if !c.steps.is_empty() {
-            out.push("    steps:".to_owned());
-            let rendered = serde_yaml::to_string(&c.steps)?;
-            for line in rendered.trim_end().lines() {
-                out.push(format!("      {line}"));
-            }
+    }
+    // A step record is emitted only when the importer actually saw one, so a
+    // hand-written config that never names prompts, tags, connection ids, or
+    // quota-exhaustion fallbacks stays byte-for-byte what it was.
+    if !c.steps.is_empty() {
+        out.push("    steps:".to_owned());
+        let rendered = serde_yaml::to_string(&c.steps)?;
+        for line in rendered.trim_end().lines() {
+            out.push(format!("      {line}"));
         }
-        // Carried only when the source declared one: an invented window would be
-        // a claim about the operator's chain that nothing measured.
-        if let Some(ctx) = c.context_length {
-            out.push(format!("    context_length: {ctx}"));
+    }
+    // Carried only when the source declared one: an invented window would be
+    // a claim about the operator's chain that nothing measured.
+    if let Some(ctx) = c.context_length {
+        out.push(format!("    context_length: {ctx}"));
+    }
+    // A bench the combo carries is a routing fact, not editor state: dropping
+    // it would silently narrow what happens once the targets refuse.
+    if !c.pool.is_empty() {
+        out.push("    pool:".to_owned());
+        for p in &c.pool {
+            out.push(format!("      - {p}"));
         }
-        // A bench the combo carries is a routing fact, not editor state: dropping
-        // it would silently narrow what happens once the targets refuse.
-        if !c.pool.is_empty() {
-            out.push("    pool:".to_owned());
-            for p in &c.pool {
-                out.push(format!("      - {p}"));
-            }
+    }
+    // Compression and judge follow the same rule: emitted only when set, so
+    // a combo that never named them stays byte-for-byte what it was.
+    if let Some(comp) = &c.compression {
+        out.push("    compression:".to_owned());
+        for line in serde_yaml::to_string(comp)?.trim_end().lines() {
+            out.push(format!("      {line}"));
         }
-        // Compression and judge follow the same rule: emitted only when set, so
-        // a combo that never named them stays byte-for-byte what it was.
-        if let Some(comp) = &c.compression {
-            out.push("    compression:".to_owned());
-            for line in serde_yaml::to_string(comp)?.trim_end().lines() {
-                out.push(format!("      {line}"));
-            }
-        }
-        if let Some(judge) = &c.judge_model {
-            out.push(format!("    judge_model: {judge}"));
-        }
+    }
+    if let Some(judge) = &c.judge_model {
+        out.push(format!("    judge_model: {judge}"));
     }
     Ok(out.join("\n"))
 }

@@ -88,7 +88,7 @@ pub enum Command {
     ///   aroute combo
     ///   aroute combo --fields id,strategy
     #[command(verbatim_doc_comment)]
-    Combo(ListArgs),
+    Combo(ComboArgs),
 
     /// Check config, credentials and registry; exits 1 on any failure.
     ///
@@ -1111,6 +1111,160 @@ pub struct AddCustomProviderArgs {
     /// re-save a row that already has its binding and no new credential.
     #[arg(long, value_name = "PATH", default_value = "-")]
     pub credential_file: String,
+}
+
+/// Options for `aroute combo`. `None` lists, exactly as `aroute providers`
+/// does, and for the same reason: the list flags sit **here** rather than on the
+/// `list` subcommand alone, so a documented `aroute combo --fields id` keeps
+/// working. `list` accepts the same flags as an explicit spelling.
+#[derive(Debug, Args)]
+pub struct ComboArgs {
+    #[command(subcommand)]
+    pub command: Option<ComboCommand>,
+
+    /// Comma-separated columns to show instead of the default set.
+    #[arg(long, value_name = "a,b,c")]
+    pub fields: Option<String>,
+
+    /// Print values in full instead of cutting them at the truncation ceiling.
+    #[arg(long)]
+    pub full: bool,
+
+    /// Emit the same rows as JSON instead of TOON.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Rows to skip from the newest end: the page after the last one shown.
+    #[arg(long, value_name = "N")]
+    pub offset: Option<usize>,
+
+    /// Most rows to show.
+    #[arg(long, value_name = "N")]
+    pub limit: Option<usize>,
+}
+
+impl ComboArgs {
+    /// The list options this `aroute combo` was argued with.
+    ///
+    /// One place the merge happens, rather than a second `ListArgs` copy that
+    /// could drift from this struct's fields — the same shape
+    /// [`ProvidersArgs::list_args`] uses.
+    #[must_use]
+    pub fn list_args(&self) -> ListArgs {
+        ListArgs {
+            fields: self.fields.clone(),
+            full: self.full,
+            json: self.json,
+            offset: self.offset,
+            limit: self.limit,
+            provider: None,
+            routable: false,
+            combo: None,
+        }
+    }
+}
+
+/// Subcommands of `aroute combo`. `None` lists.
+#[derive(Debug, Subcommand)]
+pub enum ComboCommand {
+    /// List routing combos and their distinct provider sets.
+    ///
+    /// Examples:
+    ///   aroute combo list
+    ///   aroute combo list --json
+    #[command(verbatim_doc_comment)]
+    List(ListArgs),
+
+    /// Add one combo to the routing table, validating it first.
+    ///
+    /// The validation is the panel's own `check_combos`, now one function both
+    /// surfaces call: the id's character class, every target's provider known
+    /// (registry or `custom_providers:`), the strategy one this build routes
+    /// **or one already in the file**, so a save round-trips a config it did
+    /// not write. A duplicate id is refused rather than merged.
+    ///
+    /// Examples:
+    ///   aroute combo add fast --strategy priority --targets openai/gpt-5.4,anthropic/claude
+    ///   aroute combo add fast --strategy weighted --targets a/m@2,b/m
+    #[command(verbatim_doc_comment)]
+    Add(AddComboArgs),
+
+    /// Remove one combo, refusing while another steps or judges through it.
+    ///
+    /// Examples:
+    ///   aroute combo remove fast
+    #[command(verbatim_doc_comment)]
+    Remove(RemoveComboArgs),
+
+    /// Add or remove one target on one combo: the surgical edit.
+    ///
+    /// Repointing one combo rather than rewriting the section keeps every
+    /// other combo byte-identical, and validates the new target the same way
+    /// `add` does.
+    ///
+    /// Examples:
+    ///   aroute combo target add --combo fast --target openai/gpt-5.4
+    ///   aroute combo target remove --combo fast --target anthropic/claude
+    #[command(verbatim_doc_comment)]
+    Target(ComboTargetArgs),
+}
+
+/// Options for `aroute combo add`.
+#[derive(Debug, Args)]
+pub struct AddComboArgs {
+    /// Combo id: the `model` a client asks for. 1-64 of a-z 0-9 . _ -.
+    pub id: String,
+
+    /// How targets are selected. One of the strategies this build routes, or
+    /// one already present in the file.
+    #[arg(long, value_name = "NAME")]
+    pub strategy: String,
+
+    /// Comma-separated `provider/model` targets, in strategy order.
+    ///
+    /// `target@weight` declares that target's share, the map form of a
+    /// `targets:` entry. A whole-provider target is accepted too, the same
+    /// way the panel accepts one.
+    #[arg(long, value_name = "a/m,b/m@2")]
+    pub targets: String,
+}
+
+/// Options for `aroute combo remove`.
+#[derive(Debug, Args)]
+pub struct RemoveComboArgs {
+    /// Combo id to drop from the routing table.
+    pub id: String,
+}
+
+/// Options for `aroute combo target add|remove`.
+#[derive(Debug, Args)]
+pub struct ComboTargetArgs {
+    #[command(subcommand)]
+    pub command: ComboTargetCommand,
+}
+
+/// Which way `aroute combo target` edits.
+#[derive(Debug, Subcommand)]
+pub enum ComboTargetCommand {
+    /// Append one target to one combo.
+    #[command(verbatim_doc_comment)]
+    Add(ComboTargetArgs2),
+
+    /// Drop one target from one combo, refusing when it is the last one.
+    #[command(verbatim_doc_comment)]
+    Remove(ComboTargetArgs2),
+}
+
+/// The `--combo` / `--target` pair both target verbs take.
+#[derive(Debug, Args)]
+pub struct ComboTargetArgs2 {
+    /// Combo id to edit.
+    #[arg(long, value_name = "ID")]
+    pub combo: String,
+
+    /// `provider/model` target to add or remove.
+    #[arg(long, value_name = "TARGET")]
+    pub target: String,
 }
 
 /// Options for `aroute server`.

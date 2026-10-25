@@ -55,30 +55,7 @@ use crate::commands;
 ///
 /// shortcut: hand-copied from `ar_config::Strategy::parse`; keep both in sync
 /// when a strategy is added there.
-const STRATEGIES: &[&str] = &[
-    "priority",
-    "round-robin",
-    "cost-optimized",
-    "lkgp",
-    "weighted",
-    "fill-first",
-    "p2c",
-    "least-used",
-    "random",
-    "strict-random",
-    "headroom",
-    "reset-window",
-    "reset-aware",
-    "quota-weighted",
-    "quota-share",
-    "quota-share-fair",
-    "expiry-first",
-    "context-relay",
-    "context-optimized",
-    "cache-optimized",
-    "fusion",
-    "pipeline",
-];
+const STRATEGIES: &[&str] = commands::STRATEGIES;
 
 /// Everything a handler needs, frozen at serve boot.
 pub struct Ctx {
@@ -1556,90 +1533,13 @@ async fn save_combos(
     Json(json!({ "ok": true, "pending_restart": true })).into_response()
 }
 
-/// A combo list is valid when every id is a legal model name, every target
-/// names a provider the registry or `custom_providers:` knows, and every
-/// strategy is one this build routes rather than defers. Strategies already
-/// in the file are exempt: a save must round-trip a config this page did
-/// not write.
-fn check_combos(combos: &[Combo], current: &Config) -> Result<(), String> {
-    let custom: Vec<&str> = current
-        .custom_providers
-        .iter()
-        .map(|c| c.id.as_str())
-        .collect();
-    let known_provider = |id: &str| registry().get(id).is_some() || custom.contains(&id);
-    let mut ids = BTreeSet::new();
-    let allowed: BTreeSet<&str> = STRATEGIES
-        .iter()
-        .copied()
-        .chain(current.combos.iter().map(|c| c.strategy.as_str()))
-        .collect();
-    for c in combos {
-        let id_legal = !c.id.is_empty()
-            && c.id.len() <= 64
-            && c.id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
-        if !id_legal {
-            return Err(format!(
-                "combo id {:?} is not a legal model name (1-64 of a-z 0-9 . _ -)",
-                c.id
-            ));
-        }
-        if !ids.insert(c.id.clone()) {
-            return Err(format!("combo id {:?} appears twice", c.id));
-        }
-        if c.targets.is_empty() {
-            return Err(format!("combo {:?} has no targets", c.id));
-        }
-        for t in &c.targets {
-            match t.split_once('/') {
-                Some((p, m)) if !p.is_empty() && !m.is_empty() => {
-                    if !known_provider(p) {
-                        return Err(format!("combo {:?} targets unknown provider {p:?}", c.id));
-                    }
-                }
-                _ if known_provider(t) => {}
-                _ => {
-                    return Err(format!(
-                        "combo {:?} has a malformed target {t:?} (expected provider/model)",
-                        c.id
-                    ));
-                }
-            }
-        }
-        if !allowed.contains(c.strategy.as_str()) {
-            return Err(format!(
-                "combo {:?} names strategy {:?}, which this build does not route",
-                c.id,
-                c.strategy.as_str()
-            ));
-        }
-        for (target, w) in &c.weights {
-            if !c.targets.contains(target) {
-                return Err(format!(
-                    "combo {:?} weights target {target:?} it does not list",
-                    c.id
-                ));
-            }
-            if *w == 0 {
-                return Err(format!(
-                    "combo {:?} weights target {target:?} at zero",
-                    c.id
-                ));
-            }
-        }
-        if !c.steps.is_empty() && c.steps.len() != c.targets.len() {
-            return Err(format!(
-                "combo {:?} carries {} steps for {} targets",
-                c.id,
-                c.steps.len(),
-                c.targets.len()
-            ));
-        }
-    }
-    Ok(())
-}
+/// The combo validation both surfaces share, re-exported from its one owner.
+///
+/// Phase 4 of the config-write surface moved the function into `commands.rs`
+/// beside the other config writers, so the panel's save and the CLI's
+/// `combo add`/`target add`/`target remove` answer the same question from one
+/// place. A second copy is how they would drift.
+pub(crate) use commands::check_combos;
 
 /// Sets one provider's credential in the env file. A provider the config
 /// already lists keeps the variable its own `keys:` binding names — a

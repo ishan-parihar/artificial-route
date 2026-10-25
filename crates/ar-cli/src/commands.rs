@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use ar_config::{Combo, Config};
+use ar_config::{Combo, Config, Strategy};
 use ar_keys::{CredentialStore, KeyError};
 use ar_registry::{Registry, global as registry};
 use ar_server::config::split_target_known;
@@ -19,8 +19,9 @@ use clap::CommandFactory;
 use clap::error::ErrorKind;
 
 use crate::cli::{
-    ClearLimitsArgs, Cli, Command, ConfigureArgs, DoctorArgs, ImportArgs, ListArgs, ServiceAction,
-    ServiceArgs, ServiceUnit, SetLimitsArgs, SyncArgs,
+    AddComboArgs, ClearLimitsArgs, Cli, ComboTargetArgs, ComboTargetArgs2, Command, ConfigureArgs,
+    DoctorArgs, ImportArgs, ListArgs, RemoveComboArgs, ServiceAction, ServiceArgs, ServiceUnit,
+    SetLimitsArgs, SyncArgs,
 };
 use crate::import;
 use crate::import::ImportFrom;
@@ -1209,7 +1210,13 @@ pub fn dispatch(cli: &Cli) -> anyhow::Result<()> {
             Some(crate::cli::ProviderCommand::Remove(args)) => providers_remove(cli, args),
             Some(crate::cli::ProviderCommand::AddCustom(args)) => providers_add_custom(cli, args),
         },
-        Some(Command::Combo(a)) => combo(cli, a),
+        Some(Command::Combo(a)) => match &a.command {
+            None => combo(cli, &a.list_args()),
+            Some(crate::cli::ComboCommand::List(args)) => combo(cli, args),
+            Some(crate::cli::ComboCommand::Add(args)) => combo_add(cli, args),
+            Some(crate::cli::ComboCommand::Remove(args)) => combo_remove(cli, args),
+            Some(crate::cli::ComboCommand::Target(args)) => combo_target(cli, args),
+        },
         Some(Command::Doctor(a)) => doctor(cli, a),
         Some(Command::Auth(a)) => crate::auth::run(cli, a),
         Some(Command::Run(a)) => block_on(serve::run(cli, a)),
@@ -1841,6 +1848,133 @@ fn empty_custom_section(doc: &str) -> String {
     out.join("\n") + ending
 }
 
+/// The strategies this build routes, by name.
+///
+/// The list [`check_combos`] validates against and the list the `/ui` page
+/// shows. It was `webui.rs`'s own constant until Phase 4, when the validation
+/// moved here: the panel's save and the CLI's writers must accept the same
+/// names, and a second hand-copied list is how they diverge. Still a
+/// **shortcut over `ar_config::Strategy::parse`** (which accepts `auto/*`
+/// virtual factory names too) — keep both in sync when a strategy is added.
+pub(crate) const STRATEGIES: &[&str] = &[
+    "priority",
+    "round-robin",
+    "cost-optimized",
+    "lkgp",
+    "weighted",
+    "fill-first",
+    "p2c",
+    "least-used",
+    "random",
+    "strict-random",
+    "headroom",
+    "reset-window",
+    "reset-aware",
+    "quota-weighted",
+    "quota-share",
+    "quota-share-fair",
+    "expiry-first",
+    "context-relay",
+    "context-optimized",
+    "cache-optimized",
+    "fusion",
+    "pipeline",
+];
+
+/// A combo list is valid when every id is a legal model name, every target
+/// names a provider the registry or `custom_providers:` knows, and every
+/// strategy is one this build routes rather than defers. Strategies already
+/// in the file are exempt: a save must round-trip a config this page did
+/// not write.
+///
+/// **The one owner of this question**, moved here from `webui.rs` by Phase 4 of
+/// the config-write surface. The panel's whole-section save and the CLI's
+/// `combo add`/`target add`/`target remove` must agree about what a valid combo
+/// is; two copies is how they drift, and the CLI writers had no validation at
+/// all before this. The rules are unchanged by the move, and
+/// `check_combos_accepts_a_round_trip_of_the_fixture` still passes against it,
+/// which is the evidence the extraction narrowed nothing — the fixture is a
+/// hand-written YAML string with a flow-style `targets:` list, which is the
+/// spelling the repo's own `config.yaml` uses.
+pub(crate) fn check_combos(combos: &[Combo], current: &Config) -> Result<(), String> {
+    let custom: Vec<&str> = current
+        .custom_providers
+        .iter()
+        .map(|c| c.id.as_str())
+        .collect();
+    let known_provider = |id: &str| registry().get(id).is_some() || custom.contains(&id);
+    let mut ids = BTreeSet::new();
+    let allowed: BTreeSet<&str> = STRATEGIES
+        .iter()
+        .copied()
+        .chain(current.combos.iter().map(|c| c.strategy.as_str()))
+        .collect();
+    for c in combos {
+        let id_legal = !c.id.is_empty()
+            && c.id.len() <= 64
+            && c.id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+        if !id_legal {
+            return Err(format!(
+                "combo id {:?} is not a legal model name (1-64 of a-z 0-9 . _ -)",
+                c.id
+            ));
+        }
+        if !ids.insert(c.id.clone()) {
+            return Err(format!("combo id {:?} appears twice", c.id));
+        }
+        if c.targets.is_empty() {
+            return Err(format!("combo {:?} has no targets", c.id));
+        }
+        for t in &c.targets {
+            match t.split_once('/') {
+                Some((p, m)) if !p.is_empty() && !m.is_empty() => {
+                    if !known_provider(p) {
+                        return Err(format!("combo {:?} targets unknown provider {p:?}", c.id));
+                    }
+                }
+                _ if known_provider(t) => {}
+                _ => {
+                    return Err(format!(
+                        "combo {:?} has a malformed target {t:?} (expected provider/model)",
+                        c.id
+                    ));
+                }
+            }
+        }
+        if !allowed.contains(c.strategy.as_str()) {
+            return Err(format!(
+                "combo {:?} names strategy {:?}, which this build does not route",
+                c.id, c.strategy
+            ));
+        }
+        for (target, w) in &c.weights {
+            if !c.targets.contains(target) {
+                return Err(format!(
+                    "combo {:?} weights target {target:?} it does not list",
+                    c.id
+                ));
+            }
+            if *w == 0 {
+                return Err(format!(
+                    "combo {:?} weights target {target:?} at zero",
+                    c.id
+                ));
+            }
+        }
+        if !c.steps.is_empty() && c.steps.len() != c.targets.len() {
+            return Err(format!(
+                "combo {:?} carries {} steps for {} targets",
+                c.id,
+                c.steps.len(),
+                c.targets.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Whether a candidate document means the same thing as the current one.
 ///
 /// F8, and the reason it lives in this module rather than beside one writer:
@@ -2338,6 +2472,345 @@ fn combo(cli: &Cli, args: &ListArgs) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// `aroute combo add`: validate, then append one combo row.
+///
+/// The write is an append of one block onto `combos:`, the same shape the
+/// panel writes: nothing else in the file is re-rendered, so the diff is the
+/// new row and nothing more. The two validation passes matter — the second on
+/// the *result* catches a duplicate id and a target no provider serves, which
+/// the first (on the incoming config) cannot see.
+fn combo_add(cli: &Cli, args: &AddComboArgs) -> anyhow::Result<()> {
+    let id = args.id.trim();
+    if id.is_empty() {
+        return Err(fail(
+            "the combo id is empty",
+            "the id is the model a client asks for, 1-64 of a-z 0-9 . _ -",
+        ));
+    }
+    let strategy = args.strategy.trim();
+    if strategy.is_empty() {
+        return Err(fail(
+            "the strategy is empty",
+            "one of the strategies `aroute combo` lists, e.g. priority",
+        ));
+    }
+    let (targets, weights) = parse_targets(&args.targets)?;
+
+    let doc = read_config_text(cli)?;
+    let cfg = load_edit(cli)?;
+
+    // The named strategies this build routes, plus whatever the file already
+    // holds: `check_combos` accepts the latter so a config written by an older
+    // aroute round-trips instead of being refused, and this CLI must not
+    // reject what the panel saves.
+    let in_file = cfg.combos.iter().any(|c| c.strategy.as_str() == strategy);
+    if !STRATEGIES.contains(&strategy) && !in_file {
+        return Err(fail(
+            format!("strategy {strategy:?} is not one this build routes"),
+            format!("pick one of {}", STRATEGIES.join(", ")),
+        ));
+    }
+    if cfg.combos.iter().any(|c| c.id == id) {
+        return Err(fail(
+            format!("combo {id:?} already exists"),
+            "a combo is one model name; repoint it with `aroute combo target add`",
+        ));
+    }
+    // The one validation both surfaces now share, so the CLI and the panel
+    // cannot disagree about which combos a config may hold.
+    check_combos(&cfg.combos, &cfg).map_err(|e| {
+        fail(
+            e,
+            "the config's own combos do not validate; fix those first",
+        )
+    })?;
+
+    let mut next = cfg;
+    next.combos.push(Combo {
+        id: id.to_owned(),
+        strategy: Strategy::parse(strategy),
+        targets,
+        weights,
+        pool: Vec::new(),
+        steps: Vec::new(),
+        compression: None,
+        context_length: None,
+        judge_model: None,
+    });
+    // The candidate is checked too: this is where a target whose provider no
+    // provider serves and a duplicate id are refused, on the document about to
+    // be written rather than on the one on disk.
+    check_combos(&next.combos, &next)
+        .map_err(|e| fail(e, "the new combo does not validate; nothing was written"))?;
+    // One row, rendered on its own: [`append_combo_row`] places it inside the
+    // section without re-rendering the others, which is what makes the write
+    // surgical and the round trip byte-stable.
+    let row = crate::import::render_combo_block(next.combos.last().unwrap())?;
+    let updated = append_combo_row(&doc, &row);
+    if means_the_same(&doc, &updated) {
+        println!("combos: {id} — unchanged");
+        return Ok(());
+    }
+    write_file(&cli.config, &updated)?;
+    println!("combos: added {id}");
+    println!(
+        "note: the running proxy reads its config at boot only — apply with `aroute service restart proxy`"
+    );
+    Ok(())
+}
+
+/// `aroute combo remove`: refuse while depended on, then drop the row.
+///
+/// The dependency check covers every place a combo can name a target, the same
+/// set `providers remove` refuses against: a combo stepped or judged through
+/// another would dangle the moment that row left the file, and a dangling
+/// reference fails late rather than loudly.
+fn combo_remove(cli: &Cli, args: &RemoveComboArgs) -> anyhow::Result<()> {
+    let id = args.id.trim();
+    let doc = read_config_text(cli)?;
+    let cfg = load_edit(cli)?;
+    if !cfg.combos.iter().any(|c| c.id == id) {
+        return Err(fail(
+            format!("combo {id:?} is not in this config"),
+            "`aroute combo` lists the routing table",
+        ));
+    }
+    let users: Vec<&str> = cfg
+        .combos
+        .iter()
+        .filter(|c| c.id != id && combo_names(c, id))
+        .map(|c| c.id.as_str())
+        .collect();
+    if !users.is_empty() {
+        return Err(fail(
+            format!("combo {id:?} is still referenced by: {}", users.join(", ")),
+            "delete or repoint those combos first; a dead combo fails loudly, a dangling one fails late",
+        ));
+    }
+
+    // One row's lines, and only those: the operator's blank separator and
+    // closing note stay exactly where they were, so removing the last combo
+    // added restores the file byte-for-byte.
+    let updated = remove_combo_row(&doc, id).ok_or_else(|| {
+        fail(
+            format!("combo {id:?} has no `- id:` row to remove"),
+            "the row may be written in a form this writer does not recognise; edit it by hand",
+        )
+    })?;
+    if means_the_same(&doc, &updated) {
+        println!("combos: {id} — unchanged");
+        return Ok(());
+    }
+    write_file(&cli.config, &updated)?;
+    println!("combos: removed {id}");
+    println!(
+        "note: the running proxy reads its config at boot only — apply with `aroute service restart proxy`"
+    );
+    Ok(())
+}
+
+/// Whether `combo` names `id` as a target, pool entry, step or judge.
+///
+/// The reference set `providers remove` computes over a provider id, here read
+/// for a combo id: the one who reads the file must not miss a place the writer
+/// can reach.
+fn combo_names(combo: &Combo, id: &str) -> bool {
+    combo
+        .targets
+        .iter()
+        .chain(combo.pool.iter())
+        .chain(combo.steps.iter().map(|s| &s.target))
+        .chain(combo.judge_model.iter())
+        .any(|t| target_provider(t) == id || t == id)
+}
+
+/// `aroute combo target add|remove`: one surgical target edit.
+///
+/// This is the verb the operator reaches for when one target must move and the
+/// rest of the routing table must not: repointing one combo keeps every other
+/// combo byte-identical, which rewriting the section cannot promise. The
+/// `targets` list alone is re-rendered, in the block the combo already occupies.
+fn combo_target(cli: &Cli, args: &ComboTargetArgs) -> anyhow::Result<()> {
+    match &args.command {
+        crate::cli::ComboTargetCommand::Add(a) => {
+            combo_target_add(cli, a.combo.trim(), parse_one_target(&a.target)?, a)
+        }
+        crate::cli::ComboTargetCommand::Remove(a) => {
+            combo_target_remove(cli, a.combo.trim(), parse_one_target(&a.target)?)
+        }
+    }
+}
+
+fn combo_target_add(
+    cli: &Cli,
+    combo_id: &str,
+    target: String,
+    args: &ComboTargetArgs2,
+) -> anyhow::Result<()> {
+    let doc = read_config_text(cli)?;
+    let cfg = load_edit(cli)?;
+    let catalog = catalog(&cfg)?;
+    let Some(combo) = cfg.combos.iter().find(|c| c.id == combo_id) else {
+        return Err(fail(
+            format!("combo {combo_id:?} is not in this config"),
+            "`aroute combo` lists the routing table".to_string(),
+        ));
+    };
+    if combo.targets.contains(&target) {
+        return Err(fail(
+            format!("combo {combo_id:?} already lists {target}"),
+            "one target appears once; repoint it with `aroute combo target remove` then add",
+        ));
+    }
+    // Unknown provider, resolved against the catalog: the custom rows carry no
+    // models a provider/model split can lean on, so they are matched as whole
+    // targets.
+    if target_provider_in(&target, &catalog) == ar_server::config::DEFAULT_COMBO_ID {
+        return Err(fail(
+            format!("combo {combo_id:?} would target unknown provider {target}"),
+            "`aroute providers` lists what this config can route to",
+        ));
+    }
+
+    let mut next = cfg.clone();
+    if let Some(c) = next.combos.iter_mut().find(|c| c.id == combo_id) {
+        c.targets.push(target.clone());
+    }
+    // Validated on the candidate, not on the file: this is where a target no
+    // provider serves is refused, rather than at the first request after a
+    // restart.
+    check_combos(&next.combos, &next)
+        .map_err(|e| fail(e, "the edited combo does not validate; nothing was written"))?;
+
+    // One line, inside the row's own list: every other byte of the document is
+    // copied, so `target add` then `target remove` of the same target restores
+    // the file exactly.
+    let updated = add_target_line(&doc, combo_id, &target).ok_or_else(|| {
+        fail(
+            format!("combo {combo_id:?} has no `targets:` list to add to"),
+            "the row may be written in a form this writer does not recognise; edit it by hand",
+        )
+    })?;
+    if means_the_same(&doc, &updated) {
+        println!("combos: {combo_id} — unchanged");
+        return Ok(());
+    }
+    write_file(&cli.config, &updated)?;
+    println!("combos: {combo_id} gained {}", args.target);
+    println!(
+        "note: the running proxy reads its config at boot only — apply with `aroute service restart proxy`"
+    );
+    Ok(())
+}
+
+fn combo_target_remove(cli: &Cli, combo_id: &str, target: String) -> anyhow::Result<()> {
+    let doc = read_config_text(cli)?;
+    let cfg = load_edit(cli)?;
+    let Some(combo) = cfg.combos.iter().find(|c| c.id == combo_id) else {
+        return Err(fail(
+            format!("combo {combo_id:?} is not in this config"),
+            "`aroute combo` lists the routing table",
+        ));
+    };
+    if !combo.targets.contains(&target) {
+        return Err(fail(
+            format!("combo {combo_id:?} does not list {target}"),
+            "`aroute combo` lists each combo's targets",
+        ));
+    }
+    // A one-target combo with its target gone is a combo that cannot route.
+    if combo.targets.len() == 1 {
+        return Err(fail(
+            format!("combo {combo_id:?} would have no targets"),
+            "remove the combo with `aroute combo remove` instead",
+        ));
+    }
+
+    // One line, and the row's own: the other combos and the operator's layout
+    // are copied byte for byte.
+    let updated = remove_target_line(&doc, combo_id, &target).ok_or_else(|| {
+        fail(
+            format!("combo {combo_id:?} has no line naming {target}"),
+            "the row may be written in a form this writer does not recognise; edit it by hand",
+        )
+    })?;
+    if means_the_same(&doc, &updated) {
+        println!("combos: {combo_id} — unchanged");
+        return Ok(());
+    }
+    write_file(&cli.config, &updated)?;
+    println!("combos: {combo_id} lost {target}");
+    println!(
+        "note: the running proxy reads its config at boot only — apply with `aroute service restart proxy`"
+    );
+    Ok(())
+}
+
+/// `--targets a/m,b/m@2`: the comma-separated list `aroute combo add` takes.
+///
+/// The map form (`target@weight`) is parsed back into `Combo::weights`, the
+/// field the renderer reads: writing a plain list and dropping the shares
+/// would turn a weighted chain into first-wins, so the parse keeps them.
+fn parse_targets(raw: &str) -> anyhow::Result<(Vec<String>, BTreeMap<String, u32>)> {
+    let mut targets: Vec<String> = Vec::new();
+    let mut weights: BTreeMap<String, u32> = BTreeMap::new();
+    for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (name, weight) = match entry.split_once('@') {
+            Some((n, w)) => {
+                let weight: u32 = w.parse().map_err(|_| {
+                    fail(
+                        format!("target {entry:?} has a bad weight"),
+                        "weight is a positive integer",
+                    )
+                })?;
+                if weight == 0 {
+                    return Err(fail(
+                        format!("target {entry:?} weights a target at zero"),
+                        "a zero share removes the target from the draw",
+                    ));
+                }
+                (n.trim(), weight)
+            }
+            None => (entry, 1),
+        };
+        if name.is_empty() {
+            return Err(fail(
+                format!("target {entry:?} has an empty provider/model"),
+                "a target is provider/model, e.g. openai/gpt-5.4",
+            ));
+        }
+        if !targets.iter().any(|t| t == name) {
+            targets.push(name.to_owned());
+        }
+        if weight != 1 {
+            weights.insert(name.to_owned(), weight);
+        }
+    }
+    if targets.is_empty() {
+        return Err(fail(
+            "no targets given",
+            "pass --targets provider/model, at least one",
+        ));
+    }
+    Ok((targets, weights))
+}
+
+/// `--target openai/gpt-5.4`: one target, no weight.
+///
+/// The dedup `parse_targets` performs is done by [`Combo`] instead: a second
+/// entry the operator repeats is refused by the token check below, so a
+/// parsed-away duplicate would hide that refusal.
+fn parse_one_target(raw: &str) -> anyhow::Result<String> {
+    let target = raw.trim();
+    if target.is_empty() {
+        return Err(fail(
+            "the target is empty",
+            "a target is provider/model, e.g. openai/gpt-5.4",
+        ));
+    }
+    Ok(target.to_owned())
 }
 
 /// One combo row: distinct providers, strategy, and the full target chain.
@@ -3839,17 +4312,24 @@ fn remove_section(content: &str, name: &str) -> String {
 /// `combos:` — definition before use — or appended when there is none.
 pub(crate) fn splice_section(content: &str, name: &str, rendered: &str) -> String {
     let header = format!("{name}:");
+    let all: Vec<&str> = content.lines().collect();
     let mut out: Vec<String> = Vec::new();
     let mut skipping = false;
     let mut replaced = false;
-    for line in content.lines() {
+    // An index loop rather than an iterator, because whether a blank line or a
+    // column-0 comment ends the skipped section is a **look-ahead**: it depends
+    // on the next line of substance, which a `for` over `lines()` cannot see.
+    for i in 0..all.len() {
+        let line = all[i];
         if line == header {
             out.push(rendered.trim_end_matches('\n').to_owned());
             replaced = true;
             skipping = true;
             continue;
         }
-        // A blank line or a comment ends the section being skipped.
+        // A blank line or a comment ends the section being skipped **only
+        // when what follows belongs to another section**, which is the
+        // [`rest_is_another_section`] look-ahead.
         //
         // Both are column-0 and neither is a section header, so without this
         // they are consumed with the section's body — and the block that
@@ -3859,7 +4339,19 @@ pub(crate) fn splice_section(content: &str, name: &str, rendered: &str) -> Strin
         // distinguish them (YAML allows column-0 comments anywhere), so the
         // distinction has to be made here: a body line is indented, and these
         // are not.
-        if skipping && (line.is_empty() || line.starts_with('#')) {
+        //
+        // But a **blank line inside a section body does not end it**, which the
+        // first version of this rule got wrong and no test caught: the repo's
+        // `combos:` carries a blank separator between two of its rows, so the
+        // skip stopped at that line, the rows after it survived below the
+        // spliced block, and `combo add` produced a routing table with six
+        // combination ids where it should have three.
+        if skipping
+            && (line.is_empty() || line.starts_with('#'))
+            && rest_is_another_section(&all[i + 1..])
+        {
+            // This blank line or comment belongs to the section that follows,
+            // so the skip ends here and this line goes out as it was.
             skipping = false;
         }
         if skipping && is_section_header(line) {
@@ -3899,6 +4391,297 @@ pub(crate) fn splice_section(content: &str, name: &str, rendered: &str) -> Strin
             None => format!("{}\n{}{}", content.trim_end(), rendered, ending),
         }
     }
+}
+
+/// Whether this line starts a combo entry: `  - id: <name>`.
+///
+/// Two-space indentation is not decoration, it is the disambiguator. A deeper
+/// line is a field of the entry above it (`    strategy: ...`), and a
+/// shallower one is a section header — so an entry that a caller's file wrote
+/// with different indentation is not matched, rather than matched wrongly and
+/// having the wrong lines edited.
+fn combo_row_starts(line: &str) -> bool {
+    line.len() - line.trim_start().len() == 2 && line.trim_start().starts_with("- id:")
+}
+
+/// The id an entry line names, without the `- id:` key or the surrounding space.
+fn combo_row_id(line: &str) -> &str {
+    line.trim_start().trim_start_matches("- id:").trim()
+}
+
+/// Adds one target line to one combo's own `targets:` list.
+///
+/// The most surgical writer in the surface, and the reason the row-level
+/// helpers exist: a target list is a flat list of strings at a known depth, so
+/// adding one is inserting one line after the last one that is already there.
+/// Every other byte of the document — the other combos, the operator's blank
+/// separators, the closing note — is copied verbatim.
+///
+/// The target goes at the **end** of the list, after any weighted entries: the
+/// operator is appending a fallback, and the order is the strategy's order, so
+/// the caller controls placement by the command they choose, not by luck.
+fn add_target_line(content: &str, combo_id: &str, target: &str) -> Option<String> {
+    let all: Vec<&str> = content.lines().collect();
+
+    // Walk to the row that owns `combo_id`, then to its `targets:` key.
+    let mut in_section = false;
+    let mut i = 0;
+    let row_start = loop {
+        let line = *all.get(i)?;
+        if line == "combos:" {
+            in_section = true;
+            i += 1;
+            continue;
+        }
+        if in_section && is_section_header(line) {
+            return None;
+        }
+        if in_section && combo_row_starts(line) && combo_row_id(line) == combo_id {
+            break i;
+        }
+        i += 1;
+    };
+    let targets_at = (row_start + 1..all.len())
+        .take_while(|&j| !combo_row_starts(all[j]) && !is_section_header(all[j]))
+        .find(|&j| all[j].trim() == "targets:")?;
+    // The list ends at the first line that is not indented deeper than
+    // `targets:` itself, so a sibling key (`steps:`, `pool:`) closes it.
+    let list_end = (targets_at + 1..all.len())
+        .find(|&j| all[j].len() - all[j].trim_start().len() <= 4 || all[j].trim().is_empty())
+        .unwrap_or(all.len());
+
+    let mut out: Vec<String> = all[..list_end].iter().map(|l| (*l).to_owned()).collect();
+    out.push(format!("      - {target}"));
+    out.extend(all[list_end..].iter().map(|l| (*l).to_owned()));
+    let joined = out.join("\n");
+    Some(if content.ends_with('\n') {
+        joined + "\n"
+    } else {
+        joined
+    })
+}
+
+/// Drops one target line from one combo's own `targets:` list.
+///
+/// The map form of an entry (`- target: x` / `  weight: n`) is removed as a
+/// pair: leaving the `weight:` behind would be an orphan key the next parse
+/// reads as `weights:` entries the row does not list, which
+/// [`check_combos`] refuses.
+fn remove_target_line(content: &str, combo_id: &str, target: &str) -> Option<String> {
+    let all: Vec<&str> = content.lines().collect();
+
+    let mut in_section = false;
+    let mut i = 0;
+    let row_start = loop {
+        let line = *all.get(i)?;
+        if line == "combos:" {
+            in_section = true;
+            i += 1;
+            continue;
+        }
+        if in_section && is_section_header(line) {
+            return None;
+        }
+        if in_section && combo_row_starts(line) && combo_row_id(line) == combo_id {
+            break i;
+        }
+        i += 1;
+    };
+    let targets_at = (row_start + 1..all.len())
+        .take_while(|&j| !combo_row_starts(all[j]) && !is_section_header(all[j]))
+        .find(|&j| all[j].trim() == "targets:")?;
+
+    // The plain form is one line; the map form is two, the `weight:` under the
+    // `- target:`.
+    let mut j = targets_at + 1;
+    let mut dropped: Option<usize> = None;
+    while j < all.len() {
+        let l = all[j];
+        if is_section_header(l) || combo_row_starts(l) {
+            break;
+        }
+        let indent = l.len() - l.trim_start().len();
+        if indent < 6 {
+            break;
+        }
+        let body = l.trim_start();
+        let plain = body == format!("- {target}");
+        let mapped = body == format!("- target: {target}");
+        if plain {
+            dropped = Some(1);
+            break;
+        }
+        if mapped {
+            // Consume the `weight:` line that follows, when there is one.
+            let weight_follows = all
+                .get(j + 1)
+                .is_some_and(|n| n.trim_start().starts_with("weight:"));
+            dropped = Some(if weight_follows { 2 } else { 1 });
+            break;
+        }
+        j += 1;
+    }
+    let span = dropped?;
+    let mut out: Vec<String> = all[..j].iter().map(|l| (*l).to_owned()).collect();
+    out.extend(all[j + span..].iter().map(|l| (*l).to_owned()));
+    let joined = out.join("\n");
+    Some(if content.ends_with('\n') {
+        joined + "\n"
+    } else {
+        joined
+    })
+}
+
+/// Whether what follows begins another top-level section, so the section being
+/// skipped is over.
+/// The look-ahead behind [`splice_section`]'s skip rule. A blank line inside a
+/// section body is a body separator, and a column-0 comment is either the tail
+/// of this section's own notes or the head of the next section's — two
+/// spellings nothing in the text distinguishes. The question is answered by
+/// walking past blanks and comments and looking at the next line of substance:
+/// indented means this section carries on, column-0 means it is finished, and
+/// reaching the end of the file means the notes were this section's own.
+///
+/// The last of those is the case the repo's own config exercises. `combos:` is
+/// the final section and closes with a four-line note, so a rule that ended the
+/// skip at the first column-0 comment would pull the header-less *body* of the
+/// section apart from it, and the closing note would survive below the
+/// rendered rows instead of being replaced with them.
+fn rest_is_another_section(rest: &[&str]) -> bool {
+    for line in rest {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Indented is a line of this section's body, so it is not over.
+        return !line.starts_with(' ');
+    }
+    // Only blanks and comments followed, or nothing did: the notes belong here.
+    false
+}
+
+/// Appends one rendered combo row to `combos:`, leaving every other line of the
+/// document byte-identical.
+///
+/// Why this exists beside [`splice_section`] rather than being another call to
+/// it: a whole-section re-render cannot preserve the operator's own layout. The
+/// repo's `combos:` carries a blank separator and a four-line comment that
+/// introduces its second row, and rendering the section from the parsed config
+/// moves that comment to the *end* of the block, where it documents nothing.
+/// The panel's whole-section save does exactly that (`webui.rs:1522`), which is
+/// acceptable for a form that replaces the table wholesale; a CLI verb asked to
+/// add one row has no business reflowing the other two.
+///
+/// So the row is appended inside the existing section, after its last body
+/// line, and the line that ends the section is kept where it was. The result
+/// is that `combo add` followed by `combo remove` of the same row restores the
+/// file byte-for-byte, which is the property [`combo_remove`] deletes by and
+/// the contract test below measures.
+fn append_combo_row(content: &str, rendered: &str) -> String {
+    let all: Vec<&str> = content.lines().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut in_section = false;
+    let mut i = 0;
+    while i < all.len() {
+        let line = all[i];
+        if line == "combos:" {
+            out.push(line.to_owned());
+            in_section = true;
+            i += 1;
+            continue;
+        }
+        if in_section && (line.is_empty() || line.starts_with('#')) {
+            if rest_is_another_section(&all[i + 1..]) {
+                // The section ends here. Walk back over the blank line and
+                // notes that close it, insert the row before them, and put the
+                // notes back: the row belongs at the end of the body, not above
+                // a note that documents the last row rather than the next one.
+                let mut at = out.len();
+                while at > 0 && (out[at - 1].is_empty() || out[at - 1].starts_with('#')) {
+                    at -= 1;
+                }
+                out.insert(at, rendered.trim_end_matches('\n').to_owned());
+                in_section = false;
+                continue;
+            }
+            out.push(line.to_owned());
+            i += 1;
+            continue;
+        }
+        if in_section && is_section_header(line) {
+            out.push(line.to_owned());
+            in_section = false;
+            i += 1;
+            continue;
+        }
+        out.push(line.to_owned());
+        i += 1;
+    }
+    // The section ran to the end of the file: the row belongs at the tail.
+    if in_section {
+        out.push(rendered.trim_end_matches('\n').to_owned());
+    }
+    let joined = out.join("\n");
+    if content.ends_with('\n') {
+        joined + "\n"
+    } else {
+        joined
+    }
+}
+
+/// Drops one combo row from `combos:` by its id, keeping every other line.
+///
+/// The inverse of [`append_combo_row`], and the reason the pair exists: `add`
+/// then `remove` of the same row must restore the file byte-for-byte, and the
+/// only way to honour that is to touch the lines the row owns and nothing else.
+/// A whole-section re-render would put the operator's blank separator and
+/// closing note back in canonical order, which is a change nobody asked for.
+///
+/// A row's extent runs from its `- id:` line to the line before the next entry
+/// at the same depth. Blanks and column-0 comments between two rows are **not**
+/// part of either row, so they survive the removal — the note the operator wrote
+/// above a row still describes what is above it.
+fn remove_combo_row(content: &str, id: &str) -> Option<String> {
+    let all: Vec<&str> = content.lines().collect();
+
+    // Find the entry line for `id`, inside `combos:` and nowhere else.
+    let start = {
+        let mut in_section = false;
+        let mut found = None;
+        for (i, line) in all.iter().enumerate() {
+            if *line == "combos:" {
+                in_section = true;
+                continue;
+            }
+            if in_section && is_section_header(line) {
+                in_section = false;
+            }
+            if in_section && combo_row_starts(line) && combo_row_id(line) == id {
+                found = Some(i);
+                break;
+            }
+        }
+        found
+    }?;
+
+    // The row ends where the next entry or the next section begins, whichever
+    // the file reaches first.
+    let mut end = all.len();
+    for (j, line) in all.iter().enumerate().skip(start + 1) {
+        if is_section_header(line) || combo_row_starts(line) {
+            end = j;
+            break;
+        }
+    }
+
+    let mut out: Vec<String> = Vec::with_capacity(all.len());
+    out.extend(all[..start].iter().map(|l| (*l).to_owned()));
+    out.extend(all[end..].iter().map(|l| (*l).to_owned()));
+    let joined = out.join("\n");
+    Some(if content.ends_with('\n') {
+        joined + "\n"
+    } else {
+        joined
+    })
 }
 
 /// A top-level YAML section header: **no indentation at all**, a colon, nothing
@@ -4491,6 +5274,206 @@ pub fn unknown_flag_hint(args: &[OsString], invalid: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The repo's own `config.yaml` is a combo list this build wrote or
+    /// accepted, so [`check_combos`] must say yes about it — and it is the only
+    /// fixture that carries a real operator's section: comment blocks, a
+    /// flow-style `targets:` list, and the strategies an operator actually chose
+    /// while tuning the routing table. A validator that rejects the repo's own
+    /// config is a validator nobody can use, and this is the test that catches it.
+    #[test]
+    fn check_combos_accepts_the_repos_own_config() {
+        // Relative to this source file: `crates/ar-cli/src/commands.rs` -> the
+        // repo root. Not `../../..`, which lands in `proxy/`.
+        let yaml = include_str!("../../../config.yaml");
+        let cfg = match Config::parse(yaml, no_expansion) {
+            Ok(c) => c,
+            Err(e) => panic!("the repo's config.yaml must parse: {e}"),
+        };
+        assert!(
+            !cfg.combos.is_empty(),
+            "the fixture is worthless if it carries no combos"
+        );
+        check_combos(&cfg.combos, &cfg)
+            .unwrap_or_else(|e| panic!("check_combos refused the repo's own config: {e}"));
+    }
+
+    /// The contract the Phase 4 verbs are held to: `combo add` then
+    /// `combo remove` of the same row restores the file **byte for byte**.
+    ///
+    /// Measured against the repo's own `config.yaml`, because a synthetic
+    /// fixture that omits the things a hand-written file actually carries would
+    /// pass a writer that drifted from them. The three properties are exactly
+    /// what the earlier whole-section writers got wrong:
+    ///
+    /// 1. The blank separator and the four-line note between two rows stay where
+    ///    the operator put them, above the row they document.
+    /// 2. No row is duplicated — the section's body must be consumed whole, not
+    ///    only up to its first blank line.
+    /// 3. The trailing-newline absence is the file's, not the writer's.
+    #[test]
+    fn combo_add_then_remove_is_a_byte_identical_round_trip() {
+        let yaml = include_str!("../../../config.yaml");
+        let cfg = Config::parse(yaml, no_expansion).unwrap();
+
+        let added = Combo {
+            id: "scratch".to_owned(),
+            strategy: Strategy::parse("priority"),
+            targets: vec!["openai/gpt-5.4".to_owned()],
+            weights: BTreeMap::new(),
+            pool: Vec::new(),
+            steps: Vec::new(),
+            compression: None,
+            context_length: None,
+            judge_model: None,
+        };
+        let rows: Vec<Combo> = cfg
+            .combos
+            .iter()
+            .cloned()
+            .chain(std::iter::once(added))
+            .collect();
+        check_combos(&rows, &cfg).expect("the repo's rows plus one must validate");
+
+        let row = crate::import::render_combo_block(rows.last().unwrap()).unwrap();
+        let after_add = append_combo_row(yaml, &row);
+        assert_ne!(after_add, yaml, "the add must have changed something");
+        // The three rows the file already carried are still there, once each: a
+        // writer that stopped skipping early left the section's tail below the
+        // rendered block, which is how a six-row table appears.
+        assert_eq!(
+            after_add.matches("- id:").count(),
+            yaml.matches("- id:").count() + 1
+        );
+        // Every byte up to the end of the last original row is untouched, so the
+        // blank separator and the note above `cheap` are still above it.
+        assert!(
+            after_add
+                .starts_with(&yaml[..yaml.rfind("nano\n").expect("the fixture's last target")]),
+            "every byte before the new row must be the original file"
+        );
+
+        let after_remove =
+            remove_combo_row(&after_add, "scratch").expect("the added row must be found");
+        assert_eq!(
+            after_remove, yaml,
+            "removing the row add wrote must restore the file byte for byte"
+        );
+    }
+
+    /// `combo target add` / `combo target remove` round trip too, and against
+    /// the same fixture: a target edit touches one line, so the diff must be one
+    /// line and the round trip must be empty.
+    #[test]
+    fn combo_target_add_then_remove_is_a_byte_identical_round_trip() {
+        let yaml = include_str!("../../../config.yaml");
+        let after_add = add_target_line(yaml, "default", "openai/gpt-5.4-nano")
+            .expect("the repo's `default` combo must answer");
+        assert_ne!(after_add, yaml);
+        assert_eq!(
+            after_add.lines().count(),
+            yaml.lines().count() + 1,
+            "one line was added, so exactly one line must appear"
+        );
+        let after_remove = remove_target_line(&after_add, "default", "openai/gpt-5.4-nano")
+            .expect("the line just written must be found");
+        assert_eq!(
+            after_remove, yaml,
+            "the target edit must round trip exactly"
+        );
+    }
+
+    /// The regression that produced six rows out of three.
+    ///
+    /// `splice_section` used to end its skip at the first blank line or column-0
+    /// comment, on the ground that both are unindented and so must belong to the
+    /// next section. The repo's `combos:` carries a blank separator *inside* the
+    /// section between two of its rows, so every splice stopped there, left the
+    /// rows after it below the rendered block, and the routing table read twice
+    /// the combos it had. This is the shape that caught it, held as a test.
+    #[test]
+    fn splice_consumes_a_section_body_that_carries_a_blank_separator() {
+        let doc =
+            "combos:\n  - id: one\n    strategy: priority\n\n  - id: two\n    strategy: lkgp\n";
+        let rendered = "combos:\n  - id: one\n    strategy: priority\n";
+        let out = splice_section(doc, "combos", rendered);
+        assert_eq!(
+            out.matches("- id:").count(),
+            1,
+            "`two` must be consumed with `one`"
+        );
+        assert_eq!(out, "combos:\n  - id: one\n    strategy: priority\n");
+    }
+
+    /// A column-0 comment between two rows of one section is that section's,
+    /// not the next one's — the other half of the regression above.
+    ///
+    /// The consequence is the awkward one: a comment that sits *inside* a section
+    /// is replaced with the section, because a splice owns the whole section.
+    /// That is why [`append_combo_row`] exists — the row writers preserve it, and
+    /// this test is the record of why they had to.
+    #[test]
+    fn splice_consumes_a_column_zero_comment_between_two_rows() {
+        let doc = "combos:\n  - id: one\n    strategy: priority\n\n  # why two\n  - id: two\n    strategy: lkgp\n";
+        let rendered = "combos:\n  - id: one\n    strategy: priority\n";
+        let out = splice_section(doc, "combos", rendered);
+        // `two` is consumed, and the note between the two rows goes with it.
+        assert_eq!(out.matches("- id:").count(), 1);
+        assert_eq!(out, "combos:\n  - id: one\n    strategy: priority\n");
+
+        // But a note that introduces the *next* section stays, above it — the
+        // look-ahead is what tells the two apart.
+        let boundary = "combos:\n  - id: one\n    strategy: priority\n\n# why keys\nkeys:\n  openai: $AR_KEY_OPENAI\n";
+        let out = splice_section(boundary, "combos", rendered);
+        assert!(
+            out.contains("# why keys"),
+            "the next section's note must stay: {out:?}"
+        );
+        assert!(out.contains("keys:"), "the next section must stay");
+        assert_eq!(out, boundary, "nothing else moved");
+    }
+
+    /// The trailing newline is the file's, not the writer's: the repo's
+    /// `config.yaml` ends without one deliberately, and a writer that added it
+    /// made every write read as a whole-file diff.
+    ///
+    /// This is the Phase 3 contract, restated here because `combo add` is the
+    /// third writer to reach the same file and the property is the surface's,
+    /// not one verb's.
+    #[test]
+    fn combo_writers_preserve_the_files_own_trailing_newline() {
+        let yaml = include_str!("../../../config.yaml");
+        assert!(
+            !yaml.ends_with('\n'),
+            "the fixture must end without a newline"
+        );
+        let cfg = Config::parse(yaml, no_expansion).unwrap();
+        let mut next = cfg;
+        next.combos.push(Combo {
+            id: "scratch".to_owned(),
+            strategy: Strategy::parse("priority"),
+            targets: vec!["openai/gpt-5.4".to_owned()],
+            weights: BTreeMap::new(),
+            pool: Vec::new(),
+            steps: Vec::new(),
+            compression: None,
+            context_length: None,
+            judge_model: None,
+        });
+        let row = crate::import::render_combo_block(next.combos.last().unwrap()).unwrap();
+        let after_add = append_combo_row(yaml, &row);
+        assert!(
+            !after_add.ends_with('\n'),
+            "the add must not add a final newline"
+        );
+        let after_remove =
+            remove_combo_row(&after_add, "scratch").expect("the added row must be found");
+        assert!(
+            !after_remove.ends_with('\n'),
+            "the remove must not add a final newline either"
+        );
+        assert_eq!(after_remove, yaml);
+    }
 
     #[test]
     fn default_columns_lead_with_toon_defaults() {
