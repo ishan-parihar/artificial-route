@@ -4319,6 +4319,20 @@ fn list_has_entry(content: &str, section: &str, list: &str, entry: &str) -> bool
 /// is the one edit that cannot be a list append, so it gets its own writer: the
 /// existing key is re-spelled in place, and a section with no such key gains one
 /// at the end.
+/// The key a scalar line names, without its indent or its value.
+///
+/// `  hide_paid_models: false` names `hide_paid_models`, and so does
+/// `  hide_paid_models:` — the name is the part before the first colon, and a
+/// caller that compares the whole line has to know the value it is looking for,
+/// which is the thing it is trying to change.
+fn key_name(line: &str) -> &str {
+    let body = line.trim();
+    match body.find(':') {
+        Some(at) => body[..at].trim(),
+        None => body,
+    }
+}
+
 fn set_section_scalar(content: &str, section: &str, key: &str, value: bool) -> String {
     let all: Vec<&str> = content.lines().collect();
     let Some(depth) = section_depth(&all, section) else {
@@ -4339,20 +4353,33 @@ fn set_section_scalar(content: &str, section: &str, key: &str, value: bool) -> S
             i += 1;
             continue;
         }
-        if in_section
-            && is_key_at(line, key_depth)
-            && line.trim_end() == format!("{}{}:", " ".repeat(key_depth), key)
-        {
-            out.push(format!("{}{}: {}", " ".repeat(key_depth), key, value));
+        // The key is recognised by its *name*, not by the whole line: the
+        // operator's own value is on the right of the colon and it is whatever
+        // they wrote. Matching a bare `key:` header instead matched nothing, so
+        // the only thing this writer ever did was append a second copy of the
+        // key beside the first.
+        if in_section && is_key_at(line, key_depth) && key_name(line) == key {
+            // `false` is the value `ModelVisibility` omits when it serialises,
+            // so the file's own canonical spelling of "false" is the key's
+            // absence. Writing the word leaves a byte the operator did not put
+            // there, and the round trip that should have restored the file
+            // byte-for-byte now cannot: an explicit false is still a written
+            // key. The write therefore has two directions, and the false one
+            // removes what it finds.
+            if value {
+                out.push(format!("{}{}: {}", " ".repeat(key_depth), key, value));
+            }
             done = true;
             in_section = false;
             i += 1;
             continue;
         }
         if in_section && is_section_header(line) {
-            if !done {
-                // The section ended before the key appeared: the key is added at
-                // the end of the section, which is where a new one belongs.
+            // The section ended before the key appeared. It is written at the
+            // section's own tail, which is where a new key belongs — and a
+            // `false` that finds nothing writes nothing, because the key was
+            // already absent and absence is what false means here.
+            if !done && value {
                 out.push(format!("{}{}: {}", " ".repeat(key_depth), key, value));
                 done = true;
             }
@@ -4361,10 +4388,67 @@ fn set_section_scalar(content: &str, section: &str, key: &str, value: bool) -> S
         out.push(line.to_owned());
         i += 1;
     }
-    if in_section && !done {
+    if in_section && !done && value {
         out.push(format!("{}{}: {}", " ".repeat(key_depth), key, value));
     }
-    rejoin(content, out)
+    let rejoined = rejoin(content, out);
+    // A removal that takes the section's last key leaves an empty block, which
+    // is a header the next reader has to wonder about — and it is exactly the
+    // byte an add-then-remove round trip must not leave. The section goes with
+    // the key, but only when the key was the section's whole body.
+    // Drop the section only when this write emptied it: a removal that took the
+    // section's last key leaves a header with nothing under it, and that is the
+    // byte an add-then-remove round trip must not leave. A section holding a
+    // list, or any other key, keeps its header.
+    if !value && !section_has_a_key(&rejoined, section, depth) {
+        return drop_section_str(&rejoined, section);
+    }
+    rejoined
+}
+
+/// Whether `section` still holds any key of its own, at its keys' depth.
+///
+/// A block sequence entry is not a key, so a section holding only a list is
+/// still a section with content: this answers about `hide_paid_models:` style
+/// scalars and the keys of the block, which is the thing a scalar removal can
+/// empty.
+fn section_has_a_key(doc: &str, section: &str, depth: usize) -> bool {
+    let all: Vec<&str> = doc.lines().collect();
+    let key_depth = depth + 2;
+    let mut in_section = false;
+    for line in &all {
+        if is_section(line, section) {
+            in_section = true;
+            continue;
+        }
+        if in_section && is_section_header(line) {
+            return false;
+        }
+        if in_section && indent_of(line) == Some(key_depth) && line.contains(':') {
+            return true;
+        }
+    }
+    false
+}
+
+/// Drops `section` and its body, keeping everything else byte-identical.
+fn drop_section_str(doc: &str, section: &str) -> String {
+    let all: Vec<&str> = doc.lines().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut in_section = false;
+    for line in &all {
+        if is_section(line, section) {
+            in_section = true;
+            continue;
+        }
+        if in_section && is_section_header(line) {
+            in_section = false;
+        }
+        if !in_section {
+            out.push((*line).to_owned());
+        }
+    }
+    rejoin(doc, out)
 }
 
 /// `aroute visibility`, and its `show` spelling.
@@ -9683,6 +9767,102 @@ models\":[{\"kind\":\"model\",\"model\":\"nvidia/z-ai/glm-5.3\",\"providerId\":\
         );
         // Mutation control: break `in_list = true` for the `owner.is_none()` arm
         // of `scan_nested_entry` and both assertions above fail.
+    }
+
+    // ---- Phase 6, validated late: the scalar writer had no reverse --------
+    //
+    // Found in the post-ship validation pass, not by reading the phase. Two
+    // defects, both in the direction nobody had exercised: `hide-paid` had only
+    // ever been tested as "set it to true", and the writer's own tests called it
+    // on sections whose key was already in the shape being written.
+
+    #[test]
+    fn set_section_scalar_replaces_the_key_it_finds_rather_than_adding_a_second() {
+        // The defect: the writer matched a bare `key:` header, so a key the
+        // operator had written *with a value* was never found, and every write
+        // appended a duplicate beside the original.
+        let doc = "visibility:\n  hide_paid_models: false\nlimits:\n  default:\n    rpm: 60\n";
+        let out = set_section_scalar(doc, "visibility", "hide_paid_models", true);
+        assert_eq!(
+            out.matches("hide_paid_models").count(),
+            1,
+            "one key, not two: {out:?}"
+        );
+        assert!(out.contains("  hide_paid_models: true\n"), "{out:?}");
+        assert!(
+            out.contains("limits:\n  default:\n    rpm: 60\n"),
+            "and the next section is untouched: {out:?}"
+        );
+        // Mutation control: compare the whole line to a bare `key:` header
+        // again and this fails with a second copy of the key.
+    }
+
+    #[test]
+    fn hiding_paid_false_removes_the_key_because_false_is_the_omitted_value() {
+        // `ModelVisibility` serialises `hide_paid_models: false` as the key's
+        // absence, so the file's own canonical spelling of false is nothing.
+        // A writer that spells the word leaves a byte the operator never put
+        // there, and the round trip that should have restored the file cannot.
+        let with_false =
+            "visibility:\n  hide_paid_models: false\nlimits:\n  default:\n    rpm: 60\n";
+        let out = set_section_scalar(with_false, "visibility", "hide_paid_models", false);
+        assert!(
+            !out.contains("hide_paid_models"),
+            "the false key goes: {out:?}"
+        );
+        assert!(
+            out.contains("limits:\n  default:\n    rpm: 60\n"),
+            "and nothing else moves: {out:?}"
+        );
+        // Mutation control: write the word unconditionally and this fails.
+    }
+
+    #[test]
+    fn a_false_write_takes_the_section_with_its_last_key() {
+        // A header with nothing under it is a block the next reader has to
+        // wonder about, and it is exactly the byte an add-then-remove round trip
+        // must not leave.
+        let added = "visibility:\n  hide_paid_models: true\nmcp:\n  port: 9000\n";
+        let out = set_section_scalar(added, "visibility", "hide_paid_models", false);
+        assert!(
+            !out.contains("visibility:"),
+            "the emptied section goes: {out:?}"
+        );
+        assert!(
+            out.contains("mcp:\n  port: 9000\n"),
+            "and what followed it stays: {out:?}"
+        );
+        // Mutation control: leave the header and this fails.
+    }
+
+    #[test]
+    fn a_false_write_keeps_a_section_that_still_holds_a_list() {
+        // The control for the drop rule's other half: a section whose only key
+        // went but whose list remains is not empty, and dropping it would delete
+        // the operator's own `blocked_providers:` with it.
+        let doc = "visibility:\n  hide_paid_models: true\n  blocked_providers:\n    - groq\nmcp:\n  port: 9000\n";
+        let out = set_section_scalar(doc, "visibility", "hide_paid_models", false);
+        assert!(!out.contains("hide_paid_models"), "the key goes: {out:?}");
+        assert!(
+            out.contains("visibility:\n  blocked_providers:\n    - groq\n"),
+            "and the section and its list stay: {out:?}"
+        );
+        // Mutation control: make the drop condition ignore the remaining key and
+        // this fails, taking `blocked_providers:` with it.
+    }
+
+    #[test]
+    fn hide_paid_round_trips_a_new_key_byte_for_byte() {
+        // The plan's round-trip rule, in the direction that had never been run:
+        // write a key the file did not have, then take it back out.
+        let base = "visibility:\n  blocked_providers:\n    - groq\nmcp:\n  port: 9000\n";
+        let on = set_section_scalar(base, "visibility", "hide_paid_models", true);
+        assert_ne!(on, base, "the write happened");
+        let off = set_section_scalar(&on, "visibility", "hide_paid_models", false);
+        assert_eq!(
+            off, base,
+            "write then remove restores the file byte for byte"
+        );
     }
 
     // ---- Phase 5: `aroute oauth`, the operator's stated goal ----------------
