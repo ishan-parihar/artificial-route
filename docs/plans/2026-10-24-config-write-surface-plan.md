@@ -386,36 +386,44 @@ refusals fire with their own messages and none writes a file; the repo's
 `config.yaml` was never opened for writing and the running services were never
 restarted.
 
-### Phase 5 — `aroute oauth list|add|remove` *(the operator's stated goal)*
+### Phase 5 — `aroute oauth list|add|remove` *(the operator's stated goal)* — **BLOCKED, MEASURED 2026-10-25**
 
 `docs/36` 8a specified these; the operator's ask makes them the phase the whole
-plan is for. `OAuthSession` has 13 fields (`:818-907`), of which seven are
-documented in `config.yaml:57-85` and commonly written. The verb writes
-**placement only, never a secret** — the block carries no secrets by design
-(`config.yaml:57-85`).
+plan is for. `OAuthSession` has 13 fields (`ar-config/src/lib.rs:818-853`), of
+which seven are commonly written. The verb writes **placement only, never a
+secret** — the block carries no secrets by design.
 
 - `aroute oauth list` — one row per session: `provider`, `authorization_url`,
   `token_url`, `client_id`, `redirect_uri`, `refresh_key`, `client_secret_key`.
 - `add --provider X [--authorization-url U] [--token-url U] [--client-id I]
   [--redirect-uri U] [--refresh-key name] [--client-secret-key name] [--scope S]`
-  — appends one row. Rules pinned, not invented (`config.yaml:61-79`):
-  `authorization_url` and `token_url` are **never guessed** from the provider id
-  (a guessed endpoint is an invented wire format); a `refresh_key` must name a
-  `keys:` row or the session cannot renew and `ar doctor` says so; a
-  `client_secret_key` names a third row; a `redirect_uri`, when given, must be
-  `https` or a loopback `http`.
+  — appends one row. Rules pinned, not invented: `authorization_url` and
+  `token_url` are **never guessed** from the provider id (a guessed endpoint is
+  an invented wire format); a `refresh_key` must name a `keys:` row or the
+  session cannot renew and `ar doctor` says so; a `client_secret_key` names a
+  third row; a `redirect_uri`, when given, must be `https` or a loopback `http`.
 - `remove --provider X` — one session per provider id, so the key is the id.
 
-**Ordering note:** `docs/36` 8a says this phase comes **after step 4** (the
-resumable OAuth login), because step 4 is what makes the block worth creating
-programmatically. That dependency still holds; Phase 5 is listed last of the
-five verb phases only to respect it.
+**Why it is blocked, measured rather than assumed.** The plan's own ordering note
+says this comes after step 4, the resumable OAuth login. `auth.rs` has no
+resumable path: `aroute auth login` is single-shot with a `--timeout`, and
+`AuthLoginArgs` carries no resume state. The blocker is not cosmetic.
+`persist_token` (`auth.rs:265-288`) **refuses** a session that declares no
+`refresh_key` when the provider returned a refresh token — correctly, since
+without one the session dies on its first 401. So an `oauth add` that omits
+`refresh_key` writes a row the operator's own login cannot complete, and the
+verb would be handing them a config that looks finished and is not.
 
-Test contract:
+That is a dependency, not an argument against the phase: it is the reason to do
+step 4 first, and it names the one field the new verb must not let pass.
+
+**Test contract, unchanged:**
 - `oauth_add_should_append_a_row_and_leave_the_rest_byte_identical`
 - `oauth_add_should_refuse_a_refresh_key_that_names_no_keys_row`
 - `oauth_add_should_refuse_a_non_loopback_http_redirect_uri`
 - `oauth_list_should_never_print_a_secret_value` — same gate as `keys list`.
+- `oauth_add_should_require_a_refresh_key_when_the_provider_renews` — new, from
+  the `persist_token` finding above.
 
 ### Phase 6 — `aroute visibility` *(the section nothing writes, part 1)*
 
@@ -510,3 +518,31 @@ operator chose to lose a section.
 - The second half of the `import` half of the Q17 finding: Phase 0 has landed,
   so no path destroys a section any more. What is still open is the first half —
   the CLI reaching every section, which is what Phases 1-7 build.
+
+## 8. Open findings, recorded by what found them
+
+**A row-level writer must compare bytes, not configs.** `combo add` used
+`means_the_same`, which compares *parsed* configs — and `Config` models four of
+the top-level sections a real file can carry. On a config holding `oauth:`,
+`visibility:` or `mcp:`, both parses are equal, so a row was written and then
+discarded as "unchanged": the operator's add did nothing and printed success.
+The four combo verbs now compare bytes, and
+`combo_add_lands_on_a_config_carrying_sections_no_writer_represents` holds the
+shape. The whole-section writers keep `means_the_same`, which is right for them:
+a re-render can legitimately re-spell the same configuration, and a one-row edit
+cannot.
+
+**A row-level writer must also insert at a flush header boundary.**
+`append_combo_row` reached for its boundary through a blank line or comment, so a
+`combos:` written flush against `oauth:` accepted no row at all — the same
+silent no-op by a different route. Both were found by probing a config that
+carries sections no writer represents, which is the config the Phase 0 guard was
+written for and which the repo's own file does not happen to contain.
+
+**`guard_against_section_loss` still runs only on `import`.** Phase 0's finding,
+unchanged and still true: every other write path is unguarded against a target
+carrying a section its own renderer cannot represent. The two findings above are
+why that matters for the row writers specifically — the guard is one mechanism,
+and the byte-comparison is the other. It remains the operator's call whether the
+guard is widened to every writer or whether byte-equality (which is strictly
+stronger for a row-level edit) is accepted as the guarantee.

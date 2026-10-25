@@ -2549,7 +2549,10 @@ fn combo_add(cli: &Cli, args: &AddComboArgs) -> anyhow::Result<()> {
     // surgical and the round trip byte-stable.
     let row = crate::import::render_combo_block(next.combos.last().unwrap())?;
     let updated = append_combo_row(&doc, &row);
-    if means_the_same(&doc, &updated) {
+    if updated == doc {
+        // Byte equality, not [`means_the_same`]: a row-level writer changed
+        // exactly the lines it owns, so the candidate either differs or the
+        // edit did not land.
         println!("combos: {id} — unchanged");
         return Ok(());
     }
@@ -2599,7 +2602,8 @@ fn combo_remove(cli: &Cli, args: &RemoveComboArgs) -> anyhow::Result<()> {
             "the row may be written in a form this writer does not recognise; edit it by hand",
         )
     })?;
-    if means_the_same(&doc, &updated) {
+    if updated == doc {
+        // Byte equality — see `combo_add` on why not `means_the_same`.
         println!("combos: {id} — unchanged");
         return Ok(());
     }
@@ -2693,7 +2697,8 @@ fn combo_target_add(
             "the row may be written in a form this writer does not recognise; edit it by hand",
         )
     })?;
-    if means_the_same(&doc, &updated) {
+    if updated == doc {
+        // Byte equality — see `combo_add` on why not `means_the_same`.
         println!("combos: {combo_id} — unchanged");
         return Ok(());
     }
@@ -2736,7 +2741,8 @@ fn combo_target_remove(cli: &Cli, combo_id: &str, target: String) -> anyhow::Res
             "the row may be written in a form this writer does not recognise; edit it by hand",
         )
     })?;
-    if means_the_same(&doc, &updated) {
+    if updated == doc {
+        // Byte equality — see `combo_add` on why not `means_the_same`.
         println!("combos: {combo_id} — unchanged");
         return Ok(());
     }
@@ -4608,6 +4614,15 @@ fn append_combo_row(content: &str, rendered: &str) -> String {
             continue;
         }
         if in_section && is_section_header(line) {
+            // The next section starts here with no blank or comment between
+            // them, so this header is the boundary. Insert the row before it:
+            // a `combos:` written flush against `oauth:` must still accept a
+            // new row, which the earlier version silently dropped.
+            let mut at = out.len();
+            while at > 0 && (out[at - 1].is_empty() || out[at - 1].starts_with('#')) {
+                at -= 1;
+            }
+            out.insert(at, rendered.trim_end_matches('\n').to_owned());
             out.push(line.to_owned());
             in_section = false;
             i += 1;
@@ -5473,6 +5488,65 @@ mod tests {
             "the remove must not add a final newline either"
         );
         assert_eq!(after_remove, yaml);
+    }
+
+    /// A row-level writer must not use a *semantic* no-op test.
+    ///
+    /// `combo add` originally asked [`means_the_same`], which compares parsed
+    /// configs — and `Config` models only four of the top-level sections a real
+    /// file can carry. On a config holding `oauth:`, `visibility:` or `mcp:`
+    /// both parses are equal, so the row was written and then **silently
+    /// discarded** as "unchanged". The operator's add did nothing and reported
+    /// success.
+    ///
+    /// A row-level edit changes exact bytes and nothing else, so byte equality
+    /// is both the correct and the stricter test. This is the shape that caught
+    /// it, and it is why the whole-section splice may keep `means_the_same` —
+    /// a re-render can legitimately re-spell the same configuration, which a
+    /// one-row edit cannot.
+    #[test]
+    fn combo_add_lands_on_a_config_carrying_sections_no_writer_represents() {
+        let doc = "server:\n  host: 127.0.0.1\n  port: 20128\nkeys:\n  openai: $AR_KEY_OPENAI\nproviders:\n  - id: openai\n    key: openai\ncombos:\n  - id: default\n    strategy: priority\n    targets:\n      - openai/gpt-5.4\noauth:\n  - provider: codex\n    refresh_key: codex_refresh\nvisibility:\n  defaults:\n    admin: true\n";
+
+        let cfg = Config::parse(doc, no_expansion).expect("the document parses");
+        assert!(!cfg.combos.is_empty(), "the fixture carries a combo");
+
+        let added = Combo {
+            id: "scratch".to_owned(),
+            strategy: Strategy::parse("priority"),
+            targets: vec!["openai/gpt-5.4".to_owned()],
+            weights: BTreeMap::new(),
+            pool: Vec::new(),
+            steps: Vec::new(),
+            compression: None,
+            context_length: None,
+            judge_model: None,
+        };
+        let rows: Vec<Combo> = cfg
+            .combos
+            .iter()
+            .cloned()
+            .chain(std::iter::once(added))
+            .collect();
+        let row = crate::import::render_combo_block(rows.last().unwrap()).unwrap();
+        let after_add = append_combo_row(doc, &row);
+
+        // The row landed, which is what the semantic test could not see.
+        assert_ne!(after_add, doc, "the row must appear in the candidate");
+        // Two rows in `combos:` (the fixture's `providers:` row is the third
+        // `- id:` in the document, which is why the count is not 2).
+        assert_eq!(after_add.matches("- id:").count(), 3);
+        // Every section the config carries is still there, byte for byte.
+        for section in ["server:", "keys:", "providers:", "oauth:", "visibility:"] {
+            assert!(
+                after_add.contains(section),
+                "`{section}` survived: {after_add:?}"
+            );
+        }
+        // And the whole document round trips, unemittable sections and all.
+        let after_remove =
+            remove_combo_row(&after_add, "scratch").expect("the added row must be found");
+        assert_eq!(after_remove, doc);
     }
 
     #[test]
