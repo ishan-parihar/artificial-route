@@ -1,11 +1,13 @@
 # The config-write surface: an outline-plan for closing it
 
-Status: **Phases 0-7 shipped 2026-10-24 through 2026-10-25** (`96cf513`, `9c46ff5`,
-`a34cd94`, `5e0a874`, `16d7cf1`, `218cb00`, `fadff81`). Phase 5 (`oauth add`)
-was recorded here as blocked and the claim did not survive re-derivation: it
-is shippable now, and what it needs is a ruling on two shape questions, not a
-code dependency — the amendment in that phase's section says which. Written at
-the
+Status: **Phases 0-7 shipped, and Phase 5 with them — the plan is complete**
+(`96cf513`, `9c46ff5`, `a34cd94`, `5e0a874`, `16d7cf1`, `218cb00`, `fadff81`,
+`4a2f0c8`). Phase 5 was recorded here as blocked on resumable login and the
+claim did not survive re-derivation (`e94caf8`): it was never blocked, and it is
+now shipped. What is left of the plan is three rulings that are the operator's
+rather than work: Q17 (which sections the CLI reaches, whether `mcp` ships or
+the CLI grows a `commands --json` catalog, and whether `import` may update a
+config in place). Written at the
 operator's request, then Phase 0 (the data-loss fix) was validated and landed
 before any new verb. It supersedes nothing: `docs/36` §4 step 8 specifies the
 first three verb groups (8a `oauth:`, 8b `server:`, 8c `providers:` add/remove)
@@ -433,6 +435,20 @@ ruling on two shape questions rather than a code dependency: whether
 `oauth add` may write a row with no `refresh_key` when the provider renews
 (the plan's own test contract says refuse), and whether `client_id` is
 required or left to the operator's own judgement.
+
+**Shipped, `4a2f0c8`.** The blocker paragraph below was wrong and the phase
+was never blocked; the amendment above the divider says how. Thirteen tests,
+all five of the phase's own test contracts among them, plus the two controls the
+round trips earned:
+
+| what broke running it | what the writer did |
+|---|---|
+| `append_row` inserted where a line *was* an entry | a section whose only row had continuations had no entry line that ended a row, so the loop walked past the section's end and the write produced nothing — which the verb reported as `unchanged` |
+| the no-section path wrote the row at column zero | not a list under a header, so the file did not load |
+
+The fix for the first is a rule the other phases also needed and did not have:
+**a row is its entry plus its continuation lines, so "where does the row end" is
+a property of the next line's indent, never of this line's shape.**
 
 --- The original measurement, superseded by the paragraph above ---
 
