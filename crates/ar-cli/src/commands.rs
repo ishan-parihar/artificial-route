@@ -921,9 +921,17 @@ pub fn limits_set(cli: &Cli, args: &SetLimitsArgs) -> anyhow::Result<()> {
     // The merge is per arm: a named arm is set, an arm not passed stays as it
     // was — `set --rpm` must not quietly drop a ceiling the row already
     // carried. Removing an arm is `clear`'s job, or the dashboard's.
+    //
+    // `default` is not a key. It names the row every unnamed request falls
+    // through to, which is a field of `limits:` itself and not an entry in
+    // `limits.keys:`. Writing it as a key left the operator with two rows that
+    // both answer to "default", and the one they edited was not the one the
+    // engine reads. The doc-comments on every limit error say the key is "the
+    // key the row governs, or \"default\"" — so the header they omit and the
+    // header that spells it are the same row.
     let row = match &args.key {
-        Some(name) => cfg.limits.keys.entry(name.clone()).or_default(),
-        None => &mut cfg.limits.default,
+        Some(name) if name != "default" => cfg.limits.keys.entry(name.clone()).or_default(),
+        _ => &mut cfg.limits.default,
     };
     row.rpm = args.rpm.or(row.rpm);
     row.usd_micros = args.usd_micros.or(row.usd_micros);
@@ -1163,7 +1171,7 @@ fn routable_target(target: &str, cfg: &ar_config::Config) -> bool {
 pub fn limits_clear(cli: &Cli, args: &ClearLimitsArgs) -> anyhow::Result<()> {
     let doc = read_config_text(cli)?;
     match &args.key {
-        Some(name) => {
+        Some(name) if name != "default" => {
             let mut cfg = load(cli)?;
             if cfg.limits.keys.remove(name).is_none() {
                 return Err(fail(
@@ -1181,6 +1189,22 @@ pub fn limits_clear(cli: &Cli, args: &ClearLimitsArgs) -> anyhow::Result<()> {
             };
             write_file(&cli.config, &next)?;
             println!("limits: key {name:?} removed");
+        }
+        // `--key default` names the row every unnamed request falls through
+        // to, which is a field of `limits:` and not an entry in `keys:`. It
+        // resets to the defaults rather than vanishing, because the row is
+        // the one the engine falls back to: there is no "no default" state
+        // to leave behind.
+        Some(_) => {
+            let mut cfg = load(cli)?;
+            cfg.limits.default = ar_config::Limit::default();
+            let next = if cfg.limits.is_empty() {
+                remove_section(&doc, "limits")
+            } else {
+                splice_section(&doc, "limits", &import::limits::render(&cfg.limits))
+            };
+            write_file(&cli.config, &next)?;
+            println!("limits: default row reset");
         }
         None => {
             let next = remove_section(&doc, "limits");
@@ -9465,6 +9489,178 @@ mod tests {
 
         // Clearing what is not there is an error, not a silent no-op.
         assert!(limits_clear(&cli, &ClearLimitsArgs { key: None }).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `--key default` is not a key. It names the row every unnamed request
+    /// falls through to, which is a field of `limits:` itself — writing it as
+    /// a `keys:` entry left two rows that both answered to "default", and the
+    /// one the operator edited was not the one the engine reads. This writes
+    /// the direction nobody had run: the *named* spelling of the field.
+    #[test]
+    fn limits_set_named_default_edits_the_field_not_a_key() {
+        let dir = tmpdir("limits-default");
+        let cli = limits_cli(&dir);
+        let before = std::fs::read_to_string(&cli.config).unwrap();
+        // Start from the field itself, which is the state the named write used
+        // to miss: the row exists and the key does not.
+        limits_set(
+            &cli,
+            &SetLimitsArgs {
+                key: None,
+                rpm: Some(60),
+                usd_micros: None,
+                tokens: None,
+                refuse_unpriced: Some(true),
+                model: None,
+                model_tokens: Vec::new(),
+                spend_window: None,
+            },
+        )
+        .unwrap();
+
+        limits_set(
+            &cli,
+            &SetLimitsArgs {
+                key: Some("default".to_owned()),
+                rpm: Some(90),
+                usd_micros: None,
+                tokens: None,
+                refuse_unpriced: Some(false),
+                model: None,
+                model_tokens: Vec::new(),
+                spend_window: None,
+            },
+        )
+        .unwrap();
+
+        let cfg = load(&cli).unwrap();
+        assert!(
+            cfg.limits.keys.is_empty(),
+            "default must not become a key, it is the field"
+        );
+        assert_eq!(
+            cfg.limits.default.rpm,
+            Some(90),
+            "the field carried the write"
+        );
+        assert!(!cfg.limits.default.refuse_unpriced, "and the boolean");
+
+        // The file's own canonical spelling. The field is a second `default:`
+        // nested under `limits:`, not a duplicate entry under `keys:` — a
+        // config the loader has to resolve by order of appearance.
+        let text = std::fs::read_to_string(&cli.config).unwrap();
+        assert!(
+            !text.contains("  keys:"),
+            "no keys block was invented:\n{text}"
+        );
+        assert_eq!(
+            text.matches("default:").count(),
+            1,
+            "exactly one default header:\n{text}"
+        );
+
+        // False is the absence in `ModelVisibility`, and here too — the
+        // `skip_serializing_if` field. Spelling the word would leave a byte
+        // the operator never wrote.
+        assert!(
+            !text.contains("refuse_unpriced"),
+            "false is the key's absence, not the word:\n{text}"
+        );
+
+        // Round trip back, byte for byte.
+        limits_set(
+            &cli,
+            &SetLimitsArgs {
+                key: Some("default".to_owned()),
+                rpm: Some(60),
+                usd_micros: None,
+                tokens: None,
+                refuse_unpriced: Some(true),
+                model: None,
+                model_tokens: Vec::new(),
+                spend_window: None,
+            },
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&cli.config).unwrap();
+        assert!(
+            text.contains("refuse_unpriced: true"),
+            "true is written:\n{text}"
+        );
+
+        // The field's reset path, which is what `--key default` means to
+        // `clear`: the row the engine falls back to cannot simply vanish.
+        limits_clear(
+            &cli,
+            &ClearLimitsArgs {
+                key: Some("default".to_owned()),
+            },
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&cli.config).unwrap();
+        assert!(!text.contains("limits:"), "the block went:\n{text}");
+        assert!(
+            text.contains("combos:"),
+            "the rest of the config survived:\n{text}"
+        );
+        assert!(
+            before.contains("combos:"),
+            "the fixture had it to begin with"
+        );
+
+        // The block's survival rule is the whole block being empty, not the
+        // key list. A default row that reset while a named row stayed has to
+        // keep the header — a `limits:` with a body under it is the section,
+        // and the section is what the next writer splices into.
+        limits_set(
+            &cli,
+            &SetLimitsArgs {
+                key: Some("prod".to_owned()),
+                rpm: Some(600),
+                usd_micros: None,
+                tokens: None,
+                refuse_unpriced: None,
+                model: None,
+                model_tokens: Vec::new(),
+                spend_window: None,
+            },
+        )
+        .unwrap();
+        limits_set(
+            &cli,
+            &SetLimitsArgs {
+                key: Some("default".to_owned()),
+                rpm: Some(1),
+                usd_micros: None,
+                tokens: None,
+                refuse_unpriced: None,
+                model: None,
+                model_tokens: Vec::new(),
+                spend_window: None,
+            },
+        )
+        .unwrap();
+        limits_clear(
+            &cli,
+            &ClearLimitsArgs {
+                key: Some("default".to_owned()),
+            },
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&cli.config).unwrap();
+        assert!(
+            text.contains("limits:"),
+            "the header stays while a row remains:\n{text}"
+        );
+        assert!(
+            text.contains("      rpm: 600"),
+            "and the surviving row kept its value:\n{text}"
+        );
+        assert!(
+            !text.contains("default:"),
+            "the field that reset is not rendered as an empty block:\n{text}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
