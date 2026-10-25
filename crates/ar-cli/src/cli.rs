@@ -135,6 +135,20 @@ pub enum Command {
     #[command(verbatim_doc_comment)]
     ContinueOnCut(ContinueOnCutArgs),
 
+    /// Read and write the `oauth:` block: one session per provider id.
+    ///
+    /// Placement only, never a secret: the block carries *names* of credential
+    /// rows, and the values themselves live in `keys:` and the credential store.
+    /// Two endpoints are never guessed from the provider id, because a guessed
+    /// wire format is exactly what AGENTS.md forbids inventing.
+    ///
+    /// Examples:
+    ///   aroute oauth
+    ///   aroute oauth add --provider codex --token-url https://auth/token
+    ///   aroute oauth remove --provider codex
+    #[command(verbatim_doc_comment)]
+    Oauth(OauthArgs),
+
     /// Check config, credentials and registry; exits 1 on any failure.
     ///
     /// Examples:
@@ -1525,6 +1539,98 @@ pub struct ContinueOnCutProviderArgs {
     /// Provider id to add or remove, as `providers:` spells it.
     #[arg(long, value_name = "ID")]
     pub provider: String,
+}
+
+/// Options for `aroute oauth`. `None` prints every session.
+#[derive(Debug, Args)]
+pub struct OauthArgs {
+    #[command(subcommand)]
+    pub command: Option<OauthCommand>,
+
+    /// Emit the same rows as JSON instead of TOON.
+    /// Global so it parses on either side of the subcommand: `aroute oauth
+    /// list --json` is how the plan's examples spell it, and a flag that only
+    /// parses before the verb is one every agent must be told about.
+    #[arg(long, global = true)]
+    pub json: bool,
+}
+
+/// Subcommands of `aroute oauth`.
+#[derive(Debug, Subcommand)]
+pub enum OauthCommand {
+    /// Print every session: the endpoints and the credential *names*, never a
+    /// secret value.
+    ///
+    /// Examples:
+    ///   aroute oauth list
+    ///   aroute oauth list --json
+    #[command(verbatim_doc_comment)]
+    List,
+
+    /// Append one session row.
+    ///
+    /// Both endpoints are operator-supplied: an authorize or token endpoint
+    /// guessed from the provider id is an invented wire format.
+    ///
+    /// Examples:
+    ///   aroute oauth add --provider codex --token-url https://auth/token
+    #[command(verbatim_doc_comment)]
+    Add(OauthAddArgs),
+
+    /// Remove one session, keyed by its provider id.
+    ///
+    /// Examples:
+    ///   aroute oauth remove --provider codex
+    #[command(verbatim_doc_comment)]
+    Remove(OauthProviderArgs),
+}
+
+/// The one flag `remove` needs: the id is the key, so there is nothing else.
+#[derive(Debug, Args)]
+pub struct OauthProviderArgs {
+    /// Provider id whose session goes, as `oauth:` spells it.
+    #[arg(long, value_name = "ID")]
+    pub provider: String,
+}
+
+/// The fields `oauth add` writes. Only `--provider` is required, because a
+/// session with no endpoints is still a valid row: it dispatches with a key it
+/// was given, it just cannot be logged into or renewed.
+#[derive(Debug, Args)]
+pub struct OauthAddArgs {
+    /// Provider id this session authenticates, as `providers:` spells it.
+    #[arg(long, value_name = "ID")]
+    pub provider: String,
+
+    /// Browser-facing authorize endpoint. Never guessed from the provider id.
+    #[arg(long, value_name = "URL")]
+    pub authorization_url: Option<String>,
+
+    /// Refresh endpoint. Never guessed from the provider id.
+    #[arg(long, value_name = "URL")]
+    pub token_url: Option<String>,
+
+    /// OAuth client id, when the refresh endpoint requires one.
+    #[arg(long, value_name = "ID")]
+    pub client_id: Option<String>,
+
+    /// Redirect the provider lands the person on: `https`, or a loopback `http`.
+    #[arg(long, value_name = "URI")]
+    pub redirect_uri: Option<String>,
+
+    /// `keys:` row holding the refresh token. Must name a row, or the session
+    /// cannot renew and `ar doctor` says so.
+    #[arg(long, value_name = "NAME")]
+    pub refresh_key: Option<String>,
+
+    /// `keys:` row holding a static `client_secret`, for confidential clients.
+    /// A name, never a value.
+    #[arg(long, value_name = "NAME")]
+    pub client_secret_key: Option<String>,
+
+    /// Scope requested on refresh, when the provider scopes its tokens.
+    #[arg(long, value_name = "SCOPE")]
+    pub scope: Option<String>,
 }
 
 /// Options for `aroute server`.

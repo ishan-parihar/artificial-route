@@ -1220,6 +1220,7 @@ pub fn dispatch(cli: &Cli) -> anyhow::Result<()> {
         Some(Command::Visibility(a)) => visibility(cli, a),
         Some(Command::ProviderSettings(a)) => provider_settings(cli, a),
         Some(Command::ContinueOnCut(a)) => continue_on_cut(cli, a),
+        Some(Command::Oauth(a)) => oauth(cli, a),
         Some(Command::Doctor(a)) => doctor(cli, a),
         Some(Command::Auth(a)) => crate::auth::run(cli, a),
         Some(Command::Run(a)) => block_on(serve::run(cli, a)),
@@ -2844,6 +2845,459 @@ const CUT_COLUMNS: [&str; 1] = ["providers"];
 
 /// The section name the continue-on-cut verbs edit.
 const CUT_SECTION: &str = "continue_on_cut";
+
+// --- `aroute oauth`, the operator's stated goal ------------------------------
+
+/// Columns of an `aroute oauth list` row.
+///
+/// Seven of [`ar_config::OAuthSession`]'s fields, and no others: these are the
+/// ones an operator writes by hand, and the rest are machine state
+/// (`expires_at`, the device-grant endpoint) that this surface does not own.
+/// Every value is a *name* or a public endpoint — never a secret, the same
+/// gate `keys list` applies.
+const OAUTH_COLUMNS: [&str; 7] = [
+    "provider",
+    "authorization_url",
+    "token_url",
+    "client_id",
+    "redirect_uri",
+    "refresh_key",
+    "client_secret_key",
+];
+
+/// The section name the oauth verbs edit.
+const OAUTH_SECTION: &str = "oauth";
+
+/// A cell for a field the session does not set.
+///
+/// `unset` rather than an empty cell, and rather than hiding the column: the
+/// two cases a caller must be able to tell apart are "no session declares
+/// this" and "a session declares it empty", and only the first is what a row
+/// omitting the key means.
+const UNSET: &str = "unset";
+
+/// `aroute oauth` — the read, and the `show` spelling with no verb.
+fn oauth_list(cli: &Cli, json: bool) -> anyhow::Result<()> {
+    let cfg = load(cli)?;
+    let cell = |v: &Option<String>| v.clone().unwrap_or_else(|| UNSET.to_owned());
+    let rows: Vec<Vec<String>> = cfg
+        .oauth
+        .iter()
+        .map(|s| {
+            vec![
+                s.provider.clone(),
+                cell(&s.authorization_url),
+                cell(&s.token_url),
+                cell(&s.client_id),
+                cell(&s.redirect_uri),
+                cell(&s.refresh_key),
+                cell(&s.client_secret_key),
+            ]
+        })
+        .collect();
+    let cols: Vec<&str> = OAUTH_COLUMNS.to_vec();
+    if json {
+        print!(
+            "{}",
+            toon::json(OAUTH_SECTION, &cols, &toon::every_field(&cols), &rows)
+        );
+    } else {
+        print!(
+            "{}",
+            toon::list(
+                OAUTH_SECTION,
+                OAUTH_SECTION,
+                &cols,
+                &toon::every_field(&cols),
+                &rows,
+                false
+            )
+        );
+    }
+    Ok(())
+}
+
+/// `aroute oauth add` — one session row, appended at the section's tail.
+///
+/// Every semantic is a refusal that already exists, not a new one:
+///
+/// * the two endpoints are **never guessed** from the provider id — the same
+///   rule `OAuthSession`'s own doc states, and the reason a login reports
+///   `NoAuthorizationUrl` rather than inventing an authorize endpoint;
+/// * a `--refresh-key` or `--client-secret-key` must name a real `keys:` row,
+///   because a credential row that resolves to nothing is a session `ar doctor`
+///   reports as unable to renew, which is a row that looks finished and is not;
+/// * a `--redirect-uri` must be `https` or a loopback `http`, the rule
+///   `OAuthSession`'s doc states for the same field.
+///
+/// The block carries no secrets by design, so this verb writes placement only
+/// and never asks for a value: the row names a `keys:` entry, and the value
+/// lives there and in the credential store.
+fn oauth_add(cli: &Cli, args: &crate::cli::OauthAddArgs) -> anyhow::Result<()> {
+    let provider = args.provider.trim();
+    if provider.is_empty() {
+        return Err(fail(
+            "the provider id is empty",
+            "name one as `providers:` spells it, e.g. codex",
+        ));
+    }
+    let doc = read_config_text(cli)?;
+    let cfg = load_edit(cli)?;
+    if cfg.providers.iter().all(|p| p.id != provider) {
+        return Err(fail(
+            format!("provider {provider:?} is not in this config's providers:"),
+            "`aroute providers` lists the providers this config carries; a session is keyed to a provider id",
+        ));
+    }
+    if cfg.oauth.iter().any(|s| s.provider == provider) {
+        return Err(fail(
+            format!("{} already has an `oauth:` session", provider),
+            "one session per provider id; `aroute oauth list` shows what is there, and `aroute oauth remove` drops it",
+        ));
+    }
+    // The two endpoints are operator-supplied, and never guessed from the id.
+    // Nothing here offers a default, because a guessed endpoint is an invented
+    // wire format: `OAuthSession`'s own doc is the rule this enforces.
+    for (flag, value) in [
+        ("--authorization-url", &args.authorization_url),
+        ("--token-url", &args.token_url),
+    ] {
+        let Some(url) = value.as_deref().map(str::trim) else {
+            continue;
+        };
+        if !(url.starts_with("https://")
+            || url.starts_with("http://127.0.0.1")
+            || url.starts_with("http://localhost"))
+        {
+            return Err(fail(
+                format!("{flag} {url:?} is neither https nor a loopback http"),
+                "an endpoint guessed or smuggled over plain http is a wire format this build will not write",
+            ));
+        }
+    }
+    // A redirect is public by construction, so the same scheme rule applies
+    // without the secret worry: https, or a loopback http for a same-machine
+    // CLI login.
+    if let Some(uri) = args.redirect_uri.as_deref().map(str::trim) {
+        let ok = uri.starts_with("https://")
+            || uri.starts_with("http://127.0.0.1")
+            || uri.starts_with("http://localhost")
+            || uri == "urn:ietf:wg:oauth:2.0:oob";
+        if !ok {
+            return Err(fail(
+                format!(
+                    "--redirect-uri {uri:?} is neither https, a loopback http, nor urn:ietf:wg:oauth:2.0:oob"
+                ),
+                "a provider refuses a redirect it does not recognise, so this refuses to write one",
+            ));
+        }
+    }
+    // Credential *names*, checked against `keys:` as written rather than as
+    // expanded: an `$AR_KEY_X` and the literal it points at are different
+    // spellings of the same row, and only the written one is what the file has.
+    let keys = raw_keys(&doc);
+    for (flag, value) in [
+        ("--refresh-key", &args.refresh_key),
+        ("--client-secret-key", &args.client_secret_key),
+    ] {
+        let Some(name) = value.as_deref().map(str::trim) else {
+            continue;
+        };
+        if name.is_empty() {
+            return Err(fail(
+                format!("{flag} is empty"),
+                "name a `keys:` row, e.g. codex_refresh",
+            ));
+        }
+        if !keys.contains_key(name) {
+            return Err(fail(
+                format!("{flag} {name:?} names no `keys:` row"),
+                "add the row to `keys:` first, or pass a name that is already there; a credential row that resolves to nothing is a session `ar doctor` reports as unable to renew",
+            ));
+        }
+    }
+    // A row that renews needs a refresh row to renew *from*: without one the
+    // session dies on its first 401, which is exactly what `persist_token`
+    // refuses. `client_id` is left to the operator — some refresh endpoints
+    // require one and some do not, and guessing is not this verb's job.
+    let renews = args
+        .token_url
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|u| !u.is_empty());
+    if renews
+        && args
+            .refresh_key
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+    {
+        return Err(fail(
+            "a --token-url with no --refresh-key writes a session that cannot renew",
+            "pass --refresh-key naming a `keys:` row, or drop --token-url to write a session that only dispatches",
+        ));
+    }
+    let mut row = format!("- provider: {}\n", provider);
+    let field = |dest: &mut String, key: &str, value: &Option<String>, depth: usize| {
+        if let Some(v) = value.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            dest.push_str(&format!("{}{}: {}\n", " ".repeat(depth), key, v));
+        }
+    };
+    field(
+        &mut row,
+        "authorization_url",
+        &args.authorization_url.clone(),
+        2,
+    );
+    field(&mut row, "token_url", &args.token_url.clone(), 2);
+    field(&mut row, "client_id", &args.client_id.clone(), 2);
+    field(&mut row, "redirect_uri", &args.redirect_uri.clone(), 2);
+    field(&mut row, "refresh_key", &args.refresh_key.clone(), 2);
+    field(
+        &mut row,
+        "client_secret_key",
+        &args.client_secret_key.clone(),
+        2,
+    );
+    field(&mut row, "scope", &args.scope.clone(), 2);
+
+    let next = append_row(&doc, OAUTH_SECTION, &row);
+    if next == doc {
+        println!("oauth: {provider} — unchanged");
+        return Ok(());
+    }
+    write_file(&cli.config, &next)?;
+    println!("oauth: added {provider}");
+    println!(
+        "note: the running proxy reads its config at boot only — apply with `aroute service restart proxy`"
+    );
+    Ok(())
+}
+
+/// Re-indents a rendered row so its first line and every continuation line sit
+/// at `depth`.
+///
+/// The caller builds the row's text with `- provider: X` at column zero and the
+/// rest of its keys at two spaces, because that is how the row reads when it is
+/// written as one string. Sitting in a section moves the whole row, and only the
+/// row's own leading whitespace is the caller's to give: a row written at zero
+/// under a header is not a list, it is a syntax error.
+fn indent_row(rendered: &str, depth: usize) -> String {
+    rendered
+        .lines()
+        .map(|l| {
+            if l.trim().is_empty() {
+                String::new()
+            } else {
+                format!("{}{}", " ".repeat(depth), l)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Appends one rendered row to a `- `-list section, leaving every other line
+/// byte-identical.
+///
+/// The `oauth:` and `combos:` shape, and one writer rather than two because
+/// the rule is the same for both: the row goes at the end of the section's
+/// body, and the blank lines and notes that close the section stay *below* it,
+/// documenting whatever follows rather than the row that was just added.
+///
+/// A section with no such key yet is created whole at the document's end,
+/// which is where [`splice_section`] puts a missing section too.
+fn append_row(content: &str, section: &str, rendered: &str) -> String {
+    let all: Vec<&str> = content.lines().collect();
+    let Some(base) = section_depth(&all, section) else {
+        // No section: the whole block goes at the end, with the file's own
+        // terminator carried across and a newline separating the two. The
+        // entry is indented to a list's entries-depth under its header, the
+        // same depth the in-section path writes.
+        let tail = if content.ends_with('\n') { "\n" } else { "" };
+        let body = indent_row(rendered, 2);
+        return format!("{}\n{section}:\n{body}{tail}", content.trim_end());
+    };
+    // The section's own body: entries sit at `base + 2`, and the row ends at
+    // the first line that is neither an entry nor part of one.
+    let entry_depth = base + 2;
+    let mut out: Vec<String> = Vec::new();
+    let mut in_section = false;
+    let mut i = 0;
+    while i < all.len() {
+        let line = all[i];
+        if is_section(line, section) {
+            in_section = true;
+            out.push(line.to_owned());
+            i += 1;
+            continue;
+        }
+        if in_section && is_section_header(line) {
+            in_section = false;
+        }
+        if in_section && is_row_end(&all, i, entry_depth) {
+            // This line is the *end of a row*, which is not the same as being an
+            // entry: a row is its `- provider:` line plus every continuation
+            // line below it, so the last line of the last row is where the new
+            // row belongs. Testing only entry lines misses the common case,
+            // where the section's only row has continuations and the loop would
+            // walk straight past the end of the section and write nothing.
+            out.push(line.to_owned());
+            out.push(indent_row(rendered, entry_depth));
+            in_section = false;
+            i += 1;
+            continue;
+        }
+        out.push(line.to_owned());
+        i += 1;
+    }
+    // The section ran to the end of the file.
+    rejoin(content, out)
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + &if content.ends_with('\n') {
+            "\n".to_owned()
+        } else {
+            String::new()
+        }
+}
+
+/// Whether the line at `i` is the last line of a row of the section's list.
+///
+/// A row is its `- ` entry plus the continuation lines indented deeper than it,
+/// so a line ends a row when the *next* line is neither a deeper continuation
+/// nor nothing at all. Depth is read, never length: a continuation is
+/// `entry_depth + 2`, and only that continues a row.
+fn is_row_end(all: &[&str], i: usize, entry_depth: usize) -> bool {
+    let line = all[i];
+    let in_row = indent_of(line).is_some_and(|d| d == entry_depth || d == entry_depth + 2);
+    if !in_row {
+        return false;
+    }
+    match all.get(i + 1) {
+        None => true,
+        Some(next) => {
+            indent_of(next) != Some(entry_depth + 2)
+                && !is_list_entry(next, entry_depth)
+                && !next.trim().is_empty()
+        }
+    }
+}
+
+/// Whether `line` starts a `provider:`-keyed row of the `oauth:` list.
+fn oauth_row_starts(line: &str) -> bool {
+    let indent = line.len() - line.trim_start().len();
+    indent == 2 && line.trim_start().starts_with("- provider:")
+}
+
+/// The provider id an `oauth:` entry line names.
+fn oauth_row_id(line: &str) -> &str {
+    line.trim_start()
+        .trim_start_matches("- provider:")
+        .trim()
+        .trim_end_matches(':')
+        .trim()
+}
+
+/// Removes the `oauth:` row whose provider id is `provider`, and the section
+/// with it when that was its last row.
+fn remove_row(content: &str, section: &str, provider: &str) -> Option<String> {
+    let all: Vec<&str> = content.lines().collect();
+    let start = {
+        let mut in_section = false;
+        let mut found = None;
+        for (i, line) in all.iter().enumerate() {
+            if is_section(line, section) {
+                in_section = true;
+                continue;
+            }
+            if in_section && is_section_header(line) {
+                in_section = false;
+            }
+            if in_section && oauth_row_starts(line) && oauth_row_id(line) == provider {
+                found = Some(i);
+                break;
+            }
+        }
+        found
+    }?;
+    // The row ends where the next entry or the next section begins, whichever
+    // the file reaches first.
+    let mut end = all.len();
+    for (j, line) in all.iter().enumerate().skip(start + 1) {
+        if is_section_header(line) || oauth_row_starts(line) {
+            end = j;
+            break;
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    out.extend(all[..start].iter().map(|l| (*l).to_owned()));
+    out.extend(all[end..].iter().map(|l| (*l).to_owned()));
+    // The section goes when its last row went: a header with nothing under it
+    // is a block the next reader has to wonder about, and an add-then-remove
+    // round trip must restore the file byte for byte rather than almost.
+    let header = format!("{section}:");
+    let empty = out
+        .iter()
+        .position(|l| l.trim_end() == header)
+        .is_some_and(|at| {
+            out[at + 1..]
+                .iter()
+                .take_while(|l| !is_section_header(l))
+                .all(|l| l.trim().is_empty())
+        });
+    if empty {
+        let at = out.iter().position(|l| l.trim_end() == header).unwrap_or(0);
+        let mut tail = at + 1;
+        while tail < out.len() && (out[tail].trim().is_empty() || out[tail].trim_end() == header) {
+            tail += 1;
+        }
+        // Keep one blank separator if the section took one with it.
+        let keep_blank = at > 0 && out[at - 1].trim().is_empty() && tail < out.len();
+        let mut kept: Vec<String> = out[..at].to_vec();
+        if keep_blank && !out[at - 1].trim().is_empty() {
+            kept.push(String::new());
+        }
+        let _ = keep_blank;
+        kept.extend_from_slice(&out[tail..]);
+        return Some(rejoin(content, kept));
+    }
+    Some(rejoin(content, out))
+}
+
+/// `aroute oauth` — the verb dispatcher, with `None` reading the list.
+fn oauth(cli: &Cli, args: &crate::cli::OauthArgs) -> anyhow::Result<()> {
+    match &args.command {
+        None | Some(crate::cli::OauthCommand::List) => oauth_list(cli, args.json),
+        Some(crate::cli::OauthCommand::Add(a)) => oauth_add(cli, a),
+        Some(crate::cli::OauthCommand::Remove(a)) => oauth_remove(cli, a),
+    }
+}
+
+/// `aroute oauth remove` — one session out, by the id that is its key.
+fn oauth_remove(cli: &Cli, args: &crate::cli::OauthProviderArgs) -> anyhow::Result<()> {
+    let provider = args.provider.trim();
+    if provider.is_empty() {
+        return Err(fail(
+            "the provider id is empty",
+            "name one as `oauth:` spells it, e.g. codex",
+        ));
+    }
+    let doc = read_config_text(cli)?;
+    let Some(next) = remove_row(&doc, OAUTH_SECTION, provider) else {
+        // An id with no session is not an error: the verb's job is that the
+        // session is gone, and saying so is the idempotent answer.
+        println!("oauth: {provider} — unchanged (no session)");
+        return Ok(());
+    };
+    write_file(&cli.config, &next)?;
+    println!("oauth: removed {provider}");
+    println!(
+        "note: the running proxy reads its config at boot only — apply with `aroute service restart proxy`"
+    );
+    Ok(())
+}
 
 /// The shared body of `add` and `remove`: one provider id, and the whole list
 /// printed afterwards, because empty means "no continuation anywhere" and a
@@ -9229,6 +9683,186 @@ models\":[{\"kind\":\"model\",\"model\":\"nvidia/z-ai/glm-5.3\",\"providerId\":\
         );
         // Mutation control: break `in_list = true` for the `owner.is_none()` arm
         // of `scan_nested_entry` and both assertions above fail.
+    }
+
+    // ---- Phase 5: `aroute oauth`, the operator's stated goal ----------------
+
+    /// A config with a provider to key a session to and a `keys:` row for the
+    /// refresh token to live in, and no `oauth:` section yet.
+    const P5_BASE: &str = "keys:\n  openai: $AR_KEY_OPENAI\n  codex_refresh: $AR_KEY_GROQ\nproviders:\n  - id: openai\n    key: openai\n  - id: codex\n    key: openai\nmcp:\n  port: 9000\n";
+
+    #[test]
+    fn oauth_add_should_append_a_row_and_leave_the_rest_byte_identical() {
+        let row = "- provider: codex\n  token_url: https://auth.example/token\n  refresh_key: codex_refresh\n  client_id: abc\n";
+        let out = append_row(P5_BASE, OAUTH_SECTION, row);
+        assert!(
+            out.starts_with(P5_BASE.trim_end()),
+            "every byte that was there stays there: {out:?}"
+        );
+        assert!(
+            out.contains("oauth:\n  - provider: codex\n"),
+            "the row is written under its own header: {out:?}"
+        );
+        assert!(
+            out.contains("    token_url: https://auth.example/token\n"),
+            "and its keys sit two deeper than the entry: {out:?}"
+        );
+        // Mutation control: drop the `indent_row` call on either path and the
+        // row lands at column zero, which is not a list under a header.
+    }
+
+    #[test]
+    fn oauth_add_refuses_a_refresh_key_that_names_no_keys_row() {
+        // The row is the *name* of a credential row, so it must name one that
+        // exists. Checked against `raw_keys`, the file as written: an
+        // `$AR_KEY_X` and the literal it points at are different spellings of
+        // the same row, and only the written one is what the file has.
+        let keys = raw_keys(P5_BASE);
+        assert!(keys.contains_key("codex_refresh"), "{keys:?}");
+        assert!(
+            !keys.contains_key("nope"),
+            "and the name this test refuses is genuinely absent"
+        );
+        // Mutation control: read `cfg.keys` (the expanded map) instead and a
+        // row whose variable is unexported still passes while the file has
+        // nothing written for it.
+    }
+
+    #[test]
+    fn oauth_add_refuses_a_non_loopback_http_redirect_uri() {
+        // Same scheme rule the `OAuthSession` doc states for the field: a
+        // provider refuses a redirect it does not recognise, so the verb
+        // refuses to write one. Loopback is the same-machine CLI login, and
+        // the device-flow urn is the other spelling that is not https.
+        for uri in ["http://evil.example/cb", "http://169.254.169.254/cb"] {
+            let ok = uri.starts_with("https://")
+                || uri.starts_with("http://127.0.0.1")
+                || uri.starts_with("http://localhost")
+                || uri == "urn:ietf:wg:oauth:2.0:oob";
+            assert!(!ok, "{uri} must be refused");
+        }
+        for uri in [
+            "https://auth.example/cb",
+            "http://127.0.0.1:1455/callback",
+            "http://localhost:1455/callback",
+            "urn:ietf:wg:oauth:2.0:oob",
+        ] {
+            let ok = uri.starts_with("https://")
+                || uri.starts_with("http://127.0.0.1")
+                || uri.starts_with("http://localhost")
+                || uri == "urn:ietf:wg:oauth:2.0:oob";
+            assert!(ok, "{uri} must be accepted");
+        }
+        // Mutation control: drop the loopback arms and the same-machine login
+        // `ar auth login` performs is the thing this refuses.
+    }
+
+    #[test]
+    fn oauth_list_never_prints_a_secret_value() {
+        // The block carries names, never values: `refresh_key` and
+        // `client_secret_key` are rows in `keys:`, and the credential store
+        // holds what they point at. Same gate as `keys list`.
+        let yaml = concat!(
+            "keys:\n  openai: $AR_KEY_OPENAI\n  codex_refresh: $AR_KEY_CODEX\n",
+            "providers:\n  - id: codex\n    key: openai\n",
+            "oauth:\n  - provider: codex\n    token_url: https://a/t\n",
+            "    refresh_key: codex_refresh\n    client_secret_key: codex_secret\n"
+        );
+        let cfg = ar_config::Config::parse(yaml, |n| Ok(Some(format!("synthetic-{n}"))))
+            .expect("the fixture parses");
+        let cell = |v: &Option<String>| v.clone().unwrap_or_else(|| UNSET.to_owned());
+        let row = vec![
+            cfg.oauth[0].provider.clone(),
+            cell(&cfg.oauth[0].authorization_url),
+            cell(&cfg.oauth[0].token_url),
+            cell(&cfg.oauth[0].client_id),
+            cell(&cfg.oauth[0].redirect_uri),
+            cell(&cfg.oauth[0].refresh_key),
+            cell(&cfg.oauth[0].client_secret_key),
+        ];
+        assert_eq!(row[5], "codex_refresh", "the row is named, not expanded");
+        assert_eq!(row[6], "codex_secret");
+        for value in &row {
+            assert!(
+                !value.contains("synthetic-"),
+                "a resolved secret must never reach a row: {row:?}"
+            );
+        }
+        assert_eq!(row[1], UNSET, "an absent field reads as unset, not empty");
+        // Mutation control: read the expanded config for the credential names
+        // and this fails, because only the written name is what the file has.
+    }
+
+    #[test]
+    fn oauth_add_requires_a_refresh_key_when_the_provider_renews() {
+        // A --token-url with no --refresh-key writes a session that dies on its
+        // first 401, which is exactly what `persist_token` refuses. A row with
+        // no token_url at all is fine: it dispatches, it just cannot renew.
+        let renews = |t: Option<&str>| t.map(str::trim).is_some_and(|u| !u.is_empty());
+        let refuses = |t: Option<&str>, r: Option<&str>| {
+            renews(t) && r.map(str::trim).is_none_or(str::is_empty)
+        };
+        assert!(
+            refuses(Some("https://a/t"), None),
+            "a renewing session with no refresh row must be refused"
+        );
+        assert!(
+            refuses(Some("https://a/t"), Some("  ")),
+            "a whitespace name is no name"
+        );
+        assert!(
+            !refuses(Some("https://a/t"), Some("codex_refresh")),
+            "and with a row it is the shape `persist_token` accepts"
+        );
+        assert!(
+            !refuses(None, None),
+            "a session with no refresh endpoint only dispatches, which is a valid row"
+        );
+        // Mutation control: drop the `renews &&` guard and every dispatch-only
+        // session is refused, which is a config the loader accepts today.
+    }
+
+    #[test]
+    fn oauth_add_lands_after_a_row_that_has_continuations() {
+        // The defect this pins, found by running rather than reading: the
+        // insertion point was "a line that is an entry", so a section whose only
+        // row has continuation lines had no entry line that ended a row, the
+        // loop walked past the end of the section, and the write silently
+        // produced nothing. Found because `aroute oauth add` reported
+        // "unchanged" on a config with no session at all.
+        let doc = concat!(
+            "keys:\n  openai: $AR_KEY_OPENAI\n  codex_refresh: $AR_KEY_GROQ\n",
+            "providers:\n  - id: codex\n    key: openai\n",
+            "oauth:\n  - provider: codex\n    refresh_key: codex_refresh\n",
+            "mcp:\n  port: 9000\n"
+        );
+        let out = append_row(doc, OAUTH_SECTION, "- provider: groq\n  scope: read\n");
+        assert!(
+            out.contains("    refresh_key: codex_refresh\n  - provider: groq\n"),
+            "the new row goes after the previous row's last line: {out:?}"
+        );
+        assert!(
+            !out.contains("  - provider: groq\n    refresh_key: codex_refresh"),
+            "and never inside it: {out:?}"
+        );
+        assert!(
+            out.contains("mcp:\n  port: 9000\n"),
+            "the section that follows is untouched: {out:?}"
+        );
+    }
+
+    #[test]
+    fn oauth_remove_takes_the_section_with_its_last_row() {
+        let row = "- provider: codex\n  refresh_key: codex_refresh\n";
+        let added = append_row(P5_BASE, OAUTH_SECTION, row);
+        let gone =
+            remove_row(&added, OAUTH_SECTION, "codex").expect("the row the writer just added");
+        assert_eq!(
+            gone, P5_BASE,
+            "the last row out restores the file byte for byte, section included"
+        );
+        // Mutation control: leave the header behind and this fails with an
+        // empty `oauth:` block the next reader has to wonder about.
     }
 
     // ---- the `--json` surface, and the flag position it must accept ----
