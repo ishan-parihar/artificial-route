@@ -985,13 +985,38 @@ Two tests, each with a mutation control that was run: reverting
 `append_list_entry`'s fails the second. Both controls killed their test — a
 control that survives is a test that proved nothing.
 
-The remaining gap, recorded rather than assumed away: of the **13 writer
-families** the shape set now covers **seven** — combo rows, combo targets, the
-section splice, the section scalar, the `oauth:` row, the list append and the
-nested-list writer. `with_key_binding`, `render_keys_removed` and
-`add_missing_custom_key_refs` still carry a single hand-written shape each, so a
-new defect in any of them passes by construction on that shape. That is the
-adoption work this section names as the fix and has done seven of thirteen.
+**All eight inverse-able writer families are now on the shapes, and the last one
+to be adopted found the deepest defect of the pass.** The config write surface is
+nine paired families; `add_missing_custom_key_refs` has no inverse, because `sync`
+re-enters it whole, so there is no add/remove pair to run and no round-trip claim
+to make. The other eight are: the combo row, the combo target, the section
+splice, the section scalar, the list entry, the nested list, the `oauth:` row and
+the `keys:` pair.
+
+The `keys:` pair is a wrapper over `splice_section`, so adopting it meant adopting
+the section writer, and the shapes found two defects in it that an LF document
+never shows:
+
+1. **`if line == header` is the LF-only check.** `str::lines` keeps the `\r` on a
+   CRLF line, so a CRLF `keys:\r` never equalled the `"keys:"` string beside it
+   and every CRLF document took the *missing-section* branch — which writes LF
+   separators into a CRLF file. Found because the round trip failed on the CRLF
+   shape with `- a/m\r\n` restored as `- a/m\n`.
+2. **The terminator was the LF spelling.** `if content.ends_with('\n') { "\n" }`
+   puts bare `\n` on a CRLF document and drops its final `\r`, so the last byte of
+   the file became a byte the operator never wrote.
+
+And the one these two would still have left: the rendered block arrives in LF
+because every renderer in the crate emits `\n`, so a CRLF document would come back
+with a single LF-bodied section. Re-spelled inside `splice_section`, the only
+writer that knows which document it is writing into, rather than in the renderers.
+Two controls run, both fatal.
+
+(The denominator was corrected during this pass: an earlier note said "13 writer
+families", which was never measured — a scan of every doc-in doc-out function in
+the crate returns 33, most of them readers and helpers, and the paired-family
+count is nine. A wrong denominator made the coverage claim look worse than it
+was.)
 
 And one property the round trip cannot assert, learned on the way: **a
 byte-for-byte round trip is satisfied by two mistakes that undo each other.** The
