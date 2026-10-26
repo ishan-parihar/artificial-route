@@ -6680,15 +6680,32 @@ pub(crate) fn splice_section(content: &str, name: &str, rendered: &str) -> Strin
                 // one back and left the other — a round trip that gained a
                 // line. Which of the two went was never in question, only that
                 // the file's own spacing is respected.
-                let mut block = rendered.trim_end_matches('\n').to_owned();
+                //
+                // Every `\n` below is the document's own separator, not a
+                // literal. `trim_end_matches('\n')` on a CRLF line leaves its
+                // `\r` behind, so the block starts one byte into a line the
+                // writer never meant to touch; and the separator pushed here
+                // and written into both format strings is `\n`, which puts four
+                // LF lines into a CRLF file. Measured: `limits set --key` on a
+                // CRLF document inserted `limits:\n  keys:\n    zz:\n      rpm: 5\n`
+                // and left `... 5\n\r\n` where the two met.
+                let sep = line_ending(content);
+                let mut block = rendered.trim_end_matches(sep).replace('\n', sep);
                 let separated = i.checked_sub(1).is_some_and(|j| out[j].is_empty());
                 if !separated {
-                    block.push('\n');
+                    block.push_str(sep);
                 }
                 out.insert(i, block);
-                out.join(line_ending(content)) + ending
+                out.join(sep) + ending
             }
-            None => format!("{}\n{}{}", content.trim_end(), rendered, ending),
+            None => {
+                let sep = line_ending(content);
+                format!(
+                    "{}{sep}{}{sep}",
+                    content.trim_end(),
+                    rendered.replace('\n', sep)
+                ) + ending
+            }
         }
     }
 }
@@ -11266,6 +11283,58 @@ models\":[{\"kind\":\"model\",\"model\":\"nvidia/z-ai/glm-5.3\",\"providerId\":\
     /// adopting the shapes here is a claim rather than a hunt: the value of the
     /// claim is that a future change to either line has to hold on all five
     /// states, not on the one shape the hand-written test spelled.
+    ///
+    /// A CRLF document's inserted block is CRLF, and the round trip alone does
+    /// not say so: the removal takes the block out and rejoins with the same
+    /// separator, so the pair cancels and the bytes come back even while the
+    /// write is wrong. Measured before the fix: `limits set --key` on a CRLF
+    /// document inserted `limits:\n  keys:\n    zz:\n      rpm: 5\n` — four LF
+    /// lines in a CRLF file — and left `... 5\n\r\n` where the block met the
+    /// operator's own text, because `trim_end_matches('\n')` leaves the `\r`
+    /// behind. YAML accepts one style per document, so the file still loaded and
+    /// nothing else said so.
+    #[test]
+    fn a_splice_inserts_a_crlf_block_with_the_documents_own_endings() {
+        for rendered in [
+            "limits:\n  keys:\n    zz:\n      rpm: 5\n",
+            "custom_providers:\n  - id: adhoc\n",
+        ] {
+            let sep = line_ending(shapes::CRLF);
+            let name = section_of(rendered);
+            let added = splice_section(shapes::CRLF, name, rendered);
+            // Every byte of the inserted block, and the line it was inserted
+            // between, carries the document's own separator.
+            let header = format!("{sep}{name}:");
+            assert!(
+                added.contains(&header),
+                "the inserted header was written with LF: {added:?}"
+            );
+            // One style per document: after removing every CRLF, no bare LF
+            // should be left anywhere in the file.
+            assert!(
+                !added.replace("\r\n", "").contains('\n'),
+                "a bare LF survived in a CRLF document: {added:?}"
+            );
+            // And the terminator is still the document's own: the file ends
+            // exactly as it began, on CRLF.
+            assert!(
+                added.ends_with("\r\n") == shapes::CRLF.ends_with("\r\n"),
+                "the terminator is not the one the document began with: {added:?}"
+            );
+            let back = remove_section(&added, name);
+            assert_eq!(
+                back,
+                shapes::CRLF,
+                "add then remove must restore the file byte for byte"
+            );
+        }
+    }
+
+    /// The section header a rendered block opens with, for the test above.
+    fn section_of(rendered: &str) -> &str {
+        rendered.split(':').next().unwrap_or_default()
+    }
+
     #[test]
     fn a_combo_target_write_round_trips_every_file_shape() {
         round_trips_on_every_shape(
