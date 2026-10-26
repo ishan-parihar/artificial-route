@@ -33,7 +33,7 @@ column that matters is the last one — **who can write it today**.
 | 5 | `combos:` | `id`, strategy, `targets`, `weights`, `pool`, `steps`, `compression`, `judge_model`, `context_length` | yes — **whole-section replace** (`webui.rs:1614`) validated by `check_combos` (`:1655`) | `import` (wholesale) | **GAP** — no single-item writer |
 | 6 | `oauth:` | 13 fields per session (`OAuthSession`, `:818-907`) | **no route at all** | **nothing** | **GAP + data-loss risk** |
 | 7 | `continue_on_cut:` | provider id list | no | **nothing** | **GAP** |
-| 8 | `visibility:` | `blocked_providers`, `hide_paid_models`, `model_visibility_allowlist`, `model_visibility_denylist` | no | **nothing** | **GAP** |
+| 8 | `visibility:` | `blocked_providers`, `hide_paid_models`, `model_visibility_allowlist`, `model_visibility_denylist` | no | **yes** — Phase 6 (`de6bd63`): `block`/`unblock` via `append_list_entry`/`remove_list_entry`, `hide-paid` via `set_section_scalar`, `allow`/`deny` via `visibility_glob` (all `ar-cli/src/commands.rs:4809-4888`) | done — **the original "nothing" verdict below was superseded by Phase 6; kept for the record** |
 | 9 | `provider_settings:` | `excluded_models` (globs) per provider | no | **nothing** | **GAP** |
 | 10 | `limits:` | rpm, usd_micros, tokens, refuse_unpriced, model, model_tokens, spend_window | yes | **yes** (`limits set`/`clear`) | done, `b546f4c` — **amended by `912941f`: `--key default` wrote a key, not the field** |
 
@@ -933,19 +933,19 @@ in the `commands.rs` test module that opens with a section header
 (`keys:`, `combos:`, `providers:`, `visibility:`, `limits:`, `server:`, `mcp:`,
 `oauth:`, `continue_on_cut:`, `provider_settings:`, `custom_providers:`,
 `api-keys:`, `sync_keys:`, `search_crawl:`, `model_visibility:`), and excluding
-the bare section names used as `contains()` needles, gives **115 document-shaped
+the bare section names used as `contains()` needles, gives **118 document-shaped
 fixtures**. An earlier note here recorded 164 fixtures with 130 of them lacking a
 trailing newline, 0 CRLF and 1 trailing blank; those four figures are not
-reproducible by any definition I could construct, and the 115-fixture figure
+reproducible by any definition I could construct, and the 118-fixture figure
 below carries its own count so the next reader can re-derive rather than trust:
 
 | state | fixtures carrying it | notes |
 |---|---|---|
-| ends with a newline | 84 | the common spelling |
+| ends with a newline | 87 | the common spelling |
 | no trailing newline | 23 | common, and mostly unpaired with its opposite |
 | trailing blank line | 4 | the `trim_end()` defect was here, and it stayed |
 | CRLF | 4 | the whole-file rewrite was here; one is `CRLF_TRAILING_BLANK`, added with pass six |
-| with no `combos:` | 58 | the append branch |
+| with no `combos:` | 60 | the append branch |
 
 So the no-newline state was never rare — it was *unpaired*. The pairing is what
 was missing, and it is what makes a writer's claim checkable: of the
@@ -1243,4 +1243,56 @@ wrote it by hand is not evidence, and a defect claimed against it is not a
 defect. The probe is cheap — write the state, hand it to the loader, read the
 answer — and it caught this one.
 
-Fixture table: 115 fixtures, 84 newline, 58 with no `combos:`.
+Fixture table: 118 fixtures, 87 newline, 60 with no `combos:`.
+
+---
+
+## Pass ten (2026-10-26): the section that is documentation
+
+Pass nine's rule — a fixture must carry a state the system can actually be in —
+was tested against the family nobody had re-derived, and it found a defect that
+no round trip could: a **comment inside `keys:` was destroyed by every writer
+of that section.**
+
+`keys:` is written three ways (`keys arm-gate`, `providers remove`, and
+`sync`'s numbered-credential bridge), and all three went through
+`render_keys_rows`, which builds the section from the parsed rows and splices
+the whole block. The parse has no room for a comment, so every `#` line inside
+`keys:` was gone after any of them ran. Measured through the CLI on both the
+`providers remove` and `sync` paths, on configs whose `keys:` carried a noting
+comment above the row.
+
+**And the round trips did not catch it, which is the part worth keeping.**
+`the_keys_writers_round_trip_every_file_shape` passed throughout, because it
+compared the file *after* the add to the file *after* the take-back — and the
+note was gone from both sides equally. A round trip is blind to a writer that
+deletes the same thing in both directions. Only an assertion that names the
+note catches it, which is what the new test does.
+
+The fix is `splice_keys_rows`: the rows are written **in place**, so a row that
+stays keeps the operator's note above it, a row that is added goes at the
+section's own tail, and a row that is gone takes its own line and the note that
+introduced it. The section's boundary is the one every other writer in the
+crate already uses — `is_section_header`, plus a blank or `#` line only when
+`rest_is_another_section` says what follows belongs elsewhere — because
+inventing a weaker rule here is what the first three versions of this writer
+got wrong, each of them a different way of deleting the next section.
+
+Three things this pass cost that the last one taught me to expect:
+
+1. **Three wrong writers before a right one**, each caught by a different
+   existing test: one swallowed the blank separator inside `keys:`, one deleted
+   the entire `providers:` section after it, one wrote every row twice. The
+   existing suite is what caught them, which is the argument for the fixture
+   set rather than a per-test string.
+2. **A test of my own was wrong in the other direction**: I asserted the round
+   trip restores the *intermediate* (`bound`) rather than the *shape*, which
+   pinned the add never happening.
+3. **`seen` was silently lost in a restructure** — the compiler said "unused
+   `mut`", not "your invariant is gone". The duplicate-row guard stopped
+   firing and the tests still passed, because nothing pinned it yet.
+
+The generalisation the crate now inherits, sharper than pass nine's: **a round
+trip cannot see a writer that deletes the same bytes in both directions, so a
+fixture must carry a line the writer does not own** — a comment, a blank, a
+note — and the assertion must name it.

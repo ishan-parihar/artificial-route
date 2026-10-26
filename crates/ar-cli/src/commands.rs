@@ -1713,23 +1713,119 @@ pub(crate) fn with_key_binding(doc: &str, name: &str, var: &str) -> anyhow::Resu
             value: binding,
         }),
     }
-    let section = render_keys_rows(&rows)?;
-    Ok(splice_section(doc, "keys", &section))
+    splice_keys_rows(doc, &rows)
 }
 
-/// Renders `KeyRow`s as the `keys:` section, in the given order.
+/// Writes the given rows as the `keys:` section, **keeping the operator's
+/// comments**.
 ///
-/// Same shape as [`crate::import::render_keys_section`] — two-space indent under
-/// the header, one `name: value` per line — but over a slice, because the order
-/// is the point. `serde_yaml` over an ordered `Mapping` would give the same
-/// bytes; building the lines directly keeps the rule visible here rather than
-/// depending on a serialisation order argument.
-fn render_keys_rows(rows: &[KeyRow]) -> anyhow::Result<String> {
-    let mut out: Vec<String> = vec!["keys:".to_owned()];
-    for r in rows {
-        out.push(format!("  {}: {}", r.name, r.value));
+/// The old writer rebuilt the section from the rows alone, so splicing it
+/// re-rendered the block whole and every `#` line inside it was destroyed —
+/// measured through the CLI on all three callers (`keys arm-gate`, `providers
+/// remove`, and `sync`'s numbered-credential bridge), each of which deleted a
+/// note the operator had written above the row it names. `keys:` is the section
+/// where the secret's *name* lives, so it is the one most worth documenting.
+///
+/// This is the sibling of the Phase 1 `splice_section` defect, which fixed the
+/// comments *after* a replaced section and left the ones *inside* it. The rule
+/// covering both: a writer that re-renders a section must re-render only the
+/// lines it owns.
+///
+/// So the rows are written **in place**: a line naming a row that stays keeps
+/// the operator's comment above it, a row that is added goes last, and a row
+/// that is gone is removed with its own line alone. A comment sits directly
+/// above the row it documents and is removed with it only when that row goes.
+fn splice_keys_rows(doc: &str, rows: &[KeyRow]) -> anyhow::Result<String> {
+    let written: BTreeMap<&str, &KeyRow> = rows.iter().map(|r| (r.name.as_str(), r)).collect();
+    let all: Vec<&str> = doc.lines().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    // Notes held back, so the row beneath them decides whether they survive.
+    let mut tail: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < all.len() {
+        if all[i].trim_end() == "keys:" {
+            out.push(all[i].to_owned());
+            i += 1;
+            // The section's body, up to the boundary every other writer in this
+            // crate stops at: a blank line or a `#` **only** when what follows
+            // belongs to another section. Inventing a weaker rule here is what
+            // made the first version of this writer swallow a separator, and
+            // `rest_is_another_section` is already the answer.
+            while i < all.len() {
+                let body = all[i];
+                // Two ways this section is over, and both are the ones
+                // `splice_section` honours, because a body line is indented.
+                if is_section_header(body) {
+                    break;
+                }
+                if (body.is_empty() || body.starts_with('#'))
+                    && rest_is_another_section(&all[i + 1..])
+                {
+                    break;
+                }
+                let trimmed = body.trim_start();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    tail.push(body.to_owned());
+                    i += 1;
+                    continue;
+                }
+                let name = key_name(body);
+                seen.insert(name);
+                match written.get(name) {
+                    Some(row) => {
+                        // The row stays: its notes go back in the order
+                        // written, and the row takes the value this call asked
+                        // for. An unchanged value keeps the operator's exact
+                        // bytes, so an idempotent write touches nothing.
+                        let rendered = format!("  {}: {}", row.name, row.value);
+                        out.append(&mut tail);
+                        out.push(if body == rendered {
+                            body.to_owned()
+                        } else {
+                            rendered
+                        });
+                    }
+                    // The row is gone, so the notes that introduced it go with
+                    // it: documentation for a row the file no longer carries is
+                    // not documentation.
+                    None => {
+                        tail.clear();
+                    }
+                }
+                i += 1;
+            }
+            // The body ended. A row the caller added that **nothing in the
+            // document already carries** goes here, at the section's own tail,
+            // which is where a new key belongs. `seen` holds every row the walk
+            // emitted, so a row the operator had already written keeps its one
+            // line rather than gaining a second one below.
+            //
+            // Then any notes still held back are flushed: the line that stopped
+            // the body is this section's own trailing note or blank, and
+            // dropping it was real data loss.
+            // The held notes go back first, so the operator's blank line stays
+            // where they put it and the new row lands **below** it — at the
+            // section's own tail, which is where a new key belongs.
+            out.append(&mut tail);
+            for row in rows {
+                if !seen.contains(row.name.as_str())
+                    && !out
+                        .iter()
+                        .any(|l| l.trim_start() == format!("{}: {}", row.name, row.value))
+                {
+                    out.push(format!("  {}: {}", row.name, row.value));
+                }
+            }
+            // `i` is still on the boundary line — a blank line, or the comment
+            // introducing the next section — and the outer loop emits it
+            // untouched. Consuming it here is what deleted a whole section.
+            continue;
+        }
+        out.push(all[i].to_owned());
+        i += 1;
     }
-    Ok(out.join("\n"))
+    Ok(rejoin(doc, out))
 }
 
 /// Drops one provider's `providers:` row, the `keys:` entries only it held, and
@@ -1832,22 +1928,21 @@ pub(crate) fn splice_remove_provider(
     if orphaned.is_empty() {
         return Ok(Some(next));
     }
-    let section = render_keys_removed(doc, &orphaned)?;
-    Ok(Some(splice_section(&next, "keys", &section)))
+    let kept_rows = render_keys_removed(doc, &orphaned)?;
+    Ok(Some(splice_keys_rows(&next, &kept_rows)?))
 }
 
-/// The `keys:` section with `removed` entries dropped, in the file's order.
+/// The `keys:` rows with `removed` entries dropped, in the file's order.
 ///
 /// Deleting a row is the one edit that cannot change an order, so this walks
 /// the written rows and filters rather than re-rendering a `BTreeMap`: the
 /// surviving rows stay exactly where the operator put them. Same reason as
 /// [`with_key_binding`].
-fn render_keys_removed(doc: &str, removed: &BTreeSet<String>) -> anyhow::Result<String> {
-    let rows: Vec<KeyRow> = raw_keys_in_order(doc)
+fn render_keys_removed(doc: &str, removed: &BTreeSet<String>) -> anyhow::Result<Vec<KeyRow>> {
+    Ok(raw_keys_in_order(doc)
         .into_iter()
         .filter(|r| !removed.contains(&r.name))
-        .collect();
-    render_keys_rows(&rows)
+        .collect())
 }
 
 /// The document with the `custom_providers:` section's rows and header gone.
@@ -7291,7 +7386,7 @@ fn sync_credentials(doc: &str, db: &Path) -> anyhow::Result<String> {
             row.keys = Some(names.clone());
         }
     }
-    let mut out = splice_section(doc, "keys", &render_keys_rows(&ordered)?);
+    let mut out = splice_keys_rows(doc, &ordered)?;
     out = splice_section(
         &out,
         "providers",
@@ -9672,6 +9767,71 @@ mod tests {
         assert!(detail.contains("credentials.db"), "{detail}");
     }
 
+    /// A comment inside `keys:` is the operator's, and bridging a numbered
+    /// credential takes it: the old writer built the section from the parsed
+    /// rows alone, so every `#` line inside it was gone the moment the block
+    /// was re-rendered.
+    ///
+    /// Measured through the CLI on both paths that re-render it — `providers
+    /// remove` and `sync` — and it is the section the operator most wants
+    /// documented, because it is where the secret's name lives.
+    ///
+    /// This is the sibling of the `splice_section` defect recorded in Phase 1,
+    /// which fixed the comments *after* a replaced section and left the ones
+    /// *inside* it. The rule that covers both: a writer that re-renders a
+    /// section must re-render only the lines it owns.
+    #[test]
+    fn bridging_a_numbered_credential_leaves_the_keys_blocks_notes_alone() {
+        let dir = std::env::temp_dir().join(format!("ar-cli-keysnote-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("storage.sqlite");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(concat!(
+            "CREATE TABLE provider_connections (provider TEXT, api_key TEXT,",
+            " is_active INTEGER, priority INTEGER, created_at TEXT);",
+        ))
+        .unwrap();
+        // One provider with two live connections: the second is the numbered
+        // credential whose bridge re-renders `keys:`.
+        conn.execute(
+            "INSERT INTO provider_connections VALUES ('nvidia', 'k1', 1, 5, 'a')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO provider_connections VALUES ('nvidia', 'k2', 1, 4, 'b')",
+            [],
+        )
+        .unwrap();
+        let doc = concat!(
+            "keys:\n",
+            "  # nvidia: the key for the primary nvidia account\n",
+            "  nvidia: $AR_KEY_NVIDIA\n",
+            "providers:\n",
+            "  - id: nvidia\n",
+            "    key: nvidia\n",
+            "combos:\n",
+            "  - id: c\n",
+            "    strategy: priority\n",
+            "    targets:\n",
+            "      - nvidia/gpt-5.4\n",
+        );
+        let out = sync_credentials(doc, &db).unwrap();
+        assert!(
+            out.contains("  nvidia-2: $AR_KEY_NVIDIA_2"),
+            "the numbered credential must be bridged: {out:?}"
+        );
+        assert!(
+            out.contains("  # nvidia: the key for the primary nvidia account"),
+            "the note above the row must survive the bridge: {out:?}"
+        );
+        assert!(
+            out.contains("  nvidia: $AR_KEY_NVIDIA"),
+            "the operator's own row survives: {out:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn reports_the_store_as_failed_when_it_cannot_be_read() {
         let (status, detail) = StoreProbe::Unreadable {
@@ -11623,6 +11783,13 @@ models\":[{\"kind\":\"model\",\"model\":\"nvidia/z-ai/glm-5.3\",\"providerId\":\
     /// claim the fixture set exists to test: if a future edit to
     /// `with_key_binding` starts rebuilding the document itself, this test marks
     /// it. The round trip is add-a-binding then render-these-rows-away.
+    ///
+    /// The removal step no longer renders a section and splices it: it hands the
+    /// surviving rows to `splice_keys_rows`, which writes them in place and so
+    /// keeps the notes the operator put inside `keys:`. That is the whole
+    /// difference between this round trip being byte-exact and it deleting a
+    /// line the operator wrote — and a fixture carrying a comment is the only
+    /// way to see the difference.
     #[test]
     fn the_keys_writers_round_trip_every_file_shape() {
         for shape in shapes::ALL {
@@ -11633,13 +11800,55 @@ models\":[{\"kind\":\"model\",\"model\":\"nvidia/z-ai/glm-5.3\",\"providerId\":\
             // the operator never wrote.
             let rows: std::collections::BTreeSet<String> =
                 ["added".to_owned()].into_iter().collect();
-            let rendered = render_keys_removed(&bound, &rows).expect("the rows render");
-            let back = splice_section(&bound, "keys", &rendered);
+            let kept = render_keys_removed(&bound, &rows).expect("the rows survive");
+            let back = splice_keys_rows(&bound, &kept).expect("the rows write");
+            // Back to the **shape**, not to the intermediate `bound`: that one
+            // already holds the row the add wrote, and the round trip's claim is
+            // that taking that row away restores the file the operator had.
             assert_eq!(
                 back, *shape,
                 "the keys writers must restore the file byte for byte on {shape:?}"
             );
+            assert_eq!(
+                back.matches("added:").count(),
+                0,
+                "the round trip must take back only what it wrote, on {shape:?}"
+            );
         }
+    }
+
+    /// The `keys:` writers' round trip is byte-exact on a file that carries a
+    /// note, which is the shape that distinguishes writing rows in place from
+    /// re-rendering the block. The old path built the section from parsed rows
+    /// alone, so every `#` line inside `keys:` was gone after any of the three
+    /// writers ran — and the round trip still came back byte-exact, because the
+    /// note was gone from *both* sides of it. Only an assertion that names the
+    /// note catches it.
+    #[test]
+    fn the_keys_writers_keep_a_note_inside_the_section() {
+        let noted = "keys:\n  # openai: the primary key\n  openai: $AR_KEY_OPENAI\nproviders:\n  - id: openai\n    key: openai\n";
+        let bound = with_key_binding(noted, "openai", "AR_KEY_OPENAI").unwrap();
+        assert_eq!(
+            bound, noted,
+            "writing the value the file already holds must change nothing: {bound:?}"
+        );
+        // And the note sits above the row, so a write that reorders nothing
+        // keeps both where the operator put them.
+        let bound = with_key_binding(noted, "openai", "AR_KEY_OPENAI_MOVED").unwrap();
+        assert_eq!(
+            bound,
+            "keys:\n  # openai: the primary key\n  openai: $AR_KEY_OPENAI_MOVED\nproviders:\n  - id: openai\n    key: openai\n",
+            "the note and the row both stay in place: {bound:?}"
+        );
+        // A new row is appended below, and the note stays with the row it
+        // documents rather than migrating to the new one.
+        let bound = with_key_binding(noted, "groq", "AR_KEY_GROQ").unwrap();
+        assert!(
+            bound.contains(
+                "  # openai: the primary key\n  openai: $AR_KEY_OPENAI\n  groq: $AR_KEY_GROQ"
+            ),
+            "the note stays above its own row and the new row goes last: {bound:?}"
+        );
     }
 
     /// `str::lines` strips one trailing `\r` per line, so a CRLF document whose
