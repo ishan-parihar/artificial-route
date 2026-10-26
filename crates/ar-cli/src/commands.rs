@@ -7113,10 +7113,29 @@ fn is_section_header(line: &str) -> bool {
 fn add_missing_custom_key_refs(doc: &str, custom: &[ar_registry::CustomProvider]) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut inserted = false;
+    // Membership is a **lookup into the `keys:` map**, not a substring of the
+    // document. The substring asked "does `  {id}: ` appear anywhere?", which
+    // is a question about comments and values as much as rows, and it answered
+    // it wrong in both directions: a row the operator spelled without a space
+    // after the colon, or at another indent, did not match, so a **second** row
+    // was written for the same node — two `keys:` entries with one name, which
+    // is a YAML duplicate key and which the loader refuses outright, so the
+    // proxy does not boot. Measured through the CLI: `sync` on such a config
+    // produced it and `aroute doctor` answered `invalid config YAML: mapping
+    // values are not allowed in this context at line 3 column 26`.
+    //
+    // The mirror is a false positive: a *comment* carrying the needle
+    // (`#   mine: placeholder`) suppressed the write, so a node was imported
+    // whose `key_ref` names a `keys:` row that was never written.
+    //
+    // `raw_keys` is the same reader the rest of the crate answers this question
+    // with, and it is a parse rather than a match — so the answer is about rows
+    // and is the same for every spelling of the same fact.
+    let keys = raw_keys(doc);
     for line in doc.lines() {
         if !inserted && line == "providers:" {
             for c in custom {
-                if !doc.contains(&format!("  {}: ", c.id)) {
+                if !keys.contains_key(&c.id) {
                     out.push(format!("  {}: $AR_KEY_{}", c.id, import::env_name(&c.id)));
                 }
             }
@@ -8283,6 +8302,54 @@ mod tests {
             "a referenced var with no connection was not ensured empty:\n{envdoc}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Membership is tested by a fixed string, and it collides in the silent
+    /// direction.
+    ///
+    /// The check was `!doc.contains("  {id}: ")` — a literal needle, not a
+    /// lookup into `keys:` — so it was a question about the whole document,
+    /// comments and values included, rather than about rows. The case that
+    /// bit: a **comment** carrying the needle (`#   my-gw: placeholder`) makes
+    /// the write look already-done and suppresses it, so a node is imported
+    /// whose `key_ref` names a `keys:` row that was never written and every
+    /// request through it fails to resolve a credential. The documented sample
+    /// config in this repo carries exactly those comment blocks, so this is the
+    /// documented shape and not a contrivance.
+    ///
+    /// Measured through the CLI: `sync` on a config commented that way left the
+    /// row unwritten, and `aroute doctor` reported the custom node `ok` while
+    /// its `key_ref` resolved to nothing the file carries.
+    ///
+    /// The fix reads membership the way the rest of the crate does — `raw_keys`,
+    /// a parse rather than a match, so the answer is about rows and is the same
+    /// for every spelling of the same fact.
+    #[test]
+    fn add_missing_custom_key_refs_reads_the_keys_row_not_a_substring() {
+        let node = ar_registry::CustomProvider {
+            id: "my-gw".to_owned(),
+            protocol: ar_registry::Protocol::OpenaiCompatible,
+            base_url: "https://gw.example/v1".to_owned(),
+            endpoint: None,
+            key_ref: "my-gw".to_owned(),
+            headers: Default::default(),
+        };
+        // The row exists, written the way an operator writes it: suppressed.
+        let present = "keys:\n  my-gw: $AR_KEY_MY_GW\nproviders:\n  - id: a\n";
+        let out = add_missing_custom_key_refs(present, std::slice::from_ref(&node));
+        assert_eq!(
+            out.matches("my-gw:").count(),
+            1,
+            "the row exists, so none may be written: {out:?}"
+        );
+        // And a comment carrying the needle is not a row, so the row must be
+        // written — the case the old check got wrong, in the silent direction.
+        let commented = "keys:\n  #   my-gw: placeholder from the sample config\n  a: $AR_KEY_A\nproviders:\n  - id: a\n";
+        let out = add_missing_custom_key_refs(commented, std::slice::from_ref(&node));
+        assert!(
+            out.contains("my-gw: $AR_KEY_MY_GW"),
+            "a comment carrying the needle is not a row, so the row must be written: {out:?}"
+        );
     }
 
     /// The one writer with no inverse to cancel a mistake, so its terminator

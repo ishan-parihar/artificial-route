@@ -933,19 +933,19 @@ in the `commands.rs` test module that opens with a section header
 (`keys:`, `combos:`, `providers:`, `visibility:`, `limits:`, `server:`, `mcp:`,
 `oauth:`, `continue_on_cut:`, `provider_settings:`, `custom_providers:`,
 `api-keys:`, `sync_keys:`, `search_crawl:`, `model_visibility:`), and excluding
-the bare section names used as `contains()` needles, gives **113 document-shaped
+the bare section names used as `contains()` needles, gives **115 document-shaped
 fixtures**. An earlier note here recorded 164 fixtures with 130 of them lacking a
 trailing newline, 0 CRLF and 1 trailing blank; those four figures are not
-reproducible by any definition I could construct, and the 113-fixture figure
+reproducible by any definition I could construct, and the 115-fixture figure
 below carries its own count so the next reader can re-derive rather than trust:
 
 | state | fixtures carrying it | notes |
 |---|---|---|
-| ends with a newline | 82 | the common spelling |
+| ends with a newline | 84 | the common spelling |
 | no trailing newline | 23 | common, and mostly unpaired with its opposite |
 | trailing blank line | 4 | the `trim_end()` defect was here, and it stayed |
 | CRLF | 4 | the whole-file rewrite was here; one is `CRLF_TRAILING_BLANK`, added with pass six |
-| with no `combos:` | 56 | the append branch |
+| with no `combos:` | 58 | the append branch |
 
 So the no-newline state was never rare — it was *unpaired*. The pairing is what
 was missing, and it is what makes a writer's claim checkable: of the
@@ -1151,20 +1151,27 @@ cannot see it. The shape set catches them only when the fixture carries the shap
 Re-validating the three claims this plan carries, and the exercise found a
 defect in the one family the plan had explicitly excluded.
 
-**The three claims re-derived, each with an independently written script.**
+**The three claims re-derived, each by a check written for this pass.**
 
 1. *The trailing-blank fixes*: 14 of 14 add/remove pairs byte-exact on both
    spellings of the shape (LF `\n\n`, CRLF `\r\n\r`), across all seven write
    families at CLI level. Reverting to the original `trim_end()` fails **five**
    tests and loses **six** blanks at CLI level, so the claim is carrying real
    weight and not a vacuous pass.
-2. *The fixture-audit numbers*: all six figures reproduce exactly — 113
-   fixtures, 82 newline, 23 no-newline, 4 blank, 4 CRLF, 56 with no `combos:` —
-   under a second script written from the plan's definition rather than from the
-   first script's structure. The superseded 164/130/0/1 wording was also
-   verified to really exist in `e6b3d39`, so the plan's account of its own
-   history is accurate rather than convenient.
+2. *The fixture-audit numbers*: the six figures then in the table (113
+   fixtures, 82 newline, 23 no-newline, 4 blank, 4 CRLF, 56 with no
+   `combos:`) reproduced exactly under a second script written from the plan's
+   definition rather than from the first script's structure. The superseded
+   164/130/0/1 wording was also verified to really exist in `e6b3d39`, so the
+   plan's account of its own history is accurate rather than convenient.
 3. *The shape-set adoption*: 8 of 8 families, 0 uncovered.
+
+Only the second of the three was an *independent* script in the strict sense:
+it re-implemented the counting from the plan's prose. The first was a CLI
+harness, and the third reused the shape module's own structure, so "each with
+an independently written script" overstated two of the three and is corrected
+here. The numbers themselves still reproduce, under the script that counts
+them.
 
 **And the shape check found a defect, in the ninth family the plan had set
 aside.** `add_missing_custom_key_refs` closed with `out.join(sep) + sep` — the
@@ -1196,3 +1203,44 @@ So the rule now has three clauses, all earned: a control that survives means the
 test does not reach the bug; a fixture must carry the shape the defect needs; and
 a coverage script must map the thing that is actually shared, or it invents
 families and hides real ones.
+
+---
+
+## Pass nine (2026-10-26): the excluded family, properly
+
+Pass eight flagged a membership check it did not fix, and said it wanted an
+operator's read before touching it. Continuing that instead of waiting: the
+check was worse than flagged, and in the direction that does not warn.
+
+**`add_missing_custom_key_refs` asked whether a `keys:` row exists with
+`doc.contains("  {id}: ")`** — a substring of the whole document. That is a
+question about comments and values as much as rows, and it answered wrong in the
+silent direction: a **comment** carrying the needle, which is exactly what the
+documented sample config in this repo carries, made the write look already-done
+and suppressed it. The node was imported, its `key_ref` named a `keys:` row the
+file never got, and every request through it failed to resolve a credential.
+Measured through the CLI, and `aroute doctor` reported the custom node `ok`
+throughout — the failure had no symptom short of a request.
+
+Fixed by reading membership the way the rest of the crate does: `raw_keys`, a
+parse rather than a match. One control, fatal.
+
+**The first version of the fix's test was wrong in the other direction, and the
+reason is worth keeping.** I asserted that a row spelled `{id}:$VAR` with no
+space after the colon was a reachable state the old check missed, so a duplicate
+row would be written and the config would fail to parse. Checking it showed
+`serde_yaml` **rejects that spelling outright** — it is not a state an operator
+can be in, so the assertion pinned a behaviour the loader already enforces. The
+test now pins the two states that are reachable: the row present (suppressed),
+and a comment carrying the needle (written). Three of four of my probe cases
+were real, and the one that was not was the one I had written the most
+confidently about.
+
+Which generalises the clause from pass eight into something sharper than "a
+fixture must carry the shape the defect needs": **a fixture must carry a state
+the system can actually be in.** A fixture that only parses because the test
+wrote it by hand is not evidence, and a defect claimed against it is not a
+defect. The probe is cheap — write the state, hand it to the loader, read the
+answer — and it caught this one.
+
+Fixture table: 115 fixtures, 84 newline, 58 with no `combos:`.
