@@ -2624,8 +2624,20 @@ fn create_nested_list(
             // trip measures. The separator before the new section is always
             // a newline, though -- a section glued onto the last line of the
             // previous one is a YAML error, and the file would not load at all.
+            //
+            // `trim_end` is too much here: it also takes a **blank line the
+            // operator wrote** at the end of the file and hands back only the
+            // single terminator. Measured: a document ending `- id: c\n\n`
+            // came back `- id: c\n` after one `continue-on-cut add`, and the
+            // remove did not put it back either. The terminator is the only
+            // thing that comes off, and by count rather than by shape.
+            let (head, blank) = split_trailing_blank(content);
             let tail = if content.ends_with('\n') { "\n" } else { "" };
-            format!("{}\n{section}:\n{body}{tail}", content.trim_end())
+            // The blank the file had goes between the last written line and
+            // the new section, which is where it was: above the section, not
+            // below it.
+            let blank = if blank { "\n" } else { "" };
+            format!("{head}{blank}\n{section}:\n{body}{tail}")
         }
     }
 }
@@ -4041,6 +4053,24 @@ fn line_ending(content: &str) -> &'static str {
     if uses_crlf(content) { "\r\n" } else { "\n" }
 }
 
+/// Splits a document into its written part and whether it ended with a blank
+/// line the operator put there.
+///
+/// `str::trim_end` cannot tell a trailing blank from a missing terminator,
+/// which is why the writers that rebuilt a tail from `trim_end` ate one
+/// operator's blank and left another's file alone. The document is cut at its
+/// last non-newline byte instead, so the two states stay two states.
+///
+/// The `head` keeps every byte up to and including the last line's own `\n`,
+/// or all of it for a document with no terminator.
+fn split_trailing_blank(content: &str) -> (&str, bool) {
+    let trimmed = content.trim_end_matches('\n');
+    // One blank is what a trailing `\n\n` means; more is the operator's
+    // paragraph spacing and is still theirs.
+    let blank = content.len() > trimmed.len() + usize::from(content.ends_with('\n'));
+    (trimmed, blank)
+}
+
 /// A value written as a block-sequence entry, quoted when the raw form would
 /// be read as something other than the string it is.
 ///
@@ -4236,14 +4266,21 @@ fn insert_list_at_end(
     // The file's own terminator, carried across: this config ends without one
     // deliberately, and a write that adds it changes a byte nobody asked to
     // touch, which is exactly what a round trip measures.
+    //
+    // `trim_end` is too much here for the reason the other writers record:
+    // it cannot tell a trailing newline from a trailing blank line, and a
+    // document ending `- id: c\n\n` came back `- id: c\n` — measured on a
+    // `visibility block` whose round trip lost the operator's own blank.
+    let (head, blank) = split_trailing_blank(content);
     let tail = if content.ends_with('\n') { "\n" } else { "" };
+    let blank = if blank { "\n" } else { "" };
     match depth {
         Some(_) => {
             let mut out: Vec<String> = content.lines().map(str::to_owned).collect();
             out.push(block);
             rejoin(content, out)
         }
-        None => format!("{}\n{section}:\n{block}{tail}", content.trim_end()),
+        None => format!("{head}{blank}\n{section}:\n{block}{tail}"),
     }
 }
 
@@ -10461,6 +10498,48 @@ models\":[{\"kind\":\"model\",\"model\":\"nvidia/z-ai/glm-5.3\",\"providerId\":\
         );
     }
 
+    #[test]
+    fn a_trailing_blank_survives_a_section_append_and_its_remove() {
+        // The last defect of the same class: three writers rebuilt the tail
+        // from `content.trim_end()`, which cannot tell a trailing blank from a
+        // missing terminator. Measured live on this shape: 200 bytes before,
+        // 199 after `continue-on-cut add` then `remove` -- the operator's own
+        // blank line was gone, and no later write put it back. A file ending
+        // `- id: c\n\n` and one ending `- id: c\n` are two documents, and only
+        // the second is what the writer produced for either.
+        let with_blank = concat!(
+            "keys:\n  openai: $AR_KEY_OPENAI\n",
+            "providers:\n  - id: openai\n    key: openai\n",
+            "\n",
+            "combos:\n  - id: c\n    targets:\n      - openai/gpt-5.4\n",
+            "\n",
+        );
+        let without = with_blank.trim_end_matches('\n');
+        for (section, owner, list) in [
+            (CUT_SECTION, None, CUT_SECTION),
+            (PS_SECTION, Some("openai"), PS_LIST),
+        ] {
+            for doc in [with_blank, without] {
+                let had_blank = doc.ends_with("\n\n");
+                let added =
+                    append_nested_list_entry(doc, section, owner, list, "gpt-4*").expect("write");
+                assert_ne!(added, *doc, "the write must have changed something");
+                // The blank is above the new section, where it was.
+                assert_eq!(
+                    added.matches("\n\n").count(),
+                    1 + usize::from(had_blank),
+                    "the operator's blank line was dropped: {added:?}"
+                );
+                let back = remove_nested_list_entry(&added, section, owner, list, "gpt-4*")
+                    .expect("write");
+                assert_eq!(
+                    back, doc,
+                    "add then remove must restore the file byte for byte: {back:?}"
+                );
+            }
+        }
+    }
+
     // ---- Phase 7: `provider-settings` and `continue-on-cut` -------------
     //
     // Both verbs are the `owner`-shaped writer family: a flat list directly
@@ -11013,6 +11092,45 @@ models\":[{\"kind\":\"model\",\"model\":\"nvidia/z-ai/glm-5.3\",\"providerId\":\
         );
         // Mutation control: drop the quote branch of `yaml_entry` and the first
         // assertion fails; make it quote unconditionally and the second fails.
+    }
+
+    #[test]
+    fn a_trailing_blank_survives_a_list_append_and_its_remove() {
+        // The other two sites of the same tail, where a round trip could still
+        // catch it: `append_list_entry`'s no-section branch and
+        // `append_nested_list_entry`'s. Measured on this exact shape: a
+        // `visibility block` then `unblock` took the file from 151 bytes to 150
+        // — the operator's blank was gone and no write put it back. The
+        // `visibility:` section and the `continue_on_cut:` one both end the
+        // document, so both are the no-section branch and both are the writer's
+        // tail rather than a splice's.
+        let base = concat!(
+            "keys:\n  openai: $AR_KEY_OPENAI\n",
+            "providers:\n  - id: openai\n    key: openai\n",
+            "combos:\n  - id: c\n    strategy: priority\n    targets:\n      - openai/gpt-5.4\n",
+            "\n",
+        );
+        let without = base.trim_end_matches('\n');
+        for (section, list, entry) in [
+            (VIS_SECTION, LIST_BLOCKED, "openai"),
+            (VIS_SECTION, LIST_DENY, "not-a-glob"),
+        ] {
+            for doc in [base, without] {
+                let added = append_list_entry(doc, section, list, entry)
+                    .expect("a write on a shape the writer handles");
+                assert_ne!(added, doc, "the write must have changed something");
+                assert_eq!(
+                    added.matches("\n\n").count(),
+                    doc.matches("\n\n").count(),
+                    "the operator's blank line was dropped: {added:?}"
+                );
+                let back = remove_list_entry(&added, section, list, entry).expect("remove");
+                assert_eq!(
+                    back, doc,
+                    "add then remove must restore the file byte for byte: {back:?}"
+                );
+            }
+        }
     }
 
     #[test]
