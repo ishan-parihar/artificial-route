@@ -933,10 +933,10 @@ in the `commands.rs` test module that opens with a section header
 (`keys:`, `combos:`, `providers:`, `visibility:`, `limits:`, `server:`, `mcp:`,
 `oauth:`, `continue_on_cut:`, `provider_settings:`, `custom_providers:`,
 `api-keys:`, `sync_keys:`, `search_crawl:`, `model_visibility:`), and excluding
-the bare section names used as `contains()` needles, gives **110 document-shaped
+the bare section names used as `contains()` needles, gives **111 document-shaped
 fixtures**. An earlier note here recorded 164 fixtures with 130 of them lacking a
 trailing newline, 0 CRLF and 1 trailing blank; those four figures are not
-reproducible by any definition I could construct, and the 110-fixture figure
+reproducible by any definition I could construct, and the 111-fixture figure
 below carries its own count so the next reader can re-derive rather than trust:
 
 | state | fixtures carrying it | notes |
@@ -944,7 +944,7 @@ below carries its own count so the next reader can re-derive rather than trust:
 | ends with a newline | 82 | the common spelling |
 | no trailing newline | 22 | common, and mostly unpaired with its opposite |
 | trailing blank line | 4 | the `trim_end()` defect was here, and it stayed |
-| CRLF | 2 | the whole-file rewrite was here; both written after the fix |
+| CRLF | 3 | the whole-file rewrite was here; one is `CRLF_TRAILING_BLANK`, added with pass six |
 | with no `combos:` | 54 | the append branch |
 
 So the no-newline state was never rare — it was *unpaired*. The pairing is what
@@ -1039,3 +1039,56 @@ the same mistake.
 So the durable fix is not "add fixtures" — it is a **shared, paired fixture set**
 that every writer's round trip runs against, in one call, so that a new writer
 cannot pass by choosing the shape its test happens to spell.
+
+---
+
+## Pass six (2026-10-26): the CRLF shape of the trailing blank
+
+**The shape set had no CRLF document that ended on a blank line, which is a
+*different file* from a CRLF document that merely ends.** A CRLF file ending
+`- a/m\r\n\r` yields a final `lines()` of `"\r"`; the same file ending `\r\n`
+yields `""`. Every tail rule in the crate asked about a blank line with
+`trim().is_empty()`, which is true of both — so the CRLF trailing blank
+registered as blank and went missing, while its LF twin round-tripped exactly.
+Found by running every family's pair through the CLI on all four shapes rather
+than at unit level, where the previous pass had stopped.
+
+**`split_trailing_blank` was the shared root, and it was LF-only.**
+`trim_end_matches('\n')` leaves the dangling `\r` on the head, so a CRLF
+trailing-blank file came back `head="a\r\n\r", blank=false` — both wrong. Two
+consequences, one immediately and one after the next write:
+
+1. The dangling `\r` glued onto whatever the caller appended, so a
+   `continue_on_cut:` header was written `\rcontinue_on_cut:` — a YAML error a
+   reader reports as "no such section".
+2. The trailing blank was not detected, so the blank-preservation branches never
+   fired and the operator's blank was eaten.
+
+Fixed by reading `sep = line_ending(content)` once and trimming and counting with
+`sep` rather than `'\n'`.
+
+**Three sites had hard-coded `\n` in a tail they built by hand, and the shape
+sweep named all three** once the root was fixed, because the LF twins of those
+writes had always been exact:
+
+| site | defect found | control |
+|---|---|---|
+| `create_nested_list` no-section branch | `continue_on_cut:\n  - openai\n` in a CRLF file | `a_nested_list_write_round_trips_every_file_shape` |
+| `append_list_entry` no-section branch | `visibility:\n  - a/m\n` in a CRLF file | `a_list_entry_write_round_trips_every_file_shape` |
+| `set_section_scalar` create branch | `visibility:\n  hide_paid_models: true\n` in a CRLF file | `hide_paid_round_trips_a_crlf_file_byte_for_byte` |
+
+The third is the instructive one: its LF twin round-tripped exactly, so the CRLF
+write was provably wrong while every test passed — and the first control I ran
+**survived with the bug reintroduced**, which meant the test had not been written
+yet rather than that the fix was unnecessary. The CLI measurement was the
+evidence; `hide_paid_round_trips_a_crlf_file_byte_for_byte` was then written to
+catch it, and reverting the fix kills it.
+
+**State: 349 tests, 25 of 25 CLI round trips byte-exact across four shapes, five
+controls run and all five fatal.**
+
+One measurement note, since the plan is the owner of these numbers: the fixture
+audit above is reproduced by `target/tmp/v/count.py`, whose definition is stated
+in the text. The count moved from 110 to 111 with `CRLF_TRAILING_BLANK`, and it
+will move again with the next fixture; the numbers are derivable, not constant,
+and the plan says so rather than pretending otherwise.

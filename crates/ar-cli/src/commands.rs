@@ -2632,9 +2632,18 @@ fn create_nested_list(
             // remove did not put it back either. The terminator is the only
             // thing that comes off, and by count rather than by shape.
             let (head, blank) = split_trailing_blank(content);
-            let blank = if blank { "\n" } else { "" };
-            let tail = if content.ends_with('\n') { "\n" } else { "" };
-            format!("{head}{blank}\n{section}:\n{body}{tail}")
+            // And the terminator's *spelling* is the document's, not a hard
+            // `\n`: a CRLF document that gained a section under one spelled LF
+            // gained `continue_on_cut:\n  - openai\n` mid-file, which
+            // `split_trailing_blank` then read as its head and glued the next
+            // write onto. Measured through the CLI on a CRLF shape.
+            let sep = line_ending(content);
+            let blank = if blank { sep } else { "" };
+            let tail = if content.ends_with(sep) { sep } else { "" };
+            format!(
+                "{head}{blank}{sep}{section}:{sep}{}{tail}",
+                body.replace("\n", sep)
+            )
         }
     }
 }
@@ -4038,7 +4047,7 @@ fn is_section(line: &str, section: &str) -> bool {
 fn rejoin(content: &str, out: Vec<String>) -> String {
     let sep = line_ending(content);
     let joined = out.join(sep);
-    if content.ends_with('\n') || content.ends_with("\r\n") {
+    if content.ends_with(sep) {
         joined + sep
     } else {
         joined
@@ -4074,10 +4083,17 @@ fn line_ending(content: &str) -> &'static str {
 /// The `head` keeps every byte up to and including the last line's own `\n`,
 /// or all of it for a document with no terminator.
 fn split_trailing_blank(content: &str) -> (&str, bool) {
-    let trimmed = content.trim_end_matches('\n');
-    // One blank is what a trailing `\n\n` means; more is the operator's
+    let sep = line_ending(content);
+    // The document minus one trailing blank line: a CRLF document ending
+    // `\r\n\r` has that blank, and trimming only `'\n'` leaves the dangling
+    // `\r` on the head — which then glues onto whatever the caller appends and
+    // turns a `continue_on_cut:` header into `\rcontinue_on_cut:`, a line no
+    // reader calls a section. Measured: the CRLF shape's head came back
+    // `"a\r\n\r"` with `blank=false`, both wrong.
+    let trimmed = content.trim_end_matches(sep);
+    // One blank is what a trailing `sep+sep` means; more is the operator's
     // paragraph spacing and is still theirs.
-    let blank = content.len() > trimmed.len() + usize::from(content.ends_with('\n'));
+    let blank = content.len() > trimmed.len() + sep.len();
     (trimmed, blank)
 }
 
@@ -4282,15 +4298,23 @@ fn insert_list_at_end(
     // document ending `- id: c\n\n` came back `- id: c\n` — measured on a
     // `visibility block` whose round trip lost the operator's own blank.
     let (head, blank) = split_trailing_blank(content);
-    let tail = if content.ends_with('\n') { "\n" } else { "" };
-    let blank = if blank { "\n" } else { "" };
+    // The document's own spelling, not a hard `\n`: a CRLF document that
+    // gained a block spelled LF gained `visibility:\n  - a/m\n` mid-file,
+    // and the next writer read that LF line as its head and glued its own
+    // block onto it. Measured through the CLI on a CRLF shape.
+    let sep = line_ending(content);
+    let tail = if content.ends_with(sep) { sep } else { "" };
+    let blank = if blank { sep } else { "" };
     match depth {
         Some(_) => {
             let mut out: Vec<String> = content.lines().map(str::to_owned).collect();
             out.push(block);
             rejoin(content, out)
         }
-        None => format!("{head}{blank}\n{section}:\n{block}{tail}"),
+        None => format!(
+            "{head}{blank}{sep}{section}:{sep}{}{tail}",
+            block.replace("\n", sep)
+        ),
     }
 }
 
@@ -4497,7 +4521,15 @@ fn set_section_scalar(content: &str, section: &str, key: &str, value: bool) -> S
         // blank line the operator wrote, which is the same class of claim in
         // the other direction. So the ending is taken from the file and put
         // back, and only the one separator the new section needs is written.
-        let ending = if content.ends_with('\n') { "\n" } else { "" };
+        // And the terminator's *spelling* is the document's rather than a
+        // hard `\n`: a CRLF document that gained a `visibility:` block spelled
+        // LF gained `visibility:\n  hide_paid_models: true\n` mid-file, and
+        // the false direction then stripped the `\n` and left the dangling
+        // `\r` — which glues the next write onto the header. Measured through
+        // the CLI: `hide-paid true` then `false` on a CRLF shape came back one
+        // byte short of its original, the file's own trailing `\r`.
+        let sep = line_ending(content);
+        let ending = if content.ends_with(sep) { sep } else { "" };
         let body = content.strip_suffix(ending).unwrap_or(content);
         // The section goes on a line of its own, so exactly one separator sits
         // between the body's last line and the new header. The file's own
@@ -4506,8 +4538,8 @@ fn set_section_scalar(content: &str, section: &str, key: &str, value: bool) -> S
         // `combos:` row *and* took the file's final newline. When it has
         // none, one is written, because a header cannot share a line with the
         // row above it.
-        let lead = if ending.is_empty() { "\n" } else { ending };
-        return format!("{body}{lead}{section}:\n  {key}: {value}{ending}");
+        let lead = if ending.is_empty() { sep } else { ending };
+        return format!("{body}{lead}{section}:{sep}  {key}: {value}{ending}");
     };
     let key_depth = depth + 2;
     let mut out: Vec<String> = Vec::new();
@@ -7647,13 +7679,49 @@ mod tests {
         /// is why a rewrite of every line ending went unnoticed.
         pub const CRLF: &str = "keys:\r\n  a: $AR_KEY_A\r\n\r\ncombos:\r\n  - id: c\r\n    strategy: priority\r\n    targets:\r\n      - a/m\r\n";
 
+        /// [`TRAILING_BLANK`]'s CRLF spelling, which is a *different file* from
+        /// [`CRLF`] and not a second name for it: its last bytes are `\r\n\r`,
+        /// and `str::lines` therefore yields a final line of `"\r"` rather than
+        /// the `""` the LF spelling yields. Every writer that tests a tail for
+        /// blankness with `trim().is_empty()` reports both as blank, which is
+        /// how a CRLF document's trailing blank goes missing.
+        ///
+        /// `\r\n\r` and not `\r\n\r\n`: the trailing blank line here is a
+        /// separator with no line of its own after it, exactly what a CRLF
+        /// editor saves after a blank line at the end of a file. Two
+        /// separators would be a blank line plus a terminator, which
+        /// `str::lines` reports as an ordinary `""` line and which is not the
+        /// state the defect is.
+        pub const CRLF_TRAILING_BLANK: &str = "keys:\r\n  a: $AR_KEY_A\r\n\r\ncombos:\r\n  - id: c\r\n    strategy: priority\r\n    targets:\r\n      - a/m\r\n\r";
+
         /// A config with no `combos:` section, so an insert takes the append
         /// branch instead of the anchor branch.
         pub const NO_COMBOS: &str = "keys:\n  a: $AR_KEY_A\n";
 
         /// Every document shape, for a round trip to be proven against rather
         /// than one.
-        pub const ALL: &[&str] = &[LF, NO_NEWLINE, TRAILING_BLANK, CRLF, NO_COMBOS];
+        pub const ALL: &[&str] = &[
+            LF,
+            NO_NEWLINE,
+            TRAILING_BLANK,
+            CRLF,
+            CRLF_TRAILING_BLANK,
+            NO_COMBOS,
+        ];
+    }
+
+    /// The last line `str::lines` yields for a document — the line a writer's
+    /// tail rule actually sees.
+    ///
+    /// The one fact this class of defect turns on: a CRLF document ending on a
+    /// blank line yields `"\r"` where its LF spelling yields `""`, and both
+    /// answer `""` to `trim()`.
+    fn lines_tail(content: &str) -> &str {
+        // `next_back()` would answer the question wrongly: `Lines`'s
+        // `DoubleEndedIterator` impl strips a trailing `\r` from the last line
+        // too, so it returns `""` for the very document that yields `"\r"`
+        // forward. `last()` forces the forward iterator, which does not.
+        content.lines().last().unwrap_or("")
     }
 
     /// A writer `M` that adds something to a document, and the `U` that removes
@@ -10830,6 +10898,37 @@ models\":[{\"kind\":\"model\",\"model\":\"nvidia/z-ai/glm-5.3\",\"providerId\":\
         );
     }
 
+    /// The CRLF spelling of the same round trip, which the LF test above
+    /// cannot see and which passed *while the write was wrong*: the section was
+    /// spelled `visibility:\n  hide_paid_models: true\n` — four LF lines in a
+    /// CRLF file — and the false direction then read the `\n` as the terminator
+    /// and left the file's own `\r`, so the round trip came back one byte short
+    /// forever.
+    ///
+    /// Measured through the CLI: `hide-paid true` then `false` on a CRLF shape
+    /// omitted the file's own trailing `\r`, and YAML accepted the result
+    /// because it parses either spelling.
+    #[test]
+    fn hide_paid_round_trips_a_crlf_file_byte_for_byte() {
+        let base = shapes::CRLF_TRAILING_BLANK;
+        assert!(uses_crlf(base), "the fixture is the shape it claims");
+        let on = set_section_scalar(base, "visibility", "hide_paid_models", true);
+        // One style per document: the whole file is CRLF, or the file is wrong.
+        assert!(
+            !on.replace("\r\n", "").contains('\n'),
+            "the write spelled the new section in LF inside a CRLF file: {on:?}"
+        );
+        assert!(
+            on.contains("\r\nvisibility:\r\n"),
+            "the new section header was written with LF: {on:?}"
+        );
+        let off = set_section_scalar(&on, "visibility", "hide_paid_models", false);
+        assert_eq!(
+            off, base,
+            "write then remove restores the file byte for byte on a CRLF shape: {off:?}"
+        );
+    }
+
     // ---- Phase 5: `aroute oauth`, the operator's stated goal ----------------
 
     /// A config with a provider to key a session to and a `keys:` row for the
@@ -11276,6 +11375,58 @@ models\":[{\"kind\":\"model\",\"model\":\"nvidia/z-ai/glm-5.3\",\"providerId\":\
                 "the keys writers must restore the file byte for byte on {shape:?}"
             );
         }
+    }
+
+    /// `str::lines` strips one trailing `\r` per line, so a CRLF document whose
+    /// last line is a blank line yields a final line of `"\r"` rather than
+    /// `""`. The writers that drop a section, and the printer that prunes an
+    /// empty list, test for a blank line with `trim().is_empty()`, which is
+    /// true of `"\r"` — so the line goes *as blank* and the operator's trailing
+    /// blank byte is deleted with it, while a blank line the write created
+    /// survives.
+    ///
+    /// Measured on the CLI: `continue_on_cut remove` on a CRLF document that
+    /// ends on a blank line came back 213 of 214 bytes, its last `\r` gone. The
+    /// identical LF round trip was byte exact, because LF yields `""` and
+    /// `trim()` leaves it `""` — same value, so nothing is lost. YAML parses
+    /// either spelling, so the file still loaded and only a diff shows it.
+    #[test]
+    fn a_crlf_trailing_blank_is_not_a_blank_line() {
+        // What `lines()` yields at the tail of each spelling, which is what a
+        // writer sees and what `trim().is_empty()` is asked about.
+        assert_eq!(lines_tail(shapes::CRLF_TRAILING_BLANK), "\r");
+        assert_eq!(lines_tail(shapes::TRAILING_BLANK), "");
+        assert_eq!(
+            lines_tail(shapes::CRLF_TRAILING_BLANK).trim(),
+            "",
+            "`trim()` cannot tell this `\r` line from a real blank, which is the defect"
+        );
+    }
+
+    /// Pins the round trip on the shape that missing line would break: a CRLF
+    /// document ending on a trailing blank, with a section removed from its
+    /// tail, has to come back byte for byte.
+    ///
+    /// The write and the remove are both `\r`-aware by construction, so the
+    /// pair cancels under a broken tail rule and the assertion only holds while
+    /// the tail is kept as content rather than eaten as blank — which is what
+    /// makes it a control of the rule and not a restatement of it.
+    #[test]
+    fn removing_a_section_keeps_a_crlf_trailing_blank() {
+        // The real pair, on the shape that starts with a trailing blank:
+        // append then remove. The add builds the document this shape would
+        // come back as, so the remove reads exactly what the writer produced
+        // rather than a hand-composed sketch of it.
+        let shape = shapes::CRLF_TRAILING_BLANK;
+        let added = append_nested_list_entry(shape, CUT_SECTION, None, CUT_SECTION, "groq")
+            .expect("the entry is added");
+        assert_ne!(added, shape, "the add must have changed something");
+        let back = remove_nested_list_entry(&added, CUT_SECTION, None, CUT_SECTION, "groq")
+            .expect("the entry is removed");
+        assert_eq!(
+            back, shape,
+            "add then remove must restore the file byte for byte on a CRLF trailing blank: {back:?}"
+        );
     }
 
     /// The combo *target* writer, the last row family on the shared shapes. It
