@@ -3183,8 +3183,6 @@ fn append_row(content: &str, section: &str, rendered: &str) -> String {
         // terminator carried across and a newline separating the two. The
         // entry is indented to a list's entries-depth under its header, the
         // same depth the in-section path writes.
-        let tail = if content.ends_with('\n') { "\n" } else { "" };
-        let body = indent_row(rendered, 2);
         // `trim_end` is too much: it also takes a **blank line the operator
         // wrote** at the end of the file, which is not the writer's to take.
         // Measured: a file ending `- id: c\n\n` and one ending `- id: c\n`
@@ -3192,9 +3190,24 @@ fn append_row(content: &str, section: &str, rendered: &str) -> String {
         // the new row flush against the last combo row in both. Strip the one
         // terminator and stop: a blank the operator wrote survives below the
         // last row and the new section still starts on its own line, because
-        // the format's own `\n` is what separates the two.
+        // the format's own separator is what separates the two.
+        //
+        // `\n\n` is not the terminator though. A CRLF document ends `\r\n`, and
+        // stripping only the `\n` leaves the `\r` stranded on the previous line
+        // while the separator written here is `\n` — measured, the round trip of
+        // a CRLF file left `...- a/m\r` against `...- a/m\r\n`, so the write
+        // changed the last byte of a line it was not asked to touch. The
+        // separator is the document's own, read the same way every other
+        // writer reads it, because YAML permits one style per document.
+        let sep = line_ending(content);
+        let tail = if content.ends_with(sep) { sep } else { "" };
+        // The rendered row is spelled in LF by the renderers, so a CRLF
+        // document needs it re-spelled rather than mixed: a CRLF file whose new
+        // row is LF-bodied is a document YAML accepts and a diff that shows
+        // every line.
+        let body = indent_row(rendered, 2).replace('\n', sep);
         let trimmed = content.strip_suffix(tail).unwrap_or(content);
-        return format!("{}\n{section}:\n{body}{tail}", trimmed);
+        return format!("{trimmed}{sep}{section}:{sep}{body}{tail}");
     };
     // The section's own body: entries sit at `base + 2`, and the row ends at
     // the first line that is neither an entry nor part of one.
@@ -11092,6 +11105,40 @@ models\":[{\"kind\":\"model\",\"model\":\"nvidia/z-ai/glm-5.3\",\"providerId\":\
         );
         // Mutation control: drop the quote branch of `yaml_entry` and the first
         // assertion fails; make it quote unconditionally and the second fails.
+    }
+
+    /// The `oauth:` row writer is the shape set's next family: `append_row` and
+    /// `remove_row` were the writers that ate the trailing blank, so the pair
+    /// that caught it must round-trip on every shape rather than the one it
+    /// happens to spell. A row lands inside `oauth:`, so [`shapes::NO_COMBOS`]
+    /// is the only shape this writer does not write.
+    #[test]
+    fn a_row_writer_of_a_list_section_round_trips_every_file_shape() {
+        let rendered = "- provider: codex\n  token_url: https://a.example/t\n";
+        round_trips_on_every_shape(
+            |doc| append_row(doc, OAUTH_SECTION, rendered),
+            |added| remove_row(added, OAUTH_SECTION, "codex").unwrap_or_else(|| added.to_owned()),
+            // `oauth:` has to exist for a row to land inside it, and the shapes
+            // that carry it all do.
+            |_shape| true,
+        );
+    }
+
+    /// The `oauth:` section absent, so the whole block is appended — the branch
+    /// whose tail was the defect, pinned over the shapes rather than the one
+    /// spelling the original test happened to choose.
+    #[test]
+    fn an_absent_section_row_write_round_trips_every_file_shape() {
+        for shape in shapes::ALL {
+            let trimmed = shape.trim_end_matches('\n');
+            let added = append_row(trimmed, OAUTH_SECTION, "- provider: groq\n");
+            assert_ne!(added, trimmed, "the write must have changed something");
+            let back = remove_row(&added, OAUTH_SECTION, "groq").expect("the just-written row");
+            assert_eq!(
+                back, trimmed,
+                "add then remove must restore the file byte for byte on {shape:?}"
+            );
+        }
     }
 
     #[test]
