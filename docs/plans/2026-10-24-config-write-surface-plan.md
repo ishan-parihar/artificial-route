@@ -866,3 +866,36 @@ pass never covered are the two above plus `limits clear` with no `--key`.
 
 Gates at this commit: 331 unit tests, 77 integration, 45 test binaries green
 across the workspace, clippy clean under `-D warnings`, `genome lint` 0 errors.
+
+**A CRLF document was rewritten end to end, and the loader never said so.**
+Found on 2026-10-26 by a third pass, in the geometry the first pass documented
+as untested and never ran. `serde_yaml` parses CRLF, so a CRLF `config.yaml`
+loads clean — which is why nothing warned. But `str::lines` strips the `\r`, and
+every writer rejoins with a hardcoded `"\n"`, so **one row-level write replaced
+every line ending in the file**: measured, a 164-byte CRLF config came back
+**109 bytes with zero `\r`** after one `combo add`, and the add-then-remove pair
+could not restore it.
+
+Twenty-four writers go through `lines()` and none asked about the separator. The
+fix reads the answer from the document rather than choosing it, because YAML
+permits one line-ending style per document: `line_ending(content)` returns
+`\r\n` for a document carrying any `\r` and `\n` otherwise, and the five writer
+tails that rejoin inline now use it (`rejoin`, `append_combo_row`,
+`remove_combo_row`, `splice_section`, `remove_section`). Pinned by
+`a_crlf_document_rejoins_with_crlf`, which round-trips a CRLF document byte for
+byte in both directions and asserts an LF document gains no CR from the same
+rule.
+
+Negative control: forcing `let sep = "\n"` at the five inline sites kills the
+test. The first attempt at the control targeted `rejoin` and **did not** kill
+it, because `append_combo_row` does not call `rejoin` — the second, larger
+writer tail is its own copy of the idiom, which is why the fix is five sites
+and not one.
+
+**The credential orphan is not specific to `add-custom`.** Q20's evidence was
+measured on the ad-hoc path; a third pass ran the registry path too.
+`providers add openai` writes `AR_KEY_OPENAI` into `ar.env`, and
+`providers remove` drops the config's reference while the env line survives —
+the same orphan, one `$AR_KEY_MISTRAL` left with zero references. The row now
+records both write paths, since a ruling about "a provider removal" is a ruling
+about the shared `splice_remove_provider` the two paths both call.

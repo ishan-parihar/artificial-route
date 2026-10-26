@@ -1878,8 +1878,12 @@ fn empty_custom_section(doc: &str) -> String {
             out.push(line.to_owned());
         }
     }
-    let ending = if doc.ends_with('\n') { "\n" } else { "" };
-    out.join("\n") + ending
+    let ending = if doc.ends_with('\n') || doc.ends_with("\r\n") {
+        line_ending(doc)
+    } else {
+        ""
+    };
+    out.join(line_ending(doc)) + ending
 }
 
 /// The strategies this build routes, by name.
@@ -4010,12 +4014,31 @@ fn is_section(line: &str, section: &str) -> bool {
 /// `str::lines` drops the terminator, so a document that ends without one would
 /// otherwise gain it — a change to a byte nobody asked to touch.
 fn rejoin(content: &str, out: Vec<String>) -> String {
-    let joined = out.join("\n");
-    if content.ends_with('\n') {
-        joined + "\n"
+    let sep = line_ending(content);
+    let joined = out.join(sep);
+    if content.ends_with('\n') || content.ends_with("\r\n") {
+        joined + sep
     } else {
         joined
     }
+}
+
+/// Whether the document uses CRLF line endings, which every writer has to know
+/// and which none asked: `str::lines` strips the `\r`, so rejoining with `\n`
+/// rewrites the whole file. Measured: a 164-byte CRLF config came back 109
+/// bytes after one `combo add`, all twelve `\r` gone. YAML allows one style
+/// per document, so the answer is read from the document rather than chosen.
+///
+/// `serde_yaml` parses either, so this was never a validity problem — the
+/// loader never warned while the bytes changed.
+fn uses_crlf(content: &str) -> bool {
+    content.contains('\r')
+}
+
+/// The separator to rejoin with and to close the file with, for the document's
+/// own style. LF and CRLF behave identically everywhere except these bytes.
+fn line_ending(content: &str) -> &'static str {
+    if uses_crlf(content) { "\r\n" } else { "\n" }
 }
 
 /// A value written as a block-sequence entry, quoted when the raw form would
@@ -6484,8 +6507,12 @@ fn remove_section(content: &str, name: &str) -> String {
     // A file that ends with a blank line keeps it: the pop-from-the-end a
     // previous version used took the operator's own trailing blank with the
     // removed section, because the removed section was the file's last thing.
-    let ending = if content.ends_with('\n') { "\n" } else { "" };
-    out.join("\n") + ending
+    let ending = if content.ends_with('\n') || content.ends_with("\r\n") {
+        line_ending(content)
+    } else {
+        ""
+    };
+    out.join(line_ending(content)) + ending
 }
 
 /// Replaces one top-level `name:` section with `rendered`, which carries its
@@ -6551,7 +6578,7 @@ pub(crate) fn splice_section(content: &str, name: &str, rendered: &str) -> Strin
     // having none, and one that has one keeps having exactly one.
     let ending = if content.ends_with('\n') { "\n" } else { "" };
     if replaced {
-        out.join("\n") + ending
+        out.join(line_ending(content)) + ending
     } else {
         let anchor = out.iter().position(|l| l == "combos:");
         match anchor {
@@ -6577,7 +6604,7 @@ pub(crate) fn splice_section(content: &str, name: &str, rendered: &str) -> Strin
                     block.push('\n');
                 }
                 out.insert(i, block);
-                out.join("\n") + ending
+                out.join(line_ending(content)) + ending
             }
             None => format!("{}\n{}{}", content.trim_end(), rendered, ending),
         }
@@ -6644,9 +6671,10 @@ fn add_target_line(content: &str, combo_id: &str, target: &str) -> Option<String
     let mut out: Vec<String> = all[..list_end].iter().map(|l| (*l).to_owned()).collect();
     out.push(format!("      - {target}"));
     out.extend(all[list_end..].iter().map(|l| (*l).to_owned()));
-    let joined = out.join("\n");
-    Some(if content.ends_with('\n') {
-        joined + "\n"
+    let sep = line_ending(content);
+    let joined = out.join(sep);
+    Some(if content.ends_with('\n') || content.ends_with("\r\n") {
+        joined + sep
     } else {
         joined
     })
@@ -6715,9 +6743,10 @@ fn remove_target_line(content: &str, combo_id: &str, target: &str) -> Option<Str
     let span = dropped?;
     let mut out: Vec<String> = all[..j].iter().map(|l| (*l).to_owned()).collect();
     out.extend(all[j + span..].iter().map(|l| (*l).to_owned()));
-    let joined = out.join("\n");
-    Some(if content.ends_with('\n') {
-        joined + "\n"
+    let sep = line_ending(content);
+    let joined = out.join(sep);
+    Some(if content.ends_with('\n') || content.ends_with("\r\n") {
+        joined + sep
     } else {
         joined
     })
@@ -6820,9 +6849,10 @@ fn append_combo_row(content: &str, rendered: &str) -> String {
     if in_section {
         out.push(rendered.trim_end_matches('\n').to_owned());
     }
-    let joined = out.join("\n");
-    if content.ends_with('\n') {
-        joined + "\n"
+    let sep = line_ending(content);
+    let joined = out.join(sep);
+    if content.ends_with('\n') || content.ends_with("\r\n") {
+        joined + sep
     } else {
         joined
     }
@@ -6876,9 +6906,10 @@ fn remove_combo_row(content: &str, id: &str) -> Option<String> {
     let mut out: Vec<String> = Vec::with_capacity(all.len());
     out.extend(all[..start].iter().map(|l| (*l).to_owned()));
     out.extend(all[end..].iter().map(|l| (*l).to_owned()));
-    let joined = out.join("\n");
-    Some(if content.ends_with('\n') {
-        joined + "\n"
+    let sep = line_ending(content);
+    let joined = out.join(sep);
+    Some(if content.ends_with('\n') || content.ends_with("\r\n") {
+        joined + sep
     } else {
         joined
     })
@@ -6927,7 +6958,8 @@ fn add_missing_custom_key_refs(doc: &str, custom: &[ar_registry::CustomProvider]
         }
         out.push(line.to_owned());
     }
-    out.join("\n") + "\n"
+    let sep = line_ending(doc);
+    out.join(sep) + sep
 }
 
 /// What `sync_env_file` planned for the env file: the counts the caller
@@ -8507,6 +8539,41 @@ mod tests {
                 "a removal of an absent section must not re-spell the file"
             );
         }
+    }
+
+    /// A CRLF document rejoins with CRLF, because `str::lines` strips the
+    /// `\r` and a `\n`-only rejoin rewrites every line ending in the file.
+    ///
+    /// Measured before the fix: a 164-byte CRLF config came back **109 bytes
+    /// with zero `\r`** after one `combo add`, and the add-then-remove pair
+    /// never restored it. `serde_yaml` parses either style, so the loader never
+    /// warned — the bytes changed silently. YAML permits one style per
+    /// document, so the answer is read from the document.
+    #[test]
+    fn a_crlf_document_rejoins_with_crlf() {
+        let crlf = "keys:\r\n  a: $AR_KEY_A\r\n\r\ncombos:\r\n  - id: c\r\n    strategy: priority\r\n    targets:\r\n      - a/m\r\n";
+        // Rendered the way the verb renders it: `render_combo_block` writes the
+        // row at a list entry's own depth, which is what `append_combo_row`
+        // expects to place.
+        let rendered = "- id: new\n  strategy: priority\n  targets:\n    - a/m\n";
+        let row = indent_row(rendered, 2);
+        let added = append_combo_row(crlf, &row);
+        assert!(
+            added.contains("\r\n"),
+            "the CRLF endings were rewritten: {added:?}"
+        );
+        assert_eq!(
+            remove_combo_row(&added, "new").as_deref(),
+            Some(crlf),
+            "add then remove restores a CRLF file byte for byte"
+        );
+        // And an LF document gains no CR from the same rule.
+        let lf = crlf.replace("\r\n", "\n");
+        let lf_added = append_combo_row(&lf, &row);
+        assert!(
+            !lf_added.contains('\r'),
+            "an LF document must not gain a CR: {lf_added:?}"
+        );
     }
 
     #[test]
