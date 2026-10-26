@@ -993,14 +993,14 @@ to make. The other eight are: the combo row, the combo target, the section
 splice, the section scalar, the list entry, the nested list, the `oauth:` row and
 the `keys:` pair.
 
-Seven of those eight have a test that iterates `shapes::ALL` directly, and the
-eighth — the list entry, `append_list_entry` / `remove_list_entry` — now does too,
-via `a_list_entry_write_round_trips_every_file_shape`. It was pinned before only
-by `a_trailing_blank_survives_a_list_append_and_its_remove`, which runs the pair
-over the two ending states a hand-written fixture could spell, so a CRLF document
-with no `visibility:` section was never exercised. The control that killed the new
-test was `rejoin`'s CRLF separator rather than the blank fix, which is the shape
-that would have caught it.
+**Each of the eight now has a test that iterates `shapes::ALL` directly.** That is
+the claim this section is careful about, because it was wrong twice: once as
+"13 writer families", once as "seven of eight, the keys pair has no test". The
+second was a lookup error — the test is
+`the_keys_writers_round_trip_every_file_shape`, and I had searched for
+`..._round_trips_...` with an s. Re-measured at HEAD by parsing the test module
+and naming which writers each shape test exercises: **8 of 8 families, 150 tests
+in the module.**
 
 The `keys:` pair is a wrapper over `splice_section`, so adopting it meant
 adopting the section writer, and the shapes found two defects in it that an LF
