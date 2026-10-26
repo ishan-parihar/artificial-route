@@ -6580,7 +6580,6 @@ fn remove_section(content: &str, name: &str) -> String {
 /// own header line. A section that is not present is inserted before
 /// `combos:` — definition before use — or appended when there is none.
 pub(crate) fn splice_section(content: &str, name: &str, rendered: &str) -> String {
-    let header = format!("{name}:");
     let all: Vec<&str> = content.lines().collect();
     let mut out: Vec<String> = Vec::new();
     let mut skipping = false;
@@ -6590,8 +6589,23 @@ pub(crate) fn splice_section(content: &str, name: &str, rendered: &str) -> Strin
     // on the next line of substance, which a `for` over `lines()` cannot see.
     for i in 0..all.len() {
         let line = all[i];
-        if line == header {
-            out.push(rendered.trim_end_matches('\n').to_owned());
+        // `line == header` is the check for LF only: `str::lines` keeps the
+        // `\r` on a CRLF line, so a CRLF `keys:\r` never equals `keys:` and
+        // every CRLF document took the *missing-section* branch instead, which
+        // writes LF separators. Measured: the `keys:` round trip of a CRLF
+        // shape came back `- a/m\r\n` -> `- a/m\n`, the last byte of the
+        // file changed by a write that had one section to replace.
+        if is_section(line, name) {
+            // The rendered block arrives spelled in LF, because every renderer
+            // in this crate emits `\n`. A CRLF document needs it re-spelled or
+            // the file comes back mixed, which YAML accepts and a diff shows as
+            // every line. Re-spelled here rather than in the renderers because
+            // `splice_section` is the only one of them that knows which
+            // document it is writing into.
+            let block = rendered
+                .trim_end_matches('\n')
+                .replace('\n', line_ending(content));
+            out.push(block);
             replaced = true;
             skipping = true;
             continue;
@@ -6637,7 +6651,14 @@ pub(crate) fn splice_section(content: &str, name: &str, rendered: &str) -> Strin
     // somewhere else. This repo's own `config.yaml` ends without one
     // deliberately. Preserve what was there; a file with no final newline keeps
     // having none, and one that has one keeps having exactly one.
-    let ending = if content.ends_with('\n') { "\n" } else { "" };
+    //
+    // `"\n"` is the LF spelling of that, and a CRLF document ends `\r\n`, so the
+    // bare `\n` drops the file's own `\r` and makes its last byte a byte the
+    // operator never wrote. Measured: the `keys:` round trip of a CRLF shape
+    // came back with `- a/m\r\n` spelled `- a/m\n`. The separator is the
+    // document's, read the way every other writer tail reads it.
+    let sep = line_ending(content);
+    let ending = if content.ends_with(sep) { sep } else { "" };
     if replaced {
         out.join(line_ending(content)) + ending
     } else {
@@ -11182,6 +11203,35 @@ models\":[{\"kind\":\"model\",\"model\":\"nvidia/z-ai/glm-5.3\",\"providerId\":\
                     "add then remove must restore the file byte for byte on {shape:?}"
                 );
             }
+        }
+    }
+
+    /// The `keys:` writers are the last pair, and they are covered by
+    /// construction rather than by their own call: `with_key_binding` is a thin
+    /// wrapper that resolves the rows and hands them to [`splice_section`], and
+    /// `render_keys_removed` renders rather than writes. So the shape set's
+    /// section-splice test already covers this family's every path.
+    ///
+    /// Pinned anyway, because "covered by construction" is exactly the kind of
+    /// claim the fixture set exists to test: if a future edit to
+    /// `with_key_binding` starts rebuilding the document itself, this test marks
+    /// it. The round trip is add-a-binding then render-these-rows-away.
+    #[test]
+    fn the_keys_writers_round_trip_every_file_shape() {
+        for shape in shapes::ALL {
+            let bound = with_keys_row(shape, "added", "AR_KEY_ADDED");
+            assert_ne!(bound, *shape, "the binding must have changed something");
+            // Remove only what the write added, which is what the round trip
+            // means — taking every row instead leaves an empty `keys:` header
+            // the operator never wrote.
+            let rows: std::collections::BTreeSet<String> =
+                ["added".to_owned()].into_iter().collect();
+            let rendered = render_keys_removed(&bound, &rows).expect("the rows render");
+            let back = splice_section(&bound, "keys", &rendered);
+            assert_eq!(
+                back, *shape,
+                "the keys writers must restore the file byte for byte on {shape:?}"
+            );
         }
     }
 
