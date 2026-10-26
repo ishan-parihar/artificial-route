@@ -985,13 +985,14 @@ Two tests, each with a mutation control that was run: reverting
 `append_list_entry`'s fails the second. Both controls killed their test — a
 control that survives is a test that proved nothing.
 
-The remaining gap, recorded rather than assumed away: the shape set covers **3 of
-13 writer families**. `append_list_entry`/`remove_list_entry`,
-`append_nested_list_entry`/`remove_nested_list_entry`, `add_target_line`/
-`remove_target_line`, `append_row`/`remove_row`, `with_key_binding` and
-`add_missing_custom_key_refs` each carry one hand-written shape, so a new defect
-in any of them still passes by construction on that shape. That is the adoption
-work this section names as the fix and has done three of.
+The remaining gap, recorded rather than assumed away: of the **13 writer
+families** the shape set now covers **six** — combo rows, combo targets, the
+section splice, the section scalar, the `oauth:` row and the list append.
+`append_nested_list_entry`/`remove_nested_list_entry`, `with_key_binding`,
+`render_keys_removed` and `add_missing_custom_key_refs` still carry a single
+hand-written shape each, so a new defect in any of them passes by construction
+on that shape. That is the adoption work this section names as the fix and has
+done six of thirteen.
 
 So the durable fix is not "add fixtures" — it is a **shared, paired fixture set**
 that every writer's round trip runs against, in one call, so that a new writer

@@ -11141,6 +11141,34 @@ models\":[{\"kind\":\"model\",\"model\":\"nvidia/z-ai/glm-5.3\",\"providerId\":\
         }
     }
 
+    /// The combo *target* writer, the last row family on the shared shapes. It
+    /// already read the document's own separator and terminator, which is why
+    /// adopting the shapes here is a claim rather than a hunt: the value of the
+    /// claim is that a future change to either line has to hold on all five
+    /// states, not on the one shape the hand-written test spelled.
+    #[test]
+    fn a_combo_target_write_round_trips_every_file_shape() {
+        round_trips_on_every_shape(
+            |doc| add_target_line(doc, "c", "openai/gpt-4o").unwrap_or_else(|| doc.to_owned()),
+            |added| {
+                remove_target_line(added, "c", "openai/gpt-4o").unwrap_or_else(|| added.to_owned())
+            },
+            // A target goes inside `combos:`, so every shape but the one with
+            // no combos section at all takes the write.
+            |shape| shape.contains("combos:"),
+        );
+    }
+
+    /// And the remove direction alone, on a shape never holding the target: the
+    /// direction a round trip cannot reach, because a round trip starts with a
+    /// write.
+    #[test]
+    fn a_target_removal_of_something_absent_is_a_no_op_on_every_shape() {
+        remove_alone_is_a_no_op_on_every_shape(|doc| {
+            remove_target_line(doc, "c", "nope/nope").unwrap_or_else(|| doc.to_owned())
+        });
+    }
+
     #[test]
     fn a_trailing_blank_survives_a_list_append_and_its_remove() {
         // The other two sites of the same tail, where a round trip could still
