@@ -1092,3 +1092,54 @@ audit above is reproduced by `target/tmp/v/count.py`, whose definition is stated
 in the text. The count moved from 110 to 111 with `CRLF_TRAILING_BLANK`, and it
 will move again with the next fixture; the numbers are derivable, not constant,
 and the plan says so rather than pretending otherwise.
+
+---
+
+## Pass seven (2026-10-26): the row writer, found past where the sweep stopped
+
+**The previous pass ended at four shapes and three families, and the next defect
+was in a family the sweep did not reach.** `oauth add` was not in `trip.sh`'s
+list. Running it on a CRLF document rewrote **every line of the file with LF** —
+18 lines, measured — while the whole suite was green.
+
+Two `\r` blind spots in the row writer, both the same shape as pass six and both
+in rules that read as "everything to the end":
+
+1. **`append_row` rebuilt its own tail.** It called `rejoin`, took the result
+   apart with `lines()`, joined with a literal `\n`, and appended the terminator
+   by hand. `lines()` strips the `\r` on every line, so a file the write left one
+   style came back entirely the other. `rejoin` alone is the whole tail — it
+   already writes the document's own separator and re-appends the terminator
+   only where the file had one.
+2. **`indent_row`'s output was not re-spelled on the in-section path**, so the
+   new row's own lines were LF in a CRLF file. The no-section branch already
+   did `.replace('\n', sep)`; the in-section branch pushed the raw render.
+
+Both found on the same document, and **both controls initially survived** — which
+is the third time a control has been wrong here, and twice for the same reason.
+The first round-trip fixture used a single-line row, and `indent_row` on a
+single line has no `\n` to re-spell, so re-adding the bug changed nothing. The
+lesson is now a rule: **a control that survives means the test does not reach the
+line the bug is on.** Fixtures need the shape the defect actually needs, not a
+shape that happens to parse.
+
+**And the same shape had a third spelling, in the removal.** `remove_row`
+computed the row's extent as "to the next entry, the next section, or the end of
+the file" — and a CRLF document ending on a blank line has the document's own
+dangling `\r` as its last line, with nothing after it, so "end of file" took it
+and the operator's blank went with the row. Measured: add-then-remove came back
+one byte short of the original while the identical LF round trip was exact.
+
+Fixed by stopping the extent before a dangling `\r`, and by its opposite:
+`is_row_end` had to treat a dangling `\r` as a row end, because `trim().is_empty()`
+called it blank and "blank is not a row end" refused the only legal insertion
+point — which made the write silently do nothing at all, reported as `unchanged`.
+
+**State: 352 tests, 25 of 25 CLI round trips across four shapes, seven controls
+run and all seven fatal.**
+
+The durable note for the next pass: every one of these has been
+the same mechanism in a different place — `str::lines()` drops the `\r`, and a
+hand-built tail asks about blankness, indent, or separators with rules that
+cannot see it. The shape set catches them only when the fixture carries the shape
+*and* the test reaches the line. Both halves have failed independently.

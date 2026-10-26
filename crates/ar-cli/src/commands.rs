@@ -3239,8 +3239,15 @@ fn append_row(content: &str, section: &str, rendered: &str) -> String {
             // row belongs. Testing only entry lines misses the common case,
             // where the section's only row has continuations and the loop would
             // walk straight past the end of the section and write nothing.
+            //
+            // The rendered row is spelled in LF by the renderers and re-spelled
+            // into the document's own separator here, the same translation the
+            // no-section branch above makes: in a CRLF file an LF-bodied row is
+            // a mixed document YAML accepts and a diff that shows every line.
+            // Measured through the CLI: `oauth add` on a CRLF config wrote its
+            // `- provider:` line with LF while the rest of the file was CRLF.
             out.push(line.to_owned());
-            out.push(indent_row(rendered, entry_depth));
+            out.push(indent_row(rendered, entry_depth).replace('\n', line_ending(content)));
             in_section = false;
             i += 1;
             continue;
@@ -3249,16 +3256,15 @@ fn append_row(content: &str, section: &str, rendered: &str) -> String {
         i += 1;
     }
     // The section ran to the end of the file.
+    //
+    // `rejoin` is the whole tail: it writes the document's own separator on
+    // every line and re-appends the terminator only where the file had one.
+    // Taking it apart again to add the terminator by hand is what destroyed a
+    // CRLF file — `lines()` strips the `\r` on every line and a `\n` join
+    // rewrites all of them. Measured through the CLI: `oauth add` on a CRLF
+    // config left zero of its lines carrying a `\r`, and the round trip could
+    // not see it because the remove destroys the same file the same way.
     rejoin(content, out)
-        .lines()
-        .map(str::to_owned)
-        .collect::<Vec<_>>()
-        .join("\n")
-        + &if content.ends_with('\n') {
-            "\n".to_owned()
-        } else {
-            String::new()
-        }
 }
 
 /// Whether the line at `i` is the last line of a row of the section's list.
@@ -3273,9 +3279,24 @@ fn is_row_end(all: &[&str], i: usize, entry_depth: usize) -> bool {
     if !in_row {
         return false;
     }
+    // A blank line ends the row **unless it is the dangling `\r` a CRLF
+    // document's trailing blank leaves behind**: `str::lines` strips one
+    // trailing `\r` per line, so a file ending `\r\n\r` yields that `"\r"`
+    // as a final line whose indent reads as 1 — neither a continuation of the
+    // row nor a blank the operator typed. Testing `trim().is_empty()` reports
+    // it as blank, which made the row end of the last row read as "not a row
+    // end" and the write found nowhere to go: measured, `oauth add` on a CRLF
+    // config reported "unchanged" and wrote nothing.
+    //
+    // Only the exact dangling `\r` is exempted, so a blank line the operator
+    // actually wrote still ends the row and the new row still lands below it.
+    let dangling_cr = |l: &str| l == "\r";
     match all.get(i + 1) {
         None => true,
         Some(next) => {
+            if dangling_cr(next) {
+                return true;
+            }
             indent_of(next) != Some(entry_depth + 2)
                 && !is_list_entry(next, entry_depth)
                 && !next.trim().is_empty()
@@ -3322,8 +3343,22 @@ fn remove_row(content: &str, section: &str, provider: &str) -> Option<String> {
     }?;
     // The row ends where the next entry or the next section begins, whichever
     // the file reaches first.
+    //
+    // But the trailing `\r` of a CRLF document that ends on a blank line is
+    // **not part of the row**: `str::lines` yields it as a final line whose
+    // indent reads 1, and nothing above stops the walk before it, so "to the
+    // end of the file" took it — and with it the operator's blank line.
+    // Measured: add-then-remove of one `oauth:` row on a CRLF file came back
+    // one byte short of the original, the file's own trailing `\r`, while the
+    // identical LF round trip was byte exact.
     let mut end = all.len();
     for (j, line) in all.iter().enumerate().skip(start + 1) {
+        if *line == "\r" {
+            // A dangling `\r` is the document's own blank line, never the
+            // row's last continuation line: stop before it.
+            end = j;
+            break;
+        }
         if is_section_header(line) || oauth_row_starts(line) {
             end = j;
             break;
@@ -11273,6 +11308,134 @@ models\":[{\"kind\":\"model\",\"model\":\"nvidia/z-ai/glm-5.3\",\"providerId\":\
                 "add then remove must restore the file byte for byte on {shape:?}"
             );
         }
+    }
+
+    /// The row writer rebuilds its tail by re-splitting a rejoined document
+    /// and joining with a hard `\n`, so a CRLF document comes back with **every
+    /// line ending rewritten** — 18 LF lines where the file had 18 CRLF lines —
+    /// and the round trip cannot see it, because the remove re-splits the same
+    /// destroyed file and rejoins it the same way.
+    ///
+    /// Measured through the CLI: `oauth add` on a CRLF config left zero of its
+    /// original lines carrying a `\r`. The add's own block is CRLF because
+    /// `splice_section` re-spells it, so the write is not even uniformly wrong —
+    /// the file comes back mixed, which YAML accepts.
+    #[test]
+    fn append_row_keeps_a_crlf_document_on_crlf() {
+        let crlf_oauth = "keys:\r\n  a: $AR_KEY_A\r\n\r\noauth:\r\n  - provider: codex\r\n";
+        assert!(uses_crlf(crlf_oauth), "the fixture is the shape it claims");
+        // A row with a continuation line, which is the shape `is_row_end`
+        // exists for: the new row is written *after* the previous row's last
+        // continuation, and that path is the one whose `\n` join was left
+        // untranslated. A single-line row round-trips either way, because
+        // `indent_row` has no `\n` to re-spell and the replace is a no-op —
+        // which is exactly why the first version of this test passed with the
+        // bug reintroduced.
+        let added = append_row(
+            crlf_oauth,
+            OAUTH_SECTION,
+            "- provider: groq\n  token_url: https://a.example/t\n",
+        );
+        assert_ne!(added, crlf_oauth, "the write must have changed something");
+        // One style per document, which is the property the round trip cancels.
+        assert!(
+            !added.replace("\r\n", "").contains('\n'),
+            "a CRLF document came back with LF line endings: {added:?}"
+        );
+        // And the new row really is inside the section, spelled in CRLF.
+        // Every line of the row is re-indented to the section's entry depth, so
+        // the caller's 2-space continuation lands at 4 — the assertion states
+        // what the write actually produces rather than what the render spelled.
+        assert!(
+            added.contains("- provider: groq\r\n    token_url: https://a.example/t"),
+            "the new row was not written in the document's own separator: {added:?}"
+        );
+        let back = remove_row(&added, OAUTH_SECTION, "groq").expect("the row is removed");
+        assert_eq!(
+            back, crlf_oauth,
+            "add then remove must restore the file byte for byte on a CRLF oauth section"
+        );
+    }
+
+    /// And the row-end rule has the same `\r` blind spot in the opposite
+    /// direction, which shows up as a write that **does not happen**: the last
+    /// row of a CRLF section that ends on a blank line has the dangling `\r`
+    /// after it, `trim().is_empty()` calls it blank, and "blank is not a row
+    /// end" is false — so `is_row_end` refuses the only legal insertion point
+    /// and the walk runs off the end of the document.
+    ///
+    /// Measured through the CLI: `oauth add` on a CRLF config reported
+    /// `unchanged` and wrote nothing at all.
+    #[test]
+    fn a_row_end_is_still_a_row_end_before_a_crlf_dangling_blank() {
+        // The document the CLI was measured on, spelled at unit level.
+        let crlf = "oauth:\r\n  - provider: openai\r\n    refresh_key: openai_refresh\r\n\r";
+        let all: Vec<&str> = crlf.lines().collect();
+        // The continuation line is the last line of the last row, and the
+        // dangling `\r` follows it — so it must still read as a row end.
+        let at = all
+            .iter()
+            .position(|l| l.trim() == "refresh_key: openai_refresh")
+            .expect("the row's continuation line is there");
+        assert!(
+            is_row_end(&all, at, 2),
+            "the last row's end was not found in front of a CRLF dangling blank: {crlf:?}"
+        );
+        // And the write therefore lands: the section gains a row rather than
+        // returning the document it was handed.
+        let added = append_row(crlf, OAUTH_SECTION, "- provider: groq\n");
+        assert_ne!(added, crlf, "the row write found nowhere to go");
+        assert!(
+            added.contains("- provider: groq"),
+            "no row was written: {added:?}"
+        );
+        // A blank line the operator really wrote is still a blank line: an LF
+        // document's `""` is not exempted, so the row lands after it as before.
+        let lf = "oauth:\n  - provider: openai\n    refresh_key: openai_refresh\n\n";
+        let all: Vec<&str> = lf.lines().collect();
+        let at = all
+            .iter()
+            .position(|l| l.trim() == "refresh_key: openai_refresh")
+            .expect("the row's continuation line is there");
+        assert!(
+            !is_row_end(&all, at, 2),
+            "a blank line the operator wrote must still end the row: {lf:?}"
+        );
+    }
+
+    /// And the row's extent has to stop before the document's own trailing
+    /// blank, which is the write half of the same shape: add-then-remove on a
+    /// CRLF document ending on a blank came back one byte short, the file's own
+    /// `\r`, because "to the end of the file" took that line with the row.
+    ///
+    /// The LF twin is byte exact, so this is a CRLF-only defect in a rule that
+    /// reads as "everything to the end" — and the round trip of an LF document
+    /// cannot see it.
+    #[test]
+    fn a_row_write_round_trips_a_crlf_trailing_blank_byte_for_byte() {
+        let crlf = "keys:\r\n  a: $AR_KEY_A\r\n\r\noauth:\r\n  - provider: codex\r\n    refresh_key: codex_refresh\r\n\r";
+        assert!(uses_crlf(crlf), "the fixture is the shape it claims");
+        let added = append_row(
+            crlf,
+            OAUTH_SECTION,
+            "- provider: groq\n  token_url: https://a.example/t\n",
+        );
+        assert_ne!(added, crlf, "the write must have changed something");
+        // The row landed inside the section, in the document's own separator.
+        assert!(
+            added.contains("- provider: groq\r\n"),
+            "the new row was not written in the document's own separator: {added:?}"
+        );
+        // And the document's own trailing blank is still there, below the row.
+        assert!(
+            added.ends_with("\r\n\r"),
+            "the trailing blank was moved or dropped: {added:?}"
+        );
+        let back = remove_row(&added, OAUTH_SECTION, "groq").expect("the row is removed");
+        assert_eq!(
+            back, crlf,
+            "add then remove must restore the file byte for byte on a CRLF trailing blank: {back:?}"
+        );
     }
 
     /// The list-entry writer on every shape, which closes the last family that
