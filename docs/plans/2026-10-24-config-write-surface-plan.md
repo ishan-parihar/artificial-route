@@ -986,13 +986,21 @@ Two tests, each with a mutation control that was run: reverting
 control that survives is a test that proved nothing.
 
 The remaining gap, recorded rather than assumed away: of the **13 writer
-families** the shape set now covers **six** — combo rows, combo targets, the
-section splice, the section scalar, the `oauth:` row and the list append.
-`append_nested_list_entry`/`remove_nested_list_entry`, `with_key_binding`,
-`render_keys_removed` and `add_missing_custom_key_refs` still carry a single
-hand-written shape each, so a new defect in any of them passes by construction
-on that shape. That is the adoption work this section names as the fix and has
-done six of thirteen.
+families** the shape set now covers **seven** — combo rows, combo targets, the
+section splice, the section scalar, the `oauth:` row, the list append and the
+nested-list writer. `with_key_binding`, `render_keys_removed` and
+`add_missing_custom_key_refs` still carry a single hand-written shape each, so a
+new defect in any of them passes by construction on that shape. That is the
+adoption work this section names as the fix and has done seven of thirteen.
+
+And one property the round trip cannot assert, learned on the way: **a
+byte-for-byte round trip is satisfied by two mistakes that undo each other.** The
+CRLF shape of the nested-list writer round-trips exactly while the write mixes LF
+into a CRLF document, because the remove re-strips and rejoins from the same
+broken tail. So the adoption work adds an assertion of its own —
+`uses_crlf(added) == uses_crlf(shape)` — wherever a writer rebuilds its document
+tail by hand. Any future adoption that relies on the round trip alone will make
+the same mistake.
 
 So the durable fix is not "add fixtures" — it is a **shared, paired fixture set**
 that every writer's round trip runs against, in one call, so that a new writer
