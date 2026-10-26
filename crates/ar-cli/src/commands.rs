@@ -7516,6 +7516,164 @@ pub fn unknown_flag_hint(args: &[OsString], invalid: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The file states a config writer must be proven against, in one place.
+    ///
+    /// Four passes of validation each found a defect the shipped tests could
+    /// not express, because a test pins one spelling of a file and a writer's
+    /// claim is about *pairs* of spellings. Measured before this existed: of
+    /// the 17 round-trip assertions here, 4 crossed both endings and all four
+    /// were written *after* the defect they eventually caught — the other 13
+    /// passed by choosing the shape their fixture happened to spell.
+    ///
+    /// So each state is paired with the states that make its writer's claim
+    /// checkable, and a round trip runs the whole set rather than one member
+    /// of it. The shapes are the four the passes found, plus the one they
+    /// never reached:
+    ///
+    /// - **ends with a newline** vs **ends mid-line**: the trailing newline is
+    ///   the file's, and `str::lines` drops it, so a writer that rejoins
+    ///   without asking changes a byte nobody asked about.
+    /// - **ends with a blank line**: `trim_end()` cannot tell this from no
+    ///   blank, and the two must not produce the same output.
+    /// - **CRLF**: `lines` strips the `\r`, so a `\n`-only rejoin rewrites
+    ///   every line ending in the file.
+    /// - **a file with no `combos:`** at all, which routes an insert to the
+    ///   append branch rather than the anchor branch.
+    ///
+    /// Every fixture is a document a writer can accept, and each carries
+    /// `keys:` so a `$AR_KEY_A` binding resolves under a no-expansion parse.
+    mod shapes {
+        /// One combo, ending with a newline. The common case.
+        pub const LF: &str = "keys:\n  a: $AR_KEY_A\n\ncombos:\n  - id: c\n    strategy: priority\n    targets:\n      - a/m\n";
+
+        /// The same document ending mid-line, with no final newline.
+        ///
+        /// This repo's own `config.yaml` ends this way deliberately, and a
+        /// writer must not give it one.
+        pub const NO_NEWLINE: &str = "keys:\n  a: $AR_KEY_A\n\ncombos:\n  - id: c\n    strategy: priority\n    targets:\n      - a/m";
+
+        /// A trailing blank line the operator wrote after the last row.
+        ///
+        /// `content.trim_end()` cannot tell this from [`NO_NEWLINE`], and the
+        /// two must not produce identical output.
+        pub const TRAILING_BLANK: &str = "keys:\n  a: $AR_KEY_A\n\ncombos:\n  - id: c\n    strategy: priority\n    targets:\n      - a/m\n\n";
+
+        /// The same document in CRLF. `serde_yaml` parses it identically, which
+        /// is why a rewrite of every line ending went unnoticed.
+        pub const CRLF: &str = "keys:\r\n  a: $AR_KEY_A\r\n\r\ncombos:\r\n  - id: c\r\n    strategy: priority\r\n    targets:\r\n      - a/m\r\n";
+
+        /// A config with no `combos:` section, so an insert takes the append
+        /// branch instead of the anchor branch.
+        pub const NO_COMBOS: &str = "keys:\n  a: $AR_KEY_A\n";
+
+        /// Every document shape, for a round trip to be proven against rather
+        /// than one.
+        pub const ALL: &[&str] = &[LF, NO_NEWLINE, TRAILING_BLANK, CRLF, NO_COMBOS];
+    }
+
+    /// A writer `M` that adds something to a document, and the `U` that removes
+    /// it: runs the pair over every shape in [`shapes::ALL`] and requires the
+    /// file come back byte for byte.
+    ///
+    /// Which is the property the plan claims — "add-then-remove restores the
+    /// file byte for byte" — and the reason the helper exists: proving it four
+    /// times in four separate tests is how it got proven for four shapes and
+    /// nowhere else.
+    ///
+    /// `can_add` says for which shapes the add is expected to land at all. It is
+    /// a parameter rather than an `assert_ne!` because some writers need a
+    /// section to exist to write into it: `append_combo_row` places a row inside
+    /// `combos:` and a file with none has nothing to place it in, so "the add
+    /// changed something" is not true of every shape for every writer. The
+    /// helper used to assert it, and the first call failed on
+    /// [`shapes::NO_COMBOS`] for that reason — which is the helper earning its
+    /// keep: it asks the writer a question the caller had not answered.
+    fn round_trips_on_every_shape(
+        add: impl Fn(&str) -> String,
+        remove: impl Fn(&str) -> String,
+        can_add: impl Fn(&str) -> bool,
+    ) {
+        for shape in shapes::ALL {
+            let added = add(shape);
+            if !can_add(shape) {
+                // Not a shape this writer writes. It must still leave it alone:
+                // a writer that re-spells a file it cannot edit is the same
+                // defect as one that gets an edit wrong.
+                assert_eq!(
+                    added, *shape,
+                    "a writer that cannot add must still not re-spell the file: {shape:?}"
+                );
+                continue;
+            }
+            assert_ne!(added, *shape, "the add changed nothing on {shape:?}");
+            assert_eq!(
+                remove(&added),
+                *shape,
+                "add then remove must restore the file byte for byte on {shape:?}"
+            );
+        }
+    }
+
+    /// The remove direction alone, on a shape that never held the thing.
+    ///
+    /// The direction a round trip cannot reach, because a round trip starts
+    /// with a write — and the one where `hide-paid false` created the section
+    /// it removes.
+    fn remove_alone_is_a_no_op_on_every_shape(remove: impl Fn(&str) -> String) {
+        for shape in shapes::ALL {
+            assert_eq!(
+                remove(shape),
+                *shape,
+                "a removal of something absent must not re-spell the file: {shape:?}"
+            );
+        }
+    }
+
+    /// The plan's headline property, over every shape at once rather than
+    /// one spelling of it.
+    ///
+    /// Before the fixture set existed this was pinned four times in four tests,
+    /// each on the shape that test happened to spell, and the shapes that were
+    /// not spelled were the shapes that held four separate defects. One call
+    /// over [`shapes::ALL`] is the property the plan actually claims.
+    #[test]
+    fn a_row_writer_round_trips_every_file_shape() {
+        let row = indent_row(
+            "- id: new\n  strategy: priority\n  targets:\n    - a/m\n",
+            2,
+        );
+        round_trips_on_every_shape(
+            |doc| append_combo_row(doc, &row),
+            |added| remove_combo_row(added, "new").unwrap_or_else(|| added.to_owned()),
+            // A row goes inside `combos:`, so a file with none takes the
+            // append branch and lands nowhere the removal can find it.
+            |shape| shape.contains("combos:"),
+        );
+    }
+
+    /// The remove direction alone, on shapes that never held the thing — the
+    /// direction that produced the `hide-paid false` defect and that no round
+    /// trip can reach.
+    #[test]
+    fn a_removal_of_something_absent_is_a_no_op_on_every_shape() {
+        remove_alone_is_a_no_op_on_every_shape(|doc| {
+            set_section_scalar(doc, "visibility", "hide_paid_models", false)
+        });
+    }
+
+    /// A section write, on the shapes where the absent-section branch runs.
+    #[test]
+    fn a_section_write_round_trips_every_file_shape() {
+        let block = "limits:\n  keys:\n    ci:\n      rpm: 5\n";
+        round_trips_on_every_shape(
+            |doc| splice_section(doc, "limits", block),
+            |added| remove_section(added, "limits"),
+            // The splice *inserts* a section that is absent, so every shape
+            // takes the write.
+            |_shape| true,
+        );
+    }
+
     /// The repo's own `config.yaml` is a combo list this build wrote or
     /// accepted, so [`check_combos`] must say yes about it — and it is the only
     /// fixture that carries a real operator's section: comment blocks, a
