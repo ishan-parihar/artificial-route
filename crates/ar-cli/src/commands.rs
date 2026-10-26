@@ -10639,6 +10639,13 @@ models\":[{\"kind\":\"model\",\"model\":\"nvidia/z-ai/glm-5.3\",\"providerId\":\
     fn hide_paid_round_trips_a_new_key_byte_for_byte() {
         // The plan's round-trip rule, in the direction that had never been run:
         // write a key the file did not have, then take it back out.
+        //
+        // This shape is deliberately the *other* geometry from
+        // [`a_section_write_round_trips_every_file_shape`]: here `visibility:`
+        // already exists and the write lands at the section's own tail, which
+        // is the in-section branch. The shared set covers the absent-section
+        // branch; this covers the branch that was already working, so a change
+        // to either one cannot hide behind the other.
         let base = "visibility:\n  blocked_providers:\n    - groq\nmcp:\n  port: 9000\n";
         let on = set_section_scalar(base, "visibility", "hide_paid_models", true);
         assert_ne!(on, base, "the write happened");
@@ -10647,6 +10654,18 @@ models\":[{\"kind\":\"model\",\"model\":\"nvidia/z-ai/glm-5.3\",\"providerId\":\
             off, base,
             "write then remove restores the file byte for byte"
         );
+        // The in-section branch is **not** reachable on the shared shapes,
+        // and the reason is worth stating rather than hiding behind a loop that
+        // never runs: every shape carries `keys:` and `combos:`, and
+        // `set_section_scalar` writes a boolean key, so there is no boolean to
+        // write into either. `visibility:` and `limits:` simply are not there,
+        // which is what makes the absent-section branch the one these shapes
+        // exercise. The in-section branch is covered by the hand-written shape
+        // above; a shape carrying `visibility:` alongside the other endings
+        // would be needed to pair it, and adding one to [`shapes`] would mean
+        // every other writer's assertion gained a state its target section does
+        // not have. Recorded here so the next reader does not add the loop and
+        // believe it proved something.
     }
 
     /// The same round trip on the shape that breaks it: **a file with no
