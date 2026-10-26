@@ -899,3 +899,38 @@ measured on the ad-hoc path; a third pass ran the registry path too.
 the same orphan, one `$AR_KEY_MISTRAL` left with zero references. The row now
 records both write paths, since a ruling about "a provider removal" is a ruling
 about the shared `splice_remove_provider` the two paths both call.
+
+**A verb must not create the thing it removes, and the no-op direction is the
+one a round trip never reaches.** Found on 2026-10-26 by a fourth pass that ran
+every verb's *remove* arm against a config that never held the thing — the
+direction the add/remove round trip cannot exercise, because a round trip always
+starts with a write. Two defects, both in `set_section_scalar`'s absent-section
+branch:
+
+1. **`hide-paid false` wrote a `visibility:` section into a file with none**,
+   carrying `hide_paid_models: false` — the exact spelling `ModelVisibility`
+   omits when it serialises false. So the verb whose direction is "take it out"
+   spelled the value the file's canonical form leaves absent, from a file that
+   was already in the state the verb aims for. Measured: 151 bytes became 189,
+   and nothing later removes the key, because the false direction stops once it
+   finds nothing. An absent key *is* false, so an absent section needs no write.
+2. **The same branch stripped the file's terminator and put it back only when
+   there was none.** A config ending `- id: c\n` lost its final newline and
+   gained the section flush against the last row — the opposite shape to the
+   one the previous pass had just fixed, and the reason the pair of passes was
+   necessary: each ending defect hides the other.
+
+Both pinned by `hide_paid_false_creates_no_section_and_writes_no_key`, negative
+control confirmed fatal. All nine verb families now round-trip byte-exact on
+**both** file shapes — the repo's own 4833-byte no-trailing-newline config and a
+fixture that ends with one — which is the property the first pass claimed and
+had only proved on one of the two.
+
+**The pattern across four passes is not a bug, it is a measurement gap.** Every
+defect this validation found was in a state the shipped tests could not express:
+a file with no trailing newline, a file with a trailing blank, a CRLF file, a
+config with no section, a config with no `combos:`. Each fixture in the tree
+ends with `\n` and carries the section its writer edits. Recording it in the
+plan is necessary but not sufficient; the durable fix is a **shared fixture set
+that carries those states**, adopted by every writer's tests, so a new writer
+cannot pass by accident the way these four did.
