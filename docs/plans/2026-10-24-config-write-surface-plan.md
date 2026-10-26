@@ -926,11 +926,28 @@ control confirmed fatal. All nine verb families now round-trip byte-exact on
 fixture that ends with one — which is the property the first pass claimed and
 had only proved on one of the two.
 
-**The pattern across four passes is not a bug, it is a measurement gap.** Every
-defect this validation found was in a state the shipped tests could not express:
-a file with no trailing newline, a file with a trailing blank, a CRLF file, a
-config with no section, a config with no `combos:`. Each fixture in the tree
-ends with `\n` and carries the section its writer edits. Recording it in the
-plan is necessary but not sufficient; the durable fix is a **shared fixture set
-that carries those states**, adopted by every writer's tests, so a new writer
-cannot pass by accident the way these four did.
+**The pattern across four passes is not a bug, it is a measurement gap, and the
+gap is narrower than it first looked.** Measured after recording the earlier,
+vaguer version of this note: the tree carries **164 fixture literals that look
+like YAML configs and 130 of them already lack a trailing newline**. So the
+no-newline state was not missing — it was *unpaired*. What is missing is the
+other three states entirely and the pairing that makes a writer's claim
+checkable:
+
+| state | fixtures carrying it | notes |
+|---|---|---|
+| no trailing newline | 130 | common, and mostly unpaired with its opposite |
+| trailing blank line | 1 | the `trim_end()` defect was here |
+| CRLF | **0** | the whole-file rewrite was here |
+| no `combos:` | 6 | the append branch |
+| absent section under write | 40 | common |
+
+And the sharpest number: of the **17 tests in `commands.rs` that assert a
+byte-for-byte round trip, only 4 cross both endings** — and all four were
+written by these four passes, after each defect it caught. The other 13 pin one
+shape each and pass by construction on the shape they chose, which is why four
+separate passes were needed where one would have done.
+
+So the durable fix is not "add fixtures" — it is a **shared, paired fixture set**
+that every writer's round trip runs against, in one call, so that a new writer
+cannot pass by choosing the shape its test happens to spell.
