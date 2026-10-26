@@ -2126,8 +2126,15 @@ fn providers_add_custom_should_write_the_row_the_key_ref_and_the_env_line() {
     );
     // No blank line or comment block that introduced `combos:` was consumed.
     assert!(
-        after.contains("\n\ncombos:\n"),
-        "the separator before `combos:` was eaten: {after}"
+        after.contains("X-Tenant: acme\ncombos:\n"),
+        "the row and `combos:` are adjacent: the block carries no separator that the removal could not undo: {after}"
+    );
+    // And the operator's own separator survived, above the block that took
+    // its place. Which blank is whose is the insert's question and it is
+    // answered by geometry, not by taste.
+    assert!(
+        after.contains("  my-gateway: $AR_KEY_MY_GATEWAY\n\ncustom_providers:\n"),
+        "the paragraph break the operator wrote above `combos:` was eaten: {after}"
     );
 
     let env_text = std::fs::read_to_string(out.join("ar.env")).expect("the env file was written");

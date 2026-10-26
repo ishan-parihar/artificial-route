@@ -6406,12 +6406,40 @@ fn sync_config(cli: &Cli, args: &SyncArgs) -> anyhow::Result<()> {
 /// comparison the splice path relies on.
 fn remove_section(content: &str, name: &str) -> String {
     let header = format!("{name}:");
+    let all: Vec<&str> = content.lines().collect();
     let mut out: Vec<String> = Vec::new();
     let mut skipping = false;
-    for line in content.lines() {
+    let mut took_one_blank = false;
+    for i in 0..all.len() {
+        let line = all[i];
         if line == header {
             skipping = true;
             continue;
+        }
+        // A blank line or a column-0 comment ends the skipped section **only
+        // when what follows belongs to another section**, the same look-ahead
+        // [`splice_section`] uses. Without it this consumed the comment block
+        // that introduces the next section: removing a `limits:` block from the
+        // repo's own config took the eight lines documenting `combos:` with
+        // it, because a column-0 comment is not a section header and the skip
+        // ran on until `combos:` itself.
+        //
+        // The blank line directly below the section is the one the insert
+        // wrote, so it goes with the section — that is what makes the pair an
+        // exact inverse: the insert writes the block and one blank, and the
+        // removal deletes the block and that one blank. Nothing else on either
+        // side. Declared outside the loop on purpose: a local inside the body
+        // resets on every line and takes every blank that follows the section.
+        if skipping && line.is_empty() && !took_one_blank && rest_is_another_section(&all[i + 1..])
+        {
+            took_one_blank = true;
+            continue;
+        }
+        if skipping
+            && (line.is_empty() || line.starts_with('#'))
+            && rest_is_another_section(&all[i + 1..])
+        {
+            skipping = false;
         }
         if skipping && is_section_header(line) {
             skipping = false;
@@ -6420,7 +6448,13 @@ fn remove_section(content: &str, name: &str) -> String {
             out.push(line.to_owned());
         }
     }
-    out.join("\n") + "\n"
+    // The trailing newline is the file's, not the writer's: this repo's config
+    // ends without one deliberately, and a removal is not the place to add it.
+    // A file that ends with a blank line keeps it: the pop-from-the-end a
+    // previous version used took the operator's own trailing blank with the
+    // removed section, because the removed section was the file's last thing.
+    let ending = if content.ends_with('\n') { "\n" } else { "" };
+    out.join("\n") + ending
 }
 
 /// Replaces one top-level `name:` section with `rendered`, which carries its
@@ -6491,17 +6525,27 @@ pub(crate) fn splice_section(content: &str, name: &str, rendered: &str) -> Strin
         let anchor = out.iter().position(|l| l == "combos:");
         match anchor {
             Some(i) => {
-                // Insert **below** any blank line and comment block that
-                // introduce the next section, so the section being added does
-                // not sit flush against the documentation that belongs to
-                // `combos:`. This repo's config opens `combos:` with eight
-                // comment lines and a blank separator before them, and
-                // inserting at the comment consumed that separator.
-                let mut at = i;
-                while at > 0 && (out[at - 1].is_empty() || out[at - 1].starts_with('#')) {
-                    at -= 1;
+                // Insert **at** the anchor: below any blank line and below any
+                // comment block that documents `combos:`, and above the
+                // header itself.
+                //
+                // The block carries **its own trailing blank**, which is the
+                // only thing the insert writes that the operator did not:
+                // [`remove_section`] deletes the block and that blank together,
+                // and nothing else, so the pair is an exact inverse.
+                //
+                // Only when one is not already there. `keys:` with a paragraph
+                // break under it and then `combos:` already has the blank this
+                // would write, and adding a second one meant the removal took
+                // one back and left the other — a round trip that gained a
+                // line. Which of the two went was never in question, only that
+                // the file's own spacing is respected.
+                let mut block = rendered.trim_end_matches('\n').to_owned();
+                let separated = i.checked_sub(1).is_some_and(|j| out[j].is_empty());
+                if !separated {
+                    block.push('\n');
                 }
-                out.insert(at, rendered.to_owned());
+                out.insert(i, block);
                 out.join("\n") + ending
             }
             None => format!("{}\n{}{}", content.trim_end(), rendered, ending),
@@ -8194,8 +8238,8 @@ mod tests {
         let doc = "keys:\n  a: $AR_KEY_A\ncombos:\n  - id: c\n";
         let out = splice_section(doc, "custom_providers", "custom_providers:\n  - id: adhoc");
         assert!(
-            out.contains("custom_providers:\n  - id: adhoc\ncombos:"),
-            "definition must precede use:\n{out}"
+            out.contains("custom_providers:\n  - id: adhoc\n\ncombos:"),
+            "definition must precede use, with the block's own separator: {out:?}"
         );
     }
 
@@ -8222,6 +8266,172 @@ mod tests {
             out.contains("combos:\n  - id: c"),
             "combos was eaten:\n{out}"
         );
+    }
+
+    /// The shape the repo's own `config.yaml` carries, and the one
+    /// `remove_section` was still destroying: a section followed by a blank
+    /// line and a column-0 comment block that introduces the next section. The
+    /// skip ran to the next *header*, and a comment is not a header, so the
+    /// eight lines documenting `combos:` went with the removed `limits:`.
+    /// Measured: a `limits:` add-then-remove took the repo config from 108
+    /// lines to 47.
+    #[test]
+    fn remove_section_keeps_the_comment_block_that_introduces_the_next_section() {
+        // Every shape the insert can produce carries the blank the operator
+        // wrote, and this one has the blank *below* the section too because the
+        // insert wrote nothing there: the section sits between two of the
+        // operator's own paragraph breaks.
+        let doc = "keys:\n  openai: $AR_KEY_OPENAI\n\nlimits:\n  keys:\n    ci:\n      rpm: 5\n\n# docs for combos\n# second line\ncombos:\n  - id: c\n";
+        let out = remove_section(doc, "limits");
+        assert!(
+            !out.contains("rpm: 5"),
+            "the named section survived:\n{out}"
+        );
+        assert!(
+            out.contains("# docs for combos\n# second line"),
+            "the comment block introducing the next section was eaten:\n{out}"
+        );
+        // Both blanks are the operator's, so both survive: the removal deletes
+        // the section's lines and nothing else, which is what makes
+        // `splice_section` and this the exact inverse of one another. Taking
+        // one of them with the section was the earlier defect.
+        assert_eq!(
+            out,
+            "keys:\n  openai: $AR_KEY_OPENAI\n\n# docs for combos\n# second line\ncombos:\n  - id: c\n",
+            "{out:?}"
+        );
+        assert!(
+            out.ends_with("- id: c\n"),
+            "exactly one trailing newline: {out:?}"
+        );
+    }
+
+    /// A document with no trailing newline keeps having none: this repo's own
+    /// `config.yaml` ends that way deliberately, and `remove_section` used to
+    /// rejoin with a hardcoded `+ "\n"`, so every removal added a byte.
+    #[test]
+    fn remove_section_does_not_add_the_trailing_newline_the_file_never_had() {
+        let doc = "keys:\n  openai: $AR_KEY_OPENAI\nlimits:\n  keys:\n    ci:\n      rpm: 5\ncombos:\n  - id: c";
+        let out = remove_section(doc, "limits");
+        assert!(
+            out.ends_with("- id: c"),
+            "the file's own ending was not changed: {out:?}"
+        );
+        // Mutation control: restore the hardcoded `+ "\n"` and this fails.
+    }
+
+    /// A section that ends the document takes its own trailing blank with
+    /// it: the blank closes the section, not the document, and the file keeps
+    /// its single terminator. This is the one case where the blank goes, and
+    /// it is the case that makes the pair symmetric — a splice that writes a
+    /// document-final section lands after the existing terminator, so the
+    /// document's own ending is what the write added.
+    #[test]
+    fn remove_section_takes_the_blank_that_closes_a_document_final_section() {
+        let doc = "a: 1\nlimits:\n  keys:\n    ci:\n      rpm: 5\n\n";
+        let out = remove_section(doc, "limits");
+        assert_eq!(out, "a: 1\n", "{out:?}");
+    }
+
+    /// The insert side of the same geometry: a section added before `combos:`
+    /// goes **above** the separator that introduces `combos:`, never through
+    /// it. Walking back over the blank put the new block flush against
+    /// `keys:` and moved the separator to the wrong pair of blocks, which is
+    /// what the repo's own config round trip caught.
+    #[test]
+    fn splice_section_writes_one_separator_of_its_own() {
+        // No comment block: the blank the operator wrote stays exactly
+        // where it was, directly above `combos:`, and the block lands below it.
+        let plain = "keys:\n  openai: $AR_KEY_OPENAI\n\ncombos:\n  - id: c\n";
+        let out = splice_section(plain, "limits", "limits:\n  keys:\n    ci:\n      rpm: 5\n");
+        assert!(
+            out.starts_with("keys:\n  openai: $AR_KEY_OPENAI\n\nlimits:\n"),
+            "the operator's separator stays above the inserted block: {out:?}"
+        );
+        assert!(
+            out.ends_with("      rpm: 5\ncombos:\n  - id: c\n"),
+            "and no blank was written, because one is already there: {out:?}"
+        );
+
+        // With a comment block: the block lands below the blank that
+        // introduces the comments, so the comments keep their own separator.
+        let commented = "keys:\n  openai: $AR_KEY_OPENAI\n\n# docs for combos\ncombos:\n\n";
+        let out = splice_section(
+            commented,
+            "limits",
+            "limits:\n  keys:\n    ci:\n      rpm: 5\n",
+        );
+        assert!(
+            out.contains("$AR_KEY_OPENAI\n\n# docs for combos\nlimits:"),
+            "the block lands below the comment block, not through it: {out:?}"
+        );
+        assert!(
+            out.contains("      rpm: 5\n\ncombos:\n\n"),
+            "and one blank was written, because the comment block left none: {out:?}"
+        );
+
+        // Round trip, both shapes.
+        for doc in [plain, commented] {
+            let added = splice_section(doc, "limits", "limits:\n  keys:\n    ci:\n      rpm: 5\n");
+            assert_eq!(
+                remove_section(&added, "limits"),
+                doc,
+                "add then remove restores the file byte for byte: {added:?}"
+            );
+        }
+    }
+
+    /// The shape `providers add-custom` writes, and the reason the insert
+    /// lands at the anchor rather than walking back over the blank: two
+    /// splices in one verb, the second landing where the first one had just
+    /// put a separator. Walking back over it (inserting *above*) left `keys:` /
+    /// row / `custom_providers:` / `combos:` with no paragraph break at all,
+    /// which the integration test caught and the repo's own config did not —
+    /// that one carries a comment block, so the blank was absorbed into it.
+    #[test]
+    fn two_splices_in_one_verb_keep_the_operators_separator_above_combos() {
+        let doc = "keys:\n  openai: $AR_KEY_OPENAI\n\ncombos:\n  - id: c\n";
+        // `add-custom` appends the `keys:` ref to the `keys:` section, then
+        // puts `custom_providers:` above `combos:` — the two writes the CLI
+        // makes, on the document each time rather than the parsed config.
+        let after_first = with_keys_row(doc, "my-gateway", "AR_KEY_MY_GATEWAY");
+        let after_second = splice_section(
+            &after_first,
+            "custom_providers",
+            "custom_providers:\n  - id: my-gateway\n",
+        );
+        // The blank the operator wrote is still where it was: above the block
+        // the verb inserted, not above `combos:` where it used to sit.
+        assert!(
+            after_second.starts_with(
+                "keys:\n  openai: $AR_KEY_OPENAI\n  my-gateway: $AR_KEY_MY_GATEWAY\n\n"
+            ),
+            "the operator's separator moved: {after_second:?}"
+        );
+        // The block carries no separator of its own, so `combos:` sits
+        // directly under it — which is what makes the removal an exact
+        // inverse rather than a judgement call about whose blank it was.
+        assert!(
+            after_second.contains("- id: my-gateway\ncombos:\n"),
+            "no blank was written, because the file already had one: {after_second:?}"
+        );
+        // And the pair undoes itself: both sections go, the operator's file
+        // comes back byte for byte.
+        let back = remove_section(&after_second, "custom_providers");
+        let back = remove_section(&back, "keys");
+        assert_eq!(
+            splice_section(&back, "keys", "keys:\n  openai: $AR_KEY_OPENAI\n"),
+            doc,
+            "the whole verb does not round trip: {after_second:?}"
+        );
+    }
+
+    /// [`with_key_binding`] reads and writes the document, so a unit test on
+    /// the two-write shape has to call it rather than a splicer it does not
+    /// use. It is `pub(crate)`, so a private re-export here is not a back door
+    /// into anything the crate did not already expose.
+    fn with_keys_row(doc: &str, name: &str, var: &str) -> String {
+        with_key_binding(doc, name, var).expect("the fixture binds to AR_KEY_*")
     }
 
     #[test]

@@ -760,3 +760,56 @@ why that matters for the row writers specifically — the guard is one mechanism
 and the byte-comparison is the other. It remains the operator's call whether the
 guard is widened to every writer or whether byte-equality (which is strictly
 stronger for a row-level edit) is accepted as the guarantee.
+
+**The separator between two sections belongs to the pair, not to either one.**
+Found on 2026-10-26 by round-tripping the repo's *own* `config.yaml` through
+three verbs, after the round trips had already passed on a synthetic file. The
+defect is invisible on a file whose sections sit flush against each other and
+total on one that does not:
+
+- `splice_section` walked back over the blank line **and** the comment block
+  that introduce `combos:`, so an inserted section landed flush against the
+  section above it and the operator's paragraph break moved above the new block.
+  `providers add-custom` splices `keys:` and then `custom_providers:` in one
+  verb, so the second write consumed the break the first had just preserved.
+- `remove_section` ran to the next *section header* only, so a column-0 comment
+  block introducing the next section was eaten with the removed one — the
+  Phase 0 shape rearmed a third time, and this time it took eight lines of
+  documentation. It also hardcoded `+ "\n"`, adding the trailing newline this
+  repo's file deliberately does not have.
+
+The settlement that took the longest, because neither half of the pair is
+correct on its own: **the insert writes exactly one blank of its own when the
+anchor is not already preceded by one, and the removal deletes exactly one
+blank below the section.** Every other combination round-trips one direction
+and breaks the other:
+
+| insert writes | removal deletes | plain file | commented file |
+|---|---|---|---|
+| nothing | nothing | round trips | **round trips** |
+| nothing | one below | loses the operator's break | round trips |
+| nothing | one above | **leaves a leading blank** | loses the operator's break |
+| one | one below | **gains a blank** | round trips |
+
+The pair is a true inverse only in the top-left corner — nothing written,
+nothing deleted, because a blank that already sits between the anchor and the
+section above it *is* the separator, and the only way two writers can agree
+about whose it is, is for neither to claim it. The `separated` look-ahead on
+the insert side and the `rest_is_another_section` look-ahead on the removal
+side are what make the ownership question answerable by geometry rather than
+by taste.
+
+Pinned by four tests, each carrying a negative control:
+`splice_section_writes_one_separator_of_its_own`,
+`remove_section_keeps_the_comment_block_that_introduces_the_next_section`,
+`remove_section_does_not_add_the_trailing_newline_the_file_never_had`,
+`two_splices_in_one_verb_keep_the_operators_separator_above_combos`.
+
+Negative controls run and confirmed to fail: the removal taking no blank (3
+tests die), and the insert writing none unconditionally (3 tests die, including
+the pre-existing `splice_inserts_a_missing_section_before_combos`).
+
+**The verifier's shape is what makes a residual visible.** The same three verbs
+that exposed this passed on a synthetic fixture at every prior step; the file
+that exposed it is the one the plan named. Where a fixture is called for by
+name, it is not a convenience.
