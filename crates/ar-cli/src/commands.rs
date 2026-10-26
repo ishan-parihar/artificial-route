@@ -2632,11 +2632,8 @@ fn create_nested_list(
             // remove did not put it back either. The terminator is the only
             // thing that comes off, and by count rather than by shape.
             let (head, blank) = split_trailing_blank(content);
-            let tail = if content.ends_with('\n') { "\n" } else { "" };
-            // The blank the file had goes between the last written line and
-            // the new section, which is where it was: above the section, not
-            // below it.
             let blank = if blank { "\n" } else { "" };
+            let tail = if content.ends_with('\n') { "\n" } else { "" };
             format!("{head}{blank}\n{section}:\n{body}{tail}")
         }
     }
@@ -11138,6 +11135,53 @@ models\":[{\"kind\":\"model\",\"model\":\"nvidia/z-ai/glm-5.3\",\"providerId\":\
                 back, trimmed,
                 "add then remove must restore the file byte for byte on {shape:?}"
             );
+        }
+    }
+
+    /// The nested-list writer, the whole of Phase 7's logic, on the shapes.
+    /// Two shapes because the two depths are the phase: a flat list directly
+    /// under its section (`continue_on_cut:`), and a provider-keyed list stacked
+    /// two deeper (`provider_settings:`). Each round-trips over all five shapes
+    /// rather than the one shape `P7_BASE` spells.
+    ///
+    /// The CRLF shape carries an assertion the round trip cannot make, which is
+    /// why it is here rather than in the helper: the round trip of a CRLF
+    /// document passes *while the write is wrong*, because the remove re-strips
+    /// and rejoins from the same broken tail and the two cancel. Measured at
+    /// unit level: `append_nested_list_entry` on a CRLF document with no
+    /// `continue_on_cut:` writes `- a/m\ncontinue_on_cut:\n  - openai\n` — the
+    /// separator and the entry LF, in a CRLF file. So the added document must be
+    /// one line-ending style, the way YAML requires, or the write is wrong even
+    /// though the round trip restores.
+    #[test]
+    fn a_nested_list_write_round_trips_every_file_shape() {
+        for (section, owner, list, entry) in [
+            (CUT_SECTION, None, CUT_SECTION, "openai"),
+            (PS_SECTION, Some("openai"), PS_LIST, "*-mini"),
+        ] {
+            for shape in shapes::ALL {
+                let added = append_nested_list_entry(shape, section, owner, list, entry)
+                    .unwrap_or_else(|| shape.to_string());
+                // One style per document, which is the CRLF rule the writer has
+                // to hold on a path that rebuilds its tail by hand.
+                assert_eq!(
+                    uses_crlf(&added),
+                    uses_crlf(shape),
+                    "the write mixed line endings: {added:?}"
+                );
+                if uses_crlf(shape) {
+                    assert!(
+                        added.contains(&format!("\r\n{section}:")),
+                        "the new section header was written with LF: {added:?}"
+                    );
+                }
+                let back = remove_nested_list_entry(&added, section, owner, list, entry)
+                    .unwrap_or_else(|| added.clone());
+                assert_eq!(
+                    back, *shape,
+                    "add then remove must restore the file byte for byte on {shape:?}"
+                );
+            }
         }
     }
 
