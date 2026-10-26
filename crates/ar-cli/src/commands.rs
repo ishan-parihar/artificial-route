@@ -7854,6 +7854,21 @@ mod tests {
         /// branch instead of the anchor branch.
         pub const NO_COMBOS: &str = "keys:\n  a: $AR_KEY_A\n";
 
+        /// The same document with a **note inside `keys:`**.
+        ///
+        /// The shape that carries the pass-ten defect: every writer of that
+        /// section rebuilt it from the parsed rows, so a `#` line inside it was
+        /// destroyed by all three of them — and no round trip caught it,
+        /// because the note was gone from both sides of the comparison
+        /// equally. A fixture that carries a line the writer does not own is
+        /// the only way to make a writer that deletes it in both directions
+        /// visible.
+        pub const NOTE_IN_KEYS: &str = "keys:\n  # a: the primary credential\n  a: $AR_KEY_A\n\ncombos:\n  - id: c\n    strategy: priority\n    targets:\n      - a/m\n";
+
+        /// The noted `keys:`, spelled CRLF: the note's own terminator is the
+        /// file's, and a writer that re-renders the block spells it either way.
+        pub const NOTE_IN_KEYS_CRLF: &str = "keys:\r\n  # a: the primary credential\r\n  a: $AR_KEY_A\r\n\r\ncombos:\r\n  - id: c\r\n    strategy: priority\r\n    targets:\r\n      - a/m\r\n";
+
         /// Every document shape, for a round trip to be proven against rather
         /// than one.
         pub const ALL: &[&str] = &[
@@ -7863,6 +7878,8 @@ mod tests {
             CRLF,
             CRLF_TRAILING_BLANK,
             NO_COMBOS,
+            NOTE_IN_KEYS,
+            NOTE_IN_KEYS_CRLF,
         ];
     }
 

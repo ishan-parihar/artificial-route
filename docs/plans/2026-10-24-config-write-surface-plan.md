@@ -933,18 +933,18 @@ in the `commands.rs` test module that opens with a section header
 (`keys:`, `combos:`, `providers:`, `visibility:`, `limits:`, `server:`, `mcp:`,
 `oauth:`, `continue_on_cut:`, `provider_settings:`, `custom_providers:`,
 `api-keys:`, `sync_keys:`, `search_crawl:`, `model_visibility:`), and excluding
-the bare section names used as `contains()` needles, gives **118 document-shaped
+the bare section names used as `contains()` needles, gives **120 document-shaped
 fixtures**. An earlier note here recorded 164 fixtures with 130 of them lacking a
 trailing newline, 0 CRLF and 1 trailing blank; those four figures are not
-reproducible by any definition I could construct, and the 118-fixture figure
+reproducible by any definition I could construct, and the 120-fixture figure
 below carries its own count so the next reader can re-derive rather than trust:
 
 | state | fixtures carrying it | notes |
 |---|---|---|
-| ends with a newline | 87 | the common spelling |
+| ends with a newline | 88 | the common spelling |
 | no trailing newline | 23 | common, and mostly unpaired with its opposite |
 | trailing blank line | 4 | the `trim_end()` defect was here, and it stayed |
-| CRLF | 4 | the whole-file rewrite was here; one is `CRLF_TRAILING_BLANK`, added with pass six |
+| CRLF | 5 | the whole-file rewrite was here; one is `CRLF_TRAILING_BLANK`, added with pass six |
 | with no `combos:` | 60 | the append branch |
 
 So the no-newline state was never rare — it was *unpaired*. The pairing is what
@@ -1243,7 +1243,7 @@ wrote it by hand is not evidence, and a defect claimed against it is not a
 defect. The probe is cheap — write the state, hand it to the loader, read the
 answer — and it caught this one.
 
-Fixture table: 118 fixtures, 87 newline, 60 with no `combos:`.
+Fixture table: 120 fixtures, 88 newline, 60 with no `combos:`.
 
 ---
 
@@ -1296,3 +1296,24 @@ The generalisation the crate now inherits, sharper than pass nine's: **a round
 trip cannot see a writer that deletes the same bytes in both directions, so a
 fixture must carry a line the writer does not own** — a comment, a blank, a
 note — and the assertion must name it.
+
+**Validation of the fix, one pass later** (`09efc9c` + the shape-set addition).
+Three things checked rather than assumed:
+
+1. **The panel's own write path.** `with_key_binding` is shared by both
+   `providers add` and `providers add-custom` and by two routes in `webui.rs`,
+   so the new writer is now the only path `keys:` has. Driven against this
+   repo's own `config.yaml` with a note planted above an existing row: the note
+   survived, the new row landed last, everything else byte-identical, and
+   `doctor` still accepted the file (12 checks on the untouched config, 14
+   after).
+2. **The shape set carried no note inside `keys:`**, which is the same gap in
+   the fixture set that the defect itself was hiding in — a fixture set is
+   shaped by the defects found so far, so a new class of defect is invisible to
+   it by construction. `NOTE_IN_KEYS` and `NOTE_IN_KEYS_CRLF` are added, and
+   with them in `shapes::ALL` the round trip **itself** now fails on the
+   reverted writer (it did not before), which is the fixture set doing the job
+   it was built for.
+3. **The CRLF spelling of the noted shape round-trips byte-exact**, traced
+   rather than assumed, because `keys:` is the section where this crate has
+   repeatedly lost a `\r`.
