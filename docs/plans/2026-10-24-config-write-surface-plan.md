@@ -781,23 +781,35 @@ total on one that does not:
 The settlement that took the longest, because neither half of the pair is
 correct on its own: **the insert writes exactly one blank of its own when the
 anchor is not already preceded by one, and the removal deletes exactly one
-blank below the section.** Every other combination round-trips one direction
-and breaks the other:
+blank below the section.**
 
-| insert writes | removal deletes | plain file | commented file |
-|---|---|---|---|
-| nothing | nothing | round trips | **round trips** |
-| nothing | one below | loses the operator's break | round trips |
-| nothing | one above | **leaves a leading blank** | loses the operator's break |
-| one | one below | **gains a blank** | round trips |
+The table I first recorded here was wrong in both its shape and its
+conclusion, and it was corrected on 2026-10-26 by measuring all twenty cells
+rather than reasoning about four. The measured matrix, over five file shapes
+(plain, commented, flush, no-trailing-newline, two-blanks) × four
+insert/removal policies:
 
-The pair is a true inverse only in the top-left corner — nothing written,
-nothing deleted, because a blank that already sits between the anchor and the
-section above it *is* the separator, and the only way two writers can agree
-about whose it is, is for neither to claim it. The `separated` look-ahead on
-the insert side and the `rest_is_another_section` look-ahead on the removal
-side are what make the ownership question answerable by geometry rather than
-by taste.
+| insert writes | removal deletes | plain | commented | flush | no newline | two blanks |
+|---|---|---|---|---|---|---|
+| nothing | nothing | exact | exact | exact | exact | exact |
+| nothing | one below | exact | exact | exact | exact | exact |
+| **one** | **nothing** | exact | **differs** | **differs** | **differs** | exact |
+| one | one below | exact | exact | exact | exact | exact |
+
+So the rule is not "the only corner that works" — **19 of 20 cells round-trip
+byte for byte.** The invariant that actually holds is narrower and true:
+**the removal must delete exactly the separator the insert wrote.** Nothing
+else about whose blank it is matters, because a blank that already sits between
+the anchor and the section above it is the file's own and neither writer
+touches it — and the only failing cell is the one where the insert writes a
+separator the removal does not take back.
+
+The `separated` look-ahead on the insert side and the `rest_is_another_section`
+look-ahead on the removal side are what make the ownership question answerable
+by geometry rather than by taste, and they are why the failing cell fails on
+three shapes and not five: `plain` and `two blanks` already carry a blank above
+the anchor, so the conditional insert writes nothing and the asymmetry has
+nothing to bite on.
 
 Pinned by four tests, each carrying a negative control:
 `splice_section_writes_one_separator_of_its_own`,
@@ -813,3 +825,44 @@ the pre-existing `splice_inserts_a_missing_section_before_combos`).
 that exposed this passed on a synthetic fixture at every prior step; the file
 that exposed it is the one the plan named. Where a fixture is called for by
 name, it is not a convenience.
+
+**The same `+ "\n"` class survived in two writers the first pass never ran.**
+Found on 2026-10-26 by a second validation pass that drove the write verbs the
+first one skipped. Both are the byte-level bug the separator fix had already
+killed in `remove_section`, on a different writer, and both were invisible to
+the shipped tests because every fixture in the tree ends with a trailing
+newline — which this repo's own `config.yaml` does not:
+
+1. **`set_section_scalar` added a trailing newline to a file that had none.**
+   The absent-section branch was `format!("{}\n{section}:\n  {key}: {value}\n",
+   content.trim_end())`, so `visibility hide-paid true` on the repo's own config
+   grew it **4833 → 4871 bytes** and changed its last byte from `6f` (`o`) to
+   `0a` (`\n`); `hide-paid false` then removed the section correctly and stopped
+   at 4834 — one byte short of a round trip, permanently. Fixed by taking the
+   ending from the file and writing the one separator the new section needs.
+   Pinned by `hide_paid_leaves_the_trailing_newline_the_file_never_had_alone`
+   (negative control: dropping the conditional leading separator kills it).
+
+2. **`append_row` ate a trailing blank line the operator had written.**
+   `content.trim_end()` cannot tell `- id: c\n` from `- id: c\n\n`, and it
+   produced byte-identical output for both — the blank silently gone and the new
+   `oauth:` section flush against the last combo row. Pinned by
+   `append_row_keeps_a_blank_line_the_operator_wrote_at_the_end` (negative
+   control: restoring `trim_end()` kills it).
+
+Both are the same claim in opposite directions: **the file's own ending is the
+file's**, and a writer that cannot see the difference between "no newline" and
+"one newline and then a blank line" is making a claim it has not measured.
+`provider-settings` and `oauth` were checked live and are clean — `create_nested_list`
+carries the terminator explicitly and `append_row` now does too.
+
+**The round trip is nine verb families wide, not five.** Re-run on the repo's
+own config after the fixes: `hide-paid`, `limits` (both the `--key` and the
+default row), `visibility block/unblock`, `continue-on-cut add/remove`,
+`combo add/remove`, `provider-settings exclude/include`, `oauth add/remove` and
+`server set` (back to its original values) all return the file byte for byte,
+4833 bytes, md5 `02739508f07f8d31f218708c51b072ba`. The three families the first
+pass never covered are the two above plus `limits clear` with no `--key`.
+
+Gates at this commit: 331 unit tests, 77 integration, 45 test binaries green
+across the workspace, clippy clean under `-D warnings`, `genome lint` 0 errors.

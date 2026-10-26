@@ -3169,7 +3169,16 @@ fn append_row(content: &str, section: &str, rendered: &str) -> String {
         // same depth the in-section path writes.
         let tail = if content.ends_with('\n') { "\n" } else { "" };
         let body = indent_row(rendered, 2);
-        return format!("{}\n{section}:\n{body}{tail}", content.trim_end());
+        // `trim_end` is too much: it also takes a **blank line the operator
+        // wrote** at the end of the file, which is not the writer's to take.
+        // Measured: a file ending `- id: c\n\n` and one ending `- id: c\n`
+        // produced byte-identical output — the blank gone from the first, and
+        // the new row flush against the last combo row in both. Strip the one
+        // terminator and stop: a blank the operator wrote survives below the
+        // last row and the new section still starts on its own line, because
+        // the format's own `\n` is what separates the two.
+        let trimmed = content.strip_suffix(tail).unwrap_or(content);
+        return format!("{}\n{section}:\n{body}{tail}", trimmed);
     };
     // The section's own body: entries sit at `base + 2`, and the row ends at
     // the first line that is neither an entry nor part of one.
@@ -4392,7 +4401,29 @@ fn set_section_scalar(content: &str, section: &str, key: &str, value: bool) -> S
     let Some(depth) = section_depth(&all, section) else {
         // No block at all: the whole section is added at the end of the file,
         // which is the same place `splice_section` puts a missing section.
-        return format!("{}\n{section}:\n  {key}: {value}\n", content.trim_end());
+        //
+        // The final newline is the file's, not the writer's. `str::lines`
+        // drops it, so a document that ends without one rejoins and gains it —
+        // a byte-level change to a file the operator asked to change somewhere
+        // else, and one the round trip cannot undo because the removal below
+        // is correct and the added byte is not its to take back. Measured on
+        // this repo's own `config.yaml` (108 lines, no final newline):
+        // `hide-paid true` grew it 4833 -> 4871 bytes and changed its last byte
+        // from `6f` to `0a`; `hide-paid false` then stopped at 4834, one byte
+        // short of a round trip, forever.
+        //
+        // `trim_end` is not enough on its own here: it also removes a trailing
+        // blank line the operator wrote, which is the same class of claim in
+        // the other direction. So the ending is taken from the file and put
+        // back, and only the one separator the new section needs is written.
+        let ending = if content.ends_with('\n') { "\n" } else { "" };
+        let body = content.strip_suffix(ending).unwrap_or(content);
+        // And the section needs a line of its own. A file ending mid-line has
+        // no separator to lend, so one is written above the new header — that
+        // is the same blank `splice_section` puts above a block it inserts, and
+        // the removal below takes it back with the section.
+        let lead = if ending.is_empty() { "\n" } else { "" };
+        return format!("{body}{lead}{section}:\n  {key}: {value}{ending}");
     };
     let key_depth = depth + 2;
     let mut out: Vec<String> = Vec::new();
@@ -8434,6 +8465,50 @@ mod tests {
         with_key_binding(doc, name, var).expect("the fixture binds to AR_KEY_*")
     }
 
+    /// Six geometries the four tests above do not reach, each of which
+    /// exercises a different branch or boundary: no `combos:` at all (the
+    /// append branch, not the anchor branch), the anchor at line zero, two
+    /// stacked comment blocks, a body ending in a real blank line, a comment
+    /// block at EOF, and a comment with no blank above the anchor.
+    ///
+    /// Every one round-trips byte for byte in both directions. They are pinned
+    /// here because the two shipped tests reach only two of these branches and
+    /// the branches are where the ownership rule is actually decided.
+    #[test]
+    fn the_separator_rule_holds_on_six_geometries_the_shipped_tests_miss() {
+        let block = "limits:\n  keys:\n    ci:\n      rpm: 5\n";
+        let docs = [
+            // No `combos:` at all: the section is appended, not anchored.
+            "keys:\n  a: $AR_KEY_A\n",
+            // `combos:` is line zero, so nothing precedes the anchor.
+            "combos:\n  - id: c\n",
+            // Two stacked comment blocks above the anchor.
+            "keys:\n  a: $AR_KEY_A\n\n# block one\n# more one\n\n# block two\ncombos:\n  - id: c\n",
+            // A body that ends with a real blank line before the anchor.
+            "keys:\n  a: $AR_KEY_A\n\n\ncombos:\n  - id: c\n",
+            // A comment block at EOF with no `combos:` after it.
+            "keys:\n  a: $AR_KEY_A\n\n# tail notes\ncombos:\n\n",
+            // A comment with no blank above the anchor.
+            "keys:\n  a: $AR_KEY_A\n# note\ncombos:\n  - id: c\n",
+        ];
+        for doc in docs {
+            let added = splice_section(doc, "limits", block);
+            assert_eq!(
+                remove_section(&added, "limits"),
+                doc,
+                "add then remove must restore byte for byte: {added:?}"
+            );
+            // And the reverse direction, which is the residual the plan records
+            // for `hide-paid`/`unblock`/`continue-on-cut`: a remove of a section
+            // the file never had must change nothing at all.
+            assert_eq!(
+                remove_section(doc, "limits"),
+                doc,
+                "a removal of an absent section must not re-spell the file"
+            );
+        }
+    }
+
     #[test]
     fn splice_section_does_not_swallow_a_hyphenated_section_after_it() {
         let doc =
@@ -10301,11 +10376,76 @@ models\":[{\"kind\":\"model\",\"model\":\"nvidia/z-ai/glm-5.3\",\"providerId\":\
         );
     }
 
+    /// The same round trip on the shape that breaks it: **a file with no
+    /// trailing newline and no `visibility:` section at all.**
+    ///
+    /// This repo's own `config.yaml` is that file — 108 lines, 80 comments,
+    /// ending on `...gpt-5.4-nano` with no final `\n` — and the existing test
+    /// above passes on it by accident, because its fixture ends with one. The
+    /// absent-section branch of `set_section_scalar` appended `\n`
+    /// unconditionally, so `hide-paid true` on this shape grew the file by 38
+    /// bytes and changed its last byte from `6f` (`o`) to `0a` (`\n`);
+    /// `hide-paid false` then removed the section and left the added byte
+    /// behind. Measured live: 4833 bytes before, 4871 after the write, 4834
+    /// after the removal.
+    ///
+    /// The byte it adds is not a cosmetic difference. `hide-paid false` is the
+    /// canonical spelling of false (`ModelVisibility` omits the key), so the
+    /// removal is correct and the round trip should have restored the file
+    /// exactly. A file the operator deliberately saved without a final newline
+    /// is not the writer's to give one to.
+    #[test]
+    fn hide_paid_leaves_the_trailing_newline_the_file_never_had_alone() {
+        // No `visibility:` section, and no final newline — the repo's own shape.
+        let base = "keys:\n  openai: $AR_KEY_OPENAI\ncombos:\n  - id: c\n    targets:\n      - openai/gpt-5.4-nano";
+        assert!(!base.ends_with('\n'), "the fixture is the shape it claims");
+        let on = set_section_scalar(base, "visibility", "hide_paid_models", true);
+        assert!(
+            !on.ends_with('\n'),
+            "a file that had no final newline gained one: {on:?}"
+        );
+        let off = set_section_scalar(&on, "visibility", "hide_paid_models", false);
+        assert_eq!(
+            off, base,
+            "write then remove restores the file byte for byte"
+        );
+    }
+
     // ---- Phase 5: `aroute oauth`, the operator's stated goal ----------------
 
     /// A config with a provider to key a session to and a `keys:` row for the
     /// refresh token to live in, and no `oauth:` section yet.
     const P5_BASE: &str = "keys:\n  openai: $AR_KEY_OPENAI\n  codex_refresh: $AR_KEY_GROQ\nproviders:\n  - id: openai\n    key: openai\n  - id: codex\n    key: openai\nmcp:\n  port: 9000\n";
+
+    /// A blank line the operator wrote at the end of the file is not the
+    /// writer's to take.
+    ///
+    /// Measured before the fix: a document ending `- id: c\n\n` and one
+    /// ending `- id: c\n` produced byte-identical output, so the blank was gone
+    /// from the first and the new section was flush against the last combo row
+    /// in both. `content.trim_end()` cannot tell the two apart, and the file's
+    /// own spacing is exactly what it must not discard. The fix strips the one
+    /// terminator the `tail` already named and nothing else.
+    #[test]
+    fn append_row_keeps_a_blank_line_the_operator_wrote_at_the_end() {
+        let with_blank = "keys:\n  a: $AR_KEY_A\ncombos:\n  - id: c\n\n";
+        let without = "keys:\n  a: $AR_KEY_A\ncombos:\n  - id: c\n";
+        let a = append_row(with_blank, "oauth", "- provider: openai\n");
+        let b = append_row(without, "oauth", "- provider: openai\n");
+        // They are different documents, so they must produce different output.
+        assert_ne!(
+            a, b,
+            "the trailing blank the operator wrote was discarded: {a:?}"
+        );
+        assert!(
+            a.starts_with("keys:\n  a: $AR_KEY_A\ncombos:\n  - id: c\n\noauth:\n"),
+            "the blank survived and the section still starts on its own line: {a:?}"
+        );
+        assert!(
+            a.ends_with("- provider: openai\n"),
+            "the file's own terminator is carried across: {a:?}"
+        );
+    }
 
     #[test]
     fn oauth_add_should_append_a_row_and_leave_the_rest_byte_identical() {
