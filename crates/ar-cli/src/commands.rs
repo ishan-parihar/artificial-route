@@ -11159,6 +11159,32 @@ models\":[{\"kind\":\"model\",\"model\":\"nvidia/z-ai/glm-5.3\",\"providerId\":\
         }
     }
 
+    /// The list-entry writer on every shape, which closes the last family that
+    /// was pinned only on the endings a hand-written fixture could spell. A CRLF
+    /// document with no `visibility:` section is the shape that has never been
+    /// run for this family, and the one that would find a break: this family's
+    /// writes go through `rejoin`, which is where the separator and the
+    /// terminator are decided, so a CRLF file with no section to write into
+    /// exercises both.
+    #[test]
+    fn a_list_entry_write_round_trips_every_file_shape() {
+        for (list, entry) in [(LIST_BLOCKED, "openai"), (LIST_DENY, "nope-not-a-glob")] {
+            round_trips_on_every_shape(
+                |doc| {
+                    append_list_entry(doc, VIS_SECTION, list, entry)
+                        .unwrap_or_else(|| doc.to_owned())
+                },
+                |added| {
+                    remove_list_entry(added, VIS_SECTION, list, entry)
+                        .unwrap_or_else(|| added.to_owned())
+                },
+                // The section is created when absent, so every shape takes the
+                // write.
+                |_shape| true,
+            );
+        }
+    }
+
     /// The nested-list writer, the whole of Phase 7's logic, on the shapes.
     /// Two shapes because the two depths are the phase: a flat list directly
     /// under its section (`continue_on_cut:`), and a provider-keyed list stacked
