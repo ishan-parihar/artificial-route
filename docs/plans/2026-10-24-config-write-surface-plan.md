@@ -933,19 +933,19 @@ in the `commands.rs` test module that opens with a section header
 (`keys:`, `combos:`, `providers:`, `visibility:`, `limits:`, `server:`, `mcp:`,
 `oauth:`, `continue_on_cut:`, `provider_settings:`, `custom_providers:`,
 `api-keys:`, `sync_keys:`, `search_crawl:`, `model_visibility:`), and excluding
-the bare section names used as `contains()` needles, gives **111 document-shaped
+the bare section names used as `contains()` needles, gives **113 document-shaped
 fixtures**. An earlier note here recorded 164 fixtures with 130 of them lacking a
 trailing newline, 0 CRLF and 1 trailing blank; those four figures are not
-reproducible by any definition I could construct, and the 111-fixture figure
+reproducible by any definition I could construct, and the 113-fixture figure
 below carries its own count so the next reader can re-derive rather than trust:
 
 | state | fixtures carrying it | notes |
 |---|---|---|
 | ends with a newline | 82 | the common spelling |
-| no trailing newline | 22 | common, and mostly unpaired with its opposite |
+| no trailing newline | 23 | common, and mostly unpaired with its opposite |
 | trailing blank line | 4 | the `trim_end()` defect was here, and it stayed |
-| CRLF | 3 | the whole-file rewrite was here; one is `CRLF_TRAILING_BLANK`, added with pass six |
-| with no `combos:` | 54 | the append branch |
+| CRLF | 4 | the whole-file rewrite was here; one is `CRLF_TRAILING_BLANK`, added with pass six |
+| with no `combos:` | 56 | the append branch |
 
 So the no-newline state was never rare — it was *unpaired*. The pairing is what
 was missing, and it is what makes a writer's claim checkable: of the
@@ -1143,3 +1143,56 @@ the same mechanism in a different place — `str::lines()` drops the `\r`, and a
 hand-built tail asks about blankness, indent, or separators with rules that
 cannot see it. The shape set catches them only when the fixture carries the shape
 *and* the test reaches the line. Both halves have failed independently.
+
+---
+
+## Pass eight (2026-10-26): a validation pass, which found one more
+
+Re-validating the three claims this plan carries, and the exercise found a
+defect in the one family the plan had explicitly excluded.
+
+**The three claims re-derived, each with an independently written script.**
+
+1. *The trailing-blank fixes*: 14 of 14 add/remove pairs byte-exact on both
+   spellings of the shape (LF `\n\n`, CRLF `\r\n\r`), across all seven write
+   families at CLI level. Reverting to the original `trim_end()` fails **five**
+   tests and loses **six** blanks at CLI level, so the claim is carrying real
+   weight and not a vacuous pass.
+2. *The fixture-audit numbers*: all six figures reproduce exactly — 113
+   fixtures, 82 newline, 23 no-newline, 4 blank, 4 CRLF, 56 with no `combos:` —
+   under a second script written from the plan's definition rather than from the
+   first script's structure. The superseded 164/130/0/1 wording was also
+   verified to really exist in `e6b3d39`, so the plan's account of its own
+   history is accurate rather than convenient.
+3. *The shape-set adoption*: 8 of 8 families, 0 uncovered.
+
+**And the shape check found a defect, in the ninth family the plan had set
+aside.** `add_missing_custom_key_refs` closed with `out.join(sep) + sep` — the
+terminator appended **unconditionally** — so a document that ended with no
+newline gained one. The plan had written this family off as having no inverse,
+and that is exactly why it had gone unexamined: there was no round trip to
+cancel the mistake, and `sync` re-enters the writer whole rather than undoing it.
+Fixed with `rejoin`, which already holds the rule every other writer holds.
+
+One control run, fatal.
+
+**Two lessons about validating your own claims, both learned by getting them
+wrong first.**
+
+- My first adoption script reported **six of eight families uncovered**. The
+  bug was mine, not the tree's: the family keys were compound strings
+  (`"a / b"`) that never appear literally in a body, so nothing matched. It
+  reported the same shape of wrong answer the plan had already been corrected
+  on once — "the keys pair has no test" — and it would have been a third
+  wrong record if I had trusted it.
+- The second version reported `limits` covered and `visibility allow|deny`
+  uncovered. Both wrong again, in opposite directions: `limits` matched the
+  word in a *fixture* rather than a call, and `allow`/`deny` are two verbs over
+  **one** writer, so mapping by verb invented families that do not exist. The
+  working version maps by **writer**, requires a call site rather than a
+  substring, and separates the add and remove directions.
+
+So the rule now has three clauses, all earned: a control that survives means the
+test does not reach the bug; a fixture must carry the shape the defect needs; and
+a coverage script must map the thing that is actually shared, or it invents
+families and hides real ones.

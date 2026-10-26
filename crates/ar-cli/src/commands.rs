@@ -7124,8 +7124,15 @@ fn add_missing_custom_key_refs(doc: &str, custom: &[ar_registry::CustomProvider]
         }
         out.push(line.to_owned());
     }
-    let sep = line_ending(doc);
-    out.join(sep) + sep
+    // `rejoin`, not a hand-built tail: it writes the document's own
+    // separator on every line and re-appends the terminator **only where the
+    // file had one**. The hand-built version appended it unconditionally, so a
+    // document that ended with no newline gained one — and this is the one
+    // writer in the crate with no inverse to take it back, because `sync`
+    // re-enters it whole rather than undoing it. Measured: a doc ending
+    // `providers:\n  - id: a` came back `...- id: a\n`, and its CRLF twin the
+    // same. `serde_yaml` parses either, so nothing complained except the byte.
+    rejoin(doc, out)
 }
 
 /// What `sync_env_file` planned for the env file: the counts the caller
@@ -8276,6 +8283,34 @@ mod tests {
             "a referenced var with no connection was not ensured empty:\n{envdoc}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The one writer with no inverse to cancel a mistake, so its terminator
+    /// rule is the whole claim. `add_missing_custom_key_refs` closed with
+    /// `out.join(sep) + sep` — **unconditionally** — so a document that ended
+    /// with no newline gained one, and nothing takes it back: the only writer
+    /// that calls it (`sync`) re-enters it whole rather than undoing it.
+    ///
+    /// Measured: a doc ending `providers:\n  - id: a` came back
+    /// `...- id: a\n`, and the CRLF twin the same. `serde_yaml` parses either,
+    /// so the loader never said so and the only evidence is the byte.
+    ///
+    /// This is the same `rejoin` rule every other writer holds: the terminator
+    /// is the file's, and a file that had none keeps having none.
+    #[test]
+    fn add_missing_custom_key_refs_leaves_the_terminator_the_file_had() {
+        // A doc with no `providers:` row to add under, so the writer's only
+        // action on it is the rejoin — which is exactly where the byte went.
+        for doc in [
+            "keys:\n  a: $AR_KEY_A\n\nproviders:\n  - id: a",
+            "keys:\r\n  a: $AR_KEY_A\r\n\r\nproviders:\r\n  - id: a",
+        ] {
+            let out = add_missing_custom_key_refs(doc, &[]);
+            assert_eq!(
+                out, doc,
+                "a writer that adds no row must not change the terminator: {out:?}"
+            );
+        }
     }
 
     #[test]
