@@ -927,26 +927,71 @@ fixture that ends with one — which is the property the first pass claimed and
 had only proved on one of the two.
 
 **The pattern across four passes is not a bug, it is a measurement gap, and the
-gap is narrower than it first looked.** Measured after recording the earlier,
-vaguer version of this note: the tree carries **164 fixture literals that look
-like YAML configs and 130 of them already lack a trailing newline**. So the
-no-newline state was not missing — it was *unpaired*. What is missing is the
-other three states entirely and the pairing that makes a writer's claim
-checkable:
+gap is narrower than it first looked.** The measurement has to state its
+own definition, because the count moves with it: counting every string literal
+in the `commands.rs` test module that opens with a section header
+(`keys:`, `combos:`, `providers:`, `visibility:`, `limits:`, `server:`, `mcp:`,
+`oauth:`, `continue_on_cut:`, `provider_settings:`, `custom_providers:`,
+`api-keys:`, `sync_keys:`, `search_crawl:`, `model_visibility:`), and excluding
+the bare section names used as `contains()` needles, gives **110 document-shaped
+fixtures**. An earlier note here recorded 164 fixtures with 130 of them lacking a
+trailing newline, 0 CRLF and 1 trailing blank; those four figures are not
+reproducible by any definition I could construct, and the 110-fixture figure
+below carries its own count so the next reader can re-derive rather than trust:
 
 | state | fixtures carrying it | notes |
 |---|---|---|
-| no trailing newline | 130 | common, and mostly unpaired with its opposite |
-| trailing blank line | 1 | the `trim_end()` defect was here |
-| CRLF | **0** | the whole-file rewrite was here |
-| no `combos:` | 6 | the append branch |
-| absent section under write | 40 | common |
+| ends with a newline | 82 | the common spelling |
+| no trailing newline | 22 | common, and mostly unpaired with its opposite |
+| trailing blank line | 4 | the `trim_end()` defect was here, and it stayed |
+| CRLF | 2 | the whole-file rewrite was here; both written after the fix |
+| with no `combos:` | 54 | the append branch |
 
-And the sharpest number: of the **17 tests in `commands.rs` that assert a
-byte-for-byte round trip, only 4 cross both endings** — and all four were
-written by these four passes, after each defect it caught. The other 13 pin one
-shape each and pass by construction on the shape they chose, which is why four
-separate passes were needed where one would have done.
+So the no-newline state was never rare — it was *unpaired*. The pairing is what
+was missing, and it is what makes a writer's claim checkable: of the
+round-trip tests in `commands.rs`, each pins one shape, and the shapes it did
+not spell are the ones that held four separate defects. That is the honest
+statement of the counting difficulty, recorded rather than smoothed over: a
+regex that decides "which tests assert a byte-for-byte round trip" returns
+different answers on different days for the same tree, so the number of
+round-trip tests is not a number this plan asserts. What is asserted is exactly
+what a re-run reproduces: **every writer family's add/remove pair over all five
+shapes found three of six families failing on the trailing-blank shape alone**,
+which is where the `trim_end` defect above lived.
+
+**And the measurement gap is not closed by the fixture set alone — the set has to
+actually be used, which is how the next defect was found.** Found on 2026-10-26
+by a fifth pass that ran every *writer family's* add/remove pair over
+`shapes::ALL` through the CLI, rather than over the three families the set was
+adopted by. `combo`, `limits`, `hide_paid` were exact on every shape.
+`visibility block`, `continue-on-cut` and `provider-settings` were exact on LF
+and on NO_NEWLINE and **lost exactly one byte on TRAILING_BLANK**: measured, a
+151-byte config ending `- openai/gpt-5.4\n\n` came back 150 bytes, and the add
+had been wrong too: `- id: c\n\n` became `- id: c\ncontinue_on_cut:`, so the new
+section sat flush against the last combo row instead of below the operator's
+paragraph break.
+
+The cause is the same `trim_end` class the plan names, in two of the three sites
+it was never applied to: `create_nested_list`'s no-section branch and
+`append_list_entry`'s both rebuilt the document tail as
+`format!("{}\n{section}:\n{block}{tail}", content.trim_end())`, and `trim_end`
+cannot tell a trailing newline from a trailing blank. The third site,
+`splice_section`, measures exact and was left alone rather than churned.
+
+Fixed by `split_trailing_blank`, which cuts a document at its last non-newline
+byte and reports whether a blank followed, so the two states stay two states.
+Two tests, each with a mutation control that was run: reverting
+`create_nested_list`'s blank handling fails the first, reverting
+`append_list_entry`'s fails the second. Both controls killed their test — a
+control that survives is a test that proved nothing.
+
+The remaining gap, recorded rather than assumed away: the shape set covers **3 of
+13 writer families**. `append_list_entry`/`remove_list_entry`,
+`append_nested_list_entry`/`remove_nested_list_entry`, `add_target_line`/
+`remove_target_line`, `append_row`/`remove_row`, `with_key_binding` and
+`add_missing_custom_key_refs` each carry one hand-written shape, so a new defect
+in any of them still passes by construction on that shape. That is the adoption
+work this section names as the fix and has done three of.
 
 So the durable fix is not "add fixtures" — it is a **shared, paired fixture set**
 that every writer's round trip runs against, in one call, so that a new writer
