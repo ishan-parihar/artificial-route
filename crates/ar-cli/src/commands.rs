@@ -4422,6 +4422,17 @@ fn key_name(line: &str) -> &str {
 fn set_section_scalar(content: &str, section: &str, key: &str, value: bool) -> String {
     let all: Vec<&str> = content.lines().collect();
     let Some(depth) = section_depth(&all, section) else {
+        // No block at all. A `false` writes **nothing**: the key is already
+        // absent, and absence is what `ModelVisibility` serialises for false,
+        // so creating a section to hold `hide_paid_models: false` would spell
+        // out the value the file's own canonical form omits — a key that
+        // appears from a verb whose direction is "remove". Measured: a 151-byte
+        // config with no `visibility:` grew to 189 bytes carrying
+        // `hide_paid_models: false`, and no later write takes it back, because
+        // the false direction stops looking once it finds nothing to remove.
+        if !value {
+            return content.to_owned();
+        }
         // No block at all: the whole section is added at the end of the file,
         // which is the same place `splice_section` puts a missing section.
         //
@@ -4441,11 +4452,14 @@ fn set_section_scalar(content: &str, section: &str, key: &str, value: bool) -> S
         // back, and only the one separator the new section needs is written.
         let ending = if content.ends_with('\n') { "\n" } else { "" };
         let body = content.strip_suffix(ending).unwrap_or(content);
-        // And the section needs a line of its own. A file ending mid-line has
-        // no separator to lend, so one is written above the new header — that
-        // is the same blank `splice_section` puts above a block it inserts, and
-        // the removal below takes it back with the section.
-        let lead = if ending.is_empty() { "\n" } else { "" };
+        // The section goes on a line of its own, so exactly one separator sits
+        // between the body's last line and the new header. The file's own
+        // terminator already provides it when it has one — stripping it and not
+        // restoring it is what put `visibility:` flush against the last
+        // `combos:` row *and* took the file's final newline. When it has
+        // none, one is written, because a header cannot share a line with the
+        // row above it.
+        let lead = if ending.is_empty() { "\n" } else { ending };
         return format!("{body}{lead}{section}:\n  {key}: {value}{ending}");
     };
     let key_depth = depth + 2;
@@ -8573,6 +8587,40 @@ mod tests {
         assert!(
             !lf_added.contains('\r'),
             "an LF document must not gain a CR: {lf_added:?}"
+        );
+    }
+
+    /// The remove direction on a file that has nothing to remove.
+    ///
+    /// `false` is the value `ModelVisibility` omits, so the file's canonical
+    /// spelling of "not hiding paid models" is the key's **absence** — and a
+    /// config with no `visibility:` section is already in that state. Measured
+    /// before the fix: a 151-byte config grew to 189 carrying
+    /// `hide_paid_models: false`, written by the very verb whose direction is
+    /// "take it out", and no later write removes it because the false direction
+    /// stops once it finds nothing. A verb must not create the thing it removes.
+    #[test]
+    fn hide_paid_false_creates_no_section_and_writes_no_key() {
+        let base = "keys:\n  openai: $AR_KEY_OPENAI\ncombos:\n  - id: c\n";
+        let out = set_section_scalar(base, "visibility", "hide_paid_models", false);
+        assert_eq!(
+            out, base,
+            "a false on a config with no visibility: section changed the file: {out:?}"
+        );
+        // And with a section that holds another key, false still writes nothing.
+        let with_section = "keys:\n  openai: $AR_KEY_OPENAI\nvisibility:\n  blocked_providers:\n    - groq\ncombos:\n  - id: c\n";
+        assert_eq!(
+            set_section_scalar(with_section, "visibility", "hide_paid_models", false),
+            with_section,
+            "a false with a sibling key wrote a key it should not"
+        );
+        // The true direction still works, and the pair still round-trips.
+        let on = set_section_scalar(base, "visibility", "hide_paid_models", true);
+        assert_ne!(on, base, "the true write must still write");
+        assert_eq!(
+            set_section_scalar(&on, "visibility", "hide_paid_models", false),
+            base,
+            "the pair still round-trips byte for byte"
         );
     }
 
