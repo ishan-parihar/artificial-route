@@ -55,13 +55,13 @@ const CATALOG_JSON: &str = include_str!("registry.json");
 /// How many providers the compiled-in catalog carries.///
 /// Asserted rather than documented: the `merge` doc quotes it, and a doc comment
 /// that drifts from the file is worse than no number at all.
-pub const CATALOG_PROVIDERS: usize = 276;
+pub const CATALOG_PROVIDERS: usize = 277;
 
 /// How many `(provider, model)` price rows the compiled-in catalog carries.
 ///
 /// A count, not a range: a regenerated catalog that lost rows is a different
 /// catalog, and a floor would let that pass.
-pub const CATALOG_PRICE_ROWS: usize = 187;
+pub const CATALOG_PRICE_ROWS: usize = 384;
 
 /// The flat-rate set the importer unions from the two upstream files, sorted by
 /// id so the assertion in the tests names every member.
