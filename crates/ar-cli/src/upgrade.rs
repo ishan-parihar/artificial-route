@@ -315,7 +315,7 @@ fn verify_candidate_version(candidate: &Path, expected: &str) -> anyhow::Result<
         .context("downloaded release binary could not run --version")?;
     ensure!(
         output.status.success(),
-        "downloaded release binary failed --version"
+        "downloaded release binary could not run --version (CPU feature or ABI mismatch)"
     );
     let reported = String::from_utf8_lossy(&output.stdout);
     ensure!(

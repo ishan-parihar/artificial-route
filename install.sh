@@ -756,7 +756,7 @@ chmod +x "$DIR/.aroute.new"
 # unit; the previous install stays in place because the swap never happened.
 if ! "$DIR/.aroute.new" --version >/dev/null 2>&1; then
   rm -f "$DIR/.aroute.new"
-  die "the downloaded binary does not run on this host (loader mismatch?) — the previous install was left untouched"
+  die "the downloaded binary cannot run on this host (CPU feature or ABI mismatch) — the previous install was left untouched"
 fi
 mv "$DIR/.aroute.new" "$TARGET"
 INSTALLED="$("$TARGET" --version)"

@@ -127,6 +127,12 @@ jobs:
           rm -rf "$SCRATCH"
 
       - name: Build static binary
+        # The Racknerd production host does not expose BMI2. Pin both Rust and
+        # C compilation to the x86-64 baseline so a newer release runner cannot
+        # emit host-only instructions into the portable musl artifact.
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "-C target-cpu=x86-64"
+          CFLAGS_x86_64_unknown_linux_musl: "-march=x86-64 -mtune=generic"
         run: |
           cargo build \
             --release \
