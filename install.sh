@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
-# Install, update, or remove `ar` (artificial-route) — a static musl binary with
+# Install, update, or remove `aroute` (artificial-route) — a static musl binary with
 # no runtime dependencies.
 #
 #   curl -fsSL https://raw.githubusercontent.com/ishan-parihar/artificial-route/main/install.sh | bash
 #
-# One command does the whole job: installs the newest release, writes a working
-# config, installs and starts a systemd unit so the proxy comes up on boot, and
-# proves the result with `aroute doctor`. Re-running it over an existing install
-# updates the binary and leaves your config alone. For a binary-only update,
-# `aroute upgrade` fetches the latest stable release and atomically swaps the
-# executable; restart the service separately to activate the new process.
+# The installer resolves the latest stable tag through GitHub's release redirect
+# (no REST API), verifies the asset and runs it before replacement. It writes a
+# starter config and credential env file, installs a systemd unit when available,
+# and runs `aroute doctor` when credentials are present. Existing config and env
+# files are kept. Run from a saved file to enable the weekly update timer; a pipe
+# has no saved script and skips the timer. For a binary-only update, use
+# `aroute upgrade`; restart the service separately to activate the new process.
 #
 # Flags:
 #   --version <tag>        pin an exact tag instead of the newest release
+#   --update-only          internal timer mode: install a newer stable binary only
 #   --dir <path>           install somewhere else (default $HOME/.local/bin)
 #   --service <scope>      systemd unit scope: system | user | none
 #                          (default: system when run as root, else user)
@@ -27,9 +29,9 @@
 #   --dashboard-src <path>  the dist to install: the `dashboard/dist` directory
 #                          or a tarball of it. Default: `dashboard/dist` in the
 #                          checkout this script lives in.
-#   --check                report installed vs newest and service state; change nothing
-#   --uninstall            remove the binary, unit, autostart, and dashboard dist;
-#                          keep the config, credentials, and dashboard data
+#   --check                compare with latest stable release and report service state
+#   --uninstall            remove binary, units, timer, saved installer, dashboard;
+#                          keep config, credentials, and dashboard data
 #   --force-root           allow running as root (default: refuse)
 #   --no-cta               suppress the star/donate CTA
 #   --all-harnesses        register the MCP server in every detected harness
@@ -66,9 +68,11 @@ IFS='
 	'
 
 REPO="ishan-parihar/artificial-route"
-API="https://api.github.com/repos/$REPO/releases/latest"
+LATEST_RELEASE_URL="https://github.com/$REPO/releases/latest"
 ASSET="aroute-x86_64-unknown-linux-musl"
 SERVICE_NAME="aroute"
+MAX_RELEASE_ASSET_BYTES=134217728
+MAX_CHECKSUMS_BYTES=16384
 
 # A bare `curl | sh` inherits whatever HOME the caller's shell had, which is not
 # a safe thing to assume: some CI images and some `su -c` invocations unset it,
@@ -89,6 +93,7 @@ HOME="$(resolve_home)"
 
 DIR="${AR_INSTALL_DIR:-$HOME/.local/bin}"
 CONFIG="${AR_CONFIG:-$HOME/.config/ar/config.yaml}"
+SCRIPT_COPY="$HOME/.config/ar/install.sh"
 VERSION="${AR_VERSION:-}"
 SERVICE="${AR_SERVICE:-auto}"
 DASHBOARD="${AR_DASHBOARD:-0}"
@@ -101,6 +106,7 @@ DASH_PORT="${AR_DASHBOARD_PORT:-20149}"
 DASH_BASE_PATH="${AR_DASHBOARD_BASE_PATH:-/dash}"
 CHECK_ONLY=0
 UNINSTALL=0
+UPDATE_ONLY=0
 SKIP_CTA="${SKIP_CTA:-0}"
 FORCE_ROOT="${FORCE_ROOT:-0}"
 SKIP_HARNESS="${SKIP_HARNESS:-0}"
@@ -142,6 +148,7 @@ while [ $# -gt 0 ]; do
     --with-dashboard) DASHBOARD=1; shift ;;
     --dashboard-src) DASH_SRC="$2"; shift 2 ;;
     --check) CHECK_ONLY=1; shift ;;
+    --update-only) UPDATE_ONLY=1; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
     --force-root) FORCE_ROOT=1; shift ;;
     --no-cta) SKIP_CTA=1; shift ;;
@@ -198,12 +205,12 @@ fi
 case "$(uname -s)" in
   Linux) # shellcheck disable=SC1091  # os-release is standard on Linux; the fallback below covers its absence
     DISTRO="$(. /etc/os-release 2>/dev/null && echo "${ID:-unknown}")" ;;
-  Darwin) DISTRO="macos" ;;
-  *) die "no prebuilt binary for '$(uname -s)' (want Linux or macOS)" ;;
+  Darwin) die "no prebuilt binary is published for macOS yet; see https://github.com/$REPO/releases for supported targets" ;;
+  *) die "no prebuilt binary for '$(uname -s)' (supported: Linux x86_64)" ;;
 esac
 case "$(uname -m)" in
   x86_64|amd64) ;;
-  *) die "no prebuilt binary for arch '$(uname -m)' (want x86_64)" ;;
+  *) die "no prebuilt binary for arch '$(uname -m)' (supported: x86_64 Linux)" ;;
 esac
 
 # ── Package-manager matrix ═══════════════════════════════════════════════════
@@ -343,10 +350,41 @@ systemctl_cmd() {
   if [ "$SERVICE" = system ]; then systemctl "$@"; else systemctl --user "$@"; fi
 }
 
+valid_release_tag() {
+  printf '%s\n' "$1" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'
+}
+
 latest_tag() {
-  curl -fsSL -H 'Accept: application/vnd.github+json' "$API" 2>/dev/null \
-    | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-    | head -1
+  _resolved_release_url="$(curl -fsSL --connect-timeout 15 --max-time 30 --max-redirs 5 \
+    --proto '=https' --proto-redir '=https' \
+    -o /dev/null -w '%{url_effective}' "$LATEST_RELEASE_URL" 2>/dev/null)" || return 1
+  _release_prefix="https://github.com/$REPO/releases/tag/"
+  case "$_resolved_release_url" in
+    "$_release_prefix"*) _release_tag="${_resolved_release_url#"$_release_prefix"}" ;;
+    *) return 1 ;;
+  esac
+  valid_release_tag "$_release_tag" || return 1
+  printf '%s' "$_release_tag"
+}
+
+# Compare two already-validated numeric semantic versions. Return success only
+# when the first is newer; unattended updates must never roll back a newer build.
+version_gt() {
+  _version_a="$1"
+  _version_b="$2"
+  _a_major="${_version_a%%.*}"
+  _a_tail="${_version_a#*.}"
+  _a_minor="${_a_tail%%.*}"
+  _a_patch="${_a_tail#*.}"
+  _b_major="${_version_b%%.*}"
+  _b_tail="${_version_b#*.}"
+  _b_minor="${_b_tail%%.*}"
+  _b_patch="${_b_tail#*.}"
+  [ "$_a_major" -gt "$_b_major" ] && return 0
+  [ "$_a_major" -lt "$_b_major" ] && return 1
+  [ "$_a_minor" -gt "$_b_minor" ] && return 0
+  [ "$_a_minor" -lt "$_b_minor" ] && return 1
+  [ "$_a_patch" -gt "$_b_patch" ]
 }
 
 LATEST="$(latest_tag || true)"
@@ -362,12 +400,22 @@ installed_tag() {
 if [ "$UNINSTALL" -eq 1 ]; then
   echo "removing $SERVICE_NAME ..."
   if [ "$SERVICE" != none ] && have_systemd; then
+    UNIT="$(unit_path)"
+    UPDATE_TIMER_UNIT="${UNIT%.service}.update.timer"
+    UPDATE_SERVICE_UNIT="${UPDATE_TIMER_UNIT%.timer}.service"
     systemctl_cmd disable --now "$SERVICE_NAME.service" >/dev/null 2>&1 || true
-    rm -f "$(unit_path)" "$HOME/.config/systemd/user/$SERVICE_NAME.service" \
-            /etc/systemd/system/$SERVICE_NAME.service 2>/dev/null || true
+    systemctl_cmd disable --now "$SERVICE_NAME.update.timer" >/dev/null 2>&1 || true
+    rm -f "$UNIT" "$UPDATE_TIMER_UNIT" "$UPDATE_SERVICE_UNIT" \
+      "$HOME/.config/systemd/user/$SERVICE_NAME.service" \
+      "$HOME/.config/systemd/user/$SERVICE_NAME.update.timer" \
+      "$HOME/.config/systemd/user/$SERVICE_NAME.update.service" \
+      "/etc/systemd/system/$SERVICE_NAME.service" \
+      "/etc/systemd/system/$SERVICE_NAME.update.timer" \
+      "/etc/systemd/system/$SERVICE_NAME.update.service" 2>/dev/null || true
     systemctl_cmd daemon-reload >/dev/null 2>&1 || true
   fi
   rm -f "$TARGET" "$DIR/.aroute.new"
+  rm -f "$SCRIPT_COPY" "$SCRIPT_COPY.new"
   for unit in "$HOME/.config/systemd/user/${SERVICE_NAME}-dashboard.service" \
               "/etc/systemd/user/${SERVICE_NAME}-dashboard.service"; do
     [ -f "$unit" ] || continue
@@ -387,18 +435,35 @@ if [ "$UNINSTALL" -eq 1 ]; then
   # destroy the operator's routing setup, which is the expensive part to
   # rebuild. Named explicitly, because an env file full of real keys outliving
   # the binary silently is the kind of thing nobody remembers later.
-  echo "removed binary, service unit and update timer."
+  echo "removed binary, service unit, update timer and saved installer."
   echo "kept: $CONFIG"
   echo "kept: $ENV_FILE   (credentials; delete by hand if unwanted)"
   exit 0
+fi
+
+if [ -n "$VERSION" ] && ! valid_release_tag "$VERSION"; then
+  die "--version must be a stable release tag such as v0.1.26 (got '$VERSION')"
 fi
 
 CURRENT="$(installed_tag || true)"
 CURRENT_NUM="${CURRENT#v}"
 LATEST_NUM="${LATEST#v}"
 
+if [ "$UPDATE_ONLY" -eq 1 ]; then
+  [ "$SERVICE" != none ] || die "--update-only needs a systemd service scope (system or user)"
+  have_systemd || die "--update-only needs systemd on this host"
+  [ -f "$(unit_path)" ] || die "--update-only could not find $(unit_path)"
+  [ -n "$CURRENT" ] || die "--update-only could not read the installed aroute version"
+  valid_release_tag "v$CURRENT_NUM" || die "installed aroute version '$CURRENT' is not a stable release"
+  [ -n "$LATEST" ] || die "could not resolve the latest stable release from $LATEST_RELEASE_URL"
+  if [ "$CURRENT_NUM" = "$LATEST_NUM" ] || version_gt "$CURRENT_NUM" "$LATEST_NUM"; then
+    echo "aroute is current (installed $CURRENT_NUM; latest $LATEST_NUM); no binary was changed"
+    exit 0
+  fi
+fi
+
 if [ "$CHECK_ONLY" -eq 1 ]; then
-  [ -n "$LATEST" ] || LATEST="(unknown — releases API unreachable)"
+  [ -n "$LATEST" ] || LATEST="(unknown — GitHub stable-release redirect unavailable)"
   [ -n "$CURRENT" ] || CURRENT="(none)"
   printf 'installed: %s\nlatest:    %s\n' "$CURRENT" "$LATEST"
   if [ "$CURRENT" = "(none)" ]; then
@@ -407,6 +472,8 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
     echo "status:    cannot tell (no network)"
   elif [ "$CURRENT_NUM" = "$LATEST_NUM" ]; then
     echo "status:    up to date"
+  elif [ -n "${LATEST_NUM:-}" ] && valid_release_tag "v$CURRENT_NUM" && version_gt "$CURRENT_NUM" "$LATEST_NUM"; then
+    echo "status:    installed version is newer than latest; no downgrade offered"
   else
     echo "status:    update available (run this script again)"
   fi
@@ -670,34 +737,55 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT INT TERM
 if [ -n "$VERSION" ]; then
   BASE="https://github.com/$REPO/releases/download/$VERSION"
 else
-  die "cannot reach $API, so there is no newest release to install.
-      Pass --version <tag> to pin one, e.g. --version v0.1.2"
+  die "could not resolve the latest stable release from $LATEST_RELEASE_URL.
+      Check HTTPS access to github.com or pass --version <tag>, e.g. --version v0.1.26"
 fi
 
 cd "$TMP"
 need curl curl
 echo "downloading aroute $VERSION ..."
+
+download_release_file() {
+  _release_source_url="$1"
+  _release_destination="$2"
+  _release_max_bytes="$3"
+  _release_final_url="$(curl -fsSL --connect-timeout 15 --max-time 300 \
+    --max-filesize "$_release_max_bytes" --max-redirs 5 \
+    --proto '=https' --proto-redir '=https' \
+    -o "$_release_destination" -w '%{url_effective}' "$_release_source_url")" || {
+    rm -f "$_release_destination"
+    return 1
+  }
+  _release_final_host="${_release_final_url#https://}"
+  _release_final_host="${_release_final_host%%/*}"
+  case "$_release_final_host" in
+    github.com|*.githubusercontent.com) return 0 ;;
+    *) rm -f "$_release_destination"; return 1 ;;
+  esac
+}
+
 # The release workflow renames the binary from `ar` to `aroute`, but the latest
 # published release may still ship the old asset name. Try the new name first,
 # then the old one, so the smoke test can install whatever the latest release
 # actually contains.
 ASSET_FILE=""
 for CANDIDATE in aroute-x86_64-unknown-linux-musl ar-x86_64-unknown-linux-musl; do
-  if curl -fsSL -o "$CANDIDATE" "$BASE/$CANDIDATE"; then
+  if download_release_file "$BASE/$CANDIDATE" "$CANDIDATE" "$MAX_RELEASE_ASSET_BYTES"; then
     ASSET_FILE="$CANDIDATE"
     break
   fi
 done
 [ -n "$ASSET_FILE" ] || die "no release asset found at $BASE"
 ASSET="$ASSET_FILE"
-curl -fsSL -o SHA256SUMS "$BASE/SHA256SUMS"
+download_release_file "$BASE/SHA256SUMS" SHA256SUMS "$MAX_CHECKSUMS_BYTES" \
+  || die "could not download the release checksum manifest from $BASE/SHA256SUMS"
 
 # Verified before the binary is ever executable, so a corrupt or substituted
 # download cannot run. Missing tooling is a refusal, not a skip: an install that
 # quietly gives up verification is the one that should not. There is no silent
 # package install here: on Linux sha256sum is coreutils, and on macOS shasum
-# ships with the OS, so a missing tool means the system is unusual enough to
-# be fixed by the operator, not by a sudo run from a piped install.
+# is available through coreutils on Linux, so a missing tool means the system
+# is unusual enough to be fixed by the operator, not by a sudo run from a pipe.
 if command -v sha256sum >/dev/null 2>&1; then
   grep " $ASSET\$" SHA256SUMS | sha256sum -c - >/dev/null 2>&1 \
     || die "checksum mismatch for $ASSET — report at github.com/${REPO}/issues"
@@ -746,6 +834,14 @@ if command -v systemctl >/dev/null 2>&1; then
     systemctl --user stop "$SERVICE_NAME-dashboard.service" >/dev/null 2>&1 || DASH_WAS_ACTIVE=0
   fi
 fi
+
+SERVICE_WAS_ACTIVE=0
+ROLLBACK_BIN="$DIR/.aroute.rollback"
+if [ "$UPDATE_ONLY" -eq 1 ] && systemctl_cmd is-active --quiet "$SERVICE_NAME.service" 2>/dev/null; then
+  SERVICE_WAS_ACTIVE=1
+  cp -p "$TARGET" "$ROLLBACK_BIN"
+fi
+
 # Written beside the target and renamed in: an `ar` starting during the swap sees
 # the old binary or the new one, never a truncated file that cannot exec.
 cp "$ASSET" "$DIR/.aroute.new"
@@ -764,6 +860,34 @@ if [ "$DASH_WAS_ACTIVE" -eq 1 ]; then
   systemctl --user start "$SERVICE_NAME-dashboard.service" >/dev/null 2>&1 \
     || echo "warning: dashboard unit did not restart (start it by hand)" >&2
   echo "dashsvc:   restarted on $INSTALLED"
+fi
+
+if [ "$UPDATE_ONLY" -eq 1 ]; then
+  if [ "$SERVICE_WAS_ACTIVE" -eq 1 ]; then
+    if ! systemctl_cmd restart "$SERVICE_NAME.service" >/dev/null 2>&1; then
+      mv "$ROLLBACK_BIN" "$TARGET" \
+        || die "the updated service failed and the previous binary could not be restored from $ROLLBACK_BIN"
+      systemctl_cmd restart "$SERVICE_NAME.service" >/dev/null 2>&1 || true
+      die "the updated service failed to restart; restored aroute $CURRENT"
+    fi
+    attempt=0
+    while [ "$attempt" -lt 10 ] && ! systemctl_cmd is-active --quiet "$SERVICE_NAME.service"; do
+      sleep 1
+      attempt=$((attempt + 1))
+    done
+    if ! systemctl_cmd is-active --quiet "$SERVICE_NAME.service"; then
+      mv "$ROLLBACK_BIN" "$TARGET" \
+        || die "the updated service failed and the previous binary could not be restored from $ROLLBACK_BIN"
+      systemctl_cmd restart "$SERVICE_NAME.service" >/dev/null 2>&1 || true
+      die "the updated service did not stay active; restored aroute $CURRENT"
+    fi
+    rm -f "$ROLLBACK_BIN"
+    echo "service:   restarted and active on $INSTALLED"
+  else
+    echo "service:   left stopped (it was inactive before the update)"
+  fi
+  echo "updated $CURRENT -> $INSTALLED"
+  exit 0
 fi
 
 if [ -n "$CURRENT" ] && [ "$CURRENT_NUM" != "${VERSION#v}" ]; then
@@ -838,7 +962,6 @@ fi
 # them before this branch would have run.
 # A saved copy of this installer, so the update timer below runs the audited
 # artifact rather than re-fetching a URL that could change under it.
-SCRIPT_COPY="$HOME/.config/ar/install.sh"
 mkdir -p "$ENV_DIR"
 if [ ! -f "${ENV_FILE:-$HOME/.config/ar/ar.env}" ]; then
   cat > "$ENV_FILE" <<ENVEOF
@@ -923,17 +1046,20 @@ UNITEOF
   fi
 
   # ---------------------------------------------------------------- updater --
-  # "Automatically update" is only true if something runs the installer, so a
-  # timer does. It re-runs a saved copy of this very script: same checksum
-  # verification, same tag resolution, no second download path to keep in sync.
-  # Installing a new binary restarts the service, so the running proxy changes
-  # too rather than serving the old build until someone notices.
+  # The timer runs this saved installer only when a newer stable release exists.
+  # It uses the same checksum and host checks as an interactive install, then
+  # restarts an active proxy and restores the prior binary if it will not stay up.
   TIMER="${UNIT%.service}.update.timer"
   TIMER_SVC="${TIMER%.timer}.service"
+  UPDATE_ROOT_FLAG=""
+  if [ "$SERVICE" = system ]; then UPDATE_ROOT_FLAG="--force-root"; fi
   # Only writable when this script is a real file. `curl | sh` has no $0 on disk,
   # and silently installing a timer that cannot run is worse than not having one.
   if [ -n "$SCRIPT_SRC" ]; then
-    [ -f "$SCRIPT_COPY" ] || { cp "$SCRIPT_SRC" "$SCRIPT_COPY"; chmod +x "$SCRIPT_COPY"; }
+    mkdir -p "${SCRIPT_COPY%/*}"
+    cp "$SCRIPT_SRC" "$SCRIPT_COPY.new"
+    chmod 755 "$SCRIPT_COPY.new"
+    mv "$SCRIPT_COPY.new" "$SCRIPT_COPY"
     cat > "$TIMER_SVC" <<TIMERSVC
 [Unit]
 Description=Check for an artificial-route release and install it
@@ -943,7 +1069,7 @@ Documentation=https://github.com/$REPO
 Type=oneshot
 # The saved installer, not a URL: this is the audited script, and it verifies
 # the release checksum before it replaces the binary.
-ExecStart=$SCRIPT_COPY --dir $DIR --service none
+ExecStart=$SCRIPT_COPY --dir $DIR --service $SERVICE --update-only $UPDATE_ROOT_FLAG --no-harness --no-cta
 TIMERSVC
     cat > "$TIMER" <<TIMEREOF
 [Unit]
@@ -951,8 +1077,7 @@ Description=Weekly artificial-route update check
 
 [Timer]
 # A fresh install gets its first re-check shortly after boot rather than waiting
-# out the full interval. Randomized delay so many machines do not all poll the
-# release API in the same minute.
+# out the full interval. Randomized delay spreads stable-release redirect checks.
 OnBootSec=15min
 OnUnitActiveSec=7d
 RandomizedDelaySec=1h

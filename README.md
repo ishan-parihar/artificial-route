@@ -1,6 +1,6 @@
 # Artificial Route
 
-[![release](https://img.shields.io/github/v/release/ishan-parihar/artificial-route)](https://github.com/ishan-parihar/artificial-route/releases) [![license](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE) [![musl](https://img.shields.io/badge/binary-static--musl-lightgrey)](https://github.com/ishan-parihar/artificial-route/releases) ![tests](https://img.shields.io/badge/tests-2298_passing-brightgreen)
+[![release](https://img.shields.io/github/v/release/ishan-parihar/artificial-route)](https://github.com/ishan-parihar/artificial-route/releases) [![license](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE) [![musl](https://img.shields.io/badge/binary-static--musl-lightgrey)](https://github.com/ishan-parihar/artificial-route/releases) [![CI](https://github.com/ishan-parihar/artificial-route/actions/workflows/ci.yml/badge.svg)](https://github.com/ishan-parihar/artificial-route/actions/workflows/ci.yml)
 
 **One OpenAI-compatible endpoint over 276 providers — a static binary that idles at ~28 MiB serving the full catalog.** A minimal-RAM Rust port of the OmniRoute gateway core: same combos, strategies and dialects, none of the desktop. File YAML in, SSE out — no runtime dependencies. A small built-in control page at `/ui` edits the same YAML; the full OmniRoute dashboard is an optional extra.
 
@@ -12,13 +12,13 @@ Every document in `docs/` is listed with the question it answers in [docs/PAGE-I
 curl -fsSL https://raw.githubusercontent.com/ishan-parihar/artificial-route/main/install.sh | bash
 ```
 
-That one command installs the newest release, writes a working `~/.config/ar/config.yaml`, writes a `600` credential env file, and installs and starts a **systemd unit** so the proxy comes up on boot.
+That command installs the newest stable Linux x86-64 release, creates a starter `~/.config/ar/config.yaml` and a mode-`600` credential env file, then installs and starts a **systemd unit** when systemd is available. Add provider keys to the env file before expecting requests to route.
 
-For a binary-only update after installation, run `aroute upgrade`. It follows GitHub's latest stable release redirect, verifies the binary against that release's `SHA256SUMS` file and checks its version, then atomically replaces the executable. It does not use GitHub's rate-limited API or restart a running service; restart `aroute.service` after upgrading to activate the new process.
+> The installer downloads the binary and `SHA256SUMS` from the selected GitHub Release, checks the digest, and runs `--version` on the candidate before replacing an install. These checksums detect corruption; `--verify-attestation` also verifies the release build provenance with the GitHub CLI. The installer writes the binary and starter config, creates the credential env file, and installs a service unit when systemd is available. With systemd service management enabled, running from a saved script also saves that script and enables a weekly update timer. `--uninstall` removes the binary, service, timer, saved installer, and dashboard files while keeping config, credentials, and dashboard data.
 
-The command reads `install.sh` from `main`, so the installer is always the newest one. Every binary it downloads is checked against that release's `SHA256SUMS`, and the release carries a build-provenance attestation you can verify with `gh attestation verify aroute-x86_64-unknown-linux-musl --repo ishan-parihar/artificial-route`. Pass `--verify-attestation` to have the installer run that check and refuse to install if it fails. To pin the installer as well, use the tag URL printed in that release's notes instead of `main`.
+For a binary-only update on Linux x86-64, run `aroute upgrade`. It follows GitHub's stable `/releases/latest` redirect without calling the REST API, checks the release's `SHA256SUMS` entry and version, then atomically replaces the executable. The running service keeps its old process until restarted: use `systemctl --user restart aroute.service` for a user service, or `sudo systemctl restart aroute.service` for a system service. The CLI updater currently supports Linux x86-64 only.
 
-It does **not** add the weekly update timer when piped. The timer runs a saved copy of the installer, and a piped `curl | bash` has no file to copy — `$0` is `bash`. For unattended updates, save it first:
+The one-line command downloads `install.sh` from `main`; to pin the installer, replace `main` with a release tag. A piped script has no on-disk `$0`, so it does **not** enable the weekly timer. Save it first if you want unattended updates:
 
 ```sh
 curl -fsSL -o install.sh https://raw.githubusercontent.com/ishan-parihar/artificial-route/main/install.sh
@@ -51,11 +51,9 @@ Full flag table, service details and `--uninstall` are further down under [Insta
 
 ## Installation
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/ishan-parihar/artificial-route/main/install.sh | bash
-```
+Run the install command above, or download and save the script before running it if you want the weekly update timer.
 
-Static musl binary, checksum-verified, no runtime deps. Lands in `~/.local/bin/aroute` and does the whole job in one command: installs the newest release, writes a working `config.yaml` under `~/.config/ar/` (never overwriting an existing one), writes a `600` env file for credentials, installs a **systemd unit** so the proxy starts on boot, and finishes by running `aroute doctor` so the result is proved rather than asserted.
+The installer resolves the latest tag through GitHub's `/releases/latest` redirect, then downloads that tag's asset and checksum manifest. It installs the static musl binary at `~/.local/bin/aroute`, keeps an existing config and env file, and runs the doctor when credentials are available.
 
 The written config carries two routable combos out of the box: `default` (an `openai/gpt-5.4` → `anthropic/claude-sonnet-5` least-used chain that you re-point at your own keys) and `glm-5.3` (`nvidia/z-ai/glm-5.3`, a standalone single-target combo — one combo per bare id is the house pattern that keeps harness model pickers stable as stacks change). With the `AR_MODEL_DISCOVERY=1` env line (set it in the env file), `/v1/models` reports each model's real context window — provider-native catalogs first, [models.dev](https://models.dev) second, a 128K floor last.
 
@@ -63,7 +61,7 @@ The written config carries two routable combos out of the box: `default` (an `op
 | --- | --- |
 | `--version <tag>` | pin an exact tag instead of the newest release |
 | `--dir <path>` | install somewhere else (default `~/.local/bin`) |
-| `--service <scope>` | `system` \ |
+| `--service <scope>` | `user` (default), `system`, or `none`; system scope requires an explicit root override |
 | `--no-service` | same as `--service none` |
 | `--lite` | rust binary only — **the default**; the weekly update timer always runs this mode |
 | `--with-dashboard` | also install the web dashboard (see [Dashboard](#dashboard)): ~2 GiB of compiled Next.js with its traced `node_modules`, built locally by `dashboard/rebrand-dist.sh` and installed from that tree — nothing is fetched from npm. Writes an `aroute-dashboard.service` unit, **not started** |
@@ -72,15 +70,15 @@ The written config carries two routable combos out of the box: `default` (an `op
 | `--all-harnesses` / `--no-harness` | register the MCP server (`aroute mcp`) in every detected AI harness without asking / skip it (`ALL_HARNESS=1` / `SKIP_HARNESS=1`). Claude Code and Codex are registered and verified; OpenCode gets its JSON printed. Non-interactive runs skip it unless `--all-harnesses` is given |
 | `--verify-attestation` | also run `gh attestation verify` on the downloaded binary against this repo, and stop before installing if it fails. Opt-in: needs the [GitHub CLI](https://cli.github.com), and releases published before attestations existed have none to check |
 | `--force-root` | allow running as root (default: refuse) |
-| `--check` | installed vs newest, config and dashboard presence, service and dashsvc state — changes nothing |
-| `--uninstall` | remove binary, unit, timer and dashboard dist; **keeps** config, credentials and the dashboard's data DB |
+| `--check` | compare the installed version with the latest stable release, and report config, dashboard, and service state — changes nothing |
+| `--update-only` | internal systemd timer mode: no-op unless a newer stable version exists; restarts an active service and restores the previous binary if the new service fails |
+| `--uninstall` | remove the binary, service, timer, saved installer, and dashboard dist; **keeps** config, credentials and dashboard data |
 
 The installer prints the portable `.mcp.json` entry for aroute's MCP server instead of writing it anywhere; paste it into a project root to use the tools there.
 
-`aroute upgrade` updates only the binary and does not restart the service. Re-running the installer remains the provisioning path: it replaces the binary, leaves your config and credentials untouched, and refreshes the unit. `--check` tells you honestly whether an update exists.
+`aroute upgrade` updates only the binary and leaves service restart to you. Re-running the installer remains the provisioning path: it replaces the binary, leaves your config and credentials untouched, and refreshes the unit. `--check` follows the stable release redirect and changes nothing.
 
-Unattended updates are a systemd timer (`aroute.update.timer`, weekly, with a first re-check 15 minutes after boot). It runs a **saved copy of the installer** rather than a URL, so the audited script is what runs, and an updated binary restarts the service so the live proxy changes too. The timer never passes a
-dashboard flag, so an installed dist is left alone by weekly updates.
+When the installer runs from a file, its systemd timer (`aroute.update.timer`) checks 15 minutes after boot and weekly after that. It runs the saved installer, not a mutable URL. The installer refreshes that saved copy whenever you run a newer one from a file. If a newer release exists, the timer verifies and installs it, restarts the proxy only if it was already active, and restores the previous binary if the service does not stay active. When no update exists, it leaves the binary and service alone. The timer never passes a dashboard flag, so an installed dashboard dist is left untouched.
 
 The unit is `aroute.service`, `Restart=on-failure`, reading credentials from an `EnvironmentFile` so secrets stay out of the process table. It does **not** override the bind address: loopback comes from `server.host` in the config, so the sample config binds `127.0.0.1` and an operator who edits that line changes
 where it listens. A user unit enables `loginctl enable-linger`, without which "starts on boot" is false for any session that logs out first.

@@ -112,7 +112,11 @@ jobs:
           # `set -u` when a variable is read before it is assigned: those exit
           # non-zero and must fail here rather than on a user's machine.
           sh install.sh --help >/dev/null
-          sh install.sh --check --dir "$SCRATCH/bin" | grep -q 'not installed'
+          CHECK_OUTPUT="$(sh install.sh --check --dir "$SCRATCH/bin")"
+          printf '%s\n' "$CHECK_OUTPUT" | grep -q 'not installed'
+          LATEST="$(printf '%s\n' "$CHECK_OUTPUT" | sed -n 's/^latest:[[:space:]]*//p')"
+          printf '%s\n' "$LATEST" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            || { echo "::error::installer could not resolve the stable release through GitHub's latest redirect"; exit 1; }
           # A nonexistent tag must fail the installer, not the workflow.
           # `if` swallows the expected non-zero exit; `set -e` would abort the
           # step on the very 404 this check exists to prove.
