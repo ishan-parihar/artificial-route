@@ -3,7 +3,43 @@
 Current snapshot only (no history: that is the worklog). The first `## ` block is
 what `genome wake` shows.
 
-## State — 2026-10-29
+## State — 2026-10-29 (release and deployment)
+
+Date: 2026-10-29. Branch `main` at `deddd75` (`v0.1.26`, pushed to
+`origin/main`). The release is published at
+https://github.com/ishan-parihar/artificial-route/releases/tag/v0.1.26. The
+static x86-64 musl asset is 18,669,336 bytes with SHA-256
+`c78012f87336b4de4ae22d0a86c41a7b56332216d69f1338ec44491cda3de585`;
+`SHA256SUMS` is published beside it. The source history pushed for the request
+transmutation fix, updater, portable CPU target, and releases is recorded in the
+worklog below.
+
+**The updater is exercised end to end.** A published v0.1.25 binary fetched the
+latest stable release through GitHub's release redirect, verified the checksum
+manifest, and atomically upgraded itself to v0.1.26. The resulting binary SHA
+matches the published asset digest. Both deployed v0.1.26 binaries also report
+`aroute upgrade: current 0.1.26; latest 0.1.26` without changing the file.
+
+**Local testing install:** `/home/ishanp/.local/bin/aroute` is v0.1.26,
+`aroute.service` is active, and `http://127.0.0.1:20128/healthz` returns `ok`.
+`router-ops-doctor --brief` reports READY, 12 checks passed, including 18 models,
+18 byte-identical combos, and matching local consumers. Rollback binary retained
+at `/home/ishanp/.local/bin/aroute.pre-v0.1.26-20261029`.
+
+**Racknerd production install:** `/home/nerd/.local/bin/aroute` is v0.1.26,
+`aroute.service` is active, and the loopback health check returns `ok`.
+`router-ops-doctor --vps --brief` reports READY, 13 checks passed, including
+18 models, 18 byte-identical combos, and matching consumers. Rollback binary
+retained at `/home/nerd/.local/bin/aroute.pre-v0.1.26-20261029`.
+
+The v0.1.24 release was rejected on Racknerd because its CPU lacks BMI2 and the
+binary hit `SIGILL` at `shlx`. v0.1.26 was built with a generic x86-64 CPU
+baseline; the release install passed checksum, static-link, and host execution
+checks. Existing model, combo, and harness configuration was preserved. The only
+uncommitted workspace change is the pre-existing `scripts/genome` modification;
+it was not included in release commits.
+
+## State — 2026-10-29 (pre-release source checkpoint)
 
 Date: 2026-10-29. Branch `main` @ `0896f82`; the working tree has the local
 OpenAI request-transmutation implementation and prior uncommitted work. Nothing
