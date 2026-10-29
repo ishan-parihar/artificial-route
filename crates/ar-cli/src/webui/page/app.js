@@ -1029,6 +1029,10 @@ let LOG_FAILED = 0;
 function logRow(r) {
   const when = new Date(r.at * 1000);
   const bad = r.status >= 400;
+  const attempt = bad && r.attempted_model
+    ? `attempt ${r.attempt} · upstream ${r.attempt_status} · ${r.attempted_model} · ${r.classifier_rule}`
+    : "";
+  const detail = [r.error, attempt].filter(Boolean).join(" · ");
   return H("tr", { class: bad ? "failed" : "" },
     H("td", { class: "num", text: TIME_FMT.format(when), title: when.toISOString() }),
     H("td", { text: r.key }),
@@ -1037,7 +1041,7 @@ function logRow(r) {
     H("td", null, H("span", { class: "status " + (bad ? "bad" : "good"), text: bad ? r.status + " error" : "ok" })),
     H("td", { class: "num", text: Number(r.tokens).toLocaleString() }),
     H("td", { class: "num", text: bad ? "-" : r.priced ? "$" + Number(r.usd).toFixed(6) : "unpriced" }),
-    H("td", { class: "detail", text: r.error, title: r.error }));
+    H("td", { class: "detail", text: detail, title: detail }));
 }
 function logMoreRow(offset) {
   return H("tr", { class: "more" },

@@ -269,6 +269,7 @@ async fn carries_the_callers_bearer_on_an_oauth_dispatch() {
         upstream_model: "test-model",
         stream: true,
         headers: &BTreeMap::new(),
+        openai_chat_capabilities: None,
     };
 
     let stream = exec

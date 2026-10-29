@@ -108,6 +108,12 @@ pub enum ConfigError {
         /// The window as written.
         value: String,
     },
+    /// A target request-capability row has an empty provider-local model id.
+    #[error("provider_settings {provider:?} request_capabilities has an empty model id")]
+    EmptyCapabilityModel {
+        /// Provider id whose request-capability map has an empty key.
+        provider: String,
+    },
     /// The filesystem watcher could not be installed.
     #[error("cannot watch {path}: {cause}")]
     Watch {
@@ -1036,6 +1042,113 @@ pub struct ProviderSettings {
     /// [`glob`] matcher the allow/deny lists use.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub excluded_models: Vec<String>,
+    /// OpenAI chat request capabilities, keyed by the exact provider-local model id.
+    ///
+    /// These declarations are opt-in. An absent model entry keeps the existing
+    /// byte-preserving OpenAI path. `omit_optional_parameters` names only known
+    /// OpenAI chat fields whose omission the operator has verified is acceptable
+    /// for that target; unknown request fields, messages, and tool schemas are
+    /// always preserved. Tool and role declarations are strictly parsed and
+    /// carried as metadata; this adapter does not use them to remove or relabel
+    /// request content.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub request_capabilities: BTreeMap<String, OpenAiChatCapabilities>,
+}
+
+/// The standard OpenAI chat request shape a capability row describes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiChatShape {
+    /// `/v1/chat/completions`: a `messages` array and top-level chat options.
+    #[default]
+    ChatCompletions,
+    /// A provider-specific OpenAI-compatible JSON object rather than a chat
+    /// envelope, such as a custom decisions endpoint.
+    OpenAiCompatibleObject,
+}
+
+/// A known optional OpenAI chat parameter that an operator may explicitly omit.
+///
+/// This closed enum rejects misspellings at config load and prevents an adapter
+/// from deleting an unknown client field. Omission is an explicit compatibility
+/// choice because the target will use its own default for that parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiOptionalParameter {
+    /// Sampling temperature.
+    Temperature,
+    /// Nucleus sampling probability.
+    TopP,
+    /// Presence penalty.
+    PresencePenalty,
+    /// Frequency penalty.
+    FrequencyPenalty,
+    /// Random seed.
+    Seed,
+    /// Whether token log probabilities are returned.
+    Logprobs,
+    /// Number of top token log probabilities.
+    TopLogprobs,
+    /// Stop strings.
+    Stop,
+    /// End-user identifier.
+    User,
+}
+
+impl OpenAiOptionalParameter {
+    /// The OpenAI chat JSON member this parameter names.
+    #[must_use]
+    pub const fn as_wire(self) -> &'static str {
+        match self {
+            Self::Temperature => "temperature",
+            Self::TopP => "top_p",
+            Self::PresencePenalty => "presence_penalty",
+            Self::FrequencyPenalty => "frequency_penalty",
+            Self::Seed => "seed",
+            Self::Logprobs => "logprobs",
+            Self::TopLogprobs => "top_logprobs",
+            Self::Stop => "stop",
+            Self::User => "user",
+        }
+    }
+}
+
+/// A message role a model declares it can accept on OpenAI chat requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiMessageRole {
+    /// Conversation-wide instruction.
+    System,
+    /// Application instruction with higher priority than user turns.
+    Developer,
+    /// End-user input.
+    User,
+    /// Assistant output or tool call.
+    Assistant,
+    /// Tool result.
+    Tool,
+}
+
+/// Validated capabilities for one provider-local OpenAI chat model.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case", deny_unknown_fields)]
+pub struct OpenAiChatCapabilities {
+    /// Describes the request envelope this row covers.
+    pub shape: OpenAiChatShape,
+    /// Optional fields to omit for this target. Unlisted and unknown fields pass
+    /// through unchanged.
+    #[serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub omit_optional_parameters: std::collections::BTreeSet<OpenAiOptionalParameter>,
+    /// Whether this model declares support for tool calls; `None` means unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_tool_calls: Option<bool>,
+    /// Whether this model declares support for parallel tool calls; `None` means
+    /// unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_parallel_tool_calls: Option<bool>,
+    /// Message roles this model declares; `None` means the role set is unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supported_roles: Option<std::collections::BTreeSet<OpenAiMessageRole>>,
 }
 
 impl ProviderSettings {
@@ -1429,6 +1542,17 @@ impl Config {
     /// Rejects dangling key references, which would otherwise surface as an
     /// unauthenticated upstream call at request time.
     fn validate(&self) -> Result<(), ConfigError> {
+        for (provider, settings) in &self.provider_settings {
+            if settings
+                .request_capabilities
+                .keys()
+                .any(|model| model.trim().is_empty())
+            {
+                return Err(ConfigError::EmptyCapabilityModel {
+                    provider: provider.clone(),
+                });
+            }
+        }
         for p in &self.providers {
             if !self.keys.contains_key(&p.key) {
                 // An anonymous free tier holds no credential, so demanding a name
@@ -1925,6 +2049,39 @@ combos:
     fn loads_sample_config_when_file_valid() {
         let cfg = Config::parse(SAMPLE, stub_lookup).unwrap();
         assert_eq!(cfg.combos.len(), 1);
+    }
+
+    #[test]
+    fn parses_model_scoped_openai_chat_capabilities() {
+        let yaml = "provider_settings:\n  nvidia:\n    request_capabilities:\n      minimax/model-v1:\n        omit_optional_parameters: [temperature, top_p]\n        supports_tool_calls: true\n        supports_parallel_tool_calls: false\n        supported_roles: [system, developer, user, assistant, tool]\n";
+        let cfg = Config::parse(yaml, stub_lookup).expect("typed capability row");
+        let row = &cfg.provider_settings["nvidia"].request_capabilities["minimax/model-v1"];
+        assert_eq!(row.omit_optional_parameters.len(), 2);
+        assert_eq!(row.supports_tool_calls, Some(true));
+        assert_eq!(row.supports_parallel_tool_calls, Some(false));
+        assert_eq!(
+            row.supported_roles
+                .as_ref()
+                .map(std::collections::BTreeSet::len),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_openai_parameter_capability_names() {
+        let yaml = "provider_settings:\n  nvidia:\n    request_capabilities:\n      minimax/model-v1:\n        omit_optional_parameters: [max_completion_tokens]\n";
+        let err = Config::parse(yaml, stub_lookup).expect_err("unknown parameter rejected");
+        assert!(matches!(err, ConfigError::Yaml { .. }), "got: {err:?}");
+    }
+
+    #[test]
+    fn rejects_an_empty_model_id_in_request_capabilities() {
+        let yaml = "provider_settings:\n  nvidia:\n    request_capabilities:\n      \"\": {}\n";
+        let err = Config::parse(yaml, stub_lookup).expect_err("empty model rejected");
+        assert!(
+            matches!(err, ConfigError::EmptyCapabilityModel { .. }),
+            "got: {err:?}"
+        );
     }
 
     #[test]

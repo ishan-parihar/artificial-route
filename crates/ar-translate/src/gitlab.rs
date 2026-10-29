@@ -56,7 +56,9 @@ fn simple_prompt(messages: &[Msg]) -> String {
             continue;
         }
         match msg.role {
-            Role::System => system.push(text),
+            // GitLab has one instruction prefix. Developer turns belong there
+            // with system turns so they retain precedence over user content.
+            Role::System | Role::Developer => system.push(text),
             Role::User => latest_user = text,
             Role::Assistant | Role::Tool => {}
         }
@@ -168,6 +170,20 @@ mod tests {
         assert_eq!(
             body["current_file"]["content_above_cursor"],
             "System instructions:\nbe terse\n\nsecond",
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn render_should_flatten_developer_turn_into_the_instruction_prefix() {
+        let body = rendered(&chat(vec![
+            Msg::new(Role::Developer, "always use Rust"),
+            Msg::new(Role::User, "write a function"),
+        ]));
+
+        assert_eq!(
+            body["current_file"]["content_above_cursor"],
+            "System instructions:\nalways use Rust\n\nwrite a function",
             "{body}"
         );
     }

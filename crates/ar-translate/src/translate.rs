@@ -1592,6 +1592,32 @@ mod tests {
     }
 
     #[test]
+    fn preserves_a_developer_turn_from_openai_chat() {
+        let raw = r#"{"model":"m","messages":[{"role":"developer","content":"always use Rust"}]}"#;
+        let chat: OpenAIChat = serde_json::from_str(raw).expect("fixture is valid OpenAI chat");
+
+        let canonical = to_canonical(chat).expect("developer is an OpenAI role");
+
+        assert_eq!(
+            canonical.messages,
+            vec![Msg::new(Role::Developer, "always use Rust")]
+        );
+    }
+
+    #[test]
+    fn preserves_a_developer_turn_from_responses() {
+        let raw = r#"{"model":"m","input":[{"type":"message","role":"developer","content":"always use Rust"}]}"#;
+        let req: ResponsesApi = serde_json::from_str(raw).expect("fixture is valid Responses");
+
+        let canonical = responses_to_canonical(req).expect("developer is a Responses role");
+
+        assert_eq!(
+            canonical.messages,
+            vec![Msg::new(Role::Developer, "always use Rust")]
+        );
+    }
+
+    #[test]
     fn converts_ollama_when_valid() {
         let raw = r#"{"model":"llama3.2","system":"be terse",
             "messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"}],

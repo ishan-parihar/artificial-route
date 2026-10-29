@@ -36,6 +36,12 @@ use serde::{Deserialize, Serialize};
 pub enum Role {
     /// Instructions that frame the conversation.
     System,
+    /// Application instructions that take precedence over user turns.
+    ///
+    /// OpenAI-compatible chat and Responses wires name this role explicitly.
+    /// Wires without a developer spelling render it through their instruction
+    /// channel, never as a user turn.
+    Developer,
     /// The end user.
     User,
     /// The model.
@@ -49,6 +55,7 @@ impl Role {
     pub const fn as_wire(self) -> &'static str {
         match self {
             Self::System => "system",
+            Self::Developer => "developer",
             Self::User => "user",
             Self::Assistant => "assistant",
             Self::Tool => "tool",
@@ -59,6 +66,7 @@ impl Role {
     pub fn from_wire(raw: &str) -> Option<Self> {
         match raw {
             "system" => Some(Self::System),
+            "developer" => Some(Self::Developer),
             "user" => Some(Self::User),
             "assistant" => Some(Self::Assistant),
             "tool" => Some(Self::Tool),

@@ -72,6 +72,7 @@ fn dispatch(base_url: &str) -> Dispatch<'_> {
         upstream_model: "",
         stream: false,
         headers: &NO_HEADERS,
+        openai_chat_capabilities: None,
     }
 }
 

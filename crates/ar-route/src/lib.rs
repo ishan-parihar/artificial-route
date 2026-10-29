@@ -84,7 +84,7 @@ mod simulate;
 mod strategy;
 
 pub use attempt::attempt_loop_with_pins;
-pub use attempt::{AbortReport, AttemptOutcome, MAX_ATTEMPTS, attempt_loop};
+pub use attempt::{AbortReport, AttemptDiagnostic, AttemptOutcome, MAX_ATTEMPTS, attempt_loop};
 pub use auto::{
     AUTO_VARIANTS, AccountTier, AutoCandidate, AutoCombo, AutoSelector, AutoVariant, CircuitState,
     Factors, PoolMaxima, Scored, VirtualFactory, Weights, WinnerReason, auto_variant_for_model,

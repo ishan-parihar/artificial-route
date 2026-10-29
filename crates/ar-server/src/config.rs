@@ -1603,6 +1603,13 @@ fn resolve_target(
                 entry
             }
         };
+        entry = entry.with_openai_chat_capabilities(
+            cfg.provider_settings
+                .get(provider)
+                .map_or_else(BTreeMap::new, |settings| {
+                    settings.request_capabilities.clone()
+                }),
+        );
         // The flat table's model is a display default only; a combo target always
         // carries its own spelling.
         entry.continue_on_cut = cfg.continue_on_cut.iter().any(|id| id == provider);
@@ -2186,6 +2193,24 @@ combos:
     }
 
     #[test]
+    fn carries_model_scoped_request_capabilities_into_the_dispatcher() {
+        let cfg = parse(
+            "keys:\n  openai: k\nproviders:\n  - id: openai\n    key: openai\ncombos:\n  - id: stack\n    strategy: priority\n    targets: [openai/gpt-4o-mini]\nprovider_settings:\n  openai:\n    request_capabilities:\n      gpt-4o-mini:\n        omit_optional_parameters: [temperature]\n",
+        )
+        .expect("config parses");
+        let server = ServerConfig::from_ar_config(&cfg, None, None, false, None)
+            .expect("dispatch config resolves");
+        let caps = server.providers[0]
+            .openai_chat_capabilities
+            .get("gpt-4o-mini")
+            .expect("model capabilities reach the dispatch row");
+        assert!(
+            caps.omit_optional_parameters
+                .contains(&ar_config::OpenAiOptionalParameter::Temperature)
+        );
+    }
+
+    #[test]
     fn derives_model_cards() {
         let cards = flat().model_cards();
         assert_eq!(cards[0].id, "openai/gpt-4o-mini");
@@ -2408,6 +2433,7 @@ combos:
             "groq".to_owned(),
             ar_config::ProviderSettings {
                 excluded_models: vec!["openai/*".to_owned()],
+                ..Default::default()
             },
         );
         assert_eq!(card_ids(&cfg), vec!["openai/gpt-4o-mini"]);
@@ -2422,6 +2448,7 @@ combos:
             "openai".to_owned(),
             ar_config::ProviderSettings {
                 excluded_models: vec!["*".to_owned()],
+                ..Default::default()
             },
         );
         assert_eq!(card_ids(&cfg), vec!["groq/openai/gpt-oss-120b"]);

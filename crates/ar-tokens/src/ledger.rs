@@ -54,7 +54,11 @@ CREATE TABLE IF NOT EXISTS failures (
     model      TEXT    NOT NULL,
     status     INTEGER NOT NULL,
     error      TEXT    NOT NULL,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    attempted_model TEXT NOT NULL DEFAULT '',
+    attempt INTEGER NOT NULL DEFAULT 0,
+    attempt_status INTEGER NOT NULL DEFAULT 0,
+    classifier_rule TEXT NOT NULL DEFAULT ''
 );
 ";
 
@@ -88,6 +92,18 @@ ALTER TABLE key_caps_migrated RENAME TO key_caps;
 /// keeps the old shape, so its old rows read as `-`, the value they always had.
 const MIGRATE_FAILURE_PROVIDER: &str =
     "ALTER TABLE failures ADD COLUMN provider TEXT NOT NULL DEFAULT '-';";
+
+/// The bounded attempt provenance added after the failure table first shipped.
+/// Each column is migrated independently so a partially upgraded ledger heals
+/// on its next open without rewriting or dropping existing rows.
+const MIGRATE_FAILURE_ATTEMPTED_MODEL: &str =
+    "ALTER TABLE failures ADD COLUMN attempted_model TEXT NOT NULL DEFAULT '';";
+const MIGRATE_FAILURE_ATTEMPT: &str =
+    "ALTER TABLE failures ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0;";
+const MIGRATE_FAILURE_ATTEMPT_STATUS: &str =
+    "ALTER TABLE failures ADD COLUMN attempt_status INTEGER NOT NULL DEFAULT 0;";
+const MIGRATE_FAILURE_CLASSIFIER_RULE: &str =
+    "ALTER TABLE failures ADD COLUMN classifier_rule TEXT NOT NULL DEFAULT '';";
 
 /// `usage.combo`, added after the table first shipped.
 ///
@@ -514,9 +530,11 @@ SELECT MAX(m) FROM (SELECT MAX(created_at) AS m FROM usage
 const LOG: &str = "
 SELECT * FROM (
     SELECT created_at, key_id, provider, model, total_tokens, cost_micros, priced,
-           200 AS status, '' AS error FROM usage
+           200 AS status, '' AS error, '' AS attempted_model, 0 AS attempt,
+           0 AS attempt_status, '' AS classifier_rule FROM usage
     UNION ALL
-    SELECT created_at, key_id, provider, model, 0, 0, 1, status, error FROM failures
+    SELECT created_at, key_id, provider, model, 0, 0, 1, status, error,
+           attempted_model, attempt, attempt_status, classifier_rule FROM failures
 )
 WHERE created_at >= ?1
   AND (?2 IS NULL OR model = ?2)
@@ -565,6 +583,49 @@ pub struct LogRow {
     pub status: u16,
     /// Why it failed; empty for an answered row.
     pub error: String,
+    /// Provider-local model of the final attempted target, empty when absent.
+    pub attempted_model: String,
+    /// One-based final attempt number, or zero when no upstream was dispatched.
+    pub attempt: u16,
+    /// Status returned by the final upstream attempt, zero when absent.
+    pub attempt_status: u16,
+    /// Stable router classifier rule id, empty when no attempt was classified.
+    pub classifier_rule: String,
+}
+
+/// Safe routing provenance for one failed request.
+///
+/// Contains only bounded identifiers and classifier metadata. It has no field
+/// for a request body, key, or raw provider error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FailureDiagnostic<'a> {
+    /// Provider-local model of the final attempted target.
+    pub attempted_model: &'a str,
+    /// One-based final attempt number, or zero when no upstream was dispatched.
+    pub attempt: u16,
+    /// Status returned by the final upstream attempt, or zero when absent.
+    pub attempt_status: u16,
+    /// Stable router classifier rule id, or empty when absent.
+    pub classifier_rule: &'a str,
+}
+
+/// One router-authored failure row and its optional safe attempt provenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FailureRecord<'a> {
+    /// Client key id, or `anonymous`.
+    pub key_id: &'a str,
+    /// Last provider attempted, or `-` when dispatch never happened.
+    pub provider: &'a str,
+    /// Client-facing model or combo id.
+    pub model: &'a str,
+    /// Router response status.
+    pub status: u16,
+    /// Router-authored short failure reason.
+    pub error: &'a str,
+    /// Unix timestamp in seconds.
+    pub created_at: i64,
+    /// Bounded upstream-attempt metadata.
+    pub diagnostic: FailureDiagnostic<'a>,
 }
 
 /// SQLite-backed usage ledger.
@@ -603,6 +664,18 @@ impl Ledger {
         conn.execute_batch(SCHEMA)?;
         if !has_column(&conn, "failures", "provider")? {
             conn.execute_batch(MIGRATE_FAILURE_PROVIDER)?;
+        }
+        if !has_column(&conn, "failures", "attempted_model")? {
+            conn.execute_batch(MIGRATE_FAILURE_ATTEMPTED_MODEL)?;
+        }
+        if !has_column(&conn, "failures", "attempt")? {
+            conn.execute_batch(MIGRATE_FAILURE_ATTEMPT)?;
+        }
+        if !has_column(&conn, "failures", "attempt_status")? {
+            conn.execute_batch(MIGRATE_FAILURE_ATTEMPT_STATUS)?;
+        }
+        if !has_column(&conn, "failures", "classifier_rule")? {
+            conn.execute_batch(MIGRATE_FAILURE_CLASSIFIER_RULE)?;
         }
         if !has_column(&conn, "usage", "combo")? {
             conn.execute_batch(MIGRATE_USAGE_COMBO)?;
@@ -980,10 +1053,51 @@ impl Ledger {
         error: &str,
         created_at: i64,
     ) -> Result<(), TokenError> {
-        let error: String = error.chars().take(FAILURE_TEXT_MAX).collect();
+        self.record_failure_with_diagnostic(FailureRecord {
+            key_id,
+            provider,
+            model,
+            status,
+            error,
+            created_at,
+            diagnostic: FailureDiagnostic::default(),
+        })
+    }
+
+    /// Records one failed request with safe, structured attempt provenance.
+    ///
+    /// The error remains router-authored and is bounded by the same limit as
+    /// [`Self::record_failure`]. Raw provider bodies are never stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TokenError::Sqlite`] on a write failure.
+    pub fn record_failure_with_diagnostic(
+        &self,
+        record: FailureRecord<'_>,
+    ) -> Result<(), TokenError> {
+        let error: String = record.error.chars().take(FAILURE_TEXT_MAX).collect();
+        let attempted_model: String = record
+            .diagnostic
+            .attempted_model
+            .chars()
+            .take(160)
+            .collect();
+        let classifier_rule: String = record.diagnostic.classifier_rule.chars().take(64).collect();
         self.conn.execute(
-            "INSERT INTO failures (key_id, provider, model, status, error, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![key_id, provider, model, i64::from(status), error, created_at],
+            "INSERT INTO failures (key_id, provider, model, status, error, created_at, attempted_model, attempt, attempt_status, classifier_rule) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                record.key_id,
+                record.provider,
+                record.model,
+                i64::from(record.status),
+                error,
+                record.created_at,
+                attempted_model,
+                i64::from(record.diagnostic.attempt),
+                i64::from(record.diagnostic.attempt_status),
+                classifier_rule,
+            ],
         )?;
         self.conn.execute(
             "DELETE FROM failures WHERE id <= (SELECT MAX(id) FROM failures) - ?1",
@@ -1028,6 +1142,10 @@ impl Ledger {
                 priced: row.get::<_, i64>(6)? != 0,
                 status: u16::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
                 error: row.get(8)?,
+                attempted_model: row.get(9)?,
+                attempt: u16::try_from(row.get::<_, i64>(10)?).unwrap_or(0),
+                attempt_status: u16::try_from(row.get::<_, i64>(11)?).unwrap_or(0),
+                classifier_rule: row.get(12)?,
             });
         }
         Ok(out)
@@ -1135,7 +1253,7 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, Toke
 #[cfg(test)]
 mod tests {
     use super::{Analytics, LogFilter, SpendBucket};
-    use super::{Cap, CostReport, DenyReason, Entry, Ledger, Verdict, Who};
+    use super::{Cap, CostReport, DenyReason, Entry, FailureDiagnostic, Ledger, Verdict, Who};
     use crate::pricing::{Cost, Prices, PricingTable, Usd};
     use crate::usage::NormalizedUsage;
     use rusqlite::Connection;
@@ -1330,6 +1448,37 @@ mod tests {
     }
 
     #[test]
+    fn log_should_retain_safe_attempt_diagnostic_fields() {
+        let ledger = Ledger::open_in_memory().expect("open");
+        ledger
+            .record_failure_with_diagnostic(super::FailureRecord {
+                key_id: "k1",
+                provider: "nvidia",
+                model: "large-stack",
+                status: 502,
+                error: "upstream request rejected",
+                created_at: 1_700_000_100,
+                diagnostic: FailureDiagnostic {
+                    attempted_model: "minimaxai/minimax-m3.1-flash",
+                    attempt: 1,
+                    attempt_status: 400,
+                    classifier_rule: "unclassified_400",
+                },
+            })
+            .expect("failure");
+        let row = ledger.log(&all_rows()).expect("log").remove(0);
+        assert_eq!(
+            (
+                row.attempted_model.as_str(),
+                row.attempt,
+                row.attempt_status,
+                row.classifier_rule.as_str(),
+            ),
+            ("minimaxai/minimax-m3.1-flash", 1, 400, "unclassified_400")
+        );
+    }
+
+    #[test]
     fn from_connection_should_add_the_provider_column_to_an_old_failures_table() {
         let conn = Connection::open_in_memory().expect("open");
         conn.execute_batch(
@@ -1353,6 +1502,9 @@ mod tests {
             })
             .expect("log");
         assert_eq!(rows[0].provider, "-");
+        assert_eq!(rows[0].attempted_model, "");
+        assert_eq!(rows[0].attempt_status, 0);
+        assert_eq!(rows[0].classifier_rule, "");
     }
 
     #[test]

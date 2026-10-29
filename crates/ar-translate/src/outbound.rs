@@ -286,7 +286,7 @@ pub fn render_claude_body(chat: &CanonicalChat) -> Vec<u8> {
     let mut messages: Vec<Value> = Vec::new();
 
     for msg in &chat.messages {
-        if msg.role == Role::System {
+        if matches!(msg.role, Role::System | Role::Developer) {
             if !msg.content.is_empty() {
                 system.push(json!({ "type": "text", "text": msg.content }));
             }
@@ -440,8 +440,8 @@ pub fn render_openai_responses_body(chat: &CanonicalChat) -> Vec<u8> {
 
 /// Renders `chat` as a Gemini `generateContent` request body.
 ///
-/// The mirror of [`crate::gemini_to_canonical`]: system turns become
-/// `systemInstruction`, `Role::User` and `Role::Tool` become `role: "user"`,
+/// The mirror of [`crate::gemini_to_canonical`]: system and developer turns
+/// become `systemInstruction`, `Role::User` and `Role::Tool` become `role: "user"`,
 /// `Role::Assistant` becomes `role: "model"`, and the model id — which the
 /// Gemini wire carries on the URL and nowhere in the body — is still emitted so
 /// the body is self-describing for a log or a cache key.
@@ -465,7 +465,7 @@ pub fn render_gemini_body(chat: &CanonicalChat) -> Vec<u8> {
         .collect();
 
     for msg in &chat.messages {
-        if msg.role == Role::System {
+        if matches!(msg.role, Role::System | Role::Developer) {
             if !msg.content.is_empty() {
                 system.push(json!({ "text": msg.content }));
             }
@@ -626,7 +626,9 @@ pub fn render_cursor_body(chat: &CanonicalChat) -> Vec<u8> {
 
     for msg in &chat.messages {
         match msg.role {
-            Role::System => messages.push(json!({
+            // Cursor has no instruction role, so preserve a developer turn as
+            // explicit instruction context instead of relabeling it as a user ask.
+            Role::System | Role::Developer => messages.push(json!({
                 "role": "user",
                 "content": format!("[System Instructions]\n{}", msg.content),
             })),
@@ -807,7 +809,9 @@ fn clova_part(part: &MediaPart) -> Option<Value> {
 const fn clova_role(role: Role) -> &'static str {
     match role {
         Role::Assistant => "assistant",
-        Role::System => "system",
+        // CLOVA has one instruction role; its `system` spelling retains the
+        // developer turn's precedence over user content.
+        Role::System | Role::Developer => "system",
         Role::User | Role::Tool => "user",
     }
 }
@@ -831,7 +835,7 @@ pub fn render_kiro_body(chat: &CanonicalChat) -> Vec<u8> {
     let mut dialogue: Vec<&Msg> = Vec::with_capacity(chat.messages.len());
 
     for msg in &chat.messages {
-        if msg.role == Role::System {
+        if matches!(msg.role, Role::System | Role::Developer) {
             if !msg.content.is_empty() {
                 system.push_str(&msg.content);
                 system.push('\n');
@@ -1655,6 +1659,53 @@ mod tests {
             render_for_wire(&canonical, OutboundWire::Openai),
             render_openai_body(&canonical),
             "the dispatch table must delegate, not reimplement",
+        );
+    }
+
+    #[test]
+    fn preserves_developer_on_openai_and_responses_wires() {
+        let canonical = chat(vec![Msg::new(Role::Developer, "always use Rust")]);
+
+        let openai = parsed(render_openai_body(&canonical));
+        let responses = rendered(&canonical, OutboundWire::Responses);
+
+        assert_eq!(
+            (
+                openai["messages"][0]["role"].clone(),
+                responses["input"][0]["role"].clone()
+            ),
+            (json!("developer"), json!("developer")),
+        );
+    }
+
+    #[test]
+    fn places_developer_in_each_non_openai_instruction_channel() {
+        let canonical = chat(vec![
+            Msg::new(Role::Developer, "always use Rust"),
+            user("write a function"),
+        ]);
+
+        let claude = rendered(&canonical, OutboundWire::Claude);
+        let gemini = rendered(&canonical, OutboundWire::Gemini);
+        let cursor = rendered(&canonical, OutboundWire::Cursor);
+        let clova = rendered(&canonical, OutboundWire::Clova);
+        let kiro = rendered(&canonical, OutboundWire::Kiro);
+
+        assert_eq!(
+            (
+                claude["system"][0]["text"].clone(),
+                gemini["systemInstruction"]["parts"][0]["text"].clone(),
+                cursor["messages"][0]["content"].clone(),
+                clova["messages"][0]["role"].clone(),
+                kiro["conversationState"]["currentMessage"]["userInputMessage"]["content"].clone(),
+            ),
+            (
+                json!("always use Rust"),
+                json!("always use Rust"),
+                json!("[System Instructions]\nalways use Rust"),
+                json!("system"),
+                json!("always use Rust\n\nwrite a function"),
+            ),
         );
     }
 

@@ -523,6 +523,7 @@ mod tests {
             upstream_model: "openai.gpt-oss-120b-1:0",
             stream: true,
             headers: &headers,
+            openai_chat_capabilities: None,
         };
         let canonical =
             br#"{"model":"combo","messages":[{"role":"user","content":"hi"}],"stream":true}"#;

@@ -47,8 +47,8 @@ pub use count::{
 };
 pub use error::TokenError;
 pub use ledger::{
-    Cap, CostReport, DenyReason, Entry, Ledger, LedgerRow, LogFilter, LogRow, Spend,
-    SpendBreakdown, TargetSpend, TargetSpendRow, Verdict, Who,
+    Cap, CostReport, DenyReason, Entry, FailureDiagnostic, FailureRecord, Ledger, LedgerRow,
+    LogFilter, LogRow, Spend, SpendBreakdown, TargetSpend, TargetSpendRow, Verdict, Who,
 };
 pub use meta::{ResponseMeta, usage_from_body};
 pub use pricing::{Cost, Prices, PricingTable, Usd, cost_micros};

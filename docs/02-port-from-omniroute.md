@@ -20,6 +20,17 @@ Base: `../OmniRoute/`. Do NOT copy TS. Re-implement logic in Rust, keep constant
 Highest leverage. Support P0: OpenAI chat inbound single adapter. P1: Anthropic Messages, Ollama, Responses.
 Reuse `ar-llm/conversion/*` where overlap — don't write two converters.
 
+The OpenAI-wire path keeps the client's body byte-for-byte by default and only
+rewrites the provider-local `model`. A verified target exception can be declared
+under `provider_settings.<provider>.request_capabilities.<model>`: the typed row
+names its request shape, known optional parameters that may be omitted, tool
+features, and supported message roles. The renderer only omits the explicitly
+listed optional parameters; it preserves messages, tool schemas, roles, and
+unknown fields. `chat_completions` validates a present `messages` array, while
+`open_ai_compatible_object` covers a documented custom object endpoint. No
+provider-specific row belongs in the config until its incompatibility and safe
+adaptation are measured.
+
 ## exec/ <- `open-sse/executors/`
 
 `default.ts+default/{urlNormalizers,poolConfig}+base/{headers,mergeAbortSignals}+defaultResolver.ts::getDefaultExecutor+credential.ts`.

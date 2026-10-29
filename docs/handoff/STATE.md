@@ -3,6 +3,37 @@
 Current snapshot only (no history: that is the worklog). The first `## ` block is
 what `genome wake` shows.
 
+## State — 2026-10-29
+
+Date: 2026-10-29. Branch `main` @ `0896f82`; the working tree has the local
+OpenAI request-transmutation implementation and prior uncommitted work. Nothing
+was committed or pushed.
+
+**OpenAI request-transmutation plan executed locally.** The attempt loop now
+preserves bounded attempted-target/status/rule provenance, advances on
+provider-specific and ambiguous 400s, and stops on explicit malformed-JSON
+categories. Exact model-scoped OpenAI chat capability rows can omit only
+operator-verified optional parameters; default requests preserve unknown fields
+and message/tool payloads. The canonical `developer` role is distinct and is
+preserved or mapped through supported renderers. Mock end-to-end coverage
+asserts first-target rejection and successful fallback, exact request bodies,
+sanitized errors, and diagnostics. Full details are in
+`docs/plans/2026-10-29-openai-request-transmutation-and-400-failover.md`.
+
+**Gates:** `cargo test --release --locked -q` passed (exit 0); workspace Clippy
+passed with `-D warnings`; modified Rust files pass rustfmt. The workspace
+format check still flags formatting in untouched `crates/ar-cli/src/toon.rs`
+and `crates/ar-cli/tests/cli.rs`. A 180-second loopback success-path soak passed:
+RSS plateau 35,456 KiB, final 35,916 KiB, zero health failures. CSV:
+`/tmp/ar-routeops-soak-20261029.csv`.
+
+**Scope and remaining evidence:** this was a source-only change. Racknerd,
+router configuration, and local harnesses were not changed or restarted. The
+retained NVIDIA response does not include its original error body, so the exact
+rejected field remains unknown; do not invent or configure a provider-specific
+adaptation until a safe reproduction identifies it. Live provider verification
+is pending.
+
 ## State — 2026-10-24
 
 Date: 2026-10-24. Branch `main` @ `5e0a874` (the latest commit is Phase 3 of the
@@ -401,12 +432,12 @@ several of them had gone stale (A1 said "v0.1.16 is the newest tag" when `v0.1.1
 tagged; B6 said "14 orphan pages" when the count is now 0). The old documents keep the
 **history** of their pass and point at the ledger; the ledger owns the **state**.
 
-<!-- genome:zone status sha=60fb145232b9 -->
+<!-- genome:zone status sha=f7a74cf2be93 -->
 | status | items |
 |---|---|
 | open | 36 |
 | in-progress | 3 |
-| done | 36 |
+| done | 37 |
 
 - `UI-08` [open] **Rule the canonical credential store on the VPS** and delete the other
 - `SEC-02` [open] **Every token minted since 2026-10-19 20:07:58 is valid** — the exposure window opened when a parall

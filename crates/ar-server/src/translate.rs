@@ -68,11 +68,31 @@ use serde::Deserialize;
 /// `logprobs`, `parallel_tool_calls` and a dozen other fields, and rejecting them
 /// would break every real client. The whole body is forwarded verbatim below;
 /// this struct only extracts what routing needs.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct DialectHead {
     model: String,
     #[serde(default)]
     stream: bool,
+    /// Consume only the array envelope without retaining the conversation.
+    /// The OpenAI chat route can reject a wrong-shaped `messages` field before
+    /// spending an upstream attempt while keeping prompt memory bounded to the
+    /// already-owned request body. Missing `messages` remains valid for custom
+    /// OpenAI-compatible endpoints whose request shape is not chat.
+    #[serde(
+        default,
+        rename = "messages",
+        deserialize_with = "deserialize_messages_array"
+    )]
+    _messages: Option<()>,
+}
+
+/// Validates a present `messages` field as an array without retaining its items.
+fn deserialize_messages_array<'de, D>(deserializer: D) -> Result<Option<()>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let _: Vec<serde::de::IgnoredAny> = serde::Deserialize::deserialize(deserializer)?;
+    Ok(Some(()))
 }
 
 /// The P0 OpenAI-chat-inbound translator.
@@ -220,6 +240,26 @@ mod tests {
     #[test]
     fn rejects_empty_model_string() {
         let got = OpenAiChatTranslate.to_canonical(br#"{"model":""}"#);
+        assert!(got.is_err());
+    }
+
+    #[test]
+    fn keeps_a_custom_openai_endpoint_body_without_messages() {
+        let got = to_canonical_for_route("/v1/chat/completions", br#"{"model":"m"}"#)
+            .expect("custom OpenAI-compatible endpoint body");
+        assert_eq!(got.model.as_ref(), "m");
+    }
+
+    #[test]
+    fn rejects_openai_chat_messages_that_are_not_an_array_before_dispatch() {
+        let got = to_canonical_for_route("/v1/chat/completions", br#"{"model":"m","messages":{}}"#);
+        assert!(got.is_err());
+    }
+
+    #[test]
+    fn rejects_null_messages_before_dispatch() {
+        let got =
+            to_canonical_for_route("/v1/chat/completions", br#"{"model":"m","messages":null}"#);
         assert!(got.is_err());
     }
 

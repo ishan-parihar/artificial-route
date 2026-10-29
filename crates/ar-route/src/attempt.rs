@@ -54,6 +54,8 @@ pub enum AttemptOutcome {
         model: Strng,
         /// How many providers were tried before it succeeded.
         attempts: u16,
+        /// Last failed target before success, when this call failed over.
+        diagnostic: Option<AttemptDiagnostic>,
         /// The upstream response, ready to relay.
         upstream: Upstream,
     },
@@ -71,6 +73,8 @@ pub enum AttemptOutcome {
         /// here made `ar_upstream_attempts_total` add nothing for exactly the
         /// requests that made the most upstream calls (audit F-MED-3).
         tried: u16,
+        /// Last target failure, separated from any model that later served.
+        diagnostic: Option<AttemptDiagnostic>,
     },
     /// The chain ran out after a non-rate-limit failure (5xx, transport, or an
     /// auth refusal on every key). A different chain might still succeed, so
@@ -95,6 +99,8 @@ pub enum AttemptOutcome {
         /// come back; dropping it would be the router deciding the provider's
         /// own answer was not worth relaying.
         retry_after: Option<Duration>,
+        /// Last target failure, separated from the client-facing combo id.
+        diagnostic: Option<AttemptDiagnostic>,
     },
     /// Terminal: the request itself is bad, or there was nothing to route to.
     /// Retrying the same body anywhere produces the same answer.
@@ -108,6 +114,7 @@ impl AttemptOutcome {
         match self {
             Self::Succeeded { upstream, .. } => upstream.status,
             Self::Retry { .. } => StatusCode::TOO_MANY_REQUESTS,
+            Self::Failover { status, .. } if *status == 400 => StatusCode::BAD_GATEWAY,
             Self::Failover { status, .. } => {
                 StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY)
             }
@@ -141,6 +148,17 @@ impl AttemptOutcome {
         }
     }
 
+    /// Last failed target, when the request ended with an upstream failure.
+    #[must_use]
+    pub fn diagnostic(&self) -> Option<&AttemptDiagnostic> {
+        match self {
+            Self::Succeeded { diagnostic, .. }
+            | Self::Retry { diagnostic, .. }
+            | Self::Failover { diagnostic, .. } => diagnostic.as_ref(),
+            Self::Abort(report) => report.diagnostic.as_ref(),
+        }
+    }
+
     /// Attempts spent, for `x-ar-usage` and `ar_upstream_attempts_total`.
     ///
     /// Every terminal arm reports what the loop actually dispatched, the
@@ -169,6 +187,54 @@ pub struct AbortReport {
     /// dispatched. Names the provider behind a failure row even when the
     /// abort is a refusal, not a relayed upstream answer.
     pub last_provider: Option<ProviderId>,
+    /// Last target that refused the request, when this abort followed dispatch.
+    pub diagnostic: Option<AttemptDiagnostic>,
+}
+
+/// Safe, structured details for one failed upstream attempt.
+///
+/// The stable rule id describes the router's decision without retaining or
+/// exposing provider text, which may echo user content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptDiagnostic {
+    /// Provider attempted.
+    pub provider: ProviderId,
+    /// Provider-local model attempted, not the combo id requested by the client.
+    pub model: Strng,
+    /// One-based attempt number within this request.
+    pub attempt: u16,
+    /// HTTP status from the target, or 502 for a transport failure.
+    pub status: u16,
+    /// Stable classifier rule id; never derived from untrusted body text.
+    pub rule: &'static str,
+}
+
+impl AttemptDiagnostic {
+    fn new(
+        provider: &ProviderId,
+        model: &str,
+        attempt: u16,
+        status: u16,
+        rule: &'static str,
+    ) -> Self {
+        Self {
+            // These identifiers originate in configuration. Keep response and
+            // telemetry metadata bounded even when an operator accidentally
+            // supplies an unusually long provider or model name.
+            provider: ProviderId::new(bounded_identifier(provider.as_str(), 128)),
+            model: Strng::from(bounded_identifier(model, 160)),
+            attempt,
+            status,
+            rule,
+        }
+    }
+}
+
+fn bounded_identifier(value: &str, max_chars: usize) -> &str {
+    value
+        .char_indices()
+        .nth(max_chars)
+        .map_or(value, |(index, _)| &value[..index])
 }
 
 /// One attempt's classification. Internal to the loop.
@@ -182,26 +248,8 @@ enum Step {
     Abort { status: StatusCode },
 }
 
-/// 400 bodies that mean "this request is broken", not "this provider cannot
-/// serve it".
-///
-/// Ported verbatim from `COMBO_400_STOP_ROWS`. The upstream comment is why
-/// the list is this narrow: a blanket `contains("invalid")` rule turns every
-/// model-scoped rejection into a hard stop and a one-line provider-side fix
-/// into a 400 at the edge.
-const STOP_400_ROWS: &[&str] = &[
-    "invalid message format",
-    "malformed",
-    "context",
-    "prompt",
-    "token",
-];
-
-/// 400 bodies that are a *provider capability* limit, which another provider
-/// may well not share. `comboPredicates.ts` advances on these before the stop
-/// rows are consulted, and the ordering is load-bearing: without it
-/// "maximum context length" trips the `context` stop row and a 200k prompt
-/// becomes a hard 400 instead of a failover to a bigger model.
+/// Unambiguous 400 phrases that describe a target capability, not a globally
+/// malformed request. Other providers may accept the same request.
 const ADVANCE_400_ROWS: &[&str] = &[
     "context length",
     "maximum context",
@@ -210,6 +258,21 @@ const ADVANCE_400_ROWS: &[&str] = &[
     "unrecognized request argument",
     "does not support",
 ];
+
+/// Structured upstream codes that identify target capability limits.
+const CAPABILITY_400_CODES: &[&str] = &[
+    "context_length_exceeded",
+    "max_context_length_exceeded",
+    "model_not_supported",
+    "unsupported_parameter",
+    "parameter_not_supported",
+    "unsupported_value",
+];
+
+/// Structured codes reserved for syntax errors that ar-route itself also
+/// validates before dispatch. Generic `invalid_request_error` is deliberately
+/// absent: providers use it for target-specific incompatibilities too.
+const GLOBAL_SHAPE_400_CODES: &[&str] = &["invalid_json", "malformed_json"];
 
 /// 402 is a payment-required status: a spent allowance, never a rate limit.
 /// Upstream reads the same way (`combo/quotaExhaustion.ts`'s status arm), and
@@ -307,12 +370,20 @@ enum Terminal {
 /// * **2xx** → `Success`, unless the attempt was non-streaming and the body
 ///   itself carries an error object (see [`error_status_in_body`]) — a failed
 ///   attempt wearing a 200, which fails over with the body's code.
-/// * **400 matching a stop row** → `Abort`. The body is wrong for every
-///   provider, and replaying it is pure latency.
-/// * **everything else** → `Failover`. 429, 5xx, 401/403, 408/499 and other
-///   4xx are all key- or model-scoped: another provider may accept the request.
-#[must_use]
-fn classify_status(status: u16, body: &str) -> Step {
+/// * **400 with a structured JSON-syntax code** → `Abort`. ArRoute validates
+///   the local OpenAI chat envelope before dispatch too, so this is a last-resort
+///   guard for any future ingress path.
+/// * **other 400s** → `Failover`. An upstream's generic shape refusal is not
+///   proof that every target will reject the request.
+/// * **everything else** → `Failover`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClassifiedStep {
+    step: Step,
+    rule: &'static str,
+}
+
+/// Classifies one response and assigns a stable, non-content-derived rule id.
+fn classify_status_detailed(status: u16, body: &str) -> ClassifiedStep {
     if (200..300).contains(&status) {
         return match error_status_in_body(body) {
             // A 2xx is only ever scanned when something drained its body. The
@@ -320,18 +391,71 @@ fn classify_status(status: u16, body: &str) -> Step {
             // populated scan here always comes from a drained non-streaming
             // attempt, and failing it over cannot split a stream the client
             // is already reading.
-            Some(error_status) => Step::Failover {
-                status: error_status,
+            Some(error_status) => ClassifiedStep {
+                step: Step::Failover {
+                    status: error_status,
+                },
+                rule: "success_body_error",
             },
-            None => Step::Success,
+            None => ClassifiedStep {
+                step: Step::Success,
+                rule: "success",
+            },
         };
     }
-    if status == 400 && is_stop_400(body) {
-        return Step::Abort {
-            status: StatusCode::BAD_REQUEST,
+    if status == 400 {
+        let rule = classify_400(body);
+        return match rule {
+            "global_malformed_json_400" => ClassifiedStep {
+                step: Step::Abort {
+                    status: StatusCode::BAD_REQUEST,
+                },
+                rule,
+            },
+            _ => ClassifiedStep {
+                step: Step::Failover { status },
+                rule,
+            },
         };
     }
-    Step::Failover { status }
+    ClassifiedStep {
+        step: Step::Failover { status },
+        rule: "http_status",
+    }
+}
+
+/// Classifies a bounded 400 body without treating ambiguous prose as a global
+/// client error. The first capability signal wins, even if another phrase is
+/// also present.
+fn classify_400(body: &str) -> &'static str {
+    if json_error_has_code(body, CAPABILITY_400_CODES) {
+        return "provider_capability_400";
+    }
+    let lower = body.to_ascii_lowercase();
+    if ADVANCE_400_ROWS.iter().any(|row| lower.contains(row)) {
+        return "provider_capability_400";
+    }
+    if json_error_has_code(body, GLOBAL_SHAPE_400_CODES) {
+        return "global_malformed_json_400";
+    }
+    "unclassified_400"
+}
+
+/// Reads only error `code` and `type` values from a bounded JSON body.
+fn json_error_has_code(body: &str, accepted: &[&str]) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let root = value.as_object();
+    let error = value.get("error").and_then(serde_json::Value::as_object);
+    [root, error].into_iter().flatten().any(|object| {
+        ["code", "type"].into_iter().any(|key| {
+            object
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| accepted.iter().any(|code| value.eq_ignore_ascii_case(code)))
+        })
+    })
 }
 
 /// Status a 2xx body carries when the body itself is the failure, if it is.
@@ -655,23 +779,14 @@ fn charge_failure(
             // nothing more: after a dozen oversized prompts, a breaker that
             // counted them would be blaming the endpoint for our request.
             // Upstream carves out the same class (`isModelCapacityOverloadError`
-            // in `circuitBreaker.ts`). Only the advance rows reach here — a
-            // stop-row 400 already aborted.
+            // in `circuitBreaker.ts`). All dispatched 400s reach here only
+            // after classifier rules have decided to advance.
             if status != 400 {
                 resilience.record_provider_failure(provider, BreakerClass::default());
             }
             (cooldown, false)
         }
     }
-}
-
-/// Whether a 400 body is a client-shape failure rather than a model refusal.
-fn is_stop_400(body: &str) -> bool {
-    let lower = body.to_ascii_lowercase();
-    if ADVANCE_400_ROWS.iter().any(|row| lower.contains(row)) {
-        return false;
-    }
-    STOP_400_ROWS.iter().any(|row| lower.contains(row))
 }
 
 /// Runs `canonical` against `fallback_chain` until one provider answers.
@@ -720,6 +835,7 @@ pub async fn attempt_loop_with_pins<E: Executor + ?Sized>(
             reason: "empty fallback chain".to_owned(),
             tried: 0,
             last_provider: None,
+            diagnostic: None,
         }));
     }
 
@@ -733,6 +849,9 @@ pub async fn attempt_loop_with_pins<E: Executor + ?Sized>(
     // failures record 502 so the Failover arm never has to invent a status;
     // they carry no body and no window.
     let mut last: Option<(u16, ProviderId, Duration, bool, Bytes, Option<Duration>)> = None;
+    // The target-level failure record is kept separately from `last`: quota
+    // aggregation may report a different provider than the final verdict.
+    let mut last_diagnostic: Option<AttemptDiagnostic> = None;
     // Only *throttled* attempts contribute to the aggregate window. A transport
     // failure gets our own 3s guess, and min()-ing that into the client's
     // deadline would advertise "come back in 3 seconds" when a provider has
@@ -838,7 +957,9 @@ pub async fn attempt_loop_with_pins<E: Executor + ?Sized>(
                 } else {
                     drained
                 };
-                let mut step = classify_status(upstream.status.as_u16(), &scan);
+                let classification = classify_status_detailed(upstream.status.as_u16(), &scan);
+                let mut step = classification.step;
+                let mut rule = classification.rule;
                 // Empty-completion classifier (docs/22, D5). Only fails over when
                 // another target exists: a single-target chain relays its empty
                 // answer as it always did, rather than turning it into a 502.
@@ -851,6 +972,7 @@ pub async fn attempt_loop_with_pins<E: Executor + ?Sized>(
                     empty_failovers += 1;
                     tracing::warn!(provider = %provider, model, "2xx completion is empty; failing over");
                     step = Step::Failover { status: 502 };
+                    rule = "empty_completion";
                 }
                 // The first-byte gate: a streamed attempt is only committed
                 // once its first byte crosses (or the window gives up on it).
@@ -871,6 +993,7 @@ pub async fn attempt_loop_with_pins<E: Executor + ?Sized>(
                                 "2xx stream produced no bytes; failing over"
                             );
                             step = Step::Failover { status: 502 };
+                            rule = "empty_stream";
                         }
                     }
                 }
@@ -904,19 +1027,44 @@ pub async fn attempt_loop_with_pins<E: Executor + ?Sized>(
                             // dozen bytes.
                             model: Strng::from(model),
                             attempts: tried,
+                            diagnostic: last_diagnostic,
                             upstream,
                         });
                     }
                     Step::Abort { status } => {
+                        let diagnostic = AttemptDiagnostic::new(
+                            provider,
+                            model,
+                            tried,
+                            upstream.status.as_u16(),
+                            rule,
+                        );
+                        tracing::warn!(
+                            provider = %provider,
+                            upstream_model = model,
+                            attempt = tried,
+                            status = upstream.status.as_u16(),
+                            classifier_rule = rule,
+                            "upstream refusal classified as terminal"
+                        );
                         crate::strategy::TargetLoads::global().release(&load_key);
                         return Ok(AttemptOutcome::Abort(AbortReport {
                             status,
                             reason: abort_reason(status),
                             tried,
                             last_provider: Some(provider.clone()),
+                            diagnostic: Some(diagnostic),
                         }));
                     }
                     Step::Failover { status } => {
+                        let diagnostic = AttemptDiagnostic::new(
+                            provider,
+                            model,
+                            tried,
+                            upstream.status.as_u16(),
+                            rule,
+                        );
+                        last_diagnostic = Some(diagnostic);
                         let (cooldown, throttled) = charge_failure(
                             resilience,
                             provider,
@@ -930,8 +1078,10 @@ pub async fn attempt_loop_with_pins<E: Executor + ?Sized>(
                         crate::strategy::TargetLoads::global().release(&load_key);
                         tracing::warn!(
                             provider = %provider,
-                            model,
+                            upstream_model = model,
+                            attempt = tried,
                             status,
+                            classifier_rule = rule,
                             cooldown_ms = cooldown.as_millis() as u64,
                             "attempt failed over"
                         );
@@ -959,6 +1109,7 @@ pub async fn attempt_loop_with_pins<E: Executor + ?Sized>(
                     reason: "client disconnected".to_owned(),
                     tried,
                     last_provider: Some(provider.clone()),
+                    diagnostic: None,
                 }));
             }
             Err(ExecError::Transport(msg)) => {
@@ -966,9 +1117,12 @@ pub async fn attempt_loop_with_pins<E: Executor + ?Sized>(
                 // next request does not walk into the same dead socket, and a
                 // breaker tick so enough dead sockets take the provider out.
                 let (cooldown, _) = charge_failure(resilience, provider, model, 502, "", None);
+                let diagnostic =
+                    AttemptDiagnostic::new(provider, model, tried, 502, "transport_error");
+                last_diagnostic = Some(diagnostic);
                 clear_stale_pin(pins, canonical.session.as_deref(), provider);
                 crate::strategy::TargetLoads::global().release(&load_key);
-                tracing::warn!(provider = %provider, model, error = %msg, "transport failure, failing over");
+                tracing::warn!(provider = %provider, upstream_model = model, attempt = tried, classifier_rule = "transport_error", error = %msg, "transport failure, failing over");
                 (502, provider.clone(), cooldown, false, Bytes::new(), None)
             }
         };
@@ -987,6 +1141,7 @@ pub async fn attempt_loop_with_pins<E: Executor + ?Sized>(
         tried,
         earliest_skipped,
         skipped_by,
+        last_diagnostic,
     ))
 }
 
@@ -1035,6 +1190,7 @@ fn terminate(
     tried: u16,
     earliest_skipped: Option<Duration>,
     skipped_by: Option<ProviderId>,
+    diagnostic: Option<AttemptDiagnostic>,
 ) -> AttemptOutcome {
     let Some((status, provider, cooldown, _, error_body, retry_after)) = last else {
         // Nothing was dispatched. When the skips left a recovery window — a
@@ -1049,6 +1205,7 @@ fn terminate(
                 after,
                 provider,
                 tried,
+                diagnostic: None,
             };
         }
         return AttemptOutcome::Abort(AbortReport {
@@ -1056,6 +1213,7 @@ fn terminate(
             reason: "every provider in the chain is cooling down".to_owned(),
             tried,
             last_provider: None,
+            diagnostic: None,
         });
     };
     if let Some(throttled) = throttled_by {
@@ -1067,6 +1225,7 @@ fn terminate(
             after,
             provider: throttled,
             tried,
+            diagnostic,
         };
     }
     AttemptOutcome::Failover {
@@ -1075,6 +1234,7 @@ fn terminate(
         tried,
         error_body,
         retry_after,
+        diagnostic,
     }
 }
 
@@ -1189,8 +1349,8 @@ async fn drain_success_body(upstream: &mut Upstream) -> Bytes {
 
 /// UTF-8 body of a failed upstream, lossily decoded and capped.
 ///
-/// The cap is not a size optimisation: a 400 body is scanned by
-/// [`is_stop_400`], and a megabyte of echoed prompt is both a pointless scan
+/// The cap is not a size optimisation: classifier rules only need bounded
+/// error metadata, and a megabyte of echoed prompt is both a pointless scan
 /// and a way to get user content into a log line.
 fn body_text(upstream: &Upstream) -> String {
     const MAX_BODY_SCAN: usize = 2048;
@@ -1218,8 +1378,9 @@ mod tests {
     use http::StatusCode;
 
     use super::{
-        Fault, MAX_ATTEMPTS, Step, Terminal, attempt_loop, attempt_loop_with_pins, classify_fault,
-        classify_status, error_status_in_body, is_degenerate_text,
+        AttemptDiagnostic, Fault, MAX_ATTEMPTS, Step, Terminal, attempt_loop,
+        attempt_loop_with_pins, classify_400, classify_fault, classify_status_detailed,
+        error_status_in_body, is_degenerate_text,
     };
     use crate::AttemptOutcome;
     use crate::contract::{CanonicalRequest, ExecError, Executor, ProviderId, Strng, Upstream};
@@ -1326,8 +1487,9 @@ mod tests {
     }
 
     const MALFORMED: Verdict = Verdict::Status(400, r#"{"error":"invalid message format"}"#);
+    const GLOBAL_MALFORMED_JSON: Verdict =
+        Verdict::Status(400, r#"{"error":{"code":"invalid_json"}}"#);
     const OVERFLOW: Verdict = Verdict::Status(400, "maximum context length is 8192 tokens");
-    const PROMPT_SHAPE: Verdict = Verdict::Status(400, "prompt is malformed");
     const QUOTA_429: Verdict = Verdict::Status(429, r#"{"error":{"code":"insufficient_quota"}}"#);
     const PLAIN_429: Verdict = Verdict::Status(429, "slow down");
     const PAYMENT_402: Verdict = Verdict::Status(402, "payment required");
@@ -1923,6 +2085,7 @@ mod tests {
             after,
             provider,
             tried,
+            ..
         }) = got
         else {
             panic!("expected retry, got {got:?}");
@@ -1950,6 +2113,7 @@ mod tests {
             after,
             provider,
             tried,
+            ..
         }) = got
         else {
             panic!("expected retry, got {got:?}");
@@ -2018,26 +2182,34 @@ mod tests {
     }
 
     #[test]
-    fn stops_on_malformed_400() {
-        let exec = Scripted::new(vec![MALFORMED]);
+    fn stops_on_structured_invalid_json_400() {
+        let exec = Scripted::new(vec![GLOBAL_MALFORMED_JSON]);
         let r = Resilience::new();
         let got = block(attempt_loop(&req(), &chain(&["p1", "p2"]), &exec, &r));
         let Ok(AttemptOutcome::Abort(report)) = got else {
             panic!("expected abort, got {got:?}");
         };
         assert_eq!((report.status, report.tried), (StatusCode::BAD_REQUEST, 1));
+        assert_eq!(
+            report.diagnostic.as_ref().map(|diagnostic| diagnostic.rule),
+            Some("global_malformed_json_400")
+        );
+        assert_eq!(exec.seen(), ["p1"]);
     }
 
     #[test]
-    fn never_dispatches_second_provider_after_client_fault() {
-        let exec = Scripted::new(vec![PROMPT_SHAPE]);
-        let _ = block(attempt_loop(
+    fn ambiguous_invalid_message_format_400_advances_to_next_target() {
+        let exec = Scripted::new(vec![MALFORMED, Verdict::Ok]);
+        let got = block(attempt_loop(
             &req(),
             &chain(&["p1", "p2"]),
             &exec,
             &Resilience::new(),
         ));
-        assert_eq!(exec.seen(), ["p1"]);
+        assert!(
+            matches!(got, Ok(AttemptOutcome::Succeeded { provider, .. }) if provider.as_str() == "p2")
+        );
+        assert_eq!(exec.seen(), ["p1", "p2"]);
     }
 
     #[test]
@@ -2163,37 +2335,148 @@ mod tests {
 
     #[test]
     fn classifies_2xx_as_success() {
-        assert_eq!(classify_status(200, ""), Step::Success);
+        assert_eq!(classify_status_detailed(200, "").step, Step::Success);
     }
 
     #[test]
     fn classifies_429_as_failover() {
         assert_eq!(
-            classify_status(429, "slow down"),
+            classify_status_detailed(429, "slow down").step,
             Step::Failover { status: 429 }
         );
     }
 
     #[test]
     fn classifies_500_as_failover() {
-        assert_eq!(classify_status(500, "boom"), Step::Failover { status: 500 });
+        assert_eq!(
+            classify_status_detailed(500, "boom").step,
+            Step::Failover { status: 500 }
+        );
     }
 
     #[test]
     fn classifies_auth_refusal_as_failover() {
         assert_eq!(
-            classify_status(401, "bad key"),
+            classify_status_detailed(401, "bad key").step,
             Step::Failover { status: 401 }
         );
     }
 
     #[test]
-    fn classifies_400_prompt_shape_as_abort() {
+    fn classifies_ambiguous_prompt_shape_400_as_unclassified() {
         assert_eq!(
-            classify_status(400, "prompt is malformed"),
-            Step::Abort {
-                status: StatusCode::BAD_REQUEST
-            }
+            classify_status_detailed(400, "prompt is malformed").rule,
+            "unclassified_400"
+        );
+    }
+
+    #[test]
+    fn classifies_generic_request_error_type_as_unclassified() {
+        assert_eq!(
+            classify_400(r#"{"error":{"type":"invalid_request_error"}}"#),
+            "unclassified_400"
+        );
+    }
+
+    #[test]
+    fn classifies_structured_context_code_as_provider_capability() {
+        assert_eq!(
+            classify_400(r#"{"error":{"code":"context_length_exceeded"}}"#),
+            "provider_capability_400"
+        );
+    }
+
+    #[test]
+    fn reads_structured_capability_code_at_the_error_root() {
+        assert_eq!(
+            classify_400(r#"{"code":"unsupported_parameter"}"#),
+            "provider_capability_400"
+        );
+    }
+
+    #[test]
+    fn classifies_structured_global_json_syntax_code_as_terminal() {
+        assert_eq!(
+            classify_400(r#"{"error":{"type":"malformed_json"}}"#),
+            "global_malformed_json_400"
+        );
+    }
+
+    #[test]
+    fn existing_broad_stop_words_are_not_global_classifiers() {
+        let bodies = [
+            "invalid message format",
+            "malformed",
+            "context",
+            "prompt",
+            "token",
+        ];
+        assert!(
+            bodies
+                .iter()
+                .all(|body| classify_400(body) == "unclassified_400")
+        );
+    }
+
+    #[test]
+    fn every_existing_capability_phrase_advances() {
+        let bodies = [
+            "context length exceeded",
+            "maximum context is 8k",
+            "too many tokens",
+            "unsupported parameter: parallel_tool_calls",
+            "unrecognized request argument: top_k",
+            "model does not support this feature",
+        ];
+        assert!(
+            bodies
+                .iter()
+                .all(|body| classify_400(body) == "provider_capability_400")
+        );
+    }
+
+    #[test]
+    fn nvidia_like_capability_400_falls_back_with_attempt_provenance() {
+        let exec = Scripted::new(vec![
+            Verdict::Status(
+                400,
+                r#"{"error":{"code":"unsupported_parameter","message":"unsupported parameter"}}"#,
+            ),
+            Verdict::Ok,
+        ]);
+        let targets = targets(&[
+            ("nvidia", "minimaxai/minimax-m3.1-flash"),
+            ("tokenharbor", "deepseek-v4.1-flash:free"),
+        ]);
+        let got = block(attempt_loop(&req(), &targets, &exec, &Resilience::new()));
+        let Ok(AttemptOutcome::Succeeded {
+            provider,
+            diagnostic: Some(diagnostic),
+            ..
+        }) = got
+        else {
+            panic!("expected fallback success with diagnostic, got {got:?}");
+        };
+        assert_eq!(provider.as_str(), "tokenharbor");
+        assert_eq!(diagnostic.provider.as_str(), "nvidia");
+        assert_eq!(diagnostic.model.as_ref(), "minimaxai/minimax-m3.1-flash");
+        assert_eq!(diagnostic.attempt, 1);
+        assert_eq!(diagnostic.status, 400);
+        assert_eq!(diagnostic.rule, "provider_capability_400");
+    }
+
+    #[test]
+    fn attempt_diagnostic_should_bound_unusually_long_target_names() {
+        let provider = ProviderId::new("p".repeat(200));
+        let model = "m".repeat(240);
+        let diagnostic = AttemptDiagnostic::new(&provider, &model, 1, 400, "unclassified_400");
+
+        assert_eq!(
+            (
+                diagnostic.provider.as_str().chars().count(),
+                diagnostic.model.as_ref().chars().count()
+            ),
+            (128, 160)
         );
     }
 

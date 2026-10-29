@@ -95,7 +95,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
-use ar_config::Secret;
+use ar_config::{OpenAiChatCapabilities, OpenAiChatShape, Secret};
 use ar_registry::{AuthClass, ProviderDef, WireFormat};
 use ar_translate::{CanonicalChat, OutboundWire, render_for_wire};
 use async_stream::stream;
@@ -395,6 +395,7 @@ impl ArExec {
             upstream_model: &chat.model,
             stream: chat.stream,
             headers: &provider.headers,
+            openai_chat_capabilities: None,
         };
         let encoded = serde_json::to_vec(chat)?;
         let start = self.post(&dispatch, &encoded, abort).await?;
@@ -523,6 +524,12 @@ impl ArExec {
         // The OpenAI arm is the historical path, kept whole: same bytes, same
         // `rewrite_model` behaviour, no parse through `CanonicalChat`.
         if wire == OutboundWire::Openai {
+            if let Some(capabilities) = d
+                .openai_chat_capabilities
+                .and_then(|rows| rows.get(d.upstream_model))
+            {
+                return adapt_openai_chat(canonical, d.upstream_model, capabilities);
+            }
             return rewrite_model(canonical, d.upstream_model);
         }
         // Every other wire is rendered from the typed canonical chat, so the
@@ -665,6 +672,11 @@ pub struct Dispatch<'a> {
     /// Extra outbound headers from the provider definition, applied between
     /// `Content-Type` and the auth layer. Empty for every compiled-in entry.
     pub headers: &'a BTreeMap<String, String>,
+    /// Optional model-scoped OpenAI chat capabilities supplied by file config.
+    ///
+    /// Only an exact provider-local model match is used. With no matching row,
+    /// the historical byte-preserving model rewrite remains in force.
+    pub openai_chat_capabilities: Option<&'a BTreeMap<String, OpenAiChatCapabilities>>,
 }
 
 impl<'a> Dispatch<'a> {
@@ -706,8 +718,42 @@ impl<'a> Dispatch<'a> {
             upstream_model: self.upstream_model,
             stream: self.stream,
             headers: self.headers,
+            openai_chat_capabilities: self.openai_chat_capabilities,
         }
     }
+}
+
+/// Applies only an explicitly configured, allowlisted optional-parameter
+/// omission before the ordinary provider model rewrite.
+fn adapt_openai_chat(
+    canonical: &[u8],
+    upstream_model: &str,
+    capabilities: &OpenAiChatCapabilities,
+) -> Result<Bytes, ExecError> {
+    let mut value: serde_json::Value = serde_json::from_slice(canonical)?;
+    let Some(object) = value.as_object_mut() else {
+        return Err(ExecError::NotAnObject);
+    };
+    if capabilities.shape == OpenAiChatShape::ChatCompletions
+        && !object
+            .get("messages")
+            .is_some_and(serde_json::Value::is_array)
+    {
+        return Err(ExecError::UnsupportedContent(
+            WireFormat::Openai,
+            "a messages array for chat-completions",
+        ));
+    }
+    if !upstream_model.is_empty() {
+        object.insert(
+            "model".to_owned(),
+            serde_json::Value::String(upstream_model.to_owned()),
+        );
+    }
+    for parameter in &capabilities.omit_optional_parameters {
+        object.remove(parameter.as_wire());
+    }
+    Ok(Bytes::from(serde_json::to_vec(&value)?))
 }
 
 /// Replaces the top-level `"model"` with the provider's spelling.
@@ -1403,6 +1449,43 @@ mod tests {
     }
 
     #[test]
+    fn adapts_only_declared_optional_parameters_for_the_exact_target_model() {
+        let exec = ArExec::new().expect("client");
+        let raw = br#"{"model":"large-stack","messages":[{"role":"user","content":"hi"}],"temperature":0.2,"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],"vendor_extension":{"keep":true}}"#;
+        let mut rows = BTreeMap::new();
+        rows.insert(
+            "minimax-model".to_owned(),
+            ar_config::OpenAiChatCapabilities {
+                omit_optional_parameters: [ar_config::OpenAiOptionalParameter::Temperature]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+        );
+        let mut first = dispatch_shape(WireFormat::Openai, "minimax-model");
+        first.openai_chat_capabilities = Some(&rows);
+        let adapted = exec
+            .render_request(&first, raw)
+            .expect("target adapter renders");
+        let adapted: serde_json::Value = serde_json::from_slice(&adapted).expect("json");
+        assert_eq!(adapted["model"], "minimax-model");
+        assert!(adapted.get("temperature").is_none());
+        assert_eq!(adapted["tools"][0]["function"]["name"], "lookup");
+        assert_eq!(adapted["vendor_extension"]["keep"], true);
+        assert_eq!(adapted["messages"][0]["content"], "hi");
+
+        let mut fallback = dispatch_shape(WireFormat::Openai, "deepseek-model");
+        fallback.openai_chat_capabilities = Some(&rows);
+        let passed = exec
+            .render_request(&fallback, raw)
+            .expect("unmatched target keeps passthrough");
+        let passed: serde_json::Value = serde_json::from_slice(&passed).expect("json");
+        assert_eq!(passed["temperature"], 0.2);
+        assert_eq!(passed["tools"][0]["function"]["name"], "lookup");
+        assert_eq!(passed["vendor_extension"]["keep"], true);
+    }
+
+    #[test]
     fn passes_body_through_when_no_model_configured() {
         let raw = br#"{"model":"x"}"#;
         assert_eq!(
@@ -1440,6 +1523,7 @@ mod tests {
             upstream_model: model,
             stream: true,
             headers: &NO_HEADERS,
+            openai_chat_capabilities: None,
         }
     }
 

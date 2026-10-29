@@ -26,10 +26,11 @@
 //! fixture.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use ar_compress::{Engine, Intensity, Step};
+use ar_config::{OpenAiChatCapabilities, OpenAiOptionalParameter};
 use ar_route::{ProviderId, Strategy};
 use ar_server::{
     ComboTarget, Components, HttpExec, ProviderConfig, RouteCombo, ServerConfig, bind_addr, server,
@@ -47,6 +48,7 @@ use tower::ServiceExt;
 #[derive(Debug, Default)]
 struct Seen {
     calls: AtomicUsize,
+    bodies: Mutex<Vec<serde_json::Value>>,
 }
 
 /// A mock upstream that echoes what it received and records how often it was
@@ -77,6 +79,11 @@ async fn counting_upstream_with(status: StatusCode, retry_after: &str) -> (Strin
                     .unwrap_or_default();
                 let got: serde_json::Value =
                     serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+                counter
+                    .bodies
+                    .lock()
+                    .expect("body recorder lock")
+                    .push(got.clone());
                 let echo = serde_json::json!({
                     "model": got["model"],
                     "auth": headers
@@ -99,7 +106,13 @@ async fn counting_upstream_with(status: StatusCode, retry_after: &str) -> (Strin
                         Ok(Bytes::from_static(b"data: [DONE]\n\n")),
                     ]))
                 } else {
-                    Body::from(r#"{"error":{"message":"refused"}}"#)
+                    if status == StatusCode::BAD_REQUEST {
+                        Body::from(
+                            r#"{"error":{"code":"unsupported_parameter","message":"unsupported parameter"}}"#,
+                        )
+                    } else {
+                        Body::from(r#"{"error":{"message":"refused"}}"#)
+                    }
                 };
                 builder
                     .header(header::CONTENT_TYPE, "text/event-stream")
@@ -160,6 +173,10 @@ fn header_of(map: &HeaderMap, name: &str) -> String {
 
 fn calls(seen: &Seen) -> usize {
     seen.calls.load(Ordering::Relaxed)
+}
+
+fn request_bodies(seen: &Seen) -> Vec<serde_json::Value> {
+    seen.bodies.lock().expect("body recorder lock").clone()
 }
 
 /// Builds the router with a memory cache and no bearer gate.
@@ -255,6 +272,108 @@ async fn fails_over_to_the_second_provider_when_the_first_refuses() {
         header_of(&headers, "x-ar-usage").contains("attempts=2"),
         "attempt accounting is wrong: {}",
         header_of(&headers, "x-ar-usage")
+    );
+}
+
+#[tokio::test]
+async fn adapts_one_model_then_fails_over_with_safe_attempt_provenance() {
+    let (first_url, first_seen) = counting_upstream(StatusCode::BAD_REQUEST).await;
+    let (fallback_url, fallback_seen) = counting_upstream(StatusCode::OK).await;
+    let mut capabilities = std::collections::BTreeMap::new();
+    capabilities.insert(
+        "minimaxai/minimax-m3.1-flash".to_owned(),
+        OpenAiChatCapabilities {
+            omit_optional_parameters: [OpenAiOptionalParameter::Temperature].into_iter().collect(),
+            ..Default::default()
+        },
+    );
+    let mut config = ServerConfig::single(
+        20128,
+        Strategy::Priority,
+        vec![
+            ProviderConfig::new(ProviderId::new("nvidia"), &first_url, "sk-nvidia")
+                .with_model("minimaxai/minimax-m3.1-flash")
+                .with_openai_chat_capabilities(capabilities),
+            ProviderConfig::new(
+                ProviderId::new("tokenharbor"),
+                &fallback_url,
+                "sk-tokenharbor",
+            )
+            .with_model("deepseek-v4.1-flash:free"),
+        ],
+    );
+    config.combos = vec![RouteCombo::new(
+        "large-stack",
+        Strategy::Priority,
+        vec![
+            ComboTarget::new(ProviderId::new("nvidia"), "minimaxai/minimax-m3.1-flash"),
+            ComboTarget::new(ProviderId::new("tokenharbor"), "deepseek-v4.1-flash:free"),
+        ],
+    )];
+    let router = boot(config);
+    let request = r#"{"model":"large-stack","stream":true,"temperature":0.2,"vendor_extension":{"retained":true},"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],"messages":[{"role":"developer","content":"Use Rust"},{"role":"user","content":"hi"}]}"#;
+    let (status, headers, text) = call(&router, post("/v1/chat/completions", request, &[])).await;
+
+    assert_eq!(status, StatusCode::OK, "fallback did not recover: {text}");
+    assert_eq!(calls(&first_seen), 1, "the first target was not tried once");
+    assert_eq!(
+        calls(&fallback_seen),
+        1,
+        "the compatible fallback was not tried once"
+    );
+    let decision = header_of(&headers, "x-ar-decision");
+    assert!(decision.contains("provider=tokenharbor"), "{decision}");
+    assert!(
+        decision.contains("model=deepseek-v4.1-flash:free"),
+        "{decision}"
+    );
+    let diagnostic: serde_json::Value =
+        serde_json::from_str(&header_of(&headers, "x-ar-attempt-diagnostic"))
+            .expect("safe attempt header is JSON");
+    assert_eq!(diagnostic["provider"], "nvidia");
+    assert_eq!(
+        diagnostic["attempted_model"],
+        "minimaxai/minimax-m3.1-flash"
+    );
+    assert_eq!(diagnostic["attempt"], 1);
+    assert_eq!(diagnostic["status"], 400);
+    assert_eq!(diagnostic["classifier_rule"], "provider_capability_400");
+    assert!(!text.contains("unsupported parameter"));
+
+    let first_body = request_bodies(&first_seen).remove(0);
+    assert_eq!(first_body["model"], "minimaxai/minimax-m3.1-flash");
+    assert!(first_body.get("temperature").is_none());
+    assert_eq!(first_body["tools"][0]["function"]["name"], "lookup");
+    assert_eq!(first_body["messages"][0]["role"], "developer");
+    assert_eq!(first_body["vendor_extension"]["retained"], true);
+
+    let fallback_body = request_bodies(&fallback_seen).remove(0);
+    assert_eq!(fallback_body["model"], "deepseek-v4.1-flash:free");
+    assert_eq!(fallback_body["temperature"], 0.2);
+    assert_eq!(fallback_body["tools"][0]["function"]["name"], "lookup");
+    assert_eq!(fallback_body["messages"][0]["role"], "developer");
+    assert_eq!(fallback_body["vendor_extension"]["retained"], true);
+}
+
+#[tokio::test]
+async fn refuses_a_malformed_chat_envelope_before_dispatch() {
+    let (upstream, seen) = counting_upstream(StatusCode::OK).await;
+    let router = boot(two_providers(&upstream, &upstream));
+    let (status, _, body) = call(
+        &router,
+        post(
+            "/v1/chat/completions",
+            r#"{"model":"m","stream":true,"messages":{}}"#,
+            &[],
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        calls(&seen),
+        0,
+        "malformed chat shape spent an upstream attempt"
     );
 }
 

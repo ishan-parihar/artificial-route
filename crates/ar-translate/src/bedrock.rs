@@ -25,14 +25,15 @@ use crate::canonical::{CanonicalChat, MediaPart, Role, ToolCall, ToolChoice};
 ///
 /// Turns of the same role are merged into one message, because Converse expects
 /// the user and assistant turns to alternate and a tool result is a user turn.
-/// A system turn leaves the message array for the top-level `system` block.
+/// A system or developer turn leaves the message array for the top-level
+/// `system` block, the only instruction channel Bedrock Converse exposes.
 #[must_use]
 pub fn render_bedrock_body(chat: &CanonicalChat) -> Vec<u8> {
     let mut system: Vec<Value> = Vec::new();
     let mut messages: Vec<(&'static str, Vec<Value>)> = Vec::with_capacity(chat.messages.len());
 
     for msg in &chat.messages {
-        if msg.role == Role::System {
+        if matches!(msg.role, Role::System | Role::Developer) {
             if !msg.content.is_empty() {
                 system.push(json!({ "text": msg.content }));
             }
@@ -431,6 +432,16 @@ mod tests {
 
         assert_eq!(body["system"][0]["text"], "be terse", "{body}");
         assert_eq!(body["messages"].as_array().map(Vec::len), Some(1), "{body}");
+    }
+
+    #[test]
+    fn render_should_move_developer_text_into_bedrocks_instruction_channel() {
+        let body = rendered(&chat(vec![
+            Msg::new(Role::Developer, "always use Rust"),
+            Msg::new(Role::User, "hi"),
+        ]));
+
+        assert_eq!(body["system"][0]["text"], "always use Rust", "{body}");
     }
 
     #[test]

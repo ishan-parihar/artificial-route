@@ -44,6 +44,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use ar_config::OpenAiChatCapabilities;
 use ar_registry::WireFormat;
 use ar_route::{
     ArExec as ArRouteExec, CanonicalRequest, ExecError, MediaReply, ProviderId, Upstream,
@@ -264,6 +265,11 @@ pub struct ProviderConfig {
     /// Whether this provider may take over a cut streamed reply. See `config.yaml`'s
     /// `continue_on_cut`; off unless the operator names the provider.
     pub continue_on_cut: bool,
+    /// OpenAI chat request capability declarations keyed by provider-local model.
+    ///
+    /// Populated from `provider_settings.<id>.request_capabilities`; empty means
+    /// the existing passthrough renderer applies.
+    pub openai_chat_capabilities: BTreeMap<String, OpenAiChatCapabilities>,
 }
 
 impl ProviderConfig {
@@ -297,7 +303,18 @@ impl ProviderConfig {
             needs_oauth_executor: false,
             anonymous: false,
             continue_on_cut: false,
+            openai_chat_capabilities: BTreeMap::new(),
         }
+    }
+
+    /// Sets model-scoped OpenAI chat request capabilities.
+    #[must_use]
+    pub fn with_openai_chat_capabilities(
+        mut self,
+        capabilities: BTreeMap<String, OpenAiChatCapabilities>,
+    ) -> Self {
+        self.openai_chat_capabilities = capabilities;
+        self
     }
 
     /// Marks this provider as a valid continuation target for a cut stream.
@@ -489,6 +506,7 @@ impl ProviderConfig {
             upstream_model,
             stream,
             headers: &self.headers,
+            openai_chat_capabilities: Some(&self.openai_chat_capabilities),
         }
     }
 

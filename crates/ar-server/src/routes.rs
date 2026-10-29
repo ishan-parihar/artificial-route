@@ -57,10 +57,10 @@ use std::time::{Duration, Instant};
 use ar_cache::{Cache, CacheKey, CacheState};
 use ar_compress::Step;
 use ar_route::{
-    ArExec, AttemptOutcome, AutoCandidate, AutoSelector, Candidate, CanonicalRequest, ChainTarget,
-    ChunkStream, CutFlag, JudgeOutcome, JudgePanel, JudgeTarget, ProviderId, Resilience,
-    RouteError, Strategy, Strng, pick_for_model, settle_stream, simulate_route, synthesize,
-    virtual_combo,
+    ArExec, AttemptDiagnostic, AttemptOutcome, AutoCandidate, AutoSelector, Candidate,
+    CanonicalRequest, ChainTarget, ChunkStream, CutFlag, JudgeOutcome, JudgePanel, JudgeTarget,
+    ProviderId, Resilience, RouteError, Strategy, Strng, pick_for_model, settle_stream,
+    simulate_route, synthesize, virtual_combo,
 };
 use ar_tokens::ResponseMeta;
 use axum::body::Body;
@@ -86,6 +86,8 @@ use crate::translate::to_canonical_for_route;
 pub const SESSION_HEADER: &str = "x-ar-session";
 /// Routing verdict, for the client and for support.
 pub const DECISION_HEADER: &str = "x-ar-decision";
+/// Structured last-failure provenance, distinct from `model=` (which names a serving model).
+pub const ATTEMPT_DIAGNOSTIC_HEADER: &str = "x-ar-attempt-diagnostic";
 /// The cap arm that denied a request: `usd_cap`, `token_cap`, `unpriced`,
 /// `unauditable`. The arm, never the amounts — the operator knows their own
 /// numbers, and a header log does not need them.
@@ -527,30 +529,59 @@ pub(crate) fn note_failure(
     };
     // Read only here, on a failure: a successful request never pays for the parse.
     let model = model();
-    // The provider the chain last tried, from the decision header every routed
-    // reply carries. `-` when no provider was tried (a refusal before dispatch).
-    let provider = resp
-        .headers()
-        .get(DECISION_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|d| d.split(';').find_map(|kv| kv.strip_prefix("provider=")))
-        .filter(|p| !p.is_empty())
-        .unwrap_or("-");
     let why = resp.extensions().get::<FailNote>().map_or_else(
         || status.canonical_reason().unwrap_or("error"),
         |note| note.0.as_str(),
     );
+    #[derive(serde::Deserialize)]
+    struct DiagnosticHeader {
+        provider: String,
+        attempted_model: String,
+        attempt: u16,
+        status: u16,
+        classifier_rule: String,
+    }
+    let header_diagnostic = resp
+        .headers()
+        .get(ATTEMPT_DIAGNOSTIC_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| serde_json::from_str::<DiagnosticHeader>(value).ok());
+    // The decision provider can be the rate-limited target that set an
+    // aggregate retry window. When a diagnostic exists, the ledger's provider
+    // column names the actual final dispatch instead.
+    let provider = header_diagnostic
+        .as_ref()
+        .map(|row| row.provider.as_str())
+        .filter(|provider| !provider.is_empty())
+        .or_else(|| {
+            resp.headers()
+                .get(DECISION_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|d| d.split(';').find_map(|kv| kv.strip_prefix("provider=")))
+                .filter(|p| !p.is_empty())
+        })
+        .unwrap_or("-");
+    let diagnostic = match header_diagnostic.as_ref() {
+        Some(row) => ar_tokens::FailureDiagnostic {
+            attempted_model: &row.attempted_model,
+            attempt: row.attempt,
+            attempt_status: row.status,
+            classifier_rule: &row.classifier_rule,
+        },
+        None => ar_tokens::FailureDiagnostic::default(),
+    };
     if let Err(e) = ledger
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .record_failure(
-            key_id.unwrap_or("anonymous"),
+        .record_failure_with_diagnostic(ar_tokens::FailureRecord {
+            key_id: key_id.unwrap_or("anonymous"),
             provider,
-            &model,
-            status.as_u16(),
-            why,
-            epoch_now(),
-        )
+            model: &model,
+            status: status.as_u16(),
+            error: why,
+            created_at: epoch_now(),
+            diagnostic,
+        })
     {
         // A log write must not turn a failed request into a different failure.
         tracing::warn!(error = %e, "failure log write failed");
@@ -1715,6 +1746,7 @@ async fn pipeline_response(
             .last()
             .map_or_else(|| ar_route::Strng::from("-"), |t| t.model.clone()),
         attempts: u16::try_from(outcome.trace.len()).unwrap_or(u16::MAX),
+        diagnostic: None,
         upstream,
     };
     let meta = ResponseMeta::default().with_latency(dispatched.elapsed());
@@ -1858,6 +1890,7 @@ async fn fusion_response(
         // name. Stamping the combo keeps the header honest.
         model: Strng::from(canonical.model.as_ref()),
         attempts,
+        diagnostic: None,
         upstream,
     };
     let meta = ResponseMeta::default()
@@ -3221,6 +3254,15 @@ fn decorate(
         builder = builder.header(PROVIDER_HEADER, provider.as_str());
     }
 
+    // This names the last attempted target only. `x-ar-decision`'s model
+    // continues to mean the model that served; on failover the two differ.
+    if let Some(diagnostic) = outcome.diagnostic() {
+        builder = builder.header(
+            ATTEMPT_DIAGNOSTIC_HEADER,
+            attempt_diagnostic_json(diagnostic),
+        );
+    }
+
     // Conditional, not a zero: an elapsed time too short to divide by would make
     // every downstream division nonsense, and an absent header reads as unknown.
     if let Some(tps) = meta.tokens_per_second() {
@@ -3332,7 +3374,15 @@ fn decorate(
             retry_after,
             ..
         } => {
-            let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+            let upstream_status = status;
+            // A target-scoped 400 is not a client error once every target has
+            // had a chance to accept it. Preserve its status in diagnostics and
+            // report an upstream failure at the router boundary.
+            let status = if status == StatusCode::BAD_REQUEST.as_u16() {
+                StatusCode::BAD_GATEWAY
+            } else {
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY)
+            };
             // The last provider's own identifier, when it is one this build
             // passes through. The reference projects upstream codes through
             // an allowlist (`open-sse/utils/error.ts:43-352`, ~310 entries)
@@ -3341,8 +3391,16 @@ fn decorate(
             // behaviour with the six identifiers a client of this build can
             // actually branch on. Grow the list when a real client needs a new
             // one; never by echoing whatever a provider sent.
-            let code = upstream_code(&error_body).unwrap_or("upstream_unavailable");
-            let message = format!("all providers failed; last was {provider}");
+            let code = if upstream_status == StatusCode::BAD_REQUEST.as_u16() {
+                "upstream_request_rejected"
+            } else {
+                upstream_code(&error_body).unwrap_or("upstream_unavailable")
+            };
+            let message = if upstream_status == StatusCode::BAD_REQUEST.as_u16() {
+                format!("all providers rejected the request; last was {provider}")
+            } else {
+                format!("all providers failed; last was {provider}")
+            };
             if let Some(retry_after) = retry_after {
                 // A window the provider stated is information the client can
                 // use; keeping it costs the same header the retry arm already
@@ -3682,6 +3740,18 @@ fn outcome_label(outcome: &AttemptOutcome) -> &'static str {
         AttemptOutcome::Failover { .. } => "failover",
         AttemptOutcome::Abort(_) => "abort",
     }
+}
+
+/// Serializes only bounded attempt provenance into a response header.
+fn attempt_diagnostic_json(diagnostic: &AttemptDiagnostic) -> String {
+    serde_json::json!({
+        "attempt": diagnostic.attempt,
+        "provider": diagnostic.provider.as_str(),
+        "attempted_model": diagnostic.model.as_ref(),
+        "status": diagnostic.status,
+        "classifier_rule": diagnostic.rule,
+    })
+    .to_string()
 }
 
 /// OpenAI-shaped error envelope.
@@ -4239,23 +4309,24 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use super::DECISION_HEADER;
+    use super::{ATTEMPT_DIAGNOSTIC_HEADER, DECISION_HEADER};
     use super::{
         CACHE_HEADER, COMPRESSION_ECHO, CacheControl, CutRecord, DENY_HEADER, Dialect,
-        FALLBACK_ATTEMPTS_HEADER, FailureSink, Keepalive, LATENCY_MS_HEADER, MODEL_HEADER,
-        PROVIDER_HEADER, RESPONSE_COST_HEADER, SAVINGS_TOKENS_HEADER, Stages, TOKENS_IN_HEADER,
-        TOKENS_OUT_HEADER, TOKENS_PER_SECOND_HEADER, USAGE_FRAME_CAP, UsageTee, VERSION_HEADER,
-        accept_forces_stream, build_chain, card_json, completion_seen, declares_stream, decorate,
-        epoch_now, error, error_because, kind_for, model, models_head, not_found, outcome_label,
-        require_json, resolve, unknown_model, usage_from_frames,
+        FALLBACK_ATTEMPTS_HEADER, FailNote, FailureSink, Keepalive, LATENCY_MS_HEADER,
+        MODEL_HEADER, PROVIDER_HEADER, RESPONSE_COST_HEADER, SAVINGS_TOKENS_HEADER, Stages,
+        TOKENS_IN_HEADER, TOKENS_OUT_HEADER, TOKENS_PER_SECOND_HEADER, USAGE_FRAME_CAP, UsageTee,
+        VERSION_HEADER, accept_forces_stream, build_chain, card_json, completion_seen,
+        declares_stream, decorate, epoch_now, error, error_because, kind_for, model, models_head,
+        not_found, note_failure, outcome_label, require_json, resolve, unknown_model,
+        usage_from_frames,
     };
     use super::{Continuation, SentText, resume_body, resumed};
     use crate::app::{AppState, Components};
     use crate::config::{ComboTarget, ServerConfig};
     use crate::models::ModelCard;
     use ar_route::{
-        AbortReport, ArExec, AttemptOutcome, CanonicalRequest, ExecError, MediaReply, ProviderId,
-        Strategy, Strng, Upstream,
+        AbortReport, ArExec, AttemptDiagnostic, AttemptOutcome, CanonicalRequest, ExecError,
+        MediaReply, ProviderId, Strategy, Strng, Upstream,
     };
     use ar_route::{ChunkStream, CutFlag};
     use axum::extract::{Path, State};
@@ -4798,6 +4869,7 @@ mod tests {
                 provider: ProviderId::new("p"),
                 model: Strng::from("m"),
                 attempts: 1,
+                diagnostic: None,
                 upstream: Upstream::success(Box::pin(futures::stream::empty())),
             }),
             "ok"
@@ -4811,6 +4883,7 @@ mod tests {
             reason: "bad".to_owned(),
             tried: 1,
             last_provider: None,
+            diagnostic: None,
         };
         assert_eq!(outcome_label(&AttemptOutcome::Abort(report)), "abort");
     }
@@ -4822,6 +4895,7 @@ mod tests {
             provider: ProviderId::new("openai"),
             model: Strng::from("gpt-5.4"),
             attempts,
+            diagnostic: None,
             upstream: Upstream::success(Box::pin(futures::stream::empty())),
         }
     }
@@ -4923,6 +4997,100 @@ mod tests {
     }
 
     #[test]
+    fn distinguishes_a_serving_fallback_from_the_rejected_attempt() {
+        let mut outcome = succeeded(2);
+        if let AttemptOutcome::Succeeded { diagnostic, .. } = &mut outcome {
+            *diagnostic = Some(AttemptDiagnostic {
+                provider: ProviderId::new("nvidia"),
+                model: Strng::from("minimaxai/minimax-m3.1-flash"),
+                attempt: 1,
+                status: 400,
+                rule: "unclassified_400",
+            });
+        }
+        let resp = decorate(
+            outcome,
+            Arc::new(ar_route::Resilience::new()),
+            false,
+            Dialect::OpenAi,
+            Strategy::Priority,
+            Stages {
+                failures: FailureSink::none(),
+                continuation: None,
+                compression: "default;engines=-".to_owned(),
+                cache_state: ar_cache::CacheState::Miss,
+                cache_key: None,
+                planned_target: None,
+                cache: None,
+                model: Strng::from("large-stack"),
+                cache_control: CacheControl::default(),
+                meta: ar_tokens::ResponseMeta::default(),
+            },
+        );
+        assert!(header_of(resp.headers(), DECISION_HEADER).contains("model=gpt-5.4"));
+        let diagnostic: serde_json::Value =
+            serde_json::from_str(&header_of(resp.headers(), ATTEMPT_DIAGNOSTIC_HEADER))
+                .expect("diagnostic is JSON");
+        assert_eq!(diagnostic["provider"], "nvidia");
+        assert_eq!(
+            diagnostic["attempted_model"],
+            "minimaxai/minimax-m3.1-flash"
+        );
+        assert_eq!(diagnostic["status"], 400);
+        assert_eq!(diagnostic["classifier_rule"], "unclassified_400");
+        assert_eq!(diagnostic.as_object().map(serde_json::Map::len), Some(5));
+    }
+
+    #[tokio::test]
+    async fn exhausted_ambiguous_400_returns_sanitized_502_with_attempt_details() {
+        let upstream_text = "secret prompt echoed by provider";
+        let resp = decorate(
+            AttemptOutcome::Failover {
+                status: 400,
+                provider: ProviderId::new("nvidia"),
+                tried: 1,
+                error_body: Bytes::from(upstream_text),
+                retry_after: None,
+                diagnostic: Some(AttemptDiagnostic {
+                    provider: ProviderId::new("nvidia"),
+                    model: Strng::from("minimaxai/minimax-m3.1-flash"),
+                    attempt: 1,
+                    status: 400,
+                    rule: "unclassified_400",
+                }),
+            },
+            Arc::new(ar_route::Resilience::new()),
+            false,
+            Dialect::OpenAi,
+            Strategy::Priority,
+            Stages {
+                failures: FailureSink::none(),
+                continuation: None,
+                compression: "default;engines=-".to_owned(),
+                cache_state: ar_cache::CacheState::Miss,
+                cache_key: None,
+                planned_target: None,
+                cache: None,
+                model: Strng::from("large-stack"),
+                cache_control: CacheControl::default(),
+                meta: ar_tokens::ResponseMeta::default(),
+            },
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let diagnostic: serde_json::Value =
+            serde_json::from_str(&header_of(resp.headers(), ATTEMPT_DIAGNOSTIC_HEADER))
+                .expect("diagnostic is JSON");
+        assert_eq!(
+            diagnostic["attempted_model"],
+            "minimaxai/minimax-m3.1-flash"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        assert!(!String::from_utf8_lossy(&body).contains(upstream_text));
+    }
+
+    #[test]
     fn omits_a_model_from_the_decision_when_nothing_served() {
         // A retry exhausted its chain: no target answered, so naming one would
         // be a guess. `-` is the honest placeholder the provider field uses.
@@ -4931,6 +5099,7 @@ mod tests {
                 after: Duration::from_secs(3),
                 provider: ProviderId::new("nvidia"),
                 tried: 3,
+                diagnostic: None,
             },
             Arc::new(ar_route::Resilience::new()),
             false,
@@ -4986,6 +5155,62 @@ mod tests {
         // nonsense rather than nothing.
         let headers = headers_for(ar_tokens::ResponseMeta::default(), 1);
         assert!(!headers.contains_key(TOKENS_PER_SECOND_HEADER));
+    }
+
+    #[test]
+    fn records_attempt_provenance_from_the_response_header_without_provider_text() {
+        let ledger = Arc::new(Mutex::new(
+            ar_tokens::Ledger::open_in_memory().expect("ledger opens"),
+        ));
+        let state = Components {
+            ledger: Some(Arc::clone(&ledger)),
+            ..Components::unconfigured(one_provider_config())
+        }
+        .into_state();
+        let diagnostic = serde_json::json!({
+            "attempt": 1,
+            "provider": "nvidia",
+            "attempted_model": "minimaxai/minimax-m3.1-flash",
+            "status": 400,
+            "classifier_rule": "unclassified_400"
+        })
+        .to_string();
+        let response = Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .header(
+                DECISION_HEADER,
+                "strategy=priority;outcome=retry;provider=quota-source;model=-",
+            )
+            .header(ATTEMPT_DIAGNOSTIC_HEADER, diagnostic)
+            .extension(FailNote("upstream request rejected".to_owned()))
+            .body(axum::body::Body::empty())
+            .expect("response builds");
+
+        note_failure(&state, &response, Some("key-id"), || {
+            "large-stack".to_owned()
+        });
+
+        let filter = ar_tokens::LogFilter {
+            days: 365,
+            model: None,
+            provider: None,
+            errors_only: true,
+            limit: 10,
+            offset: 0,
+        };
+        let rows = ledger
+            .lock()
+            .expect("ledger lock")
+            .log(&filter)
+            .expect("failure row");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider, "nvidia");
+        assert_eq!(rows[0].model, "large-stack");
+        assert_eq!(rows[0].attempted_model, "minimaxai/minimax-m3.1-flash");
+        assert_eq!(rows[0].attempt, 1);
+        assert_eq!(rows[0].attempt_status, 400);
+        assert_eq!(rows[0].classifier_rule, "unclassified_400");
+        assert_eq!(rows[0].error, "upstream request rejected");
     }
 
     #[test]

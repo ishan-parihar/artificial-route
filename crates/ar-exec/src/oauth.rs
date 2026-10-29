@@ -3811,6 +3811,7 @@ mod tests {
             upstream_model: "m",
             stream: false,
             headers: &BTreeMap::new(),
+            openai_chat_capabilities: None,
         };
         let stream = conn
             .dispatch(
@@ -3862,6 +3863,7 @@ mod tests {
             upstream_model: "m",
             stream: false,
             headers: &BTreeMap::new(),
+            openai_chat_capabilities: None,
         };
         let err = conn
             .dispatch(
@@ -3919,6 +3921,7 @@ mod tests {
             upstream_model: "m",
             stream: false,
             headers: &BTreeMap::new(),
+            openai_chat_capabilities: None,
         };
         let err = conn
             .dispatch(
@@ -5907,6 +5910,7 @@ mod tests {
             upstream_model: "grok-4.6",
             stream: false,
             headers: &no_headers,
+            openai_chat_capabilities: None,
         };
         let canonical = br#"{"model":"auto","messages":[{"role":"user","content":"hi"}]}"#;
         super::post_as(

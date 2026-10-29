@@ -93,6 +93,7 @@ mod tests {
             upstream_model: "claude-haiku-4-5",
             stream: false,
             headers: &headers,
+            openai_chat_capabilities: None,
         };
         let canonical = br#"{"model":"m","messages":[{"role":"user","content":"look","media":[{"kind":"image_url","body":{"image_url":{"url":"data:image/png;base64,QUJD"}}}]}]}"#;
 

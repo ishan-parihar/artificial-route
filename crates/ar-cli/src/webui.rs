@@ -917,6 +917,8 @@ async fn request_log(State(ctx): State<Arc<Ctx>>, Query(q): Query<LogQuery>) -> 
                 "at": r.created_at, "key": r.key_id, "provider": r.provider, "model": r.model,
                 "tokens": r.tokens, "usd": r.cost_usd.micros as f64 / 1_000_000.0,
                 "priced": r.priced, "status": r.status, "error": r.error,
+                "attempted_model": r.attempted_model, "attempt": r.attempt,
+                "attempt_status": r.attempt_status, "classifier_rule": r.classifier_rule,
             })).collect::<Vec<_>>(),
         }))
         .into_response(),
