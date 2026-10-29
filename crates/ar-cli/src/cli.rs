@@ -268,7 +268,7 @@ pub enum Command {
 
     /// Fetch the latest stable release and atomically replace this executable.
     ///
-    /// Verifies GitHub's SHA-256 asset digest and the downloaded binary's
+    /// Verifies the release's SHA256SUMS entry and the downloaded binary's
     /// version before replacing the current file. A running service keeps its
     /// old process image; restart it separately after a successful upgrade.
     ///

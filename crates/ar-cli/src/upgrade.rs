@@ -9,30 +9,15 @@ use std::time::Duration;
 
 use anyhow::{Context, ensure};
 use reqwest::Url;
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 const REPOSITORY: &str = "ishan-parihar/artificial-route";
 const LATEST_RELEASE_URL: &str =
-    "https://api.github.com/repos/ishan-parihar/artificial-route/releases/latest";
+    "https://github.com/ishan-parihar/artificial-route/releases/latest";
+const CHECKSUMS_ASSET: &str = "SHA256SUMS";
+const MAX_CHECKSUMS_BYTES: usize = 16 * 1024;
 const MAX_ASSET_BYTES: u64 = 128 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
-
-#[derive(Debug, Deserialize)]
-struct Release {
-    tag_name: String,
-    draft: bool,
-    prerelease: bool,
-    assets: Vec<ReleaseAsset>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ReleaseAsset {
-    name: String,
-    browser_download_url: String,
-    size: u64,
-    digest: String,
-}
 
 /// Fetches the latest stable release and replaces the currently running file.
 ///
@@ -47,33 +32,30 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .user_agent(format!("aroute/{current_version}"))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if is_github_download_url(attempt.url()) {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
         .build()
         .context("could not initialize the HTTPS client")?;
-    let release_response = client
+    let latest_response = client
         .get(LATEST_RELEASE_URL)
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
         .send()
         .await
         .context("could not fetch the latest GitHub release")?;
-    validate_api_url(release_response.url())?;
-    let release = release_response
+    let latest_url = latest_response.url().clone();
+    let latest_tag = release_tag_from_url(&latest_url)?.to_owned();
+    latest_response
         .error_for_status()
-        .context("GitHub rejected the latest-release request")?
-        .json::<Release>()
-        .await
-        .context("GitHub returned an invalid latest-release response")?;
-
-    ensure!(
-        !release.draft && !release.prerelease,
-        "GitHub's latest release is not a published stable release"
-    );
-    let latest_version = release
-        .tag_name
+        .context("GitHub rejected the latest-release request")?;
+    let latest_version = latest_tag
         .strip_prefix('v')
-        .with_context(|| format!("release tag {:?} must start with `v`", release.tag_name))?;
+        .context("latest release tag must start with `v`")?;
     let latest_key = parse_version(latest_version)
-        .with_context(|| format!("release tag {:?} is not a stable version", release.tag_name))?;
+        .with_context(|| format!("latest release tag {latest_tag:?} is not a stable version"))?;
 
     println!("aroute upgrade: current {current_version}; latest {latest_version}");
     if latest_key <= current_key {
@@ -81,15 +63,37 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let asset = find_asset(&release, asset_name)
-        .with_context(|| format!("release {:?} has no {asset_name} asset", release.tag_name))?;
-    ensure!(
-        asset.size > 0 && asset.size <= MAX_ASSET_BYTES,
-        "release asset has an invalid size: {} bytes",
-        asset.size
-    );
-    let expected_digest = parse_sha256_digest(&asset.digest)?;
-    let asset_url = validate_asset_url(&asset.browser_download_url, &release.tag_name, asset_name)?;
+    let checksums_url = release_asset_url(&latest_tag, CHECKSUMS_ASSET)?;
+    let mut checksums_response = client
+        .get(checksums_url)
+        .send()
+        .await
+        .context("could not download the release checksum manifest")?
+        .error_for_status()
+        .context("GitHub rejected the release checksum-manifest download")?;
+    validate_download_url(checksums_response.url())?;
+    if let Some(content_length) = checksums_response.content_length() {
+        ensure!(
+            content_length <= MAX_CHECKSUMS_BYTES as u64,
+            "release checksum manifest is too large"
+        );
+    }
+    let mut checksum_bytes = Vec::with_capacity(MAX_CHECKSUMS_BYTES);
+    while let Some(chunk) = checksums_response
+        .chunk()
+        .await
+        .context("failed while reading the release checksum manifest")?
+    {
+        ensure!(
+            checksum_bytes.len() + chunk.len() <= MAX_CHECKSUMS_BYTES,
+            "release checksum manifest exceeded its permitted size"
+        );
+        checksum_bytes.extend_from_slice(&chunk);
+    }
+    let checksums =
+        std::str::from_utf8(&checksum_bytes).context("release checksum manifest was not UTF-8")?;
+    let expected_digest = parse_sha256sum(checksums, asset_name)?;
+    let asset_url = release_asset_url(&latest_tag, asset_name)?;
 
     let executable =
         std::env::current_exe().context("could not locate the current aroute executable")?;
@@ -109,9 +113,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     validate_download_url(response.url())?;
     if let Some(content_length) = response.content_length() {
         ensure!(
-            content_length == asset.size,
-            "release asset length changed: metadata said {} bytes, download says {content_length}",
-            asset.size
+            content_length <= MAX_ASSET_BYTES,
+            "release asset exceeds the permitted size"
         );
     }
 
@@ -126,19 +129,15 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             .checked_add(u64::try_from(chunk.len()).context("asset chunk size overflowed")?)
             .context("downloaded asset size overflowed")?;
         ensure!(
-            downloaded <= asset.size && downloaded <= MAX_ASSET_BYTES,
-            "release asset exceeded its declared or permitted size"
+            downloaded <= MAX_ASSET_BYTES,
+            "release asset exceeded its permitted size"
         );
         hasher.update(&chunk);
         candidate_file
             .write_all(&chunk)
             .context("could not write the temporary release binary")?;
     }
-    ensure!(
-        downloaded == asset.size,
-        "release asset was truncated: expected {} bytes, received {downloaded}",
-        asset.size
-    );
+    ensure!(downloaded > 0, "release asset was empty");
     let actual_digest = hasher.finalize();
     ensure!(
         actual_digest.as_slice() == expected_digest,
@@ -217,69 +216,100 @@ fn parse_version_part(part: &str) -> anyhow::Result<u64> {
     Ok(number)
 }
 
-fn parse_sha256_digest(digest: &str) -> anyhow::Result<[u8; 32]> {
-    let hex = digest
-        .strip_prefix("sha256:")
-        .context("GitHub release asset is missing a SHA-256 digest")?;
+fn parse_sha256_digest(hex: &str) -> anyhow::Result<[u8; 32]> {
     ensure!(
         hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()),
-        "GitHub returned a malformed SHA-256 digest"
+        "release checksum manifest contains a malformed SHA-256 digest"
     );
     let mut parsed = [0_u8; 32];
     let (pairs, remainder) = hex.as_bytes().as_chunks::<2>();
-    ensure!(remainder.is_empty(), "GitHub returned an incomplete digest");
+    ensure!(
+        remainder.is_empty(),
+        "release checksum digest is incomplete"
+    );
     for (index, pair) in pairs.iter().enumerate() {
-        let digits = std::str::from_utf8(pair).context("digest was not ASCII")?;
+        let digits = std::str::from_utf8(pair).context("checksum digest was not ASCII")?;
         parsed[index] = u8::from_str_radix(digits, 16).context("digest was not hexadecimal")?;
     }
     Ok(parsed)
 }
 
-fn find_asset<'a>(release: &'a Release, expected_name: &str) -> Option<&'a ReleaseAsset> {
-    release
-        .assets
-        .iter()
-        .find(|asset| asset.name == expected_name)
+fn parse_sha256sum(manifest: &str, expected_name: &str) -> anyhow::Result<[u8; 32]> {
+    let mut digest = None;
+    for line in manifest.lines() {
+        let (hex, name) = line
+            .split_once("  ")
+            .context("release checksum manifest contains a malformed row")?;
+        let name = name.strip_prefix('*').unwrap_or(name);
+        if name == expected_name {
+            ensure!(
+                digest.is_none(),
+                "release checksum manifest repeats {expected_name}"
+            );
+            digest = Some(parse_sha256_digest(hex)?);
+        }
+    }
+    digest.with_context(|| format!("release checksum manifest has no {expected_name} entry"))
 }
 
-fn validate_asset_url(raw_url: &str, tag: &str, asset_name: &str) -> anyhow::Result<Url> {
-    let url = Url::parse(raw_url).context("GitHub returned an invalid release asset URL")?;
-    let expected_path = format!("/{REPOSITORY}/releases/download/{tag}/{asset_name}");
+fn release_tag_from_url(url: &Url) -> anyhow::Result<&str> {
     ensure!(
-        url.scheme() == "https"
-            && url.host_str() == Some("github.com")
-            && url.username().is_empty()
-            && url.password().is_none()
-            && url.port().is_none()
-            && url.path() == expected_path
-            && url.query().is_none()
-            && url.fragment().is_none(),
-        "GitHub returned an untrusted release asset URL"
+        is_github_origin(url),
+        "latest-release redirect left github.com"
     );
-    Ok(url)
+    let prefix = format!("/{REPOSITORY}/releases/tag/");
+    let tag = url
+        .path()
+        .strip_prefix(&prefix)
+        .context("latest-release redirect did not point to a release tag")?;
+    ensure!(
+        !tag.is_empty() && !tag.contains('/') && url.query().is_none() && url.fragment().is_none(),
+        "latest-release redirect returned an invalid tag path"
+    );
+    Ok(tag)
+}
+
+fn release_asset_url(tag: &str, asset_name: &str) -> anyhow::Result<Url> {
+    ensure!(
+        tag.starts_with('v')
+            && tag
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-'),
+        "release tag contains invalid path characters"
+    );
+    ensure!(
+        asset_name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-' || byte == b'_'
+        }),
+        "release asset name contains invalid path characters"
+    );
+    Url::parse(&format!(
+        "https://github.com/{REPOSITORY}/releases/download/{tag}/{asset_name}"
+    ))
+    .context("could not construct a GitHub release-asset URL")
+}
+
+fn is_github_origin(url: &Url) -> bool {
+    url.scheme() == "https"
+        && url.host_str() == Some("github.com")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_none()
+}
+
+fn is_github_download_url(url: &Url) -> bool {
+    let host = url.host_str().unwrap_or_default();
+    url.scheme() == "https"
+        && (host == "github.com" || host.ends_with(".githubusercontent.com"))
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_none()
 }
 
 fn validate_download_url(url: &Url) -> anyhow::Result<()> {
-    let host = url.host_str().unwrap_or_default();
     ensure!(
-        url.scheme() == "https"
-            && (host == "github.com" || host.ends_with(".githubusercontent.com"))
-            && url.username().is_empty()
-            && url.password().is_none()
-            && url.port().is_none(),
+        is_github_download_url(url),
         "release asset redirected outside GitHub's HTTPS download hosts"
-    );
-    Ok(())
-}
-
-fn validate_api_url(url: &Url) -> anyhow::Result<()> {
-    ensure!(
-        url.scheme() == "https"
-            && url.host_str() == Some("api.github.com")
-            && url.username().is_empty()
-            && url.password().is_none()
-            && url.port().is_none(),
-        "latest-release metadata redirected outside the GitHub API"
     );
     Ok(())
 }
@@ -361,8 +391,8 @@ impl Drop for RemoveCandidate {
 #[cfg(test)]
 mod tests {
     use super::{
-        Release, ReleaseAsset, find_asset, parse_sha256_digest, parse_version, replace_executable,
-        validate_api_url, validate_asset_url, validate_download_url,
+        is_github_download_url, parse_sha256_digest, parse_sha256sum, parse_version,
+        release_asset_url, release_tag_from_url, replace_executable, validate_download_url,
     };
     use reqwest::Url;
     use sha2::{Digest, Sha256};
@@ -372,79 +402,70 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
-    fn release_tag_should_parse_a_stable_three_part_version() {
-        assert_eq!(parse_version("0.1.24").expect("valid semver"), (0, 1, 24));
+    fn release_version_should_parse_a_stable_three_part_version() {
+        assert_eq!(parse_version("0.1.26").expect("valid semver"), (0, 1, 26));
     }
 
     #[test]
-    fn release_tag_should_reject_prerelease_and_non_numeric_versions() {
-        assert!(parse_version("0.1.24-rc1").is_err() && parse_version("v0.1.x").is_err());
+    fn release_version_should_reject_prerelease_and_non_numeric_versions() {
+        assert!(parse_version("0.1.26-rc1").is_err() && parse_version("v0.1.x").is_err());
     }
 
     #[test]
-    fn release_metadata_should_deserialize_the_required_asset_fields() {
-        let json = r#"{
-            "tag_name":"v0.1.24",
-            "draft":false,
-            "prerelease":false,
-            "assets":[{
-                "name":"aroute-x86_64-unknown-linux-musl",
-                "browser_download_url":"https://github.com/ishan-parihar/artificial-route/releases/download/v0.1.24/aroute-x86_64-unknown-linux-musl",
-                "size":18685680,
-                "digest":"sha256:f91cb428fed90a4b047dd4beb93dbc7f82bc7ba2c894ea9286d79ec6882baeed"
-            }]
-        }"#;
-        let release: Release = serde_json::from_str(json).expect("release fixture parses");
+    fn latest_release_redirect_should_return_only_a_github_release_tag() {
+        let trusted =
+            Url::parse("https://github.com/ishan-parihar/artificial-route/releases/tag/v0.1.26")
+                .expect("URL");
+        let untrusted = Url::parse("https://attacker.example/releases/tag/v0.1.26").expect("URL");
+        let unrelated =
+            Url::parse("https://github.com/ishan-parihar/artificial-route/releases/latest")
+                .expect("URL");
+        assert!(
+            release_tag_from_url(&trusted).expect("release tag") == "v0.1.26"
+                && release_tag_from_url(&untrusted).is_err()
+                && release_tag_from_url(&unrelated).is_err()
+        );
+    }
+
+    #[test]
+    fn release_asset_url_should_construct_only_safe_paths() {
+        let expected = Url::parse(
+            "https://github.com/ishan-parihar/artificial-route/releases/download/v0.1.26/aroute-x86_64-unknown-linux-musl",
+        )
+        .expect("URL");
         assert_eq!(
             (
-                release.tag_name.as_str(),
-                release.draft,
-                release.prerelease,
-                release.assets[0].size
+                release_asset_url("v0.1.26", "aroute-x86_64-unknown-linux-musl")
+                    .expect("valid release URL"),
+                release_asset_url("../../attacker", "aroute").is_err()
             ),
-            ("v0.1.24", false, false, 18_685_680)
+            (expected, true)
         );
     }
 
     #[test]
-    fn release_asset_selection_should_match_the_published_binary_name() {
-        let release = Release {
-            tag_name: "v0.1.24".to_owned(),
-            draft: false,
-            prerelease: false,
-            assets: vec![ReleaseAsset {
-                name: "SHA256SUMS".to_owned(),
-                browser_download_url: "https://github.com/ishan-parihar/artificial-route/releases/download/v0.1.24/aroute-x86_64-unknown-linux-musl".to_owned(),
-                size: 1,
-                digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
-            }, ReleaseAsset {
-                name: "aroute-x86_64-unknown-linux-musl".to_owned(),
-                browser_download_url: "https://github.com/ishan-parihar/artificial-route/releases/download/v0.1.24/aroute-x86_64-unknown-linux-musl".to_owned(),
-                size: 1,
-                digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
-            }],
-        };
-        assert_eq!(
-            find_asset(&release, "aroute-x86_64-unknown-linux-musl")
-                .expect("release has the expected binary")
-                .name,
-            "aroute-x86_64-unknown-linux-musl"
+    fn release_checksum_manifest_should_select_the_exact_asset_digest() {
+        let manifest = concat!(
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  aroute-x86_64-unknown-linux-musl\n",
+            "0000000000000000000000000000000000000000000000000000000000000000  SHA256SUMS\n"
         );
+        let expected = Sha256::digest(b"abc");
+        let actual = parse_sha256sum(manifest, "aroute-x86_64-unknown-linux-musl")
+            .expect("matching checksum exists");
+        assert_eq!(actual.as_slice(), expected.as_slice());
     }
 
     #[test]
-    fn release_asset_url_should_reject_untrusted_hosts_and_paths() {
-        let trusted = validate_asset_url(
-            "https://github.com/ishan-parihar/artificial-route/releases/download/v0.1.24/aroute-x86_64-unknown-linux-musl",
-            "v0.1.24",
-            "aroute-x86_64-unknown-linux-musl",
+    fn release_checksum_manifest_should_reject_missing_duplicate_or_malformed_rows() {
+        let digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let valid_row = format!("{digest}  aroute-x86_64-unknown-linux-musl\n");
+        let duplicate_rows = format!("{valid_row}{valid_row}");
+        assert!(
+            parse_sha256sum(&valid_row, "missing").is_err()
+                && parse_sha256sum(&duplicate_rows, "aroute-x86_64-unknown-linux-musl").is_err()
+                && parse_sha256sum("bad row", "aroute").is_err()
+                && parse_sha256_digest("bad").is_err()
         );
-        let untrusted = validate_asset_url(
-            "https://attacker.example/ishan-parihar/artificial-route/releases/download/v0.1.24/aroute-x86_64-unknown-linux-musl",
-            "v0.1.24",
-            "aroute-x86_64-unknown-linux-musl",
-        );
-        assert!(trusted.is_ok() && untrusted.is_err());
     }
 
     #[test]
@@ -454,42 +475,23 @@ mod tests {
         let untrusted = Url::parse("https://downloads.example/asset").expect("URL");
         let untrusted_port =
             Url::parse("https://release-assets.githubusercontent.com:444/asset").expect("URL");
+        let http = Url::parse("http://github.com/asset").expect("URL");
         assert!(
-            validate_download_url(&trusted).is_ok()
+            is_github_download_url(&trusted)
+                && validate_download_url(&trusted).is_ok()
                 && validate_download_url(&untrusted).is_err()
                 && validate_download_url(&untrusted_port).is_err()
+                && !is_github_download_url(&http)
         );
-    }
-
-    #[test]
-    fn release_metadata_should_stay_on_the_github_api_origin() {
-        let trusted = Url::parse(
-            "https://api.github.com/repos/ishan-parihar/artificial-route/releases/latest",
-        )
-        .expect("URL");
-        let untrusted = Url::parse("https://attacker.example/releases/latest").expect("URL");
-        assert!(validate_api_url(&trusted).is_ok() && validate_api_url(&untrusted).is_err());
     }
 
     #[test]
     fn release_digest_should_match_the_sha256_bytes() {
-        let expected = parse_sha256_digest(
-            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
-        )
-        .expect("valid digest");
+        let expected =
+            parse_sha256_digest("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+                .expect("valid digest");
         let actual = Sha256::digest(b"abc");
         assert_eq!(actual.as_slice(), expected);
-    }
-
-    #[test]
-    fn release_digest_should_reject_missing_or_malformed_hashes() {
-        assert!(
-            parse_sha256_digest(
-                "sha1:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-            )
-            .is_err()
-                && parse_sha256_digest("sha256:bad").is_err()
-        );
     }
 
     #[test]

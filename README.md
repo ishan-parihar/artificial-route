@@ -14,7 +14,7 @@ curl -fsSL https://raw.githubusercontent.com/ishan-parihar/artificial-route/main
 
 That one command installs the newest release, writes a working `~/.config/ar/config.yaml`, writes a `600` credential env file, and installs and starts a **systemd unit** so the proxy comes up on boot.
 
-For a binary-only update after installation, run `aroute upgrade`. It fetches the latest stable GitHub release, verifies the asset digest and version, and atomically replaces the executable. It does not restart a running service; restart `aroute.service` after upgrading to activate the new process.
+For a binary-only update after installation, run `aroute upgrade`. It follows GitHub's latest stable release redirect, verifies the binary against that release's `SHA256SUMS` file and checks its version, then atomically replaces the executable. It does not use GitHub's rate-limited API or restart a running service; restart `aroute.service` after upgrading to activate the new process.
 
 The command reads `install.sh` from `main`, so the installer is always the newest one. Every binary it downloads is checked against that release's `SHA256SUMS`, and the release carries a build-provenance attestation you can verify with `gh attestation verify aroute-x86_64-unknown-linux-musl --repo ishan-parihar/artificial-route`. Pass `--verify-attestation` to have the installer run that check and refuse to install if it fails. To pin the installer as well, use the tag URL printed in that release's notes instead of `main`.
 
