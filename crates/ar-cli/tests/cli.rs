@@ -705,6 +705,90 @@ fn empty_dir(name: &str) -> PathBuf {
     dir
 }
 
+#[cfg(unix)]
+struct FakeSystemctl {
+    bin: PathBuf,
+    state: PathBuf,
+    log: PathBuf,
+    installed: bool,
+}
+
+#[cfg(unix)]
+fn fake_systemctl(name: &str, installed: bool, initial_state: &str) -> FakeSystemctl {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = empty_dir(name);
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).expect("the fake bin directory writes");
+    let command = bin.join("systemctl");
+    std::fs::write(
+        &command,
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$AR_TEST_SYSTEMCTL_LOG"
+verb=""
+unit=""
+for arg in "$@"; do
+  case "$arg" in
+    list-unit-files|show|is-enabled|enable|disable)
+      verb="$arg"
+      unit=""
+      ;;
+    *)
+      if [ -n "$verb" ] && [ -z "$unit" ]; then unit="$arg"; fi
+      ;;
+  esac
+done
+case "$verb" in
+  list-unit-files)
+    if [ "$AR_TEST_SYSTEMCTL_INSTALLED" = yes ]; then printf '%s enabled\n' "$unit"; fi
+    ;;
+  show) printf 'active\n' ;;
+  is-enabled) state=$(cat "$AR_TEST_SYSTEMCTL_STATE"); printf '%s\n' "$state"; [ "$state" = enabled ] ;;
+  enable) printf 'enabled\n' > "$AR_TEST_SYSTEMCTL_STATE" ;;
+  disable) printf 'disabled\n' > "$AR_TEST_SYSTEMCTL_STATE" ;;
+  *) printf 'unexpected systemctl call: %s\n' "$*" >&2; exit 64 ;;
+esac
+"#,
+    )
+    .expect("the fake systemctl writes");
+    let mut permissions = std::fs::metadata(&command)
+        .expect("the fake systemctl metadata reads")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&command, permissions).expect("the fake systemctl becomes executable");
+
+    let state = root.join("state");
+    std::fs::write(&state, format!("{initial_state}\n")).expect("the fake service state writes");
+    let log = root.join("calls.log");
+    let _ = std::fs::remove_file(&log);
+    FakeSystemctl {
+        bin,
+        state,
+        log,
+        installed,
+    }
+}
+
+#[cfg(unix)]
+fn ar_with_systemctl(args: &[&str], fake: &FakeSystemctl) -> Output {
+    let path = std::env::join_paths(std::iter::once(fake.bin.clone()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .expect("the isolated PATH joins");
+    Command::new(BIN)
+        .args(args)
+        .current_dir(fixture_dir())
+        .env("PATH", path)
+        .env("AR_TEST_SYSTEMCTL_STATE", &fake.state)
+        .env("AR_TEST_SYSTEMCTL_LOG", &fake.log)
+        .env(
+            "AR_TEST_SYSTEMCTL_INSTALLED",
+            if fake.installed { "yes" } else { "no" },
+        )
+        .output()
+        .expect("the ar binary runs with fake systemctl")
+}
+
 /// Parses `count: N of TOTAL` out of a rendered list.
 ///
 /// Reads the printed header rather than the command's own internals, because
@@ -885,7 +969,12 @@ fn gate_dir(name: &str) -> PathBuf {
         .env("AR_CRED_STORE", &store)
         .output()
         .expect("the first arming runs");
-    assert_eq!(out.status.code(), Some(0), "the store must start armed: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the store must start armed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     dir
 }
 
@@ -909,7 +998,10 @@ fn a_second_arming_is_refused_and_names_the_flag_that_allows_it() {
 
     assert_eq!(code(&out), 1, "refusing is a failure, not a silent success");
     let text = format!("{}{}", stdout(&out), stderr(&out));
-    assert!(text.contains("already armed"), "must name the reason: {text}");
+    assert!(
+        text.contains("already armed"),
+        "must name the reason: {text}"
+    );
     assert!(text.contains("--force"), "must name the flag: {text}");
     // The store must be byte-identical: the refusal happened before any secret
     // was generated or written, which is what makes it safe to run unattended.
@@ -943,11 +1035,17 @@ fn keys_list_reports_the_store_and_says_tokens_are_not_recorded() {
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
     let text = stdout(&out);
     assert!(text.contains("gate: armed"), "{text}");
-    assert!(text.contains("http-gate"), "the row name must appear: {text}");
+    assert!(
+        text.contains("http-gate"),
+        "the row name must appear: {text}"
+    );
     // The honesty this verb exists for: no token material, and a plain statement
     // that none is knowable -- an empty table would read as "there are none".
     assert!(text.contains("minted tokens are not recorded"), "{text}");
-    assert!(!text.contains("eyJ"), "no JWT material may be printed: {text}");
+    assert!(
+        !text.contains("eyJ"),
+        "no JWT material may be printed: {text}"
+    );
 }
 
 #[test]
@@ -1048,11 +1146,7 @@ fn models_limit_pages_and_total_names_the_unpaged_count() {
 
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
     let text = stdout(&out);
-    assert_eq!(
-        first_row_count(&text),
-        1,
-        "one row is printed: {text}"
-    );
+    assert_eq!(first_row_count(&text), 1, "one row is printed: {text}");
     assert!(
         text.contains("count: 1 of 3 total"),
         "TOTAL stays 3 so the caller knows there is more: {text}"
@@ -1078,11 +1172,7 @@ fn doctor_limit_pages_and_a_status_filter_cannot_launder_a_failure() {
     let out = ar(&["doctor", "--limit", "3"]);
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
     let text = stdout(&out);
-    assert_eq!(
-        first_row_count(&text),
-        3,
-        "three checks print: {text}"
-    );
+    assert_eq!(first_row_count(&text), 3, "three checks print: {text}");
     assert!(
         text.contains("count: 3 of 12 total"),
         "the fixture has 12 checks; TOTAL must be the full count: {text}"
@@ -1163,30 +1253,32 @@ fn doctor_unknown_status_names_the_valid_ones() {
 // verbs need root-visible units, so they are not asserted against here.
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 #[test]
-fn service_status_is_read_only_and_reports_each_unit_once() {
+fn service_status_should_report_both_units_read_only_when_units_are_not_installed() {
     // The one verb that is safe to run at any time, and the one an agent needs
     // before routing: two rows, one per unit, each naming systemd's verdict
     // AND this process's own probe. Those are two different claims, and the
     // incident `docs/25` records was a service systemd called active while its
     // port did not answer.
-    let out = ar(&["service", "status"]);
-
-    // Exit 0 here because both real units are up on the host the suite runs on.
-    // The exit-code contract itself is pinned below, against a unit that does
-    // not exist, rather than against the host's current state.
-    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let fake = fake_systemctl("service-status", false, "disabled");
+    let out = ar_with_systemctl(&["service", "status"], &fake);
     let text = stdout(&out);
-    assert!(text.contains("aroute.service"), "{text}");
-    assert!(text.contains("aroute-dashboard.service"), "{text}");
+    let log = std::fs::read_to_string(&fake.log).expect("the systemctl calls are logged");
     assert_eq!(
-        count_rows(&text),
-        2,
-        "one row per unit, never a duplicate: {text}"
-    );
-    assert!(
-        text.contains("port 20128") && text.contains("20149"),
-        "each row names its port so a mismatch is visible: {text}"
+        (
+            code(&out),
+            text.contains("aroute.service"),
+            text.contains("aroute-dashboard.service"),
+            count_rows(&text),
+            text.matches("not installed").count(),
+            log.lines()
+                .all(|call| !["enable", "disable", "start", "stop", "restart"]
+                    .iter()
+                    .any(|verb| call.split_whitespace().nth(1) == Some(verb)))
+        ),
+        (0, true, true, 2, 2, true),
+        "status should be read-only and report both absent units once: {text}; calls: {log}"
     );
 }
 
@@ -1235,85 +1327,70 @@ fn service_rejects_a_unit_that_does_not_exist_by_name() {
     );
 }
 
+#[cfg(unix)]
 #[test]
-fn service_enable_disable_change_boot_state_only_not_the_running_state() {
+fn service_disable_should_only_change_boot_persistence_when_unit_is_installed() {
     // `enable`/`disable` answer "will it come back after a reboot", which is a
     // different question from "is it running". The A/B that proved the split:
     // `disable dashboard` left the unit `active` and answering on its port
     // while `is-enabled` flipped to `disabled` — the two states are
     // independent and both must stay observable in `status`.
     //
-    // This test drives the real binary against the real user systemd, then
-    // restores the state it found, so it is safe to run on the operator's
-    // host: the only mutation is the one `systemctl enable/disable` makes,
-    // and that is the behaviour under test.
-    let before = std::process::Command::new("systemctl")
-        .args(["--user", "is-enabled", "aroute-dashboard.service"])
-        .output()
-        .expect("systemctl runs");
-    let was_enabled = before.status.success();
-
-    let out = ar(&["service", "disable", "dashboard"]);
-    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    // This test drives the real binary against a per-test systemctl shim.
+    // It proves the CLI sends only the boot-persistence verb and never touches
+    // a developer's or CI runner's actual services.
+    let fake = fake_systemctl("service-disable", true, "enabled");
+    let out = ar_with_systemctl(&["service", "disable", "dashboard"], &fake);
     let text = stdout(&out);
-    assert!(
-        text.contains("disabled at boot"),
-        "the verb says what it changed: {text}"
-    );
-    assert!(
-        text.contains("boot persistence only"),
-        "the note names the exact scope of the change: {text}"
-    );
-
-    // The running state must be untouched by the disable.
-    let active = std::process::Command::new("systemctl")
-        .args(["--user", "is-active", "aroute-dashboard.service"])
-        .output()
-        .expect("systemctl runs");
-    assert_eq!(
-        String::from_utf8_lossy(&active.stdout).trim(),
-        "active",
-        "disable must not stop a running unit"
-    );
+    let state_after_disable = std::fs::read_to_string(&fake.state).expect("state reads");
 
     // `status` now shows both states, which is how an agent sees the split.
-    let status = ar(&["service", "status", "dashboard"]);
+    let status = ar_with_systemctl(&["service", "status", "dashboard"], &fake);
     let st = stdout(&status);
-    assert!(
-        st.contains("disabled at boot"),
-        "status reports the boot state: {st}"
-    );
-
-    // Restore whatever we found, then confirm the restore took.
-    let restore = if was_enabled { "enable" } else { "disable" };
-    let out = ar(&["service", restore, "dashboard"]);
-    assert_eq!(code(&out), 0, "restore failed: {}", stderr(&out));
-    let after = std::process::Command::new("systemctl")
-        .args(["--user", "is-enabled", "aroute-dashboard.service"])
-        .output()
-        .expect("systemctl runs");
+    let log = std::fs::read_to_string(&fake.log).expect("the systemctl calls are logged");
     assert_eq!(
-        after.status.success(),
-        was_enabled,
-        "the original boot state is restored"
+        (
+            code(&out),
+            text.contains("disabled at boot"),
+            text.contains("boot persistence only"),
+            state_after_disable.trim(),
+            st.contains("disabled at boot"),
+            log.lines().all(|call| !["start", "stop", "restart"]
+                .iter()
+                .any(|verb| call.split_whitespace().nth(1) == Some(verb)))
+        ),
+        (0, true, true, "disabled", true, true),
+        "disable changes boot persistence only: {text}; status: {st}; calls: {log}"
     );
 }
 
+#[cfg(unix)]
 #[test]
-fn service_enable_is_idempotent_and_reports_it() {
+fn service_enable_should_be_idempotent_when_unit_is_already_enabled() {
     // Boot persistence is a state, not an action: `enable` on an enabled unit
     // is the same outcome, not an error. An agent that cannot tell whether its
     // `enable` was needed would have to check first, which is a second call
     // the verb can absorb by just succeeding.
-    let out = ar(&["service", "enable", "proxy"]);
-    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
-    assert!(stdout(&out).contains("enabled at boot"), "{}", stdout(&out));
-    // The unit was enabled before this test and still is.
-    let check = std::process::Command::new("systemctl")
-        .args(["--user", "is-enabled", "aroute.service"])
-        .output()
-        .expect("systemctl runs");
-    assert!(check.status.success());
+    let fake = fake_systemctl("service-enable", true, "enabled");
+    let out = ar_with_systemctl(&["service", "enable", "proxy"], &fake);
+    let text = stdout(&out);
+    let state = std::fs::read_to_string(&fake.state).expect("state reads");
+    let log = std::fs::read_to_string(&fake.log).expect("the systemctl calls are logged");
+    assert_eq!(
+        (
+            code(&out),
+            text.contains("enabled at boot"),
+            state.trim(),
+            log.lines()
+                .any(|call| call == "--user --no-pager enable aroute.service"),
+            log.lines()
+                .all(|call| !["disable", "start", "stop", "restart"]
+                    .iter()
+                    .any(|verb| call.split_whitespace().nth(1) == Some(verb)))
+        ),
+        (0, true, "enabled", true, true),
+        "enable should be idempotent without changing running state: {text}; calls: {log}"
+    );
 }
 
 #[test]
@@ -1749,8 +1826,14 @@ fn server_set_should_not_swallow_the_comment_block_after_the_section() {
         after.contains("# The credentials block: declared names, secrets stay in env."),
         "the comment block documenting the next section was eaten: {after}"
     );
-    assert!(after.contains("keys:\n  a: sk-x"), "keys: was eaten: {after}");
-    assert!(after.contains("port: 20129"), "the write did not land: {after}");
+    assert!(
+        after.contains("keys:\n  a: sk-x"),
+        "keys: was eaten: {after}"
+    );
+    assert!(
+        after.contains("port: 20129"),
+        "the write did not land: {after}"
+    );
 }
 
 /// The contract tests Phase 2 of the config-write surface names.
@@ -1787,13 +1870,7 @@ fn providers_add_should_write_the_row_the_key_ref_and_the_env_line_together() {
 
     let res = ar_in(
         &out,
-        &[
-            "providers",
-            "add",
-            "anthropic",
-            "--credential-file",
-            "cred",
-        ],
+        &["providers", "add", "anthropic", "--credential-file", "cred"],
     );
     assert_eq!(
         code(&res),
@@ -1994,13 +2071,7 @@ fn providers_add_should_work_on_a_config_whose_other_keys_are_unexported() {
 
     let res = ar_in(
         &out,
-        &[
-            "providers",
-            "add",
-            "anthropic",
-            "--credential-file",
-            "cred",
-        ],
+        &["providers", "add", "anthropic", "--credential-file", "cred"],
     );
     assert_eq!(
         code(&res),
@@ -2036,7 +2107,8 @@ fn providers_add_should_work_on_a_config_whose_other_keys_are_unexported() {
 fn providers_add_custom_should_write_the_row_the_key_ref_and_the_env_line() {
     let out = empty_dir("providers-add-custom");
     let held = out.join("config.yaml");
-    std::fs::write(out.join("cred"), "sk-gateway-credential\n").expect("the credential file writes");
+    std::fs::write(out.join("cred"), "sk-gateway-credential\n")
+        .expect("the credential file writes");
     std::fs::write(
         &held,
         concat!(
@@ -2415,7 +2487,8 @@ fn custom_providers_round_trip_must_come_back_byte_identical() {
 
     let after = std::fs::read_to_string(&held).expect("readable");
     assert_eq!(
-        after, original,
+        after,
+        original,
         "a round trip must return the file to its exact bytes; leftover: {}",
         after
             .lines()

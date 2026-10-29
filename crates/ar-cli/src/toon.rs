@@ -116,7 +116,8 @@ pub fn list_paged(
     let mut out = list(name, noun, all, fields, rows, full);
     // `list` wrote `count: N of N total` as its first line; rewrite it to carry
     // the real total rather than duplicating the renderer for one digit.
-    if let Some(rest) = out.strip_prefix(&format!("count: {} of {} total\n", rows.len(), rows.len()))
+    if let Some(rest) =
+        out.strip_prefix(&format!("count: {} of {} total\n", rows.len(), rows.len()))
     {
         out = format!("count: {} of {total} total\n{rest}", rows.len());
     }
@@ -353,7 +354,10 @@ mod tests {
     #[test]
     fn quotes_a_cell_containing_a_comma_so_the_column_count_holds() {
         let cell = clip("/path/with, comma/config.yaml");
-        assert!(cell.starts_with('"') && cell.ends_with('"'), "not quoted: {cell}");
+        assert!(
+            cell.starts_with('"') && cell.ends_with('"'),
+            "not quoted: {cell}"
+        );
 
         // A quote-aware parser splits into exactly the header's three columns.
         // `split(',')` alone cannot see quotes, so it still yields 4 -- which is
@@ -411,9 +415,18 @@ mod tests {
         // not.
         let rows = vec![
             vec!["openai".to_owned(), "openai".to_owned(), "ok".to_owned()],
-            vec!["anthropic".to_owned(), "anthropic".to_owned(), "ok".to_owned()],
+            vec![
+                "anthropic".to_owned(),
+                "anthropic".to_owned(),
+                "ok".to_owned(),
+            ],
         ];
-        let out = json("providers", &["id", "provider", "status", "base_url", "key"], &["id".to_owned(), "provider".to_owned(), "status".to_owned()], &rows);
+        let out = json(
+            "providers",
+            &["id", "provider", "status", "base_url", "key"],
+            &["id".to_owned(), "provider".to_owned(), "status".to_owned()],
+            &rows,
+        );
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         assert_eq!(parsed["count"], 2, "{out}");
         assert_eq!(parsed["total"], 2, "{out}");
@@ -431,7 +444,12 @@ mod tests {
             "ok".to_owned(),
             "/path/with, comma/config.yaml".to_owned(),
         ]];
-        let out = json("checks", &["check", "status", "detail"], &["check".to_owned(), "status".to_owned(), "detail".to_owned()], &rows);
+        let out = json(
+            "checks",
+            &["check", "status", "detail"],
+            &["check".to_owned(), "status".to_owned(), "detail".to_owned()],
+            &rows,
+        );
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         assert_eq!(parsed["rows"].as_array().unwrap().len(), 1, "{out}");
         assert_eq!(
@@ -442,8 +460,16 @@ mod tests {
 
     #[test]
     fn json_projects_only_the_requested_columns() {
-        let rows = vec![vec!["openai".to_owned(), "https://api.openai.com/v1".to_owned()]];
-        let out = json("providers", &["id", "provider", "status", "base_url", "key"], &["id".to_owned()], &rows);
+        let rows = vec![vec![
+            "openai".to_owned(),
+            "https://api.openai.com/v1".to_owned(),
+        ]];
+        let out = json(
+            "providers",
+            &["id", "provider", "status", "base_url", "key"],
+            &["id".to_owned()],
+            &rows,
+        );
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         assert_eq!(parsed["rows"][0]["id"], "openai", "{out}");
         assert!(
@@ -471,14 +497,7 @@ mod tests {
             "active, port 20128 answers".to_owned(),
         ];
         let fields: Vec<String> = cols.iter().map(|s| s.to_string()).collect();
-        let out = list(
-            "service",
-            "services",
-            &cols,
-            &fields,
-            &[comma_row],
-            false,
-        );
+        let out = list("service", "services", &cols, &fields, &[comma_row], false);
         assert!(
             out.contains("\"active, port 20128 answers\""),
             "the comma-bearing cell is quoted: {out}"
@@ -496,7 +515,12 @@ mod tests {
             "services",
             &cols,
             &fields,
-            &[vec!["aroute.service".to_owned(), "active".to_owned(), "ok".to_owned(), long]],
+            &[vec![
+                "aroute.service".to_owned(),
+                "active".to_owned(),
+                "ok".to_owned(),
+                long,
+            ]],
             false,
         );
         assert!(
