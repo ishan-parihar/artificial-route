@@ -131,7 +131,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "ar-cache"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "blake3",
  "bytes",
@@ -146,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "ar-cli"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "anyhow",
  "ar-compress",
@@ -178,7 +178,7 @@ dependencies = [
 
 [[package]]
 name = "ar-compress"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "ar-tokens",
  "thiserror",
@@ -186,7 +186,7 @@ dependencies = [
 
 [[package]]
 name = "ar-config"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "ar-compress",
  "ar-core",
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "ar-core"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "serde",
  "serde_json",
@@ -211,7 +211,7 @@ dependencies = [
 
 [[package]]
 name = "ar-exec"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "ar-config",
  "ar-core",
@@ -236,7 +236,7 @@ dependencies = [
 
 [[package]]
 name = "ar-guard"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "aho-corasick",
  "regex-automata",
@@ -245,7 +245,7 @@ dependencies = [
 
 [[package]]
 name = "ar-keys"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "aes-gcm",
  "ar-core",
@@ -267,11 +267,11 @@ dependencies = [
 
 [[package]]
 name = "ar-limit"
-version = "0.1.25"
+version = "0.1.26"
 
 [[package]]
 name = "ar-mcp"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "ar-config",
  "ar-exec",
@@ -292,7 +292,7 @@ dependencies = [
 
 [[package]]
 name = "ar-obs"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "ar-keys",
  "crossbeam-channel",
@@ -306,7 +306,7 @@ dependencies = [
 
 [[package]]
 name = "ar-registry"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "ar-core",
  "serde",
@@ -317,7 +317,7 @@ dependencies = [
 
 [[package]]
 name = "ar-route"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "ar-cache",
  "bytes",
@@ -331,7 +331,7 @@ dependencies = [
 
 [[package]]
 name = "ar-server"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "ar-cache",
  "ar-compress",
@@ -364,7 +364,7 @@ dependencies = [
 
 [[package]]
 name = "ar-tokens"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "ar-registry",
  "http",
@@ -376,7 +376,7 @@ dependencies = [
 
 [[package]]
 name = "ar-translate"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "insta",
  "serde",
