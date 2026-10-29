@@ -42,7 +42,7 @@ pub struct Cli {
     pub command: Option<Command>,
 }
 
-/// The command surface. Seven verbs: one long-running, one network, five local.
+/// The command surface; each verb is explicit and noninteractive.
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Run the proxy listener until interrupted.
@@ -265,6 +265,17 @@ pub enum Command {
     /// `install.sh` writes the units; `--system` is accepted because the
     /// same units can be installed system-wide.
     Service(ServiceArgs),
+
+    /// Fetch the latest stable release and atomically replace this executable.
+    ///
+    /// Verifies GitHub's SHA-256 asset digest and the downloaded binary's
+    /// version before replacing the current file. A running service keeps its
+    /// old process image; restart it separately after a successful upgrade.
+    ///
+    /// Examples:
+    ///   aroute upgrade
+    #[command(verbatim_doc_comment)]
+    Upgrade,
 
     /// Convert another tool's provider/model list into config.yaml + registry.json.
     ///

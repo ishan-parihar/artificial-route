@@ -1283,6 +1283,7 @@ pub fn dispatch(cli: &Cli) -> anyhow::Result<()> {
         },
         Some(Command::CostReport(a)) => cost_report(cli, a),
         Some(Command::Service(a)) => service(cli, a),
+        Some(Command::Upgrade) => block_on(crate::upgrade::run()),
     }
 }
 

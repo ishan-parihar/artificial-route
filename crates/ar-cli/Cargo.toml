@@ -81,6 +81,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # LiteLLM configs are YAML in every config people actually have.
 serde_yaml = { workspace = true }
+sha2 = "0.10"
 tokio = { workspace = true }
 # `util` for `ServiceExt::oneshot`, which lets `aroute run` drive the real router
 # in-process instead of re-implementing the request path.

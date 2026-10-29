@@ -7,8 +7,9 @@
 # One command does the whole job: installs the newest release, writes a working
 # config, installs and starts a systemd unit so the proxy comes up on boot, and
 # proves the result with `aroute doctor`. Re-running it over an existing install
-# updates the binary and leaves your config alone. There is no separate updater
-# to drift out of sync with this one.
+# updates the binary and leaves your config alone. For a binary-only update,
+# `aroute upgrade` fetches the latest stable release and atomically swaps the
+# executable; restart the service separately to activate the new process.
 #
 # Flags:
 #   --version <tag>        pin an exact tag instead of the newest release
@@ -1024,7 +1025,8 @@ installed to $TARGET
   $TARGET doctor      # re-check at any time
   $TARGET serve       # foreground; the unit already runs it as a service
 
-Upgrade:  curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | bash
+Upgrade binary only:  $TARGET upgrade  (does not restart the service)
+Reinstall/provision:  curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | bash
   Check:    curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | bash -s -- --check
   Remove:   curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | bash -s -- --uninstall
   Dashboard: bash install.sh --with-dashboard --dashboard-src <dashboard/dist-or-tarball>

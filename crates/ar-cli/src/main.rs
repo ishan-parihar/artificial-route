@@ -20,6 +20,7 @@ mod import;
 mod mcp;
 mod serve;
 mod toon;
+mod upgrade;
 mod version;
 mod webui;
 

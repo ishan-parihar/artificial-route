@@ -14,6 +14,8 @@ curl -fsSL https://raw.githubusercontent.com/ishan-parihar/artificial-route/main
 
 That one command installs the newest release, writes a working `~/.config/ar/config.yaml`, writes a `600` credential env file, and installs and starts a **systemd unit** so the proxy comes up on boot.
 
+For a binary-only update after installation, run `aroute upgrade`. It fetches the latest stable GitHub release, verifies the asset digest and version, and atomically replaces the executable. It does not restart a running service; restart `aroute.service` after upgrading to activate the new process.
+
 The command reads `install.sh` from `main`, so the installer is always the newest one. Every binary it downloads is checked against that release's `SHA256SUMS`, and the release carries a build-provenance attestation you can verify with `gh attestation verify aroute-x86_64-unknown-linux-musl --repo ishan-parihar/artificial-route`. Pass `--verify-attestation` to have the installer run that check and refuse to install if it fails. To pin the installer as well, use the tag URL printed in that release's notes instead of `main`.
 
 It does **not** add the weekly update timer when piped. The timer runs a saved copy of the installer, and a piped `curl | bash` has no file to copy — `$0` is `bash`. For unattended updates, save it first:
@@ -75,7 +77,7 @@ The written config carries two routable combos out of the box: `default` (an `op
 
 The installer prints the portable `.mcp.json` entry for aroute's MCP server instead of writing it anywhere; paste it into a project root to use the tools there.
 
-Re-running it *is* the update path: it replaces the binary, leaves your config and credentials untouched, and refreshes the unit. `--check` tells you honestly whether an update exists.
+`aroute upgrade` updates only the binary and does not restart the service. Re-running the installer remains the provisioning path: it replaces the binary, leaves your config and credentials untouched, and refreshes the unit. `--check` tells you honestly whether an update exists.
 
 Unattended updates are a systemd timer (`aroute.update.timer`, weekly, with a first re-check 15 minutes after boot). It runs a **saved copy of the installer** rather than a URL, so the audited script is what runs, and an updated binary restarts the service so the live proxy changes too. The timer never passes a
 dashboard flag, so an installed dist is left alone by weekly updates.
