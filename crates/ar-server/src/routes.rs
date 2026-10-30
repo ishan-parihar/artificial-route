@@ -3375,14 +3375,11 @@ fn decorate(
             ..
         } => {
             let upstream_status = status;
-            // A target-scoped 400 is not a client error once every target has
-            // had a chance to accept it. Preserve its status in diagnostics and
-            // report an upstream failure at the router boundary.
-            let status = if status == StatusCode::BAD_REQUEST.as_u16() {
-                StatusCode::BAD_GATEWAY
-            } else {
-                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY)
-            };
+            // Upstream rejections (such as 400 context-length or capability limits)
+            // must return BAD_REQUEST at the boundary rather than mutating to BAD_GATEWAY.
+            // Mutating to 502 causes edge proxies (e.g. Cloudflare) to drop the JSON
+            // payload and serve generic HTML error pages that crash client JSON parsers.
+            let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
             // The last provider's own identifier, when it is one this build
             // passes through. The reference projects upstream codes through
             // an allowlist (`open-sse/utils/error.ts:43-352`, ~310 entries)
@@ -5042,7 +5039,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exhausted_ambiguous_400_returns_sanitized_502_with_attempt_details() {
+    async fn exhausted_ambiguous_400_returns_sanitized_400_with_attempt_details() {
         let upstream_text = "secret prompt echoed by provider";
         let resp = decorate(
             AttemptOutcome::Failover {
@@ -5076,7 +5073,7 @@ mod tests {
                 meta: ar_tokens::ResponseMeta::default(),
             },
         );
-        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let diagnostic: serde_json::Value =
             serde_json::from_str(&header_of(resp.headers(), ATTEMPT_DIAGNOSTIC_HEADER))
                 .expect("diagnostic is JSON");

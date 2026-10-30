@@ -114,7 +114,6 @@ impl AttemptOutcome {
         match self {
             Self::Succeeded { upstream, .. } => upstream.status,
             Self::Retry { .. } => StatusCode::TOO_MANY_REQUESTS,
-            Self::Failover { status, .. } if *status == 400 => StatusCode::BAD_GATEWAY,
             Self::Failover { status, .. } => {
                 StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY)
             }
@@ -252,6 +251,7 @@ enum Step {
 /// malformed request. Other providers may accept the same request.
 const ADVANCE_400_ROWS: &[&str] = &[
     "context length",
+    "context_length",
     "maximum context",
     "too many tokens",
     "unsupported parameter",
@@ -261,6 +261,7 @@ const ADVANCE_400_ROWS: &[&str] = &[
 
 /// Structured upstream codes that identify target capability limits.
 const CAPABILITY_400_CODES: &[&str] = &[
+    "context_length",
     "context_length_exceeded",
     "max_context_length_exceeded",
     "model_not_supported",
@@ -448,14 +449,21 @@ fn json_error_has_code(body: &str, accepted: &[&str]) -> bool {
     };
     let root = value.as_object();
     let error = value.get("error").and_then(serde_json::Value::as_object);
-    [root, error].into_iter().flatten().any(|object| {
-        ["code", "type"].into_iter().any(|key| {
-            object
-                .get(key)
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|value| accepted.iter().any(|code| value.eq_ignore_ascii_case(code)))
+    let details = value.get("details").and_then(serde_json::Value::as_object);
+    let error_details = error
+        .and_then(|obj| obj.get("details"))
+        .and_then(serde_json::Value::as_object);
+    [root, error, details, error_details]
+        .into_iter()
+        .flatten()
+        .any(|object| {
+            ["code", "type"].into_iter().any(|key| {
+                object
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| accepted.iter().any(|code| value.eq_ignore_ascii_case(code)))
+            })
         })
-    })
 }
 
 /// Status a 2xx body carries when the body itself is the failure, if it is.
@@ -2384,6 +2392,12 @@ mod tests {
             classify_400(r#"{"error":{"code":"context_length_exceeded"}}"#),
             "provider_capability_400"
         );
+    }
+
+    #[test]
+    fn classifies_nvidia_context_length_details_as_provider_capability() {
+        let body = r#"{"message":"Invalid request","type":"Bad Request","code":400,"details":{"type":"context_length","limit":262144,"actual":270183}}"#;
+        assert_eq!(classify_400(body), "provider_capability_400");
     }
 
     #[test]
