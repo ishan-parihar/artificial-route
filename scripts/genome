@@ -40,6 +40,7 @@ import math
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -152,7 +153,7 @@ ERR = 2
 MIN_CHUNK = 5  # lines; `ask` hits narrower than this point at a lead line without its content
 HUB_NODE_CAP = 3000  # nodes; above this `graph hubs` ranks by degree and says betweenness was not computed
 _TMP_SEQ = itertools.count()  # makes each atomic_write temp name unique within this process too
-VERSION = "2026.11.02-75"
+VERSION = "2026.11.05-15"
 # every key genome reads: an unknown key is a typo that would silently switch a check off (E017)
 CONFIG_KEYS = {
     "genome": {"modules", "schema_version"},
@@ -335,6 +336,29 @@ class Cfg:
     def ignore(self) -> set[str]:
         v = self.get("core", "pointer_ignore", "")
         return set(v.split() if isinstance(v, str) else v)
+
+    def coord_root(self) -> Path:
+        """The checkout the agents module's mutable state (boards, feed, seen marks) lives in: inside
+        a linked git worktree that is the MAIN worktree — the coordination home — so flock guards one
+        real inode, feed ids are minted once and the inbox is not per-worktree. Everywhere else it is
+        root. The main worktree is trusted only when it carries this genome's config (a submodule's or
+        bare repo's common dir does not, and a pruned main worktree must not strand the state)."""
+        if getattr(self, "_coord", None) is None:
+            home = self.root
+            if (self.root / ".git").is_file():  # a linked worktree: .git is a file into <main>/.git/worktrees/<id>
+                gitdir = sh(self.root, "git", "rev-parse", "--path-format=absolute", "--git-dir").strip()
+                common = sh(self.root, "git", "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+                main = Path(common).resolve().parent if common else None
+                if common and gitdir and common != gitdir and main \
+                        and ((main / "genome.toml").is_file() or (main / "kb.toml").is_file()):
+                    home = main
+            self._coord = home
+        return self._coord
+
+    def coord(self, p: Path) -> Path:
+        """Re-root a role path onto the coordination home (see coord_root)."""
+        home = self.coord_root()
+        return p if home == self.root else home / p.relative_to(self.root)
 
 
 def deep_merge(base: dict, more: dict) -> dict:
@@ -1393,8 +1417,30 @@ def lint_core(cfg: Cfg) -> list[str]:
             if st in TERMINAL and (len(r) < 3 or "→ [" not in r[2]):
                 out.append(f"E003 register {rid}: terminal without `→ [YYYY-MM-DD] <evidence>`")
             if st in TERMINAL and len(r) > 2:
+                # THE REGISTER'S EVIDENCE USES THE SAME GRAMMAR AS THE LEDGER'S. It did
+                # not: E010 matched every backticked run with a slash in it
+                # (`re.findall(r"`([^`]+)`")`), while E009 — the same question asked of
+                # the same kind of cell — used `pointers()`, which reads a token as a
+                # FILE only when it is file-shaped. So the identical prose was a missing
+                # file in the register and prose in the ledger, and a register row
+                # written by any human being was a lint error: measured 2026-11-05 on
+                # switchpost, 4 rows, 10 findings, every one of them a shell command
+                # (`cp ~/.local/bin/... && systemctl --user restart ...`), an API route
+                # (`GET /api/providers`) or a diff invocation — none of them a file
+                # path, and all of them the evidence a careful row is supposed to cite.
+                # One grammar for one question: the strict one, plus the repo's own
+                # pointer_ignore list (a repo that names a path in prose says so once).
                 for tok in re.findall(r"`([^`]+)`", r[2]):
-                    if "/" in tok and not PTR_BAD.search(tok) and not (cfg.root / tok).exists():
+                    if "/" not in tok or PTR_BAD.search(tok):
+                        continue
+                    t = tok.rstrip(".,:;)").split("#")[0].split("::")[0]
+                    t = re.sub(r":\d+(-\d+)?$", "", t)
+                    if not t or t in ign or not re.fullmatch(r"[\w./@+-]+", t):
+                        continue
+                    if not (re.search(FILE_EXT + r"$", t)
+                            or (re.search(FILE_EXT + r"\.[A-Za-z_]\w*$", t) and "/" in t)):
+                        continue
+                    if not (cfg.root / t).exists():
                         out.append(f"E010 register {rid}: evidence `{tok}` missing")
     # ledger evidence
     if cfg.has("ledger"):
@@ -2621,10 +2667,42 @@ def doctor_findings(cfg: Cfg) -> tuple[list[str], list[str]]:
             if len(r) > 5 and r[2] == "ruled" and r[5] in ("", "—"):
                 finds.append(f"ruling {r[0]} not applied to its owner (genome q apply {r[0]} --applied <path>)")
     finds += running_edits(cfg)
-    d = cfg.path("workflows")
+    # A kind declaration that cannot work makes `graph`, `show`, `card`, `impact` and
+    # `place` unable to run at all. Measured 2026-11-05: `doctor` reported
+    # `healthy: true` on exactly such a repo while `lint` reported E501 — a health
+    # check that does not check the thing that is broken. Doctor already reports
+    # what lint reports for the other roles, so it reports this too.
+    finds += [p.replace("E501 ", "", 1) for p in kind_problems(cfg)]
+    # A numbered worklog must live in a DIRECTORY. Measured 2026-11-05: a repo
+    # that flipped `worklog_form` to "numbered" while `worklog` still pointed
+    # at the template's single file made `genome log` die with a raw
+    # FileExistsError traceback — and `doctor` reported "healthy" on that
+    # tree. The same shape as the kind check above: a health report that says
+    # healthy next to a crashing command is a report that contradicts the
+    # tool's own behaviour. The worklog is the surface a later session resumes
+    # from, so it crashing is not a cosmetic problem.
+    if cfg.has("worklog") and worklog_numbered(cfg):
+        wl = cfg.path("worklog")
+        if wl.exists() and not wl.is_dir():
+            finds.append(f"numbered worklog needs `worklog` to be a DIRECTORY, but {cfg.rel(wl)} is a file "
+                         f"— `genome log` crashes on it; point the role at a directory or use "
+                         f"`worklog_form = \"file\"`")
+    d = cfg.coord(cfg.path("workflows"))
     if "agents" in cfg.modules and cfg.form("workflows")[0] == "file" and d.is_dir():
         for f in sorted(d.glob("*.md")):
             info += [f"live claim {f.stem}: {r[0]} {r[3]}" for r in rows(f) if len(r) > 3 and r[1] == "in-progress"]
+    if "agents" in cfg.modules and shutil.which("wt") is None and shutil.which("git-wt") is None:
+        mgr = ("brew install worktrunk" if sys.platform == "darwin"
+               else "sudo pacman -S worktrunk" if Path("/etc/arch-release").exists()
+               else "winget install max-sixty.worktrunk" if sys.platform == "win32"
+               else "cargo install worktrunk --locked")
+        info.append(f"worktrunk not installed (parallel-agent worktrees): {mgr}")
+    if "agents" in cfg.modules and (cfg.root / ".git").is_file() and cfg.coord_root() == cfg.root:
+        # a linked worktree whose coordination fell back to LOCAL: the main checkout does not carry
+        # this genome's config (pruned main, bare repo, submodule) — every guarantee the coordination
+        # home makes is silently gone, so say so instead of letting agents trust flock that isn't there
+        info.append("linked worktree resolved to LOCAL coordination — the main checkout carries no "
+                    "genome.toml/kb.toml; claims and the feed are per-worktree until it is restored")
     return finds, info
 
 
@@ -2699,6 +2777,9 @@ def cmd_wake(args) -> None:
     dirty = len(sh(cfg.root, "git", "status", "--porcelain").splitlines())
     print(f"# genome wake — {cfg.root.name} @ {br or '-'} {head or '-'} ({dirty} dirty) "
           f"[{', '.join(sorted(cfg.modules))}]")
+    if cfg.coord_root() != cfg.root:
+        print(f"coordination: linked worktree — boards, feed and claims live in the main checkout "
+              f"({cfg.coord_root()}); finish code with `wt merge`, commit records from the main worktree")
     cap = cfg.get("core", "wake_lines", 18)
     if cfg.has("state"):
         lines = read(cfg.path("state")).splitlines()
@@ -2751,22 +2832,24 @@ def cmd_wake(args) -> None:
     elif cfg.has("worklog"):
         print("\n## LAST WORKLOG")
         print("\n".join(read(cfg.path("worklog")).splitlines()[-3:]))
-    if "agents" in cfg.modules and cfg.has("feed"):
-        aid = os.environ.get("GENOME_AGENT_ID") or os.environ.get("KB_AGENT_ID")
-        if aid:
-            seen_f = cfg.root / ".genome" / f"seen-{aid}"
-            seen = read(seen_f).strip()
-            lines = read(cfg.path("feed")).splitlines()
-            if seen:
-                idx = next((i for i, l in enumerate(lines) if f"[{seen}]" in l), -1)
-                lines = lines[idx + 1:]
-            mine = [l for l in lines if f"@{aid}" in l]
-            print(f"\n## INBOX  @{aid}: {len(mine)} new")
-            print("\n".join(mine[-8:]))
-            ids = re.findall(r"\*\*\[(F\d{4,})\]", read(cfg.path("feed")))
-            if ids:
-                seen_f.parent.mkdir(exist_ok=True)
-                seen_f.write_text(ids[-1])
+    if "agents" in cfg.modules and (cfg.has("feed") or cfg.coord(cfg.path("feed")).exists()):
+        # the identity is per-checkout (agent_identity), so the inbox and its read mark are too:
+        # an agent that never exported GENOME_AGENT_ID still gets its own inbox, not the host's
+        aid = agent_identity(cfg, args)
+        seen_f = cfg.coord(cfg.root / ".genome" / f"seen-{aid}")
+        seen = read(seen_f).strip()
+        feed = cfg.coord(cfg.path("feed"))
+        lines = read(feed).splitlines()
+        if seen:
+            idx = next((i for i, l in enumerate(lines) if f"[{seen}]" in l), -1)
+            lines = lines[idx + 1:]
+        mine = [l for l in lines if f"@{aid}" in l]
+        print(f"\n## INBOX  @{aid}: {len(mine)} new")
+        print("\n".join(mine[-8:]))
+        ids = re.findall(r"\*\*\[(F\d{4,})\]", read(feed))
+        if ids:
+            seen_f.parent.mkdir(exist_ok=True)
+            seen_f.write_text(ids[-1])
     if cfg.kinds:  # one line per kind: counts per state, generated and never hand-kept
         ents, _ = load_entities(cfg)
         print("\n## KINDS")
@@ -3008,6 +3091,8 @@ def scaffold_roles(cfg: Cfg) -> list[str]:
                 atomic_write(p / "README.md", EVIDENCE_TPL)
             elif role in dirs:
                 p.mkdir(parents=True)
+                if not any(p.iterdir()):  # git drops empty dirs: a fresh worktree then reports the role missing
+                    (p / ".gitkeep").touch()
                 if role == "archive" and cfg.get("core", "archive_form", "flat") == "flat":
                     atomic_write(p / "INDEX.md", "| date | original | reason |\n|---|---|---|\n")
             elif role in tpl:
@@ -3030,6 +3115,30 @@ def ignore_runtime(root: Path) -> list[str]:
     return [f".gitignore (+{', '.join(want)})"]
 
 
+def wt_hooks(root: Path) -> list[str]:
+    """When worktrunk is installed, wire its lifecycle to genome: wake on worktree start, lint
+    before a merge. No wt, or hooks already present → nothing written; a later init offers again."""
+    if shutil.which("wt") is None or (root / ".config" / "wt.toml").exists():
+        return []
+    p = root / ".config" / "wt.toml"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("# worktrunk hooks — genome joins the wt lifecycle (project commands need first-run approval)\n"
+                 "[pre-start]\ngenome = \"genome wake\"\n\n[pre-merge]\ngenome = \"genome lint\"\n")
+    return [".config/wt.toml"]
+
+
+def agents_note(root: Path) -> str | None:
+    """AGENTS.md is the hand-written contract — init keeps an existing one, never rewrites it. When
+    that file predates the agents module, the worktrunk loop never landed in it and nothing else in
+    the repo carries the protocol; say so instead of writing into the file."""
+    p = root / "AGENTS.md"
+    if p.exists() and "Parallel agents — worktrees" not in p.read_text():
+        return ("note: AGENTS.md predates the worktrunk loop — add the 'Parallel agents — worktrees' "
+                "section (export GENOME_AGENT_ID, wt switch -c, genome wake/claim/done, wt merge main; "
+                "boards, feed and claims live in the main worktree)")
+    return None
+
+
 def cmd_init(args) -> None:
     root = Path.cwd().resolve()
     chain = bp_chain([s for a in args.blueprint or [] for s in a.split(",") if s], root)
@@ -3042,11 +3151,16 @@ def cmd_init(args) -> None:
         if chain:
             bp_preflight(cfg, chain)
         made = scaffold_roles(cfg) + ignore_runtime(root)
+        if "agents" in cfg.modules:
+            made += wt_hooks(root)
+            note = agents_note(root)
         if chain:
             made += bp_apply(root, chain)
         print(f"genome init: genome.toml kept; {len(made)} change(s): missing roles at their mapped paths, runtime ignores")
         for m in made:
             print(f"  + {m}")
+        if "agents" in cfg.modules and note:
+            print(note)
         print("next: `genome lint --advisory`, then triage (references/adoption.md)")
         return
     mods = PROFILES[args.profile] if args.profile else ["core", *[m for m in (args.modules or "").split(",") if m]]
@@ -3103,8 +3217,13 @@ def cmd_init(args) -> None:
         for rel, body in files.get(m, []):
             write(rel, body)
         for d in dirs.get(m, []):
-            (root / d).mkdir(parents=True, exist_ok=True)
+            p = root / d
+            p.mkdir(parents=True, exist_ok=True)
+            if not any(p.iterdir()):  # git drops empty dirs: a fresh worktree then reports the role missing
+                (p / ".gitkeep").touch()
     made += ignore_runtime(root)
+    if "agents" in mods:
+        made += wt_hooks(root)
     if "records" in mods:
         cfg = find_cfg(root)
         emit_records(cfg)
@@ -3116,6 +3235,8 @@ def cmd_init(args) -> None:
         print(f"  + {m}")
     for k in kept:
         print(f"  = {k} (kept)")
+    if "agents" in mods and (note := agents_note(root)):
+        print(note)
     print("next: `genome wake`; the loop is in docs/playbooks/" + chain[-1][0] + ".md" if chain and chain[-1][2]
           else "next: fill AGENTS.md (what this is, the routing table), then `genome lint`")
 
@@ -3251,6 +3372,21 @@ def cmd_log(args) -> None:
     if worklog_numbered(cfg):
         if not args.entry:
             die("numbered worklog: `genome log \"<title>\"` creates the next file")
+        # The numbered form lives in a DIRECTORY: every entry is its own
+        # NNNN-date-slug.md under it, and `worklog_files` already guards with
+        # `if d.is_dir()`. This branch never did. Measured 2026-11-05: a repo
+        # that only flips `worklog_form` to "numbered" while its `worklog`
+        # still points at the template's single file (`docs/kb/WORKLOG.md`)
+        # got `mkdir` called on a FILE and died with a raw FileExistsError
+        # traceback from an ordinary `genome log` — while `genome doctor`
+        # reported "healthy" on the same tree. A health check that says
+        # healthy next to a crashing command is a report that contradicts
+        # the tool's own behaviour, which is the shape `doctor` exists to
+        # prevent. Say what is wrong and how to fix it.
+        if not wl.is_dir():
+            die(f"numbered worklog needs `worklog` to be a DIRECTORY, but {cfg.rel(wl)} is a file.\n"
+                f"  Point the role at a directory (e.g. `worklog = \"{wl.parent.name}/{wl.stem}\"`) "
+                f"and move the existing entries into it; `worklog_form = \"file\"` keeps the single-file form.")
         with Guarded(wl / ".genome-log"):  # two sessions logging at once must not share a number
             nums = [int(re.match(r"\d+", f.name).group(0)) for f in worklog_files(cfg)]
             width = cfg.get("core", "worklog_width", 4)
@@ -3263,9 +3399,25 @@ def cmd_log(args) -> None:
         return
     with Guarded(wl):
         wl.parent.mkdir(parents=True, exist_ok=True)
+        # The body belongs to the entry line. It used to be DROPPED here: the
+        # numbered branch wrote args.body, this branch wrote only the headline,
+        # so `genome log "TITLE" --body-file body.md` silently truncated the
+        # entry to its title in every repo whose worklog is a single file (71
+        # of the 75 in this fleet). The worklog is the surface a later session
+        # resumes from, so a headline with no body is a lost-work surface of
+        # exactly the kind this repo's rules exist to prevent.
+        #
+        # One entry is one physical line in this file, so a multi-line body is
+        # flattened: every run of whitespace becomes one space. That keeps the
+        # markdown readable without introducing a second entry marker, and it
+        # is lossless for the prose this worklog holds.
+        body = " ".join(args.body.split()) if args.body else ""
+        line = f"- **{now()}**{sig} — {args.entry}"
+        if body:
+            line += " " + body
         with open(wl, "a") as f:
-            f.write(f"- **{now()}**{sig} — {args.entry}\n")
-    print(f"worklog: appended ({cfg.rel(wl)})")
+            f.write(line + "\n")
+    print(f"worklog: appended ({cfg.rel(wl)})" + (f" ({len(args.body)} chars of body)" if args.body else ""))
 
 
 def cmd_handoff(args) -> None:
@@ -4086,6 +4238,14 @@ def _dispatch_upgrade(rows: list, apply: bool, roots: list | None = None) -> Non
             names = sorted({Path(r["path"]).resolve().name for r in load_installs()["installs"]})
             die("no registered install matches " + ", ".join(sorted(wanted))
                 + f" ({before} registered; `genome installs list` names them)", ERR)
+    # bin and skill rows are deliberately outside every dispatch: the installed CLI owns its
+    # own update (a reinstall — `genome upgrade` names the command), and skills roots are
+    # install.sh's publish-time job. Deliberate is not silent: name them, so an all-clear
+    # line cannot stand next to copies this dispatch never even looked at.
+    skipped = [r for r in rows if r.get("kind") not in ("vendored", "kb")]
+    if skipped:
+        print(f"note: {len(skipped)} bin/skill row(s) sit outside every dispatch — the installed CLI "
+              f"moves by reinstall (`genome upgrade` names the command), skills roots by install.sh at publish")
     targets = []
     for r in rows:
         if r.get("kind") not in ("vendored", "kb"):
@@ -4125,6 +4285,7 @@ def _dispatch_upgrade(rows: list, apply: bool, roots: list | None = None) -> Non
             print(f"swap source: {swap_source} ({sv})")
     ok = skipped = failed = 0
     broken_out: list[tuple] = []  # (row, old_version, reason, child_output): upgraded, but left broken
+    landed_rows: list = []        # rows whose disk re-read proved the swap landed at ref
     for r, cli, v in targets:
         cmd = [sys.executable, str(cli), "upgrade"] + (["--apply"] if apply else [])
         try:
@@ -4154,7 +4315,9 @@ def _dispatch_upgrade(rows: list, apply: bool, roots: list | None = None) -> Non
         # the state that must never read as green.
         if apply and res.returncode == 0:
             landed = _version_of(Path(r["path"]))
-            if landed != ref:
+            if landed == ref:
+                landed_rows.append(r)
+            else:
                 broken = broken or f"the copy is {landed} on disk, not {ref}"
         if res.returncode == 0:
             if not broken:
@@ -4204,6 +4367,25 @@ def _dispatch_upgrade(rows: list, apply: bool, roots: list | None = None) -> Non
             why = (out.splitlines()[0] if out else
                    "exit " + str(res.returncode) + " (no output — run it directly: " + " ".join(cmd) + ")")
             print(f"ERROR  {r['path']} — {why}")
+    if apply and landed_rows:
+        # THE REGISTRY RECORDS WHAT THE DISPATCH LANDED. The manifest row's version is a
+        # PUBLISH-TIME snapshot from registration day, and nothing refreshed it — so after
+        # every dispatch `installs verify` called every copy it had just upgraded STALE
+        # ("changed since registration"): true, and noise that drowns the row that drifted
+        # for real. This dispatch already re-read the disk (the swap is verified on land),
+        # so it is the writer that knows; it records the version it proved. `registered`
+        # stays untouched — that field answers "when did we first see this", not "when
+        # did it last change". Reload before writing: `--roots` filtered this view, and
+        # saving the filtered subset would drop the rows it excluded.
+        data = load_installs()
+        landed_paths = {r["path"] for r in landed_rows}
+        hit = 0
+        for row in data["installs"]:
+            if row["path"] in landed_paths:
+                row["version"] = ref
+                hit += 1
+        save_installs(data)
+        print(f"registry: {hit} row(s) recorded at {ref}")
     # A copy that upgraded but was left broken is its OWN category: it is not ok (the
     # KB needs a fix), not failed (the swap worked, a retry would not help), and not
     # skipped (nothing refused). Folding it into `ok` is what made a broken fleet report
@@ -4340,7 +4522,7 @@ def cmd_installs(args) -> None:
         if getattr(args, "against_shipped", False):
             _verify_against_shipped(rows)
             return
-        stale, broken = [], []
+        stale, broken, unreadable = [], [], []
         for r in rows:
             p = Path(r["path"])
             v = _version_of(p)
@@ -4349,16 +4531,27 @@ def cmd_installs(args) -> None:
             elif v == "none":
                 # a KB with no local CLI: present and legitimate, nothing to compare
                 continue
+            elif v == "?":
+                # A registered copy whose entry point carries no VERSION stamp — the measured
+                # shape is a decayed package install (the uv tool venv on this machine lost its
+                # package; the shim stayed on PATH and every invocation tracebacks). "?" against
+                # the manifest's own "?" compares equal, so the silence here is the exact silent
+                # failure this registry exists to catch. And the copy cannot doctor itself: the
+                # CLI is the thing that is broken.
+                unreadable.append((r, v))
             elif r.get("version") and r["version"] != "?" and v != r["version"]:
                 stale.append((r, v))
         for r, v in broken:
             print(f"MISSING {r['kind']} {r['path']} (was version {r.get('version', '?')})")
+        for r, v in unreadable:
+            print(f"UNREADABLE {r['kind']} {r['path']} — no VERSION stamp in the entry point; "
+                  f"the install is decayed — reinstall it (genome upgrade names the command)")
         for r, v in stale:
             print(f"STALE   {r['kind']} {r['path']} — manifest says {r['version']}, on disk {v}")
-        if not broken and not stale:
+        if not broken and not unreadable and not stale:
             print(f"verify: all {len(rows)} registered install(s) present, versions unchanged")
             return
-        die(f"{len(broken)} missing, {len(stale)} changed since registration", ERR)
+        die(f"{len(broken)} missing, {len(unreadable)} unreadable, {len(stale)} changed since registration", ERR)
     if args.installs_cmd == "scan":
         # Find installs the manifest does not know about. Skills roots come from the
         # harness conventions install.sh probes; bins from PATH; vendored copies by
@@ -4795,10 +4988,22 @@ def agent_id(args) -> str:
         or f"agent-{platform.node()}"
 
 
+def agent_identity(cfg: Cfg, args) -> str:
+    """agent_id, disambiguated per checkout. The same-host default (`agent-<hostname>`) is one
+    identity shared by every worktree on the machine, and a shared identity silently defeats
+    claim exclusivity — the holder check reads `held == aid` as self, so worktree B can take
+    worktree A's item without a word. An agent that never exported GENOME_AGENT_ID gets its
+    checkout name appended instead; an explicit --agent or exported id is taken as given
+    (one agent = one id is the convention the AGENTS.md block teaches)."""
+    aid = agent_id(args)
+    return aid if aid != f"agent-{platform.node()}" or cfg.coord_root() == cfg.root \
+        else f"{aid}@{cfg.root.name}"
+
+
 def _post(cfg: Cfg, aid: str, msg: str, wf=None, to=None, reply=None) -> str | None:
     if cfg.form("feed")[0] != "file" or "agents" not in cfg.modules:
         return None
-    feed = cfg.path("feed")
+    feed = cfg.coord(cfg.path("feed"))
     feed.parent.mkdir(parents=True, exist_ok=True)
     with Guarded(feed):
         ids = [int(x) for x in re.findall(r"\*\*\[F(\d{4,})\]", read(feed))]
@@ -4813,11 +5018,11 @@ def _post(cfg: Cfg, aid: str, msg: str, wf=None, to=None, reply=None) -> str | N
 def _wf_path(cfg: Cfg, wf: str) -> Path:
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,40}", wf or ""):
         die(f"workflow name `{wf}` must be kebab-case")
-    return cfg.require("workflows", "genome wf") / f"{wf}.md"
+    return cfg.coord(cfg.require("workflows", "genome wf")) / f"{wf}.md"
 
 
 def _board_of(cfg: Cfg, item: str) -> Path:
-    d = cfg.path("workflows")
+    d = cfg.coord(cfg.path("workflows"))
     for f in sorted(d.glob("*.md")) if d.is_dir() else []:
         if find_row(f, item):
             return f
@@ -4844,7 +5049,7 @@ def cmd_wf(args) -> None:
             append_row(p, [f"{args.name}-{n:03d}", "open", args.item, "—", "—"], "")
         print(f"{args.name}-{n:03d} added (open)")
     else:
-        d = cfg.path("workflows")
+        d = cfg.coord(cfg.path("workflows"))
         for f in sorted(d.glob("*.md")) if d.is_dir() else []:
             rs = rows(f)
             print(f"{f.stem:24} {len(rs):3} rows, {sum(r[1] == 'open' for r in rs if len(r) > 1)} open")
@@ -4854,7 +5059,7 @@ def cmd_claim(args) -> None:
     cfg = find_cfg()
     cfg.need("agents")
     p = _board_of(cfg, args.item)
-    aid = agent_id(args)
+    aid = agent_identity(cfg, args)
     with Guarded(p):
         r = list(find_row(p, args.item))
         held = claim_holder(r[3] if len(r) > 3 else "")
@@ -4870,19 +5075,20 @@ def cmd_done(args) -> None:
     cfg = find_cfg()
     cfg.need("agents")
     p = _board_of(cfg, args.item)
+    aid = agent_identity(cfg, args)
     if args.new_status in TERMINAL and not args.evidence:
         die("terminal: --evidence names where the verdict lives")
     with Guarded(p):
         row = find_row(p, args.item)
         r = list(row) + ["—"] * (5 - len(row))
         held = claim_holder(r[3])
-        if held and held != agent_id(args):
+        if held and held != aid:
             die(f"`{args.item}` is claimed by {held} — only the holder finishes it", ERR)
         r[1] = args.new_status
         if args.new_status in TERMINAL:
             r[4] = f"[{today()}] {args.evidence}" + (f" — {args.note}" if args.note else "")
         replace_row(p, args.item, r)
-    _post(cfg, agent_id(args), f"`{args.item}` → {args.new_status}", p.stem)
+    _post(cfg, aid, f"`{args.item}` → {args.new_status}", p.stem)
     print(f"{args.item} → {args.new_status}")
 
 
@@ -4890,7 +5096,7 @@ def cmd_claim_register(args) -> None:
     cfg = find_cfg()
     cfg.need("agents")
     reg = cfg.require("register", "genome claim-register")
-    aid = agent_id(args)
+    aid = agent_identity(cfg, args)
     with Guarded(reg):
         row = register_find(cfg, args.id) or die(f"no register row `{args.id}`")
         r = list(row) + [""] * (4 - len(row))
@@ -4908,14 +5114,15 @@ def cmd_post(args) -> None:
     cfg = find_cfg()
     cfg.need("agents")
     cfg.require("feed", "genome post")
-    fid = _post(cfg, agent_id(args), args.message, args.workflow, args.to.lstrip("@") if args.to else None, args.reply)
-    print(f"feed: [{fid}] by {agent_id(args)}")
+    aid = agent_identity(cfg, args)
+    fid = _post(cfg, aid, args.message, args.workflow, args.to.lstrip("@") if args.to else None, args.reply)
+    print(f"feed: [{fid}] by {aid}")
 
 
 def cmd_feed(args) -> None:
     cfg = find_cfg()
     cfg.need("agents")
-    feed = cfg.require("feed", "genome feed")
+    feed = cfg.coord(cfg.require("feed", "genome feed"))
     lines = read(feed).splitlines()
     if args.since:
         idx = next((i for i, l in enumerate(lines) if f"[{args.since}]" in l), None)
@@ -5025,6 +5232,28 @@ def agents_tpl(mods: list[str], gate: str) -> str:
         rows_ += [("the stack: language, size, wiring, gate (generated)", "the `stack` zone below — `genome outline`"),
                   ("how those parts fit together, and the reading order", "`docs/OUTLINE.md`")]
     table = "\n".join(f"| {q} | {a} |" for q, a in rows_)
+    wt = ""
+    if "agents" in mods:
+        wt = """
+## Parallel agents — worktrees
+
+Several agents work this repo at once through git worktrees (`wt`, worktrunk). One agent = one
+worktree = one `GENOME_AGENT_ID`. Boards, feed and claims live in the **main worktree** (the
+coordination home) wherever you run the commands from; code stays isolated in your worktree.
+
+```bash
+export GENOME_AGENT_ID=<agent id>   # identity for claims/feed — one agent = one worktree
+wt switch -c <branch>               # your isolated checkout
+genome wake                         # orientation + inbox — works inside a worktree
+genome claim <item>                 # flock-guarded across ALL worktrees of this repo
+# … work …
+genome done <item> done --evidence <path>
+wt merge main                       # squash, rebase, merge, cleanup
+```
+
+Commit board/feed changes from the main worktree (`genome close` there); `wt merge` never touches
+them. Register claims (`claim-register`) and register transitions are main-worktree work.
+"""
     return f"""# AGENTS.md — the entry contract
 
 Orientation, the gate, and **which document owns which question**.
@@ -5051,7 +5280,7 @@ The card's `architecture` class points here until a repo names a different owner
 | question | answer lives in |
 |---|---|
 {table}
-
+{wt}
 ## Rules
 
 1. One owner per question; amend the owner, never add a second.
@@ -5241,8 +5470,35 @@ WHERE_RE = re.compile(r"^\s*([A-Za-z_][\w.-]*)\s*(<=|>=|!=|=|<|>|~)\s*(.*?)\s*$"
 
 
 def kind_specs(cfg: Cfg) -> dict[str, dict]:
+    """The declared kinds, each with its defaults filled in.
+
+    A kind whose declaration CANNOT WORK is not handed out. Measured
+    2026-11-05: `kind_dir()` read `k["path"]` with no guard, so a `[kinds.x]`
+    block with no `path` made `graph`, `show`, `card`, `impact` and `place`
+    die with a raw `KeyError: 'path'` traceback — while `lint` reported E501
+    correctly and `doctor` reported `healthy: true`.
+
+    A traceback is a failure of the TOOL, not of the repo, and the repo's
+    mistake is already named by E501 (`path` is required). So the declaration is
+    dropped here, and the reason is said ONCE on stderr — the commands then
+    report "no such kind" instead of dying, and the linter still names E501.
+
+    Dropping it is not hiding it: the kind never appears in `genome kinds`
+    output, and the stderr line says which one and why. The alternative —
+    handing out a kind that cannot be read — is what made the commands crash.
+    """
     out = {}
     for name, k in cfg.kinds.items():
+        if not isinstance(k.get("path"), str) or not k["path"]:
+            # said once per process, not once per command
+            if not getattr(cfg, "_kind_warned", False):
+                print(f"genome: note: kind `{name}` is not usable — `path` is required, so it is "
+                      f"skipped (run `genome lint` for E501)", file=sys.stderr)
+                try:
+                    cfg._kind_warned = True
+                except AttributeError:
+                    pass
+            continue
         s = dict(k)
         s.setdefault("store", "dir")
         s.setdefault("mutability", "append-only" if s["store"] == "jsonl" else "current")
@@ -5256,8 +5512,25 @@ def kind_specs(cfg: Cfg) -> dict[str, dict]:
 
 
 def kind_problems(cfg: Cfg) -> list[str]:
-    """E501: a kind declaration that cannot work (checked before any entity is read)."""
+    """E501: a kind declaration that cannot work (checked before any entity is read).
+
+    This reads the RAW declarations, not `kind_specs()`. Measured 2026-11-05:
+    `kind_specs()` began skipping a kind that has no `path`, so that the
+    commands would stop crashing on it — and because this function iterated
+    `kind_specs()`, the linter stopped REPORTING it too. The fix for a crash
+    must not silence the check that names the defect: E501 is the only place
+    the operator is told what to fix.
+
+    So the raw kinds are validated here, and `kind_specs()` is what the
+    commands read.
+    """
     out, specs = [], kind_specs(cfg)
+    # the kinds `kind_specs` could not hand out are still checked: they are the
+    # ones the operator most needs to be told about.
+    for n, k in cfg.kinds.items():
+        if n in specs:
+            continue
+        out.append(f"E501 kind `{n}`: `path` is required")
     for n, k in specs.items():
         def bad(msg):
             out.append(f"E501 kind `{n}`: {msg}")
