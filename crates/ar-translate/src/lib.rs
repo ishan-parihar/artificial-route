@@ -135,6 +135,7 @@ mod gemini;
 mod gemini_upstream;
 mod gitlab;
 mod media;
+mod namespaces;
 mod ollama;
 mod openai;
 mod outbound;
@@ -162,6 +163,7 @@ pub use media::{
     EMBEDDING_REGISTRY, EmbeddingFamily, EmbeddingInput, EmbeddingRequest, EmbeddingUpstream,
     EmbeddingUsage, EmbeddingVector, MediaError, Modality, create_embedding_response, family_guard,
 };
+pub use namespaces::ToolNamespaces;
 pub use ollama::{OllamaChat, OllamaMessage, OllamaOptions};
 pub use openai::{
     OpenAIChat, OpenAIChunk, OpenAIChunkChoice, OpenAIContent, OpenAIContentPart, OpenAIDelta,

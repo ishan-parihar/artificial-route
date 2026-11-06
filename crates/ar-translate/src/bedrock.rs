@@ -119,12 +119,12 @@ fn bedrock_tool_use(call: &ToolCall) -> Value {
     } else {
         json!({})
     };
-    json!({ "toolUse": { "toolUseId": call.id, "name": call.name, "input": input } })
+    json!({ "toolUse": { "toolUseId": call.id, "name": call.flat_name(), "input": input } })
 }
 
 fn bedrock_tool(tool: &crate::canonical::CanonicalTool) -> Value {
     let mut spec = Map::with_capacity(3);
-    spec.insert("name".to_owned(), tool.name.as_str().into());
+    spec.insert("name".to_owned(), tool.flat_name().into());
     if let Some(description) = &tool.description {
         spec.insert("description".to_owned(), description.as_str().into());
     }
@@ -451,6 +451,7 @@ mod tests {
             id: "tu_1".to_owned(),
             name: "add".to_owned(),
             arguments: json!({ "a": 1 }),
+            namespace: None,
         }];
         let mut result = Msg::new(Role::Tool, "3");
         result.tool_call_id = Some("tu_1".to_owned());
@@ -491,6 +492,7 @@ mod tests {
             name: "lookup".to_owned(),
             description: None,
             parameters: json!({ "type": "object" }),
+            namespace: None,
         }];
         c.tool_choice = Some(ToolChoice::Named("lookup".to_owned()));
         let body = rendered(&c);

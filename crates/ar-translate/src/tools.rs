@@ -39,7 +39,11 @@ fn str_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
 /// Builds a declaration from a name, an optional description and a schema read
 /// under `schema_key` (`parameters` for OpenAI-style, `input_schema` for
 /// Anthropic).
-fn declared(decl: &Value, schema_key: &str) -> Result<CanonicalTool, TranslateError> {
+///
+/// `namespace` is the namespace the declaration was grouped under, when the
+/// client groups its tools into namespaces. It is `None` for a plain
+/// declaration.
+fn declared(decl: &Value, schema_key: &str, namespace: Option<&str>) -> Result<CanonicalTool, TranslateError> {
     let name = str_field(decl, "name").ok_or_else(|| invalid("a tool has no `name`"))?;
     Ok(CanonicalTool {
         name: name.to_owned(),
@@ -49,6 +53,7 @@ fn declared(decl: &Value, schema_key: &str) -> Result<CanonicalTool, TranslateEr
             .filter(|schema| !schema.is_null())
             .cloned()
             .unwrap_or_else(empty_schema),
+        namespace: namespace.map(str::to_owned),
     })
 }
 
@@ -78,7 +83,7 @@ pub(crate) fn openai_tools(rest: &Value) -> Result<Vec<CanonicalTool>, Translate
             let function = tool
                 .get("function")
                 .ok_or_else(|| invalid("a function tool has no `function` object"))?;
-            declared(function, "parameters")
+            declared(function, "parameters", None)
         })
         .collect()
 }
@@ -100,15 +105,49 @@ pub(crate) fn openai_tool_choice(rest: &Value) -> Result<Option<ToolChoice>, Tra
 
 /// The Responses API's `tools`: the same declarations, flattened (no `function`
 /// wrapper), with the same built-in refusal.
+///
+/// A `namespace` container is **expanded**, not refused: it groups several
+/// declarations under one name, and every inner declaration is an ordinary
+/// Responses function tool. The group is a client-side grouping (Codex uses it
+/// for its MCP servers), so the inner tools keep their own names and carry the
+/// group's name as their namespace. The namespace is put back on the reply, so
+/// the client resolves the call it made.
+///
+/// A `custom` (freeform) inner tool has no schema this build can route, so it
+/// is refused by name rather than dropped.
 pub(crate) fn responses_tools(rest: &Value) -> Result<Vec<CanonicalTool>, TranslateError> {
-    tool_list(rest)?
+    let mut out = Vec::new();
+    for tool in tool_list(rest)? {
+        match str_field(tool, "type") {
+            Some("function") => out.push(declared(tool, "parameters", None)?),
+            Some("namespace") => out.extend(namespace_tools(tool)?),
+            Some(kind) => return Err(unsupported(kind)),
+            None => return Err(unsupported("")),
+        }
+    }
+    Ok(out)
+}
+
+/// The declarations inside one `namespace` container.
+///
+/// Each inner declaration is read as an ordinary Responses function tool, with
+/// the container's name as its namespace. An inner type this build does not
+/// run is refused: a dropped declaration is a tool the model never sees, which
+/// is the silent substitution this crate exists to prevent.
+fn namespace_tools(container: &Value) -> Result<Vec<CanonicalTool>, TranslateError> {
+    let namespace = str_field(container, "name")
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| invalid("a namespace tool has no `name`"))?;
+    let tools = container
+        .get("tools")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid("a namespace tool has no `tools` array"))?;
+    tools
         .iter()
-        .map(|tool| {
-            let kind = str_field(tool, "type").unwrap_or_default();
-            if kind != "function" {
-                return Err(unsupported(kind));
-            }
-            declared(tool, "parameters")
+        .map(|tool| match str_field(tool, "type") {
+            Some("function") => declared(tool, "parameters", Some(namespace)),
+            Some(kind) => Err(unsupported(kind)),
+            None => Err(unsupported("")),
         })
         .collect()
 }
@@ -132,7 +171,7 @@ pub(crate) fn anthropic_tools(rest: &Value) -> Result<Vec<CanonicalTool>, Transl
     tool_list(rest)?
         .iter()
         .map(|tool| match str_field(tool, "type") {
-            None | Some("custom") => declared(tool, "input_schema"),
+            None | Some("custom") => declared(tool, "input_schema", None),
             Some(kind) => Err(unsupported(kind)),
         })
         .collect()
@@ -175,7 +214,7 @@ pub(crate) fn gemini_tools(rest: &Value) -> Result<Vec<CanonicalTool>, Translate
             .as_array()
             .ok_or_else(|| invalid("`functionDeclarations` must be an array"))?;
         for decl in declarations {
-            out.push(declared(decl, "parameters")?);
+            out.push(declared(decl, "parameters", None)?);
         }
     }
     Ok(out)
@@ -240,6 +279,7 @@ pub(crate) fn openai_tool_calls(rest: &Value) -> Result<Vec<ToolCall>, Translate
                 id: id.to_owned(),
                 name: name.to_owned(),
                 arguments,
+                namespace: None,
             })
         })
         .collect()
@@ -405,5 +445,89 @@ mod tests {
         let chat = responses_to_canonical(req).expect("valid request");
         let body = render(&render_openai_responses_body(&chat));
         assert_eq!(body["tools"][0]["name"], "get_weather");
+    }
+
+    /// Codex groups its MCP tools into `namespace` containers. The container is
+    /// a client-side grouping, so the inner tools are ordinary function
+    /// declarations and the container is expanded rather than refused.
+    #[test]
+    fn responses_tools_should_expand_a_namespace_container_into_its_inner_tools() {
+        let raw = r#"{"model":"m","input":"hi","tools":[
+            {"type":"namespace","name":"mcp__serena","tools":[
+                {"type":"function","name":"activate_project","parameters":{"type":"object"}},
+                {"type":"function","name":"initial_instructions","parameters":{"type":"object"}}]}]}"#;
+        let req: ResponsesApi = serde_json::from_str(raw).expect("valid");
+        let chat = responses_to_canonical(req).expect("a namespace container is expanded");
+
+        assert_eq!(chat.tools.len(), 2, "{:?}", chat.tools);
+        assert_eq!(chat.tools[0].name, "activate_project");
+        assert_eq!(
+            chat.tools[0].namespace.as_deref(),
+            Some("mcp__serena"),
+            "the inner tool keeps the container's namespace"
+        );
+        assert_eq!(chat.tools[1].namespace.as_deref(), Some("mcp__serena"));
+    }
+
+    /// The namespace reaches the upstream as one flat function per inner tool,
+    /// because no upstream in the registry speaks a namespace container.
+    #[test]
+    fn responses_tools_should_flatten_a_namespaced_declaration_for_the_upstream() {
+        let raw = r#"{"model":"m","input":"hi","tools":[
+            {"type":"namespace","name":"mcp__serena","tools":[
+                {"type":"function","name":"activate_project","parameters":{"type":"object"}}]}]}"#;
+        let req: ResponsesApi = serde_json::from_str(raw).expect("valid");
+        let chat = responses_to_canonical(req).expect("valid request");
+        let body = render(&render_openai_responses_body(&chat));
+
+        assert_eq!(body["tools"][0]["type"], "function", "{body}");
+        assert_eq!(body["tools"][0]["name"], "mcp__serena__activate_project", "{body}");
+    }
+
+    /// A namespace container with an inner tool this build does not run is
+    /// refused, not dropped: a dropped declaration is a tool the model never
+    /// sees.
+    #[test]
+    fn responses_tools_should_refuse_a_freeform_tool_inside_a_namespace() {
+        let raw = r#"{"model":"m","input":"hi","tools":[
+            {"type":"namespace","name":"mcp__serena","tools":[
+                {"type":"custom","name":"freeform","format":{"type":"text"}}]}]}"#;
+        let req: ResponsesApi = serde_json::from_str(raw).expect("valid");
+        let err = responses_to_canonical(req).expect_err("a freeform tool is not run here");
+
+        assert_eq!(
+            err.to_string(),
+            r#"unsupported tool type "custom": this build does not run it"#
+        );
+    }
+
+    /// A namespace container with no name cannot be resolved, so it is refused
+    /// rather than flattened into an unresolvable name.
+    #[test]
+    fn responses_tools_should_refuse_a_namespace_container_with_no_name() {
+        let raw = r#"{"model":"m","input":"hi","tools":[
+            {"type":"namespace","tools":[{"type":"function","name":"f"}]}]}"#;
+        let req: ResponsesApi = serde_json::from_str(raw).expect("valid");
+        let err = responses_to_canonical(req).expect_err("a nameless namespace is refused");
+
+        assert!(
+            err.to_string().contains("namespace"),
+            "unhelpful error: {err}"
+        );
+    }
+
+    /// The hosted `web_search` tool is not something this build runs, and the
+    /// refusal stays: a dropped declaration is a tool the model never sees.
+    #[test]
+    fn responses_tools_should_refuse_a_hosted_web_search_declaration() {
+        let raw = r#"{"model":"m","input":"hi",
+            "tools":[{"type":"web_search","external_web_access":true}]}"#;
+        let req: ResponsesApi = serde_json::from_str(raw).expect("valid");
+        let err = responses_to_canonical(req).expect_err("a hosted tool is not run here");
+
+        assert_eq!(
+            err.to_string(),
+            r#"unsupported tool type "web_search": this build does not run it"#
+        );
     }
 }

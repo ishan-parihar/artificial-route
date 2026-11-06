@@ -775,6 +775,7 @@ pub(crate) fn gemini_tool_call(call: &crate::gemini::GeminiFunctionCall) -> Opti
         id,
         name,
         arguments: call.args.clone().unwrap_or_else(|| json!({})),
+        namespace: None,
     })
 }
 
@@ -1086,6 +1087,7 @@ fn anthropic_tool_call(block: &AnthropicBlock) -> Option<ToolCall> {
         id: id.to_owned(),
         name: name.to_owned(),
         arguments,
+        namespace: None,
     })
 }
 
@@ -1155,6 +1157,7 @@ fn ollama_tool_calls(rest: &serde_json::Value) -> Result<Vec<ToolCall>, Translat
                 id: id.to_owned(),
                 name: name.to_owned(),
                 arguments,
+                namespace: None,
             })
         })
         .collect()
@@ -1273,6 +1276,11 @@ fn responses_function_call(item: ResponsesItem) -> Result<Msg, TranslateError> {
         id: call_id,
         name,
         arguments,
+        namespace: item
+            .rest
+            .get("namespace")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
     }];
     Ok(turn)
 }

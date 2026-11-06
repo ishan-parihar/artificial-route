@@ -538,7 +538,7 @@ pub fn render_gemini_body(chat: &CanonicalChat) -> Vec<u8> {
 /// for bytes, and rejects the OpenAI wrapper around it.
 /// The Gemini `functionCall` part a canonical call renders to.
 fn gemini_function_call(call: &ToolCall) -> Value {
-    json!({ "functionCall": { "name": call.name, "args": call.arguments } })
+    json!({ "functionCall": { "name": call.flat_name(), "args": call.arguments } })
 }
 
 /// The Gemini `functionResponse` part answering the call `id`.
@@ -921,14 +921,15 @@ pub fn render_kiro_body(chat: &CanonicalChat) -> Vec<u8> {
 /// under `inputSchema.json`. A tool with no description is spelled `Tool:
 /// <name>`, because the reference does that and Kiro rejects an empty one.
 fn kiro_tool_spec(tool: &CanonicalTool) -> Value {
+    let name = tool.flat_name();
     let description = tool
         .description
         .as_deref()
         .filter(|d| !d.trim().is_empty())
-        .map_or_else(|| format!("Tool: {}", tool.name), str::to_owned);
+        .map_or_else(|| format!("Tool: {name}"), str::to_owned);
     json!({
         "toolSpecification": {
-            "name": tool.name,
+            "name": name,
             "description": description,
             "inputSchema": { "json": tool.parameters },
         }
@@ -1384,12 +1385,12 @@ fn encode(value: Value) -> Vec<u8> {
 /// One declared tool in Anthropic's spelling: `input_schema`, no wrapper.
 /// The Anthropic `tool_use` block a canonical call renders to.
 fn claude_tool_use(call: &ToolCall) -> Value {
-    json!({ "type": "tool_use", "id": call.id, "name": call.name, "input": call.arguments })
+    json!({ "type": "tool_use", "id": call.id, "name": call.flat_name(), "input": call.arguments })
 }
 
 fn claude_tool(tool: &CanonicalTool) -> Value {
     let mut decl = Map::with_capacity(3);
-    decl.insert("name".to_owned(), tool.name.as_str().into());
+    decl.insert("name".to_owned(), tool.flat_name().into());
     if let Some(description) = &tool.description {
         decl.insert("description".to_owned(), description.as_str().into());
     }
@@ -1411,19 +1412,28 @@ fn claude_tool_choice(choice: &ToolChoice) -> Value {
 /// declaration fields beside `type`, no wrapper object.
 /// The Responses `function_call` item a canonical call renders to. Its
 /// `arguments` is a JSON string on this wire, as it is on the chat wire.
+///
+/// `name` is the unqualified name and `namespace` is its own field beside it,
+/// which is the shape a client that groups tools reads: it resolves the call by
+/// `(namespace, name)`, so a flat name with no namespace lands in its default
+/// namespace and is refused as unknown.
 fn responses_function_call(call: &ToolCall) -> Value {
-    json!({
+    let mut item = json!({
         "type": "function_call",
         "call_id": call.id,
         "name": call.name,
         "arguments": call.arguments.to_string(),
-    })
+    });
+    if let Some(namespace) = call.namespace.as_deref() {
+        item["namespace"] = namespace.into();
+    }
+    item
 }
 
 fn responses_tool(tool: &CanonicalTool) -> Value {
     let mut decl = Map::with_capacity(4);
     decl.insert("type".to_owned(), "function".into());
-    decl.insert("name".to_owned(), tool.name.as_str().into());
+    decl.insert("name".to_owned(), tool.flat_name().into());
     if let Some(description) = &tool.description {
         decl.insert("description".to_owned(), description.as_str().into());
     }
@@ -1444,7 +1454,7 @@ fn responses_tool_choice(choice: &ToolChoice) -> Value {
 /// One declaration inside Gemini's `functionDeclarations` group.
 fn gemini_declaration(tool: &CanonicalTool) -> Value {
     let mut decl = Map::with_capacity(3);
-    decl.insert("name".to_owned(), tool.name.as_str().into());
+    decl.insert("name".to_owned(), tool.flat_name().into());
     if let Some(description) = &tool.description {
         decl.insert("description".to_owned(), description.as_str().into());
     }
@@ -1511,6 +1521,7 @@ mod tests {
             id: "c1".to_owned(),
             name: "add".to_owned(),
             arguments: json!({ "a": 1 }),
+            namespace: None,
         }];
         let mut answer = Msg::new(Role::Tool, "5");
         answer.tool_call_id = Some("c1".to_owned());

@@ -127,6 +127,14 @@ pub struct ToolCall {
     pub name: String,
     /// The arguments the model produced, as a JSON value.
     pub arguments: serde_json::Value,
+    /// The namespace the tool was called under, when it was declared in one.
+    ///
+    /// A client that groups tools into namespaces (Codex does) resolves an
+    /// incoming call by `(namespace, name)`, so the namespace has to travel
+    /// with the call: without it the client looks the name up in its default
+    /// namespace, does not find it, and refuses the call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 
 /// One non-text content part, carried across the canonical boundary unchanged.
@@ -220,6 +228,47 @@ pub struct CanonicalTool {
     pub description: Option<String>,
     /// JSON Schema for the arguments, exactly as declared.
     pub parameters: serde_json::Value,
+    /// The namespace the tool was declared under, when it was declared in one.
+    ///
+    /// No wire in the registry speaks a namespace container, so a namespaced
+    /// declaration is flattened into one flat function whose name carries the
+    /// namespace. The namespace is kept here so the reply can put it back: a
+    /// client that groups tools resolves a call by `(namespace, name)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+}
+
+impl CanonicalTool {
+    /// The name an upstream sees: the flat name, carrying the namespace when
+    /// the tool was declared in one.
+    ///
+    /// The join is `namespace__name`. The split is driven by the *declared*
+    /// namespaces rather than by parsing the flat name, so a name that already
+    /// contains `__` (`_web_run`, `mcp__serena`) round-trips exactly.
+    #[must_use]
+    pub fn flat_name(&self) -> String {
+        match self.namespace.as_deref() {
+            Some(namespace) => format!("{namespace}__{}", self.name),
+            None => self.name.clone(),
+        }
+    }
+}
+
+impl ToolCall {
+    /// The name an upstream sees: the flat name, carrying the namespace when
+    /// the call was made under one.
+    ///
+    /// The join is `namespace__name`, the same join [`CanonicalTool::flat_name`]
+    /// uses for the declaration, so a call round-trips: the upstream echoes the
+    /// flat name back and the reply path splits it on the **declared**
+    /// namespaces, not on any `__` in the name.
+    #[must_use]
+    pub fn flat_name(&self) -> String {
+        match self.namespace.as_deref() {
+            Some(namespace) => format!("{namespace}__{}", self.name),
+            None => self.name.clone(),
+        }
+    }
 }
 
 /// Which tool the model is steered toward.
@@ -393,7 +442,7 @@ pub(crate) fn openai_tool_call(call: &ToolCall) -> serde_json::Value {
     serde_json::json!({
         "id": call.id,
         "type": "function",
-        "function": { "name": call.name, "arguments": call.arguments.to_string() },
+        "function": { "name": call.flat_name(), "arguments": call.arguments.to_string() },
     })
 }
 
@@ -401,7 +450,7 @@ pub(crate) fn openai_tool_call(call: &ToolCall) -> serde_json::Value {
 /// the same name, description and schema.
 pub(crate) fn openai_tool(tool: &CanonicalTool) -> serde_json::Value {
     let mut function = serde_json::Map::with_capacity(3);
-    function.insert("name".to_owned(), tool.name.as_str().into());
+    function.insert("name".to_owned(), tool.flat_name().into());
     if let Some(description) = &tool.description {
         function.insert("description".to_owned(), description.as_str().into());
     }
