@@ -425,6 +425,7 @@ impl ArTranslate<OpenAIChat> for OpenAiInbound {
             stream: input.stream.unwrap_or(false),
             tools: crate::tools::openai_tools(&input.rest)?,
             tool_choice: crate::tools::openai_tool_choice(&input.rest)?,
+            reasoning_effort: crate::tools::openai_reasoning_effort(&input.rest)?,
         })
     }
 }
@@ -486,6 +487,10 @@ impl ArTranslate<AnthropicMessages> for AnthropicInbound {
             stream: input.stream.unwrap_or(false),
             tools: crate::tools::anthropic_tools(&input.rest)?,
             tool_choice: crate::tools::anthropic_tool_choice(&input.rest)?,
+            // Anthropic asks for thinking as a token budget, not an effort
+            // level, so there is no effort to carry across. The build refuses
+            // an inbound `thinking` block outright, so nothing is lost.
+            reasoning_effort: None,
         })
     }
 }
@@ -529,6 +534,7 @@ impl ArTranslate<ResponsesApi> for ResponsesInbound {
             stream: input.stream.unwrap_or(false),
             tools: crate::tools::responses_tools(&input.rest)?,
             tool_choice: crate::tools::responses_tool_choice(&input.rest)?,
+            reasoning_effort: crate::tools::responses_reasoning_effort(&input.rest)?,
         })
     }
 }
@@ -589,6 +595,7 @@ impl ArTranslate<OllamaChat> for OllamaInbound {
             stream: input.stream.unwrap_or(false),
             tools: crate::tools::openai_tools(&input.rest)?,
             tool_choice: crate::tools::openai_tool_choice(&input.rest)?,
+            reasoning_effort: crate::tools::openai_reasoning_effort(&input.rest)?,
         })
     }
 }
@@ -656,6 +663,9 @@ impl ArTranslate<GeminiChat> for GeminiInbound {
             stream: false,
             tools: crate::tools::gemini_tools(&input.rest)?,
             tool_choice: crate::tools::gemini_tool_choice(&input.rest)?,
+            // Gemini asks for thinking as a token budget (`thinkingConfig`), not
+            // an effort level, so there is no effort to carry across.
+            reasoning_effort: None,
         })
     }
 }

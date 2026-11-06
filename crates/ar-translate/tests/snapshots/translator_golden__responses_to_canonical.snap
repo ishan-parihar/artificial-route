@@ -43,4 +43,5 @@ CanonicalChat {
     stream: true,
     tools: [],
     tool_choice: None,
+    reasoning_effort: None,
 }

@@ -211,6 +211,58 @@ pub struct CanonicalChat {
     /// upstream's own default, which is what an absent `tool_choice` means.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
+    /// How hard the caller asked the model to think, when it said so.
+    ///
+    /// Codex sends this as `reasoning: {"effort": "medium", "summary": "auto"}`
+    /// on every request. It is not decoration: the effort changes what the
+    /// upstream is asked to produce, so dropping it silently answers a harder
+    /// question with an easier one. Only the effort is carried — the summary
+    /// asks for a *reasoning trace* in the reply, which this build does not
+    /// render back to a client (see the `reframe` module's note on
+    /// `reasoning_content`), so carrying it would promise something the reply
+    /// path cannot deliver.
+    ///
+    /// The field is serialised under its canonical name, not the wire's
+    /// `reasoning`. The canonical body is what `ar-server` hands `ar-exec`,
+    /// and `ar-exec` reads it back into a `CanonicalChat` before rendering it
+    /// for the upstream — so a body that spelled the field `reasoning` would
+    /// not survive that crossing, and the effort would be lost exactly where
+    /// it matters. Each wire renderer maps it to that wire's own spelling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+/// How hard the caller asked the model to think.
+///
+/// The Responses wire spells the effort as a bare string (`"medium"`), the
+/// OpenAI chat wire as a field on a `reasoning` object, and Anthropic as a
+/// `thinking.budget_tokens` budget. This is the one shape all three reduce
+/// to, and it is carried as an enum so an effort this build does not know is
+/// refused at the edge rather than quietly mapped onto the nearest one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    /// The lowest setting, for a fast answer.
+    Minimal,
+    /// A little thinking.
+    Low,
+    /// The middle setting.
+    Medium,
+    /// A lot of thinking.
+    High,
+}
+
+impl ReasoningEffort {
+    /// The effort as the OpenAI chat wire spells it.
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
 }
 
 /// One callable tool, in the one shape every dialect reduces to: a name, an
@@ -324,6 +376,7 @@ pub enum ToolChoice {
 ///     stream: true,
 ///     tools: vec![],
 ///     tool_choice: None,
+///     reasoning_effort: None,
 /// };
 /// let body = String::from_utf8(render_openai_body(&chat)).unwrap();
 ///
@@ -383,6 +436,18 @@ pub fn render_openai_body(chat: &CanonicalChat) -> Vec<u8> {
     }
     if let Some(choice) = &chat.tool_choice {
         body.insert("tool_choice".to_owned(), openai_tool_choice(choice));
+    }
+    if let Some(effort) = chat.reasoning_effort {
+        // The canonical name, not the wire's `reasoning`. This body is read
+        // back into a `CanonicalChat` by `ar-exec` before it renders the
+        // upstream's wire, so a body that spelled the field `reasoning` would
+        // not survive that crossing, and the effort would be lost exactly
+        // where it matters. [`crate::render_openai_wire_body`] maps it to the
+        // OpenAI wire's own spelling.
+        body.insert(
+            "reasoning_effort".to_owned(),
+            serde_json::json!(effort.as_wire()),
+        );
     }
 
     // `to_vec` on strings, integers, bools and already-valid `Value`s cannot

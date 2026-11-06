@@ -12,7 +12,7 @@
 use serde_json::{Value, json};
 
 use crate::TranslateError;
-use crate::canonical::{CanonicalTool, ToolCall, ToolChoice};
+use crate::canonical::{CanonicalTool, ReasoningEffort, ToolCall, ToolChoice};
 
 /// The schema an absent `parameters` means: a function that takes no arguments.
 fn empty_schema() -> Value {
@@ -165,6 +165,48 @@ pub(crate) fn responses_tool_choice(rest: &Value) -> Result<Option<ToolChoice>, 
     }
 }
 
+/// The Responses API's `reasoning`: `{"effort": "medium", "summary": "auto"}`.
+///
+/// Only the effort is carried. `summary` asks the upstream for a reasoning
+/// trace in the reply, and this build does not render one back to a client,
+/// so carrying it would promise something the reply path cannot deliver. An
+/// effort this build does not know is refused rather than mapped onto the
+/// nearest one: a request that asked for more thinking than it gets should
+/// say so, not answer as if it had been asked for less.
+pub(crate) fn responses_reasoning_effort(
+    rest: &Value,
+) -> Result<Option<ReasoningEffort>, TranslateError> {
+    let Some(reasoning) = present(rest, "reasoning") else {
+        return Ok(None);
+    };
+    let Some(effort) = str_field(reasoning, "effort") else {
+        // A `reasoning` object with no effort says nothing about how hard to
+        // think. It is not an error — it is an absence.
+        return Ok(None);
+    };
+    match effort {
+        "minimal" => Ok(Some(ReasoningEffort::Minimal)),
+        "low" => Ok(Some(ReasoningEffort::Low)),
+        "medium" => Ok(Some(ReasoningEffort::Medium)),
+        "high" => Ok(Some(ReasoningEffort::High)),
+        other => Err(invalid(&format!(
+            "`reasoning.effort` names an effort this build does not run: {other}"
+        ))),
+    }
+}
+
+/// The OpenAI chat wire's `reasoning`: `{"effort": "medium"}`.
+///
+/// The chat wire spells the effort under `reasoning.effort` where the
+/// Responses wire spells it the same way, so the two share one reader. An
+/// effort this build does not know is refused rather than mapped onto the
+/// nearest one.
+pub(crate) fn openai_reasoning_effort(
+    rest: &Value,
+) -> Result<Option<ReasoningEffort>, TranslateError> {
+    responses_reasoning_effort(rest)
+}
+
 /// Anthropic `tools`: `{name, description, input_schema}`. A `type` other than
 /// `custom` marks a server-side tool this build does not run, so it is refused.
 pub(crate) fn anthropic_tools(rest: &Value) -> Result<Vec<CanonicalTool>, TranslateError> {
@@ -299,7 +341,7 @@ fn keyword_choice(keyword: &str) -> Result<ToolChoice, TranslateError> {
 mod tests {
     use serde_json::{Value, json};
 
-    use crate::canonical::{ToolChoice, render_openai_body};
+    use crate::canonical::{ReasoningEffort, ToolChoice, render_openai_body};
     use crate::outbound::{render_claude_body, render_gemini_body, render_openai_responses_body};
     use crate::{
         AnthropicMessages, GeminiChat, OpenAIChat, ResponsesApi, anthropic_to_canonical,
@@ -528,6 +570,117 @@ mod tests {
         assert_eq!(
             err.to_string(),
             r#"unsupported tool type "web_search": this build does not run it"#
+        );
+    }
+
+    /// Codex sends `reasoning` on every request. The effort changes what the
+    /// upstream is asked to produce, so dropping it answers a harder question
+    /// with an easier one.
+    #[test]
+    fn responses_reasoning_should_carry_the_effort() {
+        let raw = r#"{"model":"m","input":"hi",
+            "reasoning":{"effort":"medium","summary":"auto"}}"#;
+        let req: ResponsesApi = serde_json::from_str(raw).expect("valid");
+        let chat = responses_to_canonical(req).expect("valid request");
+
+        assert_eq!(chat.reasoning_effort, Some(ReasoningEffort::Medium));
+    }
+
+    /// The effort has to reach the upstream, not stop at the canonical shape.
+    #[test]
+    fn responses_reasoning_should_render_back_on_the_responses_wire() {
+        let raw = r#"{"model":"m","input":"hi","reasoning":{"effort":"high"}}"#;
+        let req: ResponsesApi = serde_json::from_str(raw).expect("valid");
+        let chat = responses_to_canonical(req).expect("valid request");
+
+        let body = render(&render_openai_responses_body(&chat));
+
+        assert_eq!(body["reasoning"]["effort"], "high", "{body}");
+    }
+
+    /// The OpenAI chat wire spells it the same way, and the same effort has to
+    /// survive that crossing too.
+    #[test]
+    fn openai_reasoning_should_carry_the_effort() {
+        let raw = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+            "reasoning":{"effort":"low"}}"#;
+        let chat = to_canonical(openai(raw)).expect("valid request");
+
+        assert_eq!(chat.reasoning_effort, Some(ReasoningEffort::Low));
+    }
+
+    /// An effort this build does not know is refused, not mapped onto the
+    /// nearest one: a request that asked for more thinking than it gets should
+    /// say so.
+    #[test]
+    fn responses_reasoning_should_refuse_an_effort_this_build_does_not_run() {
+        let raw = r#"{"model":"m","input":"hi","reasoning":{"effort":"extreme"}}"#;
+        let req: ResponsesApi = serde_json::from_str(raw).expect("valid");
+        let err = responses_to_canonical(req).expect_err("an unknown effort is refused");
+
+        assert!(
+            err.to_string().contains("extreme"),
+            "the error names the effort: {err}"
+        );
+    }
+
+    /// A `reasoning` object with no effort says nothing about how hard to
+    /// think. That is an absence, not an error.
+    #[test]
+    fn responses_reasoning_should_read_an_absent_effort_as_no_effort() {
+        let raw = r#"{"model":"m","input":"hi","reasoning":{"summary":"auto"}}"#;
+        let req: ResponsesApi = serde_json::from_str(raw).expect("valid");
+        let chat = responses_to_canonical(req).expect("valid request");
+
+        assert_eq!(chat.reasoning_effort, None);
+    }
+
+    /// A request with no `reasoning` at all renders no `reasoning` on the
+    /// upstream body, so an upstream that does not know the field never sees
+    /// it.
+    #[test]
+    fn responses_reasoning_should_render_nothing_when_no_effort_was_asked_for() {
+        let raw = r#"{"model":"m","input":"hi"}"#;
+        let req: ResponsesApi = serde_json::from_str(raw).expect("valid");
+        let chat = responses_to_canonical(req).expect("valid request");
+
+        let body = render(&render_openai_responses_body(&chat));
+
+        assert!(body.get("reasoning").is_none(), "{body}");
+    }
+
+    /// The canonical body is what `ar-server` hands `ar-exec`, and `ar-exec`
+    /// reads it back into a `CanonicalChat` before rendering the upstream's
+    /// wire. If the canonical body spelled the field the way the *wire* does,
+    /// the effort would be lost at that crossing — which is exactly where it
+    /// matters, because the crossing is the last chance to carry it.
+    #[test]
+    fn reasoning_effort_should_survive_the_canonical_body_round_trip() {
+        let raw = r#"{"model":"m","input":"hi","reasoning":{"effort":"high"}}"#;
+        let req: ResponsesApi = serde_json::from_str(raw).expect("valid");
+        let chat = responses_to_canonical(req).expect("valid request");
+
+        let body = render_openai_body(&chat);
+        let back: crate::canonical::CanonicalChat =
+            serde_json::from_slice(&body).expect("the canonical body reads back");
+
+        assert_eq!(back.reasoning_effort, Some(ReasoningEffort::High));
+    }
+
+    /// The upstream wire spells the effort `reasoning`, not `reasoning_effort`.
+    /// A provider reads the wire spelling, so the wire renderer has to emit it.
+    #[test]
+    fn reasoning_effort_should_render_on_the_openai_wire_in_its_own_spelling() {
+        let raw = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+            "reasoning":{"effort":"medium"}}"#;
+        let chat = to_canonical(openai(raw)).expect("valid request");
+
+        let body = render(&crate::outbound::render_openai_wire_body(&chat));
+
+        assert_eq!(body["reasoning"]["effort"], "medium", "{body}");
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "the wire spelling only: {body}"
         );
     }
 }

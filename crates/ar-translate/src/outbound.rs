@@ -82,7 +82,7 @@ use serde_json::{Map, Value, json};
 
 use crate::canonical::{
     CanonicalChat, CanonicalResponse, CanonicalTool, FinishReason, MediaPart, Msg, Role, ToolCall,
-    ToolChoice, openai_tool, openai_tool_choice, render_openai_body,
+    ToolChoice, openai_tool, openai_tool_choice,
 };
 
 /// Which provider wire a dispatch must render into.
@@ -179,6 +179,7 @@ impl std::fmt::Display for OutboundWire {
 ///     stream: true,
 ///     tools: vec![],
 ///     tool_choice: None,
+///     reasoning_effort: None,
 /// };
 /// let body: serde_json::Value =
 ///     serde_json::from_slice(&render_for_wire(&chat, OutboundWire::Claude)).unwrap();
@@ -191,7 +192,7 @@ impl std::fmt::Display for OutboundWire {
 #[must_use]
 pub fn render_for_wire(chat: &CanonicalChat, wire: OutboundWire) -> Vec<u8> {
     match wire {
-        OutboundWire::Openai => render_openai_body(chat),
+        OutboundWire::Openai => render_openai_wire_body(chat),
         OutboundWire::Claude => render_claude_body(chat),
         OutboundWire::Responses => render_openai_responses_body(chat),
         OutboundWire::Gemini | OutboundWire::Antigravity => render_gemini_body(chat),
@@ -435,7 +436,34 @@ pub fn render_openai_responses_body(chat: &CanonicalChat) -> Vec<u8> {
     if let Some(choice) = &chat.tool_choice {
         body.insert("tool_choice".to_owned(), responses_tool_choice(choice));
     }
+    if let Some(effort) = chat.reasoning_effort {
+        // The Responses wire spells the effort as a bare string inside a
+        // `reasoning` object.
+        body.insert("reasoning".to_owned(), json!({ "effort": effort.as_wire() }));
+    }
     encode(Value::Object(body))
+}
+
+/// Renders `chat` as an OpenAI chat-completions **upstream** request body.
+///
+/// The sibling of [`crate::render_openai_body`], which builds the *canonical*
+/// body that `ar-server` hands `ar-exec`. The two differ in exactly one
+/// field: the canonical body spells the reasoning effort `reasoning_effort`
+/// (so it survives being read back into a [`CanonicalChat`]), while the
+/// upstream wire spells it `reasoning: {"effort": …}` (what an OpenAI
+/// provider reads). Everything else is the same, so this renderer is the
+/// canonical body with the one field renamed.
+#[must_use]
+pub fn render_openai_wire_body(chat: &CanonicalChat) -> Vec<u8> {
+    let mut body: Value = serde_json::from_slice(&crate::render_openai_body(chat))
+        .unwrap_or_else(|_| Value::Object(Map::new()));
+    let Some(object) = body.as_object_mut() else {
+        return crate::render_openai_body(chat);
+    };
+    if let Some(effort) = object.remove("reasoning_effort") {
+        object.insert("reasoning".to_owned(), json!({ "effort": effort }));
+    }
+    serde_json::to_vec(&body).unwrap_or_else(|_| crate::render_openai_body(chat))
 }
 
 /// Renders `chat` as a Gemini `generateContent` request body.
@@ -1482,9 +1510,10 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        OutboundWire, render_for_wire, render_openai_body, to_anthropic_response,
+        OutboundWire, render_for_wire, render_openai_wire_body, to_anthropic_response,
         to_responses_response,
     };
+    use crate::canonical::render_openai_body;
     use crate::anthropic::AnthropicMessages;
     use crate::canonical::{
         CanonicalChat, CanonicalResponse, FinishReason, MediaPart, Msg, Role, Usage,
@@ -1511,6 +1540,7 @@ mod tests {
             stream: true,
             tools: Vec::new(),
             tool_choice: None,
+            reasoning_effort: None,
         }
     }
 
@@ -1668,9 +1698,22 @@ mod tests {
         let canonical = tri();
         assert_eq!(
             render_for_wire(&canonical, OutboundWire::Openai),
-            render_openai_body(&canonical),
+            render_openai_wire_body(&canonical),
             "the dispatch table must delegate, not reimplement",
         );
+    }
+
+    /// The OpenAI wire renderer differs from the canonical body renderer in
+    /// exactly one field: the reasoning effort's name. Everything else has to
+    /// be byte-identical, or the wire would drift from the canonical shape
+    /// that every other renderer is written against.
+    #[test]
+    fn openai_wire_differs_from_the_canonical_body_only_in_the_reasoning_name() {
+        let canonical = chat(vec![Msg::new(Role::User, "hi")]);
+        let wire = parsed(render_openai_wire_body(&canonical));
+        let body = parsed(render_openai_body(&canonical));
+
+        assert_eq!(wire, body, "no effort, so no difference");
     }
 
     #[test]

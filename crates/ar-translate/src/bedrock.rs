@@ -409,6 +409,7 @@ mod tests {
             stream: false,
             tools: Vec::new(),
             tool_choice: None,
+            reasoning_effort: None,
         }
     }
 

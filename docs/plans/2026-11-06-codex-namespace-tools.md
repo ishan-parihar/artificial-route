@@ -229,16 +229,37 @@ empty for every client that sends no namespace.
 ### 5.6 Fields Codex needs that this build drops
 
 Codex sends `reasoning`, `parallel_tool_calls`, `store`, `include` and
-`client_metadata`. The canonical shape has no field for any of them, so they
-are dropped today. They are not a **blocker** — the request answers 200
-without them — but `reasoning` in particular changes what the model does, so
-the plan carries `reasoning` (the effort/summary request) as a canonical field
-and renders it back on the Responses wire.
+`client_metadata`. They are not a **blocker** — the request answers 200 without
+them — but `reasoning` in particular changes what the model does.
 
-`store`, `include` and `client_metadata` are recorded as **not carried**, with
-the reason: `store:false` and the `include` list are OpenAI bookkeeping, and
-`client_metadata` is a Codex-internal routing hint that no upstream in the
-registry reads. Dropping them changes nothing the model sees.
+`reasoning` **is carried**, as `CanonicalChat::reasoning_effort`:
+`ReasoningEffort` is an enum (`Minimal` / `Low` / `Medium` / `High`), read
+from `reasoning.effort` on both the Responses and the OpenAI chat wire and
+rendered back on both. An effort this build does not know is **refused**
+rather than mapped onto the nearest one: a request that asked for more
+thinking than it gets should say so, not answer as if it had been asked for
+less.
+
+Only the effort is carried, not the `summary`. `summary: "auto"` asks the
+upstream for a reasoning *trace* in the reply, and this build does not render
+one back to a client (see the `reframe` module's note on `reasoning_content`),
+so carrying it would promise something the reply path cannot deliver.
+
+The effort has **two spellings**, on purpose. The canonical body
+(`render_openai_body`) spells it `reasoning_effort`, because that body is read
+back into a `CanonicalChat` by `ar-exec` before the upstream's wire is
+rendered, and a body that spelled the field the way the *wire* does would lose
+the effort at exactly that crossing. The upstream wire
+(`render_openai_wire_body`, and the `ar-exec` OpenAI arm that forwards the
+canonical body verbatim) spells it `reasoning: {"effort": …}`, which is what
+an OpenAI provider reads. The two renderers differ in that one field and
+nothing else, and a test asserts that.
+
+`parallel_tool_calls`, `store`, `include` and `client_metadata` are recorded
+as **not carried**, with the reason: `parallel_tool_calls` is a concurrency
+hint no upstream in the registry reads, `store:false` and the `include` list
+are OpenAI bookkeeping, and `client_metadata` is a Codex-internal routing
+hint. Dropping them changes nothing the model sees.
 
 ## 6. Acceptance
 
@@ -251,6 +272,32 @@ registry reads. Dropping them changes nothing the model sees.
    server — verified with a **real MCP tool dispatch**, not a smoke reply.
 5. A request that declares a genuinely unsupported hosted tool is still
    **refused**, not dropped.
+
+### 6.1 What was verified, and how
+
+Against the captured Codex request (24 tool entries: 13 `namespace`
+containers, 11 flat `function` declarations):
+
+| Check | Before | After |
+|---|---|---|
+| The captured Codex body, verbatim | 400 `unparsable_body`, `unsupported tool type "namespace"` | 200, SSE stream opens |
+| A forced namespaced call, on the wire | — | `{"name":"memory_recall","namespace":"mcp__memory_wire"}` |
+| A hosted `web_search` declaration | 400, named | 400, named (unchanged) |
+
+A live `codex exec -p aroute` then dispatched a real MCP call:
+
+```
+mcp: memory-wire/memory_recall started
+mcp: memory-wire/memory_recall (completed)
+```
+
+which is the acceptance criterion that matters: the namespace expansion and
+the namespace restoration both hold, end to end, through the public tunnel.
+
+Deployed to the local host (`127.0.0.1:20128`) and to the RackNerd host
+behind `aroute.ishanparihar.com` (a static musl build, the same artifact
+shape the release workflow publishes, because the VPS runs glibc 2.36 and
+cannot run the host-linked binary).
 
 ## 7. Bound
 

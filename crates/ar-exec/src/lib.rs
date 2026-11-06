@@ -84,6 +84,7 @@
 //!     stream: true,
 //!     tools: vec![],
 //!     tool_choice: None,
+//!     reasoning_effort: None,
 //! };
 //! let abort = CancellationToken::new();
 //! // Not awaited: a doctest must not perform network I/O.
@@ -92,6 +93,7 @@
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
@@ -524,13 +526,20 @@ impl ArExec {
         // The OpenAI arm is the historical path, kept whole: same bytes, same
         // `rewrite_model` behaviour, no parse through `CanonicalChat`.
         if wire == OutboundWire::Openai {
+            // The canonical body spells the reasoning effort `reasoning_effort`
+            // so it survives the read-back into a `CanonicalChat`. An OpenAI
+            // provider reads `reasoning: {"effort": …}`, so the name is
+            // rewritten here, on the way to the wire. Without it the effort
+            // would reach the provider under a name it does not know, and the
+            // model would answer as if it had been asked for less thinking.
+            let canonical = rename_reasoning_effort(canonical);
             if let Some(capabilities) = d
                 .openai_chat_capabilities
                 .and_then(|rows| rows.get(d.upstream_model))
             {
-                return adapt_openai_chat(canonical, d.upstream_model, capabilities);
+                return adapt_openai_chat(&canonical, d.upstream_model, capabilities);
             }
-            return rewrite_model(canonical, d.upstream_model);
+            return rewrite_model(&canonical, d.upstream_model);
         }
         // Every other wire is rendered from the typed canonical chat, so the
         // upstream receives a body in its own dialect rather than a renamed
@@ -721,6 +730,36 @@ impl<'a> Dispatch<'a> {
             openai_chat_capabilities: self.openai_chat_capabilities,
         }
     }
+}
+
+/// Renames the canonical `reasoning_effort` field to the OpenAI wire's own
+/// `reasoning` spelling.
+///
+/// The canonical body is what `ar-server` hands this crate, and it spells the
+/// effort `reasoning_effort` so that reading it back into a
+/// [`CanonicalChat`] keeps it. An OpenAI provider reads
+/// `reasoning: {"effort": …}`, so the name has to change on the way out.
+///
+/// A body with no such field, or one that is not a JSON object, is returned
+/// unchanged: there is nothing to rename, and a body this cannot parse is
+/// the caller's to fix, not this function's to invent.
+fn rename_reasoning_effort(body: &[u8]) -> Cow<'_, [u8]> {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return Cow::Borrowed(body);
+    };
+    let Some(object) = value.as_object_mut() else {
+        return Cow::Borrowed(body);
+    };
+    let Some(effort) = object.remove("reasoning_effort") else {
+        return Cow::Borrowed(body);
+    };
+    object.insert(
+        "reasoning".to_owned(),
+        serde_json::json!({ "effort": effort }),
+    );
+    Cow::Owned(
+        serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec()),
+    )
 }
 
 /// Applies only an explicitly configured, allowlisted optional-parameter
@@ -1559,6 +1598,44 @@ mod tests {
         ));
     }
 
+    /// The canonical body spells the reasoning effort `reasoning_effort` so it
+    /// survives being read back into a `CanonicalChat`. An OpenAI provider
+    /// reads `reasoning: {"effort": …}`, so the OpenAI arm — which forwards
+    /// the canonical body rather than re-rendering it — has to rename the
+    /// field. Without that rename the provider sees a name it does not know
+    /// and answers as if it had been asked for less thinking.
+    #[test]
+    fn renames_the_reasoning_effort_on_the_openai_wire() {
+        let exec = ArExec::new().unwrap();
+        let d = dispatch_shape(WireFormat::Openai, "m");
+        let body = br#"{"model":"m","messages":[],"stream":false,
+            "reasoning_effort":"medium"}"#;
+
+        let bytes = exec.render_request(&d, body).expect("rendered");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+
+        assert_eq!(value["reasoning"]["effort"], "medium", "{value}");
+        assert!(
+            value.get("reasoning_effort").is_none(),
+            "the canonical name must not reach the wire: {value}"
+        );
+    }
+
+    /// A body with no effort is forwarded unchanged: there is nothing to
+    /// rename, and inventing a `reasoning` field would be a request the caller
+    /// never wrote.
+    #[test]
+    fn leaves_a_body_with_no_reasoning_effort_alone() {
+        let exec = ArExec::new().unwrap();
+        let d = dispatch_shape(WireFormat::Openai, "m");
+
+        let bytes = exec.render_request(&d, CANONICAL).expect("rendered");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+
+        assert!(value.get("reasoning").is_none(), "{value}");
+        assert!(value.get("reasoning_effort").is_none(), "{value}");
+    }
+
     #[test]
     fn maps_every_named_registry_wire_to_a_renderer() {
         // The unblock, asserted on the mapping rather than on a count: every
@@ -1958,6 +2035,7 @@ mod tests {
             stream: true,
             tools: Vec::new(),
             tool_choice: None,
+            reasoning_effort: None,
         };
 
         let err = exec

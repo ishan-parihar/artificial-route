@@ -151,6 +151,7 @@ mod tests {
             stream: true,
             tools: Vec::new(),
             tool_choice: None,
+            reasoning_effort: None,
         }
     }
 

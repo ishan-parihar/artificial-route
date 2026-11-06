@@ -27,4 +27,5 @@ CanonicalChat {
     stream: false,
     tools: [],
     tool_choice: None,
+    reasoning_effort: None,
 }

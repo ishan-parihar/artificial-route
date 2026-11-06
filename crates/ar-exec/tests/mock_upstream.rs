@@ -104,6 +104,7 @@ fn chat() -> CanonicalChat {
         stream: true,
         tools: Vec::new(),
         tool_choice: None,
+        reasoning_effort: None,
     }
 }
 

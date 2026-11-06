@@ -150,8 +150,8 @@ pub use anthropic::{
 pub use anthropic_upstream::{AnthropicStream, anthropic_response_to_openai};
 pub use bedrock::{BedrockStream, bedrock_response_to_openai, render_bedrock_body};
 pub use canonical::{
-    CanonicalChat, CanonicalResponse, CanonicalTool, FinishReason, MediaPart, Msg, Role, ToolCall,
-    ToolChoice, Usage, render_openai_body,
+    CanonicalChat, CanonicalResponse, CanonicalTool, FinishReason, MediaPart, Msg,
+    ReasoningEffort, Role, ToolCall, ToolChoice, Usage, render_openai_body,
 };
 pub use gemini::{
     GeminiBlob, GeminiChat, GeminiContent, GeminiFunctionCall, GeminiFunctionResponse,

@@ -253,6 +253,7 @@ fn canonical_chat_to_openai_body_omits_absent_sampling() {
         stream: false,
         tools: Vec::new(),
         tool_choice: None,
+        reasoning_effort: None,
     };
 
     let body = String::from_utf8(render_openai_body(&canonical)).expect("a rendered body is UTF-8");
