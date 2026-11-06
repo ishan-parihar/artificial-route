@@ -20,6 +20,10 @@ workspace = true
 # crate holds no pin store. Workspace-internal, no new external dep; the cycle
 # is impossible because `ar-cache` does not depend on `ar-route`.
 ar-cache = { path = "../ar-cache" }
+# `ToolNamespaces` — the map that puts a client's tool namespace back on the
+# reply. `ar-translate` is already the crate that owns the wire dialects and
+# it does not depend on `ar-route`, so the edge is acyclic.
+ar-translate = { path = "../ar-translate" }
 bytes = { workspace = true }
 futures = { workspace = true }
 http = "1"

@@ -30,8 +30,8 @@ use ar_exec::{DEFAULT_FRAME_CAP, SseDecoder, SseEvent};
 use ar_registry::WireFormat;
 use ar_route::ChunkStream;
 use ar_translate::{
-    AnthropicStream, GeminiStream, ResponsesStream, claude_stop_reason, openai_reply_to_anthropic,
-    openai_reply_to_ollama, openai_reply_to_responses,
+    AnthropicStream, GeminiStream, ResponsesStream, ToolNamespaces, claude_stop_reason,
+    openai_reply_to_anthropic, openai_reply_to_ollama, openai_reply_to_responses,
 };
 
 use crate::routes::Dialect;
@@ -60,18 +60,64 @@ pub(crate) fn reply(dialect: Dialect, completion: Value) -> Value {
     }
 }
 
+/// Re-spells one whole OpenAI completion in `dialect`, restoring the tool
+/// namespaces the request declared.
+///
+/// A client that groups its tools resolves a call by `(namespace, name)`, so
+/// the `function_call` item has to carry the namespace beside the name. The
+/// upstream only knows the flat name, so the namespace comes from what the
+/// request declared.
+#[must_use]
+pub(crate) fn reply_with_namespaces(
+    dialect: Dialect,
+    completion: Value,
+    namespaces: &ToolNamespaces,
+) -> Value {
+    if namespaces.is_empty() || !matches!(dialect, Dialect::Responses) {
+        return reply(dialect, completion);
+    }
+    let mut out = reply(dialect, completion);
+    let Some(calls) = out
+        .get_mut("output")
+        .and_then(Value::as_array_mut)
+    else {
+        return out;
+    };
+    for item in calls {
+        if item.get("type").and_then(Value::as_str) != Some("function_call") {
+            continue;
+        }
+        let Some(flat) = item.get("name").and_then(Value::as_str).map(str::to_owned) else {
+            continue;
+        };
+        let (name, namespace) = namespaces.split(&flat);
+        let Some(namespace) = namespace else {
+            continue;
+        };
+        item["name"] = name.into();
+        item["namespace"] = namespace.into();
+    }
+    out
+}
+
 /// Re-frames a stream from `source`'s shape as `dialect`'s own events.
 ///
 /// The bytes go through one decoder, so a frame split across reads is joined
 /// before it is read. A source that is not OpenAI chunks is lifted first, by
 /// [`Lift`].
+///
+/// `namespaces` is the request's own map of the flat tool names it declared
+/// under a namespace. A client that groups its tools resolves a call by
+/// `(namespace, name)`, so the `function_call` item has to carry the namespace
+/// beside the name, and the upstream only knows the flat name.
 pub(crate) fn stream(
     mut upstream: ChunkStream,
     dialect: Dialect,
     model: &str,
     source: WireFormat,
+    namespaces: &ToolNamespaces,
 ) -> ChunkStream {
-    let mut reframer = Reframer::new(dialect, model, source);
+    let mut reframer = Reframer::new(dialect, model, source, namespaces);
     Box::pin(async_stream::stream! {
         let mut decoder = SseDecoder::new(DEFAULT_FRAME_CAP);
         while let Some(chunk) = upstream.next().await {
@@ -158,6 +204,9 @@ struct Reframer {
     /// Set when the upstream speaks a non-OpenAI stream: its events are lifted to
     /// OpenAI chunks before they reach the state machine above.
     lift: Option<Lift>,
+    /// The request's own map of the flat tool names it declared under a
+    /// namespace, so a `function_call` item can carry the namespace back.
+    namespaces: ToolNamespaces,
 }
 
 /// A content block or output item left open.
@@ -182,7 +231,12 @@ struct Tool {
 }
 
 impl Reframer {
-    fn new(dialect: Dialect, model: &str, source: WireFormat) -> Self {
+    fn new(
+        dialect: Dialect,
+        model: &str,
+        source: WireFormat,
+        namespaces: &ToolNamespaces,
+    ) -> Self {
         Self {
             dialect,
             model: model.to_owned(),
@@ -196,6 +250,7 @@ impl Reframer {
             finish_reason: None,
             usage: None,
             lift: Lift::for_source(source),
+            namespaces: namespaces.clone(),
         }
     }
 
@@ -539,6 +594,23 @@ impl Reframer {
             kind: OpenKind::Tool(slot),
         });
         let call = &self.tools[slot];
+        // The upstream knows the flat name; the client resolves a call by
+        // `(namespace, name)`, so both the opening item and the closing one
+        // carry the split. Emitting the flat name in one and the split in the
+        // other would make a client that reads either one see a different
+        // tool.
+        let (name, namespace) = self.namespaces.split(&call.name);
+        let mut item = json!({
+            "type": "function_call",
+            "id": format!("fc_{}", call.id),
+            "call_id": call.id,
+            "name": name,
+            "arguments": "",
+            "status": "in_progress",
+        });
+        if let Some(namespace) = namespace {
+            item["namespace"] = namespace.into();
+        }
         let data = match self.dialect {
             Dialect::Anthropic => json!({
                 "type": "content_block_start",
@@ -553,14 +625,7 @@ impl Reframer {
             Dialect::Responses => json!({
                 "type": "response.output_item.added",
                 "output_index": index,
-                "item": {
-                    "type": "function_call",
-                    "id": format!("fc_{}", call.id),
-                    "call_id": call.id,
-                    "name": call.name,
-                    "arguments": "",
-                    "status": "in_progress",
-                },
+                "item": item,
             }),
             Dialect::Ollama | Dialect::OpenAi => return,
         };
@@ -622,14 +687,21 @@ impl Reframer {
             }
             (Dialect::Responses, OpenKind::Tool(slot)) => {
                 let call = &self.tools[slot];
-                let item = json!({
+                // The upstream knows the flat name; the client resolves a call
+                // by `(namespace, name)`, so the split comes from what the
+                // request declared and the item carries both halves.
+                let (name, namespace) = self.namespaces.split(&call.name);
+                let mut item = json!({
                     "type": "function_call",
                     "id": format!("fc_{}", call.id),
                     "call_id": call.id,
-                    "name": call.name,
+                    "name": name,
                     "arguments": call.arguments,
                     "status": "completed",
                 });
+                if let Some(namespace) = namespace {
+                    item["namespace"] = namespace.into();
+                }
                 self.emit(
                     json!({
                         "type": "response.function_call_arguments.done",
@@ -702,7 +774,16 @@ mod tests {
     /// Runs `chunks` through the state machine the way the stream does, and
     /// returns each frame's JSON payload in order.
     fn frames(dialect: Dialect, chunks: &[Value]) -> Vec<Value> {
-        let mut reframer = Reframer::new(dialect, "served", WireFormat::Openai);
+        frames_with(dialect, chunks, &ToolNamespaces::default())
+    }
+
+    /// The same, with the request's own namespace map.
+    fn frames_with(
+        dialect: Dialect,
+        chunks: &[Value],
+        namespaces: &ToolNamespaces,
+    ) -> Vec<Value> {
+        let mut reframer = Reframer::new(dialect, "served", WireFormat::Openai, namespaces);
         let mut out: Vec<Bytes> = Vec::new();
         for chunk in chunks {
             out.extend(reframer.push(chunk.to_string().as_bytes()));
@@ -819,6 +900,138 @@ mod tests {
         assert!(sequence.windows(2).all(|w| w[0] < w[1]), "{sequence:?}");
     }
 
+    /// The upstream knows only the flat name; a client that groups its tools
+    /// resolves the call by `(namespace, name)`, so the `function_call` item
+    /// has to carry the namespace back. Without it the client looks the name
+    /// up in its default namespace and refuses the call as unknown.
+    #[test]
+    fn responses_stream_should_restore_the_namespace_on_a_tool_call() {
+        let namespaces = ToolNamespaces::from_declarations(&[ar_translate::CanonicalTool {
+            name: "activate_project".to_owned(),
+            description: None,
+            parameters: json!({ "type": "object" }),
+            namespace: Some("mcp__serena".to_owned()),
+        }]);
+        let out = frames_with(
+            Dialect::Responses,
+            &[
+                json!({"id":"c1","model":"m","choices":[{"delta":{"tool_calls":[
+                    {"index":0,"id":"call_1","type":"function",
+                     "function":{"name":"mcp__serena__activate_project","arguments":"{}"}}]}}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+            ],
+            &namespaces,
+        );
+
+        let item = out
+            .iter()
+            .find_map(|f| f.pointer("/item"))
+            .expect("the tool call item");
+        assert_eq!(item["name"], "activate_project", "{out:?}");
+        assert_eq!(item["namespace"], "mcp__serena", "{out:?}");
+    }
+
+    /// A tool the request never declared under a namespace keeps its flat name
+    /// and gets no namespace: the client resolves it in its own default
+    /// namespace, which is what it always did.
+    #[test]
+    fn responses_stream_should_leave_an_undeclared_tool_name_alone() {
+        let out = frames(
+            Dialect::Responses,
+            &[
+                json!({"id":"c1","model":"m","choices":[{"delta":{"tool_calls":[
+                    {"index":0,"id":"call_1","type":"function",
+                     "function":{"name":"exec_command","arguments":"{}"}}]}}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+            ],
+        );
+
+        let item = out
+            .iter()
+            .find_map(|f| f.pointer("/item"))
+            .expect("the tool call item");
+        assert_eq!(item["name"], "exec_command", "{out:?}");
+        assert!(item.get("namespace").is_none(), "{out:?}");
+    }
+
+    /// The whole (non-streaming) reply gets the same treatment: the namespace
+    /// comes back on the `function_call` item.
+    #[test]
+    fn a_whole_reply_should_restore_the_namespace_on_a_tool_call() {
+        let namespaces = ToolNamespaces::from_declarations(&[ar_translate::CanonicalTool {
+            name: "memory_recall".to_owned(),
+            description: None,
+            parameters: json!({ "type": "object" }),
+            namespace: Some("mcp__memory_wire".to_owned()),
+        }]);
+        let completion = json!({
+            "id": "c1",
+            "model": "m",
+            "choices": [{"index":0,"message":{"role":"assistant","content":null,
+                "tool_calls":[{"id":"call_1","type":"function",
+                    "function":{"name":"mcp__memory_wire__memory_recall","arguments":"{}"}}]},
+                "finish_reason":"tool_calls"}],
+            "usage": {"prompt_tokens":1,"completion_tokens":1,"total_tokens":2},
+        });
+
+        let out = reply_with_namespaces(Dialect::Responses, completion, &namespaces);
+
+        let item = &out["output"][0];
+        assert_eq!(item["type"], "function_call", "{out}");
+        assert_eq!(item["name"], "memory_recall", "{out}");
+        assert_eq!(item["namespace"], "mcp__memory_wire", "{out}");
+    }
+
+    /// The split is driven by the *declared* namespace, so a name that itself
+    /// carries the separator round-trips exactly.
+    #[test]
+    fn a_whole_reply_should_restore_a_namespace_that_carries_the_separator() {
+        let namespaces = ToolNamespaces::from_declarations(&[ar_translate::CanonicalTool {
+            name: "_web_run".to_owned(),
+            description: None,
+            parameters: json!({ "type": "object" }),
+            namespace: Some("mcp__codex_apps__search_service".to_owned()),
+        }]);
+        let completion = json!({
+            "id": "c1",
+            "model": "m",
+            "choices": [{"index":0,"message":{"role":"assistant","content":null,
+                "tool_calls":[{"id":"call_1","type":"function",
+                    "function":{"name":"mcp__codex_apps__search_service___web_run","arguments":"{}"}}]},
+                "finish_reason":"tool_calls"}],
+        });
+
+        let out = reply_with_namespaces(Dialect::Responses, completion, &namespaces);
+
+        assert_eq!(out["output"][0]["name"], "_web_run", "{out}");
+        assert_eq!(
+            out["output"][0]["namespace"], "mcp__codex_apps__search_service",
+            "{out}"
+        );
+    }
+
+    /// A request that declared no namespace gets the reply it always got.
+    #[test]
+    fn a_whole_reply_should_leave_an_undeclared_tool_name_alone() {
+        let completion = json!({
+            "id": "c1",
+            "model": "m",
+            "choices": [{"index":0,"message":{"role":"assistant","content":null,
+                "tool_calls":[{"id":"call_1","type":"function",
+                    "function":{"name":"exec_command","arguments":"{}"}}]},
+                "finish_reason":"tool_calls"}],
+        });
+
+        let out = reply_with_namespaces(
+            Dialect::Responses,
+            completion,
+            &ToolNamespaces::default(),
+        );
+
+        assert_eq!(out["output"][0]["name"], "exec_command", "{out}");
+        assert!(out["output"][0].get("namespace").is_none(), "{out}");
+    }
+
     #[test]
     fn ollama_stream_should_emit_text_lines_then_a_done_line_with_counts() {
         let out = frames(
@@ -878,7 +1091,13 @@ mod tests {
             Bytes::from(right.to_owned()),
         ]));
 
-        let got: Vec<Bytes> = stream(upstream, Dialect::Anthropic, "m", WireFormat::Openai)
+        let got: Vec<Bytes> = stream(
+            upstream,
+            Dialect::Anthropic,
+            "m",
+            WireFormat::Openai,
+            &ToolNamespaces::default(),
+        )
             .collect()
             .await;
 
@@ -901,7 +1120,13 @@ mod tests {
             Bytes::from("data: [DONE]\n\n"),
         ]));
 
-        let got: Vec<Bytes> = stream(upstream, Dialect::Anthropic, "m", WireFormat::Openai)
+        let got: Vec<Bytes> = stream(
+            upstream,
+            Dialect::Anthropic,
+            "m",
+            WireFormat::Openai,
+            &ToolNamespaces::default(),
+        )
             .collect()
             .await;
         let text: String = got
@@ -929,7 +1154,13 @@ mod tests {
             ),
         ]));
 
-        let got: Vec<Bytes> = stream(upstream, Dialect::Responses, "m", WireFormat::Anthropic)
+        let got: Vec<Bytes> = stream(
+            upstream,
+            Dialect::Responses,
+            "m",
+            WireFormat::Anthropic,
+            &ToolNamespaces::default(),
+        )
             .collect()
             .await;
         let text: String = got
@@ -963,6 +1194,7 @@ mod tests {
             Dialect::Anthropic,
             "m",
             WireFormat::OpenaiResponses,
+            &ToolNamespaces::default(),
         )
         .collect()
         .await;
@@ -990,9 +1222,15 @@ mod tests {
             ),
         ]));
 
-        let got: Vec<Bytes> = stream(upstream, Dialect::OpenAi, "m", WireFormat::Gemini)
-            .collect()
-            .await;
+        let got: Vec<Bytes> = stream(
+            upstream,
+            Dialect::OpenAi,
+            "m",
+            WireFormat::Gemini,
+            &ToolNamespaces::default(),
+        )
+        .collect()
+        .await;
         let text: String = got
             .iter()
             .map(|f| String::from_utf8_lossy(f).into_owned())

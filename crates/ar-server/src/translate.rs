@@ -52,8 +52,8 @@
 
 use ar_route::CanonicalRequest;
 use ar_translate::{
-    AnthropicMessages, OllamaChat, ResponsesApi, anthropic_to_canonical, ollama_to_canonical,
-    render_openai_body, responses_to_canonical,
+    AnthropicMessages, OllamaChat, ResponsesApi, ToolNamespaces, anthropic_to_canonical,
+    ollama_to_canonical, render_openai_body, responses_to_canonical,
 };
 use bytes::Bytes;
 use serde::Deserialize;
@@ -153,7 +153,9 @@ pub fn to_canonical_for_route(route: &str, inbound: &[u8]) -> Result<CanonicalRe
         "/v1/messages" => typed(inbound, |raw| {
             let req: AnthropicMessages = serde_json::from_slice(raw)
                 .map_err(|e| format!("/v1/messages is not an Anthropic Messages body: {e}"))?;
-            anthropic_to_canonical(req).map_err(|e| e.to_string())
+            let chat = anthropic_to_canonical(req).map_err(|e| e.to_string())?;
+            let namespaces = ToolNamespaces::from_declarations(&chat.tools);
+            Ok((chat, namespaces))
         }),
         "/v1/responses" => {
             // `input` is required by `ResponsesApi` and by no other dialect, so a
@@ -162,13 +164,17 @@ pub fn to_canonical_for_route(route: &str, inbound: &[u8]) -> Result<CanonicalRe
             typed(inbound, |raw| {
                 let req: ResponsesApi = serde_json::from_slice(raw)
                     .map_err(|e| format!("/v1/responses is not a Responses body: {e}"))?;
-                responses_to_canonical(req).map_err(|e| e.to_string())
+                let chat = responses_to_canonical(req).map_err(|e| e.to_string())?;
+                let namespaces = ToolNamespaces::from_declarations(&chat.tools);
+                Ok((chat, namespaces))
             })
         }
         "/api/chat" => typed(inbound, |raw| {
             let req: OllamaChat = serde_json::from_slice(raw)
                 .map_err(|e| format!("/api/chat is not an Ollama chat body: {e}"))?;
-            ollama_to_canonical(req).map_err(|e| e.to_string())
+            let chat = ollama_to_canonical(req).map_err(|e| e.to_string())?;
+            let namespaces = ToolNamespaces::from_declarations(&chat.tools);
+            Ok((chat, namespaces))
         }),
         other => Err(format!("no inbound dialect is registered for {other}")),
     }
@@ -193,15 +199,22 @@ fn require_field(route: &str, inbound: &[u8], field: &str) -> Result<(), String>
 /// line; this owns the half they share, which is the re-encode. Re-encoding is
 /// mandatory for these three — the client sent a different shape and the upstream
 /// only reads this one.
+///
+/// The namespaces the request's tool declarations were grouped under travel
+/// with the body, because the reply path has to put them back on the
+/// `function_call` item and the body alone does not say which namespace a flat
+/// tool name belongs to.
 fn typed<F>(inbound: &[u8], render: F) -> Result<CanonicalRequest, String>
 where
-    F: FnOnce(&[u8]) -> Result<ar_translate::CanonicalChat, String>,
+    F: FnOnce(&[u8]) -> Result<(ar_translate::CanonicalChat, ToolNamespaces), String>,
 {
-    let chat = render(inbound)?;
+    let (chat, namespaces) = render(inbound)?;
     // Render before the move: `chat.model` is consumed by `CanonicalRequest::new`
     // and the renderer still needs the whole struct.
     let body = Bytes::from(render_openai_body(&chat));
-    Ok(CanonicalRequest::new(chat.model, body).with_stream(chat.stream))
+    Ok(CanonicalRequest::new(chat.model, body)
+        .with_stream(chat.stream)
+        .with_tool_namespaces(namespaces))
 }
 
 #[cfg(test)]

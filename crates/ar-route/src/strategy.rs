@@ -1978,6 +1978,9 @@ fn chained_request(canonical: &CanonicalRequest, answer: &str) -> Option<Canonic
         body,
         stream: false,
         session: canonical.session.clone(),
+        // The stage body carries no tool declarations, so there is no namespace
+        // to put back on its reply.
+        tool_namespaces: ar_translate::ToolNamespaces::default(),
     })
 }
 

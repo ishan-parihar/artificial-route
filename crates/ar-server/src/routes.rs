@@ -1007,7 +1007,13 @@ async fn handle_chat_inner(
     let source = reframe_source(state, outcome.provider(), dialect, canonical.stream);
     let meta = if canonical.stream {
         if let Some(source) = source {
-            reframe_stream(&mut outcome, dialect, &canonical.model, source);
+            reframe_stream(
+                &mut outcome,
+                dialect,
+                &canonical.model,
+                source,
+                &canonical.tool_namespaces,
+            );
         }
         account_stream(
             &mut outcome,
@@ -1032,6 +1038,7 @@ async fn handle_chat_inner(
             dispatched.elapsed(),
             savings_tokens,
             source,
+            &canonical.tool_namespaces,
         )
         .await
     };
@@ -1108,6 +1115,7 @@ async fn buffer_for_accounting(
     elapsed: Duration,
     savings_tokens: u32,
     source: Option<ar_registry::WireFormat>,
+    namespaces: &ar_translate::ToolNamespaces,
 ) -> ResponseMeta {
     let defaults = || {
         ResponseMeta::default()
@@ -1140,7 +1148,7 @@ async fn buffer_for_accounting(
     // A reply the client reads in its own dialect is counted off the OpenAI body
     // it was rendered from: the usage keys are the same, and that is the shape
     // `read_and_record` is told to read.
-    let client = source.and_then(|source| reframed_body(dialect, source, &body));
+    let client = source.and_then(|source| reframed_body(dialect, source, &body, namespaces));
     let counted = if client.is_some() {
         Dialect::OpenAi
     } else {
@@ -2163,20 +2171,26 @@ fn reframe_stream(
     dialect: Dialect,
     model: &str,
     source: ar_registry::WireFormat,
+    namespaces: &ar_translate::ToolNamespaces,
 ) {
     let AttemptOutcome::Succeeded { upstream, .. } = outcome else {
         return;
     };
     let inner = std::mem::replace(&mut upstream.stream, Box::pin(futures::stream::empty()));
-    upstream.stream = reframe::stream(inner, dialect, model, source);
+    upstream.stream = reframe::stream(inner, dialect, model, source, namespaces);
 }
 
 /// The buffered reply re-spelled in `dialect`, or `None` when the body is not a
 /// completion in its source shape: an error object relays as it arrived.
-fn reframed_body(dialect: Dialect, source: ar_registry::WireFormat, body: &[u8]) -> Option<Bytes> {
+fn reframed_body(
+    dialect: Dialect,
+    source: ar_registry::WireFormat,
+    body: &[u8],
+    namespaces: &ar_translate::ToolNamespaces,
+) -> Option<Bytes> {
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
     let completion = reframe::completion(source, value)?;
-    serde_json::to_vec(&reframe::reply(dialect, completion))
+    serde_json::to_vec(&reframe::reply_with_namespaces(dialect, completion, namespaces))
         .ok()
         .map(Bytes::from)
 }
@@ -4824,6 +4838,7 @@ mod tests {
                 body: Bytes::new(),
                 stream: false,
                 session: Some(Strng::from("sess-1")),
+                tool_namespaces: ar_translate::ToolNamespaces::default(),
             },
         )
         .expect("the combo resolves");
@@ -4848,6 +4863,7 @@ mod tests {
                 body: Bytes::new(),
                 stream: false,
                 session: None,
+                tool_namespaces: ar_translate::ToolNamespaces::default(),
             },
         )
         .expect("the combo resolves");

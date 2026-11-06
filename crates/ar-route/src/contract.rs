@@ -17,6 +17,8 @@ use bytes::Bytes;
 use futures::Stream;
 use http::StatusCode;
 
+use ar_translate::ToolNamespaces;
+
 use crate::resilience::{BreakerClass, Resilience};
 
 /// Interned provider/model/session name.
@@ -276,6 +278,14 @@ pub struct CanonicalRequest {
     /// Opaque client-supplied stickiness key for `Strategy::Lkgp`
     /// (`x-ar-session`). `None` disables pinning for this request.
     pub session: Option<Strng>,
+    /// The namespaces the request's tool declarations were grouped under.
+    ///
+    /// A client that groups its tools (Codex does, for its MCP servers) calls
+    /// them back by `(namespace, name)`. The upstream sees one flat function
+    /// per tool, so the reply path has to put the namespace back — and it can
+    /// only do that from what the request declared. Empty for every request
+    /// that declares no namespace, which is what the field has always meant.
+    pub tool_namespaces: ToolNamespaces,
 }
 
 impl CanonicalRequest {
@@ -287,6 +297,7 @@ impl CanonicalRequest {
             body,
             stream: false,
             session: None,
+            tool_namespaces: ToolNamespaces::default(),
         }
     }
 
@@ -313,6 +324,14 @@ impl CanonicalRequest {
     #[must_use]
     pub fn with_session(mut self, session: Option<Strng>) -> Self {
         self.session = session;
+        self
+    }
+
+    /// Attaches the namespaces the request's tool declarations were grouped
+    /// under.
+    #[must_use]
+    pub fn with_tool_namespaces(mut self, namespaces: ToolNamespaces) -> Self {
+        self.tool_namespaces = namespaces;
         self
     }
 }
