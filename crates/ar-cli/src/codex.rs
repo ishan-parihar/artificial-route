@@ -479,6 +479,25 @@ fn build(bundled: &serde_json::Value, lanes: &[Lane]) -> Result<serde_json::Valu
                     .unwrap_or(0)
                     .max(0);
                 object.insert("priority".to_owned(), serde_json::json!(offset + priority));
+
+                // The hidden entries are kept so a template slug Codex itself
+                // names still resolves, and they are held to the same tool
+                // rules as the lanes: a hidden entry is still an entry Codex
+                // can resolve by slug, and one that declares the hosted
+                // search tool or the freeform apply_patch tool would draw the
+                // same refusal a listed entry draws.
+                object.insert(
+                    "supports_search_tool".to_owned(),
+                    serde_json::Value::Bool(false),
+                );
+                for key in REMOVED_OVERRIDES {
+                    object.remove(key);
+                }
+                object.remove("apply_patch_tool_type");
+                object.insert(
+                    "use_responses_lite".to_owned(),
+                    serde_json::Value::Bool(false),
+                );
             }
             row
         })
@@ -1129,6 +1148,35 @@ mod tests {
             catalog["models"][0].get("apply_patch_tool_type").is_none(),
             "the freeform apply_patch tool must not be declared"
         );
+    }
+
+    #[test]
+    fn no_entry_declares_a_tool_the_router_cannot_run() {
+        // Every entry, listed or hidden: a hidden entry is still an entry
+        // Codex resolves by slug, and one that declares the hosted search tool
+        // or the freeform apply_patch tool draws the same refusal a listed
+        // entry draws.
+        let catalog = build(&bundled(), &[lane("large-stack")]).expect("built");
+        let rows = catalog["models"].as_array().expect("an array");
+
+        for row in rows {
+            let slug = row.get("slug").and_then(serde_json::Value::as_str).unwrap_or("?");
+            assert_eq!(
+                row.get("supports_search_tool").and_then(serde_json::Value::as_bool),
+                Some(false),
+                "{slug} declares the hosted search tool"
+            );
+            assert!(
+                row.get("apply_patch_tool_type").is_none(),
+                "{slug} declares the freeform apply_patch tool"
+            );
+            for field in REMOVED_OVERRIDES {
+                assert!(
+                    row.get(field).is_none(),
+                    "{slug} writes a null where Codex expects a string or a map: {field}"
+                );
+            }
+        }
     }
 
     #[test]
