@@ -1093,6 +1093,13 @@ pub enum OpenAiOptionalParameter {
     Stop,
     /// End-user identifier.
     User,
+    /// The reasoning-effort object.
+    ///
+    /// Not every OpenAI-compatible provider reads it: one that does not
+    /// answers `400 Unsupported parameter(s): reasoning` and the whole
+    /// request fails. An operator declares the omission per model, the same
+    /// way they declare it for `temperature` or `top_p`.
+    Reasoning,
 }
 
 impl OpenAiOptionalParameter {
@@ -1109,6 +1116,7 @@ impl OpenAiOptionalParameter {
             Self::TopLogprobs => "top_logprobs",
             Self::Stop => "stop",
             Self::User => "user",
+            Self::Reasoning => "reasoning",
         }
     }
 }
@@ -2072,6 +2080,21 @@ combos:
         let yaml = "provider_settings:\n  nvidia:\n    request_capabilities:\n      minimax/model-v1:\n        omit_optional_parameters: [max_completion_tokens]\n";
         let err = Config::parse(yaml, stub_lookup).expect_err("unknown parameter rejected");
         assert!(matches!(err, ConfigError::Yaml { .. }), "got: {err:?}");
+    }
+
+    #[test]
+    fn parses_a_reasoning_omission_as_an_optional_parameter() {
+        // A provider that rejects `reasoning` outright fails the whole request,
+        // so the omission has to be declarable the same way `temperature` is.
+        let yaml = "provider_settings:\n  nvidia:\n    request_capabilities:\n      minimaxai/minimax-m3.1-flash:\n        omit_optional_parameters: [reasoning]\n";
+        let cfg = Config::parse(yaml, stub_lookup).expect("a typed capability row");
+        let row = &cfg.provider_settings["nvidia"].request_capabilities
+            ["minimaxai/minimax-m3.1-flash"];
+        assert!(
+            row.omit_optional_parameters
+                .contains(&OpenAiOptionalParameter::Reasoning),
+            "the omission is declared: {row:?}"
+        );
     }
 
     #[test]
