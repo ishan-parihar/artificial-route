@@ -1375,8 +1375,17 @@ const USAGE_FRAME_CAP: usize = 64 * 1024;
 ///
 /// The buffer is bounded by [`USAGE_FRAME_CAP`]: a line over the cap is
 /// dropped rather than held, so a hostile upstream cannot grow the scanner
-/// without limit. What the client receives never depends on what the scanner
-/// kept — the relay is the upstream's bytes either way.
+/// without limit. The drop ends at that line's own newline, so the line after
+/// it is read as a line of its own. What the client receives never depends on
+/// what the scanner kept — the relay is the upstream's bytes either way.
+///
+/// Each dialect's counts ride on a different shape, and the scanner reads
+/// exactly those: OpenAI's `usage` on the chunk that carries one, Anthropic's
+/// `message_start` (the input) composed with a later `message_delta` (the
+/// output), Responses' `response.completed` or `response.incomplete` (the
+/// two terminal events), and Ollama's root-level counts on its `done:true`
+/// line. A shape that never arrives yields no usage: the scanner reports
+/// nothing rather than a count it did not read.
 ///
 /// The cost of frame-awareness is a JSON parse per data line, on the frame
 /// path. The old two-frame tail deferred its parsing to the end of the
@@ -1428,8 +1437,12 @@ impl UsageScanner {
                 continue;
             }
             if self.pending.len().saturating_add(line.len()) > USAGE_FRAME_CAP {
+                // This line is over the cap and this newline is its own, so
+                // the drop ends HERE: the next line is a line of its own and
+                // is scanned as one. Setting the dropping flag here instead
+                // would swallow the line after this one, and a usage frame
+                // that happened to follow an oversized line would go with it.
                 self.pending.clear();
-                self.dropping = true;
                 continue;
             }
             self.pending.extend_from_slice(line);
@@ -1481,7 +1494,13 @@ impl UsageScanner {
         match self.dialect {
             Dialect::Anthropic => {
                 let head = self.head.as_ref()?;
-                let output = self.usage.as_ref()?;
+                let Some(output) = self.usage.as_ref() else {
+                    // No `message_delta` arrived, but the start frame's input
+                    // count is a count the upstream did send. It is recorded
+                    // alone rather than thrown away: a stream cut before its
+                    // last event still consumed its prompt.
+                    return head.get("input_tokens").map(|_| head.clone());
+                };
                 // The delta names the input count too when a re-framed stream
                 // has it: its `message_start` cannot know it yet.
                 Some(serde_json::json!({
@@ -1534,10 +1553,18 @@ impl UsageScanner {
                 let Some(frame) = data_json(line) else {
                     return;
                 };
-                if frame.get("type").and_then(serde_json::Value::as_str)
-                    == Some("response.completed")
-                {
-                    self.usage = frame.pointer("/response/usage").cloned();
+                // Both terminal events carry the usage: `response.completed`
+                // for a reply that ran to its end, `response.incomplete` for
+                // one the model's length limit cut short. The counts of a
+                // truncated reply are still the counts of a served reply, so
+                // reading only the completed one left the ledger blank for
+                // every reply that hit the limit.
+                let terminal = matches!(
+                    frame.get("type").and_then(serde_json::Value::as_str),
+                    Some("response.completed") | Some("response.incomplete")
+                );
+                if terminal && let Some(usage) = frame.pointer("/response/usage") {
+                    self.usage = Some(usage.clone());
                 }
             }
             Dialect::Ollama => {
@@ -1623,13 +1650,18 @@ fn json_line(line: &[u8]) -> Option<serde_json::Value> {
 ///   lands.
 /// * A line over [`USAGE_FRAME_CAP`] is dropped, not held: an upstream that
 ///   sends an endless line must not be able to grow the scanner's buffer.
-///   The relay is unaffected — what the client receives never depends on
-///   what the scanner kept.
+///   The drop ends at that line's own newline, so the line after it is still
+///   read. The relay is unaffected — what the client receives never depends
+///   on what the scanner kept.
 /// * A usage frame split across chunk boundaries is pieced together, because
 ///   HTTP chunked encoding splits wherever the upstream's writer's buffer
 ///   boundary falls, and `reqwest` yields at network-chunk boundaries rather
 ///   than SSE-event boundaries. The scanner assembles a line across chunks
 ///   and scans it once it is complete.
+/// * One served request is one observation: the streaming arm writes its
+///   trace line and audit row once, where the non-streaming arm writes
+///   theirs. Writing them from both halves of the streaming arm wrote each
+///   row three times, and the audit ledger counted one reply three times.
 struct UsageTee {
     /// The upstream stream, wrapped in place inside [`Upstream::stream`].
     inner: Pin<Box<dyn Stream<Item = Bytes> + Send>>,
@@ -1695,7 +1727,6 @@ impl UsageTee {
             &self.model,
             usage,
         );
-        self.record_obs(usage);
         self.state.metrics.work.observe(&ar_obs::Request {
             provider: &self.provider,
             family: price_family(&meta),
@@ -1710,7 +1741,6 @@ impl UsageTee {
             duration_us: u64::try_from(self.dispatched.elapsed().as_micros()).unwrap_or(u64::MAX),
             queue_wait_us: 0,
         });
-        self.record_obs(usage);
     }
 
     /// The streamed arm's half of [`record_obs`], with the same split: full
@@ -1747,6 +1777,11 @@ impl UsageTee {
             return;
         };
         self.observe(&usage);
+        // The trace line and the audit row are written once, here: `observe`
+        // writes the metric, and this is the one place the write path runs.
+        // Writing them from both halves wrote each row three times for one
+        // streamed request, and the audit ledger then counted the same reply
+        // three times over.
         self.record_obs(&usage);
         let Some(ledger) = self.state.ledger.as_ref() else {
             return;
@@ -6298,6 +6333,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_streamed_reply_records_its_usage_when_the_usage_frame_is_split() {
+        // The first bug: `reqwest` yields at network-chunk boundaries, which
+        // are not SSE-event boundaries, so the usage frame can straddle two
+        // chunks. The old shape kept whole chunks, so a split frame was never
+        // parsed and the ledger recorded nothing for a reply that had sent
+        // its counts.
+        let ledger = Arc::new(Mutex::new(
+            ar_tokens::Ledger::open_in_memory().expect("in-memory ledger"),
+        ));
+        let chunks = [
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"",
+            "completion_tokens\":7}}\n\n",
+            "data: [DONE]\n\n",
+        ];
+        let exec = Arc::new(CannedExec(chunks.to_vec()));
+        let router = crate::app::app(routed_with_ledger(exec, Arc::clone(&ledger)));
+        let resp = drive(
+            &router,
+            chat(
+                r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ),
+        )
+        .await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("stream drains");
+        assert_eq!(
+            body.as_ref(),
+            chunks.concat().as_bytes(),
+            "the tee must relay the upstream's exact bytes"
+        );
+        let row = only_row(&ledger).expect("the split usage frame was recorded");
+        assert_eq!(row.total_tokens, 18);
+    }
+
+    #[tokio::test]
+    async fn a_streamed_reply_records_its_usage_behind_a_tail_of_keepalives() {
+        // The second bug: the old shape kept a window of the last two frames,
+        // so an upstream that sent its usage and then a tail of keepalives
+        // evicted the usage before the stream ended, and the ledger recorded
+        // nothing. The usage frame stays the last one seen, however many
+        // frames follow it.
+        let ledger = Arc::new(Mutex::new(
+            ar_tokens::Ledger::open_in_memory().expect("in-memory ledger"),
+        ));
+        let chunks = vec![
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}\n\n",
+            "data: {\"choices\":[]}\n\n",
+            "data: {\"choices\":[]}\n\n",
+            "data: {\"choices\":[]}\n\n",
+            "data: {\"choices\":[]}\n\n",
+            "data: {\"choices\":[]}\n\n",
+            "data: {\"choices\":[]}\n\n",
+            "data: {\"choices\":[]}\n\n",
+            "data: {\"choices\":[]}\n\n",
+            "data: [DONE]\n\n",
+        ];
+        let exec = Arc::new(CannedExec(chunks));
+        let router = crate::app::app(routed_with_ledger(exec, Arc::clone(&ledger)));
+        let resp = drive(
+            &router,
+            chat(
+                r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ),
+        )
+        .await;
+        drain_body(resp).await;
+        let row = only_row(&ledger).expect("the usage frame survived the tail");
+        assert_eq!(row.total_tokens, 18);
+    }
+
+    #[tokio::test]
     async fn an_anthropic_stream_records_the_usage_its_openai_upstream_reports() {
         // The OpenAI upstream reports its counts on the chunk after the finish
         // reason. The re-frame carries them in `message_delta`, and the tee
@@ -6348,6 +6459,37 @@ mod tests {
         .await;
         drain_body(resp).await;
         let row = only_row(&ledger).expect("the completed response's usage was recorded");
+        assert_eq!(row.total_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn a_truncated_responses_stream_records_the_usage_it_sent() {
+        // A stream cut off by the model's length limit ends on
+        // `response.incomplete` rather than `response.completed`. The usage
+        // the upstream did send rides in that event too: the counts of a
+        // truncated reply are still the counts of a served reply, and the
+        // ledger must not go blank for one whose finish reason happened to
+        // be `length`.
+        let ledger = Arc::new(Mutex::new(
+            ar_tokens::Ledger::open_in_memory().expect("in-memory ledger"),
+        ));
+        let exec = Arc::new(CannedExec(vec![
+            "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"length\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n",
+            "data: [DONE]\n\n",
+        ]));
+        let router = crate::app::app(routed_with_ledger(exec, Arc::clone(&ledger)));
+        let resp = drive(
+            &router,
+            post_to(
+                "/v1/responses",
+                "{\"model\":\"m\",\"input\":\"hi\",\"stream\":true}",
+            ),
+        )
+        .await;
+        drain_body(resp).await;
+        let row = only_row(&ledger)
+            .expect("the incomplete response's usage was recorded");
         assert_eq!(row.total_tokens, 5);
     }
 
@@ -6730,6 +6872,15 @@ mod tests {
         .expect("responses completed");
         assert_eq!(usage(got), ar_tokens::NormalizedUsage::new(3, 2));
 
+        // Responses: the incomplete event is the other terminal one, and its
+        // usage is the same shape.
+        let got = scan(
+            Dialect::Responses,
+            &[b"data: {\"type\":\"response.incomplete\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n"],
+        )
+        .expect("responses incomplete");
+        assert_eq!(usage(got), ar_tokens::NormalizedUsage::new(3, 2));
+
         // Ollama: the final `done:true` NDJSON line carries both counts at
         // its root.
         let got = scan(
@@ -6738,6 +6889,44 @@ mod tests {
         )
         .expect("ollama final line");
         assert_eq!(usage(got), ar_tokens::NormalizedUsage::new(9, 4));
+    }
+
+    #[test]
+    fn the_scanner_composes_an_anthropic_usage_from_frames_far_apart() {
+        // Anthropic splits its counts: the input rides in the opening
+        // `message_start` and the output in a later `message_delta`, with the
+        // whole answer's worth of content frames between them. The old shape
+        // kept a first frame and a two-frame tail, so the input was only
+        // found when the start frame happened to be the first chunk and the
+        // output only when the delta happened to be in the last two. The
+        // scanner holds the first start frame and the last delta however far
+        // apart they are, and composes them.
+        let mut scanner = UsageScanner::new(Dialect::Anthropic);
+        scanner.feed(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":21,\"cache_read_input_tokens\":3}}}\n\n",
+        );
+        // Content frames, enough of them that a two-frame window would have
+        // forgotten the opening frame long before the delta arrived.
+        for index in 0..50 {
+            scanner.feed(
+                format!(
+                    "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":{index},\"delta\":{{\"type\":\"text_delta\",\"text\":\"hi\"}}}}\n\n"
+                )
+                .as_bytes(),
+            );
+        }
+        scanner.feed(
+            b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":5}}\n\n",
+        );
+        scanner.feed(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+        scanner.finish();
+
+        let got = scanner.usage().expect("the composed anthropic usage");
+        assert_eq!(
+            ar_tokens::NormalizedUsage::from_usage(&got),
+            ar_tokens::NormalizedUsage::new(24, 5),
+            "the input count and the output count are composed into one figure"
+        );
     }
 
     #[test]
@@ -6751,6 +6940,45 @@ mod tests {
         scanner.finish();
 
         assert!(scanner.usage().is_none());
+    }
+
+    #[test]
+    fn a_partial_line_yields_no_usage_until_it_is_complete() {
+        // A half-arrived usage frame is not a usage frame: the scanner is
+        // still holding the line's bytes, so there is nothing to report yet.
+        // Reporting the partial line's prefix as usage would invent a count
+        // the upstream never sent, which is exactly what the ledger must not
+        // hold.
+        let mut scanner = UsageScanner::new(Dialect::OpenAi);
+        scanner.feed(b"data: {\"usage\":{\"prompt_tokens\":11,\"completion_tok");
+        assert!(
+            scanner.usage().is_none(),
+            "a partial line was reported as a usage frame"
+        );
+
+        // The rest of the line arrives: now it is a frame.
+        scanner.feed(b"ens\":7}}\n\n");
+        scanner.finish();
+        let got = scanner.usage().expect("the completed usage frame");
+        assert_eq!(
+            ar_tokens::NormalizedUsage::from_usage(&got),
+            ar_tokens::NormalizedUsage::new(11, 7)
+        );
+    }
+
+    #[test]
+    fn a_partial_line_that_never_completes_yields_no_usage() {
+        // A stream cut before its usage frame's line ended carries no count
+        // the upstream actually sent: the honest answer is none, not the
+        // prefix of a frame that never arrived whole.
+        let mut scanner = UsageScanner::new(Dialect::OpenAi);
+        scanner.feed(b"data: {\"usage\":{\"prompt_tokens\":11,\"completion_tok");
+        scanner.finish();
+
+        assert!(
+            scanner.usage().is_none(),
+            "a truncated line was reported as a usage frame"
+        );
     }
 
     #[test]
@@ -6999,6 +7227,46 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_streamed_reply_is_observed_once() {
+        // One served request is one trace line and one audit row, whichever arm
+        // served it. The streaming arm's observation is written from two
+        // places that each call the writer, so a stream could leave three rows
+        // for one request: the audit ledger would report the same reply
+        // three times, and the trace file would carry it three times too.
+        let dir = std::env::temp_dir().join(format!("ar-obs-stream-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let exec = Arc::new(CannedExec(vec![
+            r#"data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7}}"#,
+        ]));
+        let state = Components {
+            exec,
+            obs_dir: Some(dir.clone()),
+            ..Components::unconfigured(one_provider_config())
+        }
+        .into_state();
+        let router = crate::app::app(state);
+        let resp = drive(
+            &router,
+            chat(
+                r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ),
+        )
+        .await;
+        drain_body(resp).await;
+
+        // Dropped before reading: `AuditLedger` takes redb's exclusive file
+        // lock, so the writer and any reader cannot coexist in one process.
+        drop(router);
+
+        let audit = ar_obs::AuditLedger::open(&dir.join("audit.redb")).expect("audit open");
+        let rows = audit.query(0, u64::MAX).expect("audit query");
+        assert_eq!(rows.len(), 1, "one streamed request, one row: {rows:?}");
+        drop(audit);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_line_over_the_cap_is_not_kept_for_accounting() {
         // The cap is what keeps the scanner's buffer bounded against an
@@ -7013,6 +7281,51 @@ mod tests {
             "an over-cap line was held in the buffer"
         );
         assert!(scanner.usage().is_none());
+    }
+
+    #[test]
+    fn an_over_cap_line_does_not_swallow_the_line_that_follows_it() {
+        // The cap drops the oversized line, but the drop must end at that
+        // line's own newline: the usage frame that comes after it is still a
+        // usage frame. A scanner that resumed one line late would drop the
+        // usage with the oversized line, and a stream whose payload happens to
+        // exceed the cap would record nothing.
+        let mut scanner = UsageScanner::new(Dialect::OpenAi);
+        scanner.feed(&vec![b'x'; USAGE_FRAME_CAP + 1]);
+        scanner.feed(b"\n");
+        scanner.feed(b"data: {\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}\n\n");
+        scanner.finish();
+
+        let got = scanner
+            .usage()
+            .expect("the usage frame after the oversized line");
+        assert_eq!(
+            ar_tokens::NormalizedUsage::from_usage(&got),
+            ar_tokens::NormalizedUsage::new(11, 7)
+        );
+    }
+
+    #[test]
+    fn an_over_cap_line_and_the_line_after_it_can_share_one_chunk() {
+        // The same drop, arriving in one chunk: the oversized line's own
+        // newline ends the oversized line, so the usage frame on the next
+        // line is still a usage frame. The drop must not run one line past
+        // the newline that ended it.
+        let mut chunk = vec![b'x'; USAGE_FRAME_CAP + 1];
+        chunk.push(b'\n');
+        chunk.extend_from_slice(b"data: {\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}\n\n");
+
+        let mut scanner = UsageScanner::new(Dialect::OpenAi);
+        scanner.feed(&chunk);
+        scanner.finish();
+
+        let got = scanner
+            .usage()
+            .expect("the usage frame after the oversized line");
+        assert_eq!(
+            ar_tokens::NormalizedUsage::from_usage(&got),
+            ar_tokens::NormalizedUsage::new(11, 7)
+        );
     }
 
     /// A panel of two that answers distinctly, and (optionally) a judge.
