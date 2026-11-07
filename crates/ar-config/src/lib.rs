@@ -1100,6 +1100,16 @@ pub enum OpenAiOptionalParameter {
     /// request fails. An operator declares the omission per model, the same
     /// way they declare it for `temperature` or `top_p`.
     Reasoning,
+    /// The `stream_options` object, whose `include_usage` member asks for a
+    /// terminal usage frame.
+    ///
+    /// The router sets this itself on a streaming OpenAI request, because a
+    /// provider that is not asked sends no counts at all and the request then
+    /// costs nothing on the ledger. A target that rejects the field outright
+    /// (`400 Unsupported parameter(s): stream_options`) is not a target whose
+    /// usage can be recovered by sending it, so the operator names it here and
+    /// the injection is skipped for that model.
+    StreamOptions,
 }
 
 impl OpenAiOptionalParameter {
@@ -1117,6 +1127,7 @@ impl OpenAiOptionalParameter {
             Self::Stop => "stop",
             Self::User => "user",
             Self::Reasoning => "reasoning",
+            Self::StreamOptions => "stream_options",
         }
     }
 }

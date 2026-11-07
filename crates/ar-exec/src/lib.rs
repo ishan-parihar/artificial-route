@@ -9,10 +9,12 @@
 //! other 158 executors (bedrock SigV4, vertex, claude-web, codex OAuth) as
 //! `docs/02` directs.
 //!
-//! The OpenAI wire is the default and stays byte-identical; the other seven
-//! wires are rendered from the same canonical chat by `ar-translate`'s outbound
-//! mappers. [`render_request`] is the single place that gate lives, and
-//! [`outbound_wire`] is the single mapping from a registry label to a renderer.
+//! The OpenAI wire is the default and stays a byte-preserving passthrough,
+//! apart from the router's own `stream_options.include_usage` ask on a
+//! streaming chat request; the other seven wires are rendered from the same
+//! canonical chat by `ar-translate`'s outbound mappers. [`render_request`] is
+//! the single place that gate lives, and [`outbound_wire`] is the single
+//! mapping from a registry label to a renderer.
 //!
 //! # Response direction
 //!
@@ -97,7 +99,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
-use ar_config::{OpenAiChatCapabilities, OpenAiChatShape, Secret};
+use ar_config::{OpenAiChatCapabilities, OpenAiChatShape, OpenAiOptionalParameter, Secret};
 use ar_registry::{AuthClass, ProviderDef, WireFormat};
 use ar_translate::{CanonicalChat, OutboundWire, render_for_wire};
 use async_stream::stream;
@@ -533,13 +535,29 @@ impl ArExec {
             // would reach the provider under a name it does not know, and the
             // model would answer as if it had been asked for less thinking.
             let canonical = rename_reasoning_effort(canonical);
-            if let Some(capabilities) = d
+            // The capability row is resolved once so the body render and the
+            // usage injection read the same target's declaration: an operator
+            // who omits `stream_options` for this model means it for both, and
+            // the row that matched for the adapter is the row the injection
+            // honours.
+            let capabilities = d
                 .openai_chat_capabilities
-                .and_then(|rows| rows.get(d.upstream_model))
-            {
-                return adapt_openai_chat(&canonical, d.upstream_model, capabilities);
+                .and_then(|rows| rows.get(d.upstream_model));
+            let mut body = if let Some(capabilities) = capabilities {
+                adapt_openai_chat(&canonical, d.upstream_model, capabilities)?
+            } else {
+                rewrite_model(&canonical, d.upstream_model)?
+            };
+            // A stream the router has not asked for usage in costs nothing on
+            // the ledger: the OpenAI-compatible upstreams send the counts only
+            // when the request carries `stream_options.include_usage`, so the
+            // field is added on the way out rather than left to the caller's
+            // client to remember. A non-streaming reply carries the same usage
+            // object without the field, so only the stream arm is rewritten.
+            if d.stream && !omits_parameter(capabilities, OpenAiOptionalParameter::StreamOptions) {
+                body = include_usage(body)?;
             }
-            return rewrite_model(&canonical, d.upstream_model);
+            return Ok(body);
         }
         // Every other wire is rendered from the typed canonical chat, so the
         // upstream receives a body in its own dialect rather than a renamed
@@ -792,6 +810,59 @@ fn adapt_openai_chat(
     for parameter in &capabilities.omit_optional_parameters {
         object.remove(parameter.as_wire());
     }
+    Ok(Bytes::from(serde_json::to_vec(&value)?))
+}
+
+/// Whether a capability row declares that an optional parameter is omitted for
+/// this target.
+///
+/// `None` is the no-row case and omits nothing: an unmatched target keeps the
+/// historical byte-preserving path, so a parameter the operator never named
+/// is never dropped and never suppresses a router-owned field.
+fn omits_parameter(
+    capabilities: Option<&OpenAiChatCapabilities>,
+    parameter: OpenAiOptionalParameter,
+) -> bool {
+    capabilities.is_some_and(|capabilities| capabilities.omit_optional_parameters.contains(&parameter))
+}
+
+/// Asks a streaming OpenAI request for the usage counts it will not send
+/// otherwise.
+///
+/// The OpenAI-compatible upstreams put the prompt and completion counts in a
+/// terminal stream frame only when the request carries
+/// `stream_options.include_usage`; without it the stream ends with no `usage`
+/// object at all and the ledger has nothing to record for the request. The
+/// field is therefore set by the router rather than left to the caller's
+/// client to remember.
+///
+/// A `stream_options` object the client already sent is merged into, so the
+/// members it names survive alongside the router's own. A client value that is
+/// not an object names no member and cannot carry the request on the wire, so
+/// it is replaced by the object the OpenAI chat wire understands.
+///
+/// # Errors
+///
+/// [`ExecError::Encode`] when the body is not valid JSON, or
+/// [`ExecError::NotAnObject`] when it is valid JSON but not an object — there
+/// is no top-level member to hang `stream_options` on in either case.
+fn include_usage(body: Bytes) -> Result<Bytes, ExecError> {
+    let mut value: serde_json::Value = serde_json::from_slice(&body)?;
+    let Some(object) = value.as_object_mut() else {
+        return Err(ExecError::NotAnObject);
+    };
+    let mut options = match object.remove("stream_options") {
+        Some(serde_json::Value::Object(existing)) => existing,
+        _ => serde_json::Map::new(),
+    };
+    options.insert(
+        "include_usage".to_owned(),
+        serde_json::Value::Bool(true),
+    );
+    object.insert(
+        "stream_options".to_owned(),
+        serde_json::Value::Object(options),
+    );
     Ok(Bytes::from(serde_json::to_vec(&value)?))
 }
 
@@ -1524,6 +1595,152 @@ mod tests {
         assert_eq!(passed["vendor_extension"]["keep"], true);
     }
 
+    /// A streaming OpenAI dispatch carries the usage request itself: the
+    /// OpenAI-compatible upstreams send the prompt and completion counts only
+    /// when the request names them, so a stream without this field ends with no
+    /// `usage` object and the ledger records nothing for the request.
+    #[test]
+    fn asks_a_streaming_openai_request_for_its_usage() {
+        let exec = ArExec::new().expect("client");
+        let d = dispatch_shape(WireFormat::Openai, "m");
+
+        let bytes = exec.render_request(&d, CANONICAL).expect("rendered");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+
+        assert_eq!(
+            value["stream_options"]["include_usage"],
+            serde_json::json!(true),
+            "{value}"
+        );
+    }
+
+    /// A non-streaming reply carries the same usage object without the field,
+    /// so asking for it there would be a request the provider never needed.
+    #[test]
+    fn leaves_a_non_streaming_openai_request_without_stream_options() {
+        let exec = ArExec::new().expect("client");
+        let mut d = dispatch_shape(WireFormat::Openai, "m");
+        d.stream = false;
+        let body = br#"{"model":"m","messages":[],"stream":false}"#;
+
+        let bytes = exec.render_request(&d, body).expect("rendered");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+
+        assert!(value.get("stream_options").is_none(), "{value}");
+    }
+
+    /// The opt-out is the operator's word on a target that rejects the field
+    /// outright (`400 Unsupported parameter(s): stream_options`), so the router
+    /// sends no such field to that model at all.
+    #[test]
+    fn skips_the_usage_request_when_the_target_omits_stream_options() {
+        let exec = ArExec::new().expect("client");
+        let mut rows = BTreeMap::new();
+        rows.insert(
+            "strict-target".to_owned(),
+            ar_config::OpenAiChatCapabilities {
+                omit_optional_parameters: [
+                    ar_config::OpenAiOptionalParameter::StreamOptions,
+                ]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+        );
+        let mut d = dispatch_shape(WireFormat::Openai, "strict-target");
+        d.openai_chat_capabilities = Some(&rows);
+
+        let bytes = exec.render_request(&d, CANONICAL).expect("rendered");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+
+        assert!(value.get("stream_options").is_none(), "{value}");
+    }
+
+    /// The opt-out names one parameter, not the whole row: a target that omits
+    /// `reasoning` still gets the usage request, because the two choices are
+    /// independent.
+    #[test]
+    fn asks_for_usage_when_the_target_omits_something_else() {
+        let exec = ArExec::new().expect("client");
+        let mut rows = BTreeMap::new();
+        rows.insert(
+            "reasoning-target".to_owned(),
+            ar_config::OpenAiChatCapabilities {
+                omit_optional_parameters: [ar_config::OpenAiOptionalParameter::Reasoning]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+        );
+        let mut d = dispatch_shape(WireFormat::Openai, "reasoning-target");
+        d.openai_chat_capabilities = Some(&rows);
+
+        let bytes = exec.render_request(&d, CANONICAL).expect("rendered");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+
+        assert_eq!(
+            value["stream_options"]["include_usage"],
+            serde_json::json!(true),
+            "{value}"
+        );
+    }
+
+    /// A client that sent its own `stream_options` keeps the members it named:
+    /// the router merges the usage request into the object rather than
+    /// replacing it.
+    #[test]
+    fn merges_the_usage_request_into_a_client_stream_options_object() {
+        let exec = ArExec::new().expect("client");
+        let d = dispatch_shape(WireFormat::Openai, "m");
+        let body = br#"{"model":"m","messages":[],"stream":true,
+            "stream_options":{"other_member":"keep"}}"#;
+
+        let bytes = exec.render_request(&d, body).expect("rendered");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+
+        assert_eq!(
+            value["stream_options"]["include_usage"],
+            serde_json::json!(true),
+            "{value}"
+        );
+        assert_eq!(value["stream_options"]["other_member"], "keep", "{value}");
+    }
+
+    /// The field belongs to the OpenAI chat wire alone: Anthropic and Gemini
+    /// carry their usage in their own stream dialect, and a `stream_options`
+    /// object on either body is a field the upstream does not know.
+    #[test]
+    fn leaves_the_other_wires_without_stream_options() {
+        let exec = ArExec::new().expect("client");
+        for dialect in [WireFormat::Anthropic, WireFormat::Gemini] {
+            let bytes = exec
+                .render_request(&dispatch_shape(dialect, "m"), CANONICAL)
+                .expect("rendered");
+            let value: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+
+            assert!(value.get("stream_options").is_none(), "{dialect:?}: {value}");
+        }
+    }
+
+    /// The no-capability-row path is the historical one, and it still rewrites
+    /// the model: the usage request rides on the same bytes rather than
+    /// replacing them.
+    #[test]
+    fn keeps_the_model_rewrite_when_no_capability_row_matches() {
+        let exec = ArExec::new().expect("client");
+        let d = dispatch_shape(WireFormat::Openai, "llama-3.3-70b");
+
+        let bytes = exec.render_request(&d, CANONICAL).expect("rendered");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+
+        assert_eq!(value["model"], "llama-3.3-70b", "{value}");
+        assert_eq!(
+            value["stream_options"]["include_usage"],
+            serde_json::json!(true),
+            "{value}"
+        );
+    }
+
     #[test]
     fn passes_body_through_when_no_model_configured() {
         let raw = br#"{"model":"x"}"#;
@@ -1738,14 +1955,26 @@ mod tests {
         );
     }
 
+    /// The default path must not move: same model rewrite. The one router-owned
+    /// addition is the usage ask on a streaming chat request, so the delegation
+    /// is asserted against `rewrite_model` with that one member added, rather
+    /// than against a golden string.
     #[test]
-    fn leaves_the_openai_wire_byte_identical() {
+    fn leaves_the_openai_wire_byte_identical_apart_from_the_usage_ask() {
         let exec = ArExec::new().unwrap();
         let d = dispatch_shape(WireFormat::Openai, "llama-3.3-70b");
-        assert_eq!(
-            exec.render_request(&d, CANONICAL).expect("rendered"),
-            rewrite_model(CANONICAL, "llama-3.3-70b").expect("rewrite"),
+        let rewritten = rewrite_model(CANONICAL, "llama-3.3-70b").expect("rewrite");
+        let rewritten: serde_json::Value = serde_json::from_slice(&rewritten).expect("json");
+        let mut expected = rewritten.as_object().expect("object").clone();
+        expected.insert(
+            "stream_options".to_owned(),
+            serde_json::json!({ "include_usage": true }),
         );
+
+        let got = exec.render_request(&d, CANONICAL).expect("rendered");
+        let got: serde_json::Value = serde_json::from_slice(&got).expect("json");
+
+        assert_eq!(got.as_object().expect("object"), &expected, "{got}");
     }
 
     /// One dispatch test per newly-unblocked provider family, asserting the
