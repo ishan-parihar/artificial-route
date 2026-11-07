@@ -1353,13 +1353,249 @@ fn record_obs(
     }
 }
 
-/// A frame kept for accounting is capped at this many bytes: usage frames are
-/// tiny, and a chunk bigger than this is payload, not bookkeeping.
+/// A line kept for accounting is capped at this many bytes: usage frames are
+/// tiny, and a line bigger than this is payload, not bookkeeping.
+///
+/// The cap bounds the scanner's own buffer, never the relay: an upstream's
+/// bytes reach the client whatever their size.
 const USAGE_FRAME_CAP: usize = 64 * 1024;
-/// How many trailing frames are kept: the frame before the terminator is
-/// where three of the four dialects carry usage, and one spare covers a
-/// terminator that arrives as its own chunk.
-const USAGE_TAIL_FRAMES: usize = 2;
+
+/// Reads a streamed reply's usage out of the bytes as they arrive.
+///
+/// The scanner is frame-aware rather than chunk-aware: HTTP chunked encoding
+/// splits wherever the upstream's writer's buffer boundary falls, and
+/// `reqwest`'s body stream yields at network-chunk boundaries rather than at
+/// SSE-event boundaries, so one `data:` line can arrive in two pieces. The
+/// scanner carries the partial line over to the next chunk and reads the line
+/// once it is complete.
+///
+/// It keeps the LAST usage-bearing frame rather than the last frames: a
+/// provider that sends its usage frame before a terminator and a trailing
+/// keepalive would otherwise have the usage evicted before the stream ended.
+///
+/// The buffer is bounded by [`USAGE_FRAME_CAP`]: a line over the cap is
+/// dropped rather than held, so a hostile upstream cannot grow the scanner
+/// without limit. What the client receives never depends on what the scanner
+/// kept — the relay is the upstream's bytes either way.
+///
+/// The cost of frame-awareness is a JSON parse per data line, on the frame
+/// path. The old two-frame tail deferred its parsing to the end of the
+/// stream but could only see the last two chunks, which is exactly where the
+/// missing usage came from.
+struct UsageScanner {
+    /// Which usage shape to read.
+    dialect: Dialect,
+    /// The bytes of the line being assembled, carried across chunks.
+    pending: Vec<u8>,
+    /// Whether the current line overflowed the cap and is being dropped.
+    ///
+    /// Set while the oversized line's remainder is still arriving: its bytes
+    /// are skipped until its newline ends it, so the scanner resynchronises
+    /// on the next line instead of holding the rest of an endless line.
+    dropping: bool,
+    /// Anthropic's `message_start` usage — the input counts.
+    head: Option<serde_json::Value>,
+    /// The last usage-bearing frame seen, per dialect.
+    usage: Option<serde_json::Value>,
+}
+
+impl UsageScanner {
+    /// A scanner for one dialect's usage shape.
+    fn new(dialect: Dialect) -> Self {
+        Self {
+            dialect,
+            pending: Vec::new(),
+            dropping: false,
+            head: None,
+            usage: None,
+        }
+    }
+
+    /// Reads the chunk's bytes, keeping what the dialect's usage shape needs.
+    ///
+    /// The line buffer is bounded by [`USAGE_FRAME_CAP`]: a line over the cap
+    /// is dropped, and the scanner resumes with the next line rather than
+    /// holding the rest of the upstream's endless one.
+    fn feed(&mut self, chunk: &[u8]) {
+        let mut rest = chunk;
+        while let Some(index) = rest.iter().position(|byte| *byte == b'\n') {
+            let (line, remainder) = rest.split_at(index);
+            rest = &remainder[1..];
+            if self.dropping {
+                // The oversized line ends here: resume with the next one.
+                self.dropping = false;
+                self.pending.clear();
+                continue;
+            }
+            if self.pending.len().saturating_add(line.len()) > USAGE_FRAME_CAP {
+                self.pending.clear();
+                self.dropping = true;
+                continue;
+            }
+            self.pending.extend_from_slice(line);
+            let complete = std::mem::take(&mut self.pending);
+            self.scan_line(&complete);
+            // The allocation is kept for the next line: a stream is mostly
+            // lines of the same size, and a fresh allocation per line would
+            // make the scanner the stream's allocator.
+            self.pending = complete;
+            self.pending.clear();
+        }
+        if self.dropping {
+            return;
+        }
+        if self.pending.len().saturating_add(rest.len()) > USAGE_FRAME_CAP {
+            self.pending.clear();
+            self.dropping = true;
+            return;
+        }
+        self.pending.extend_from_slice(rest);
+    }
+
+    /// Reads the trailing partial line, if any, as a complete one.
+    ///
+    /// A stream may end without a final newline; such a line is complete in
+    /// every other sense, and dropping it would lose a usage frame the
+    /// upstream did send.
+    fn finish(&mut self) {
+        if self.dropping {
+            self.dropping = false;
+            self.pending.clear();
+            return;
+        }
+        if self.pending.is_empty() {
+            return;
+        }
+        let complete = std::mem::take(&mut self.pending);
+        self.scan_line(&complete);
+        self.pending = complete;
+        self.pending.clear();
+    }
+
+    /// The usage this stream carried, per dialect.
+    ///
+    /// `None` when the dialect's usage shape never appeared: an OpenAI
+    /// stream without `stream_options.include_usage` carries no counts
+    /// in-band at all, and the honest answer is none, not an estimate.
+    fn usage(&self) -> Option<serde_json::Value> {
+        match self.dialect {
+            Dialect::Anthropic => {
+                let head = self.head.as_ref()?;
+                let output = self.usage.as_ref()?;
+                // The delta names the input count too when a re-framed stream
+                // has it: its `message_start` cannot know it yet.
+                Some(serde_json::json!({
+                    "input_tokens": output
+                        .get("input_tokens")
+                        .or_else(|| head.get("input_tokens"))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    "cache_read_input_tokens": head.get("cache_read_input_tokens").cloned().unwrap_or(serde_json::Value::Null),
+                    "cache_creation_input_tokens": head.get("cache_creation_input_tokens").cloned().unwrap_or(serde_json::Value::Null),
+                    "output_tokens": output.get("output_tokens").cloned().unwrap_or(serde_json::Value::Null),
+                }))
+            }
+            _ => self.usage.clone(),
+        }
+    }
+
+    /// Reads one complete line, keeping it if the dialect's usage rides it.
+    fn scan_line(&mut self, line: &[u8]) {
+        match self.dialect {
+            Dialect::OpenAi => {
+                let Some(frame) = data_json(line) else {
+                    return;
+                };
+                if let Some(usage) = frame.get("usage").filter(|usage| usage.is_object()) {
+                    self.usage = Some(usage.clone());
+                }
+            }
+            Dialect::Anthropic => {
+                let Some(frame) = data_json(line) else {
+                    return;
+                };
+                match frame.get("type").and_then(serde_json::Value::as_str) {
+                    Some("message_start") => {
+                        // The FIRST start frame's counts: a later one would
+                        // re-send the opening, not report new counts.
+                        if self.head.is_none() {
+                            self.head = frame.pointer("/message/usage").cloned();
+                        }
+                    }
+                    Some("message_delta") => {
+                        if let Some(usage) = frame.get("usage") {
+                            self.usage = Some(usage.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Dialect::Responses => {
+                let Some(frame) = data_json(line) else {
+                    return;
+                };
+                if frame.get("type").and_then(serde_json::Value::as_str)
+                    == Some("response.completed")
+                {
+                    self.usage = frame.pointer("/response/usage").cloned();
+                }
+            }
+            Dialect::Ollama => {
+                let Some(frame) = json_line(line) else {
+                    return;
+                };
+                if frame.get("done").and_then(serde_json::Value::as_bool) == Some(true) {
+                    // Ollama's counts live at the frame's root, outside any
+                    // `usage` map, so the frame itself is the usage.
+                    self.usage = Some(frame);
+                }
+            }
+        }
+    }
+}
+
+/// The JSON payload of a `data:` line — the SSE shape every dialect but
+/// Ollama uses.
+///
+/// The prefix is matched loosely: the SSE grammar writes `data: ` with one
+/// space, but implementations ship `data:` with no space and with several, and
+/// a usage frame behind a variant spelling is still a usage frame. The
+/// payload's own leading whitespace is trimmed either way.
+fn data_json(line: &[u8]) -> Option<serde_json::Value> {
+    const PREFIX: &[u8] = b"data:";
+    let payload = if line.len() >= PREFIX.len()
+        && line[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
+    {
+        // The prefix's case is not fixed by every SSE implementation, and a
+        // usage frame that arrives as `Data:` is still a usage frame.
+        &line[PREFIX.len()..]
+    } else {
+        return None;
+    };
+    json_line(trim_ascii(payload))
+}
+
+/// Trims ASCII whitespace from both ends of `bytes`.
+fn trim_ascii(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(start, |index| index + 1);
+    &bytes[start..end]
+}
+
+/// The JSON in one line, if the line carries one.
+///
+/// A trailing carriage return is trimmed: CRLF endings are legal in SSE and
+/// in NDJSON, and `serde_json` rejects a payload with one left on it.
+fn json_line(line: &[u8]) -> Option<serde_json::Value> {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    serde_json::from_slice(line).ok()
+}
 
 /// Records a streamed reply's usage when the upstream ends.
 ///
@@ -1367,11 +1603,12 @@ const USAGE_TAIL_FRAMES: usize = 2;
 /// stream costs SSE parsing on the hot path — which left the ledger blank for
 /// exactly the traffic agentic clients send most, and left the pre-dispatch
 /// budget gate under-enforcing it. This closes that split without putting any
-/// parsing on the frame path: the tee keeps a first frame and a two-frame tail
-/// (each capped at [`USAGE_FRAME_CAP`]), relays every byte untouched, and only
-/// when the upstream ends does it parse what it kept for the dialect's usage
-/// shape and record it. A stream no ledger is configured for is not wrapped at
-/// all — the relay keeps its zero-overhead shape, same as before.
+/// parsing of whole frames on the frame path: the tee reads the stream's lines
+/// as they arrive through a [`UsageScanner`], relays every byte untouched, and
+/// records what the dialect's usage shape carried when the upstream ends.
+/// Every streamed reply is wrapped, ledger or not, because `/metrics` is
+/// unconditional and a stream's usage is as much an observation as a ledger
+/// row.
 ///
 /// # What this deliberately does not do
 ///
@@ -1384,17 +1621,20 @@ const USAGE_TAIL_FRAMES: usize = 2;
 /// * Headers stay zeroed on streams: they are sent before the first byte, so
 ///   the count is not knowable yet; the ledger is where a stream's usage
 ///   lands.
-/// * A usage frame split across chunk boundaries is skipped, not pieced
-///   together: whole events per write is how every SSE server this relay
-///   speaks to behaves, and a framing-scanner is a parser by another name.
+/// * A line over [`USAGE_FRAME_CAP`] is dropped, not held: an upstream that
+///   sends an endless line must not be able to grow the scanner's buffer.
+///   The relay is unaffected — what the client receives never depends on
+///   what the scanner kept.
+/// * A usage frame split across chunk boundaries is pieced together, because
+///   HTTP chunked encoding splits wherever the upstream's writer's buffer
+///   boundary falls, and `reqwest` yields at network-chunk boundaries rather
+///   than SSE-event boundaries. The scanner assembles a line across chunks
+///   and scans it once it is complete.
 struct UsageTee {
     /// The upstream stream, wrapped in place inside [`Upstream::stream`].
     inner: Pin<Box<dyn Stream<Item = Bytes> + Send>>,
-    /// The first frame seen — Anthropic puts its input count in `message_start`.
-    head: Option<Bytes>,
-    /// The trailing [`USAGE_TAIL_FRAMES`] frames — where every dialect's final
-    /// counts ride.
-    tail: Vec<Bytes>,
+    /// Reads the dialect's usage out of the stream as it arrives.
+    scanner: UsageScanner,
     /// State cloned once per request (all `Arc`s); read only at record time.
     state: AppState,
     /// Accounting name for whoever the gate verified, or the anonymous
@@ -1409,7 +1649,6 @@ struct UsageTee {
     /// first; a per-combo figure needs the second, and two combos sharing a
     /// target would otherwise be indistinguishable.
     combo: String,
-    dialect: Dialect,
     /// Carried so the observation reports what the router actually spent, the
     /// same figure `ar_upstream_attempts_total` counts.
     attempts: u16,
@@ -1427,10 +1666,14 @@ impl Stream for UsageTee {
         let this = self.get_mut();
         match this.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(chunk)) => {
-                this.retain(&chunk);
+                this.scanner.feed(&chunk);
                 Poll::Ready(Some(chunk))
             }
             Poll::Ready(None) => {
+                // The stream may end without a final newline; the scanner reads
+                // that trailing partial line as a complete one, so a usage
+                // frame the upstream did send is not lost to its last byte.
+                this.scanner.finish();
                 this.record();
                 Poll::Ready(None)
             }
@@ -1440,23 +1683,6 @@ impl Stream for UsageTee {
 }
 
 impl UsageTee {
-    /// Keeps a frame for accounting, cheapest-first: first frame once, then a
-    /// two-frame tail. A frame over the cap is not kept — usage never rides in
-    /// megabytes.
-    fn retain(&mut self, chunk: &Bytes) {
-        if chunk.len() > USAGE_FRAME_CAP {
-            return;
-        }
-        if self.head.is_none() {
-            self.head = Some(chunk.clone());
-            return;
-        }
-        self.tail.push(chunk.clone());
-        if self.tail.len() > USAGE_TAIL_FRAMES {
-            self.tail.remove(0);
-        }
-    }
-
     /// The same observation [`read_and_record`] makes for a buffered reply.
     ///
     /// Split out so the streaming arm reaches `metrics.work` too: `record` runs
@@ -1513,10 +1739,11 @@ impl UsageTee {
         );
     }
 
-    /// Parses what was kept and records it — the only place this tee reads
-    /// frame content, on the last poll, after every byte has been relayed.
+    /// Reads what the scanner saw and records it — the only place this tee
+    /// reads frame content, on the last poll, after every byte has been
+    /// relayed.
     fn record(&self) {
-        let Some(usage) = usage_from_frames(self.dialect, self.head.as_ref(), &self.tail) else {
+        let Some(usage) = self.scanner.usage() else {
             return;
         };
         self.observe(&usage);
@@ -1581,8 +1808,7 @@ fn account_stream(
     let inner = std::mem::replace(&mut upstream.stream, Box::pin(futures::stream::empty()));
     upstream.stream = Box::pin(UsageTee {
         inner,
-        head: None,
-        tail: Vec::with_capacity(USAGE_TAIL_FRAMES),
+        scanner: UsageScanner::new(dialect),
         state: state.clone(),
         key_id: key_id.unwrap_or("anonymous").to_owned(),
         provider: provider.as_str().to_owned(),
@@ -1590,96 +1816,9 @@ fn account_stream(
         // of the destructure would allocate a second one for nothing.
         model: model.clone(),
         combo: combo.to_owned(),
-        dialect,
         attempts,
         dispatched,
     });
-}
-
-/// Reads the usage value out of what a stream retained, per dialect.
-///
-/// Every branch works on whole `data:` lines and whole NDJSON lines only; a
-/// line that fails to parse is dropped, which is the split-frame ceiling
-/// documented on [`UsageTee`].
-fn usage_from_frames(
-    dialect: Dialect,
-    head: Option<&Bytes>,
-    tail: &[Bytes],
-) -> Option<serde_json::Value> {
-    let data_frames = |chunk: &Bytes| {
-        chunk
-            .split(|byte| *byte == b'\n')
-            .filter_map(|line| line.strip_prefix(b"data: "))
-            .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
-            .collect::<Vec<_>>()
-    };
-    match dialect {
-        Dialect::OpenAi => tail.iter().rev().find_map(|chunk| {
-            data_frames(chunk).into_iter().rev().find_map(|frame| {
-                frame
-                    .get("usage")
-                    .filter(|usage| usage.is_object())
-                    .cloned()
-            })
-        }),
-        Dialect::Anthropic => {
-            // Input rides in the very first frame (`message_start`), output in
-            // the last (`message_delta`) — both are kept, so the compose is
-            // one lookup each.
-            let input = head
-                .and_then(|chunk| {
-                    data_frames(chunk).into_iter().find(|frame| {
-                        frame.get("type").and_then(serde_json::Value::as_str)
-                            == Some("message_start")
-                    })
-                })
-                .and_then(|frame| frame.pointer("/message/usage").cloned());
-            let output = tail
-                .iter()
-                .rev()
-                .find_map(|chunk| {
-                    data_frames(chunk).into_iter().rev().find(|frame| {
-                        frame.get("type").and_then(serde_json::Value::as_str)
-                            == Some("message_delta")
-                    })
-                })
-                .and_then(|frame| frame.get("usage").cloned());
-            match (input, output) {
-                // The delta names the input count too when a re-framed stream
-                // has it: its `message_start` cannot know it yet.
-                (Some(input), Some(output)) => Some(serde_json::json!({
-                    "input_tokens": output
-                        .get("input_tokens")
-                        .or_else(|| input.get("input_tokens"))
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null),
-                    "cache_read_input_tokens": input.get("cache_read_input_tokens").cloned().unwrap_or(serde_json::Value::Null),
-                    "cache_creation_input_tokens": input.get("cache_creation_input_tokens").cloned().unwrap_or(serde_json::Value::Null),
-                    "output_tokens": output.get("output_tokens").cloned().unwrap_or(serde_json::Value::Null),
-                })),
-                (Some(input), None) if input.get("input_tokens").is_some() => Some(input),
-                _ => None,
-            }
-        }
-        Dialect::Responses => tail.iter().rev().find_map(|chunk| {
-            data_frames(chunk)
-                .into_iter()
-                .rev()
-                .find(|frame| {
-                    frame.get("type").and_then(serde_json::Value::as_str)
-                        == Some("response.completed")
-                })
-                .and_then(|frame| frame.pointer("/response/usage").cloned())
-        }),
-        Dialect::Ollama => tail.iter().rev().find_map(|chunk| {
-            chunk
-                .split(|byte| *byte == b'\n')
-                .filter(|line| !line.is_empty())
-                .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
-                .rev()
-                .find(|frame| frame.get("done").and_then(serde_json::Value::as_bool) == Some(true))
-        }),
-    }
 }
 
 /// Runs one `pipeline` request: each target is a stage, in order.
@@ -4348,11 +4487,10 @@ mod tests {
         CACHE_HEADER, COMPRESSION_ECHO, CacheControl, CutRecord, DENY_HEADER, Dialect,
         FALLBACK_ATTEMPTS_HEADER, FailNote, FailureSink, Keepalive, LATENCY_MS_HEADER,
         MODEL_HEADER, PROVIDER_HEADER, RESPONSE_COST_HEADER, SAVINGS_TOKENS_HEADER, Stages,
-        TOKENS_IN_HEADER, TOKENS_OUT_HEADER, TOKENS_PER_SECOND_HEADER, USAGE_FRAME_CAP, UsageTee,
-        VERSION_HEADER, accept_forces_stream, build_chain, card_json, completion_seen,
+        TOKENS_IN_HEADER, TOKENS_OUT_HEADER, TOKENS_PER_SECOND_HEADER, USAGE_FRAME_CAP, UsageScanner,
+        UsageTee, VERSION_HEADER, accept_forces_stream, build_chain, card_json, completion_seen,
         declares_stream, decorate, epoch_now, error, error_because, kind_for, model, models_head,
         not_found, note_failure, outcome_label, require_json, resolve, unknown_model,
-        usage_from_frames,
     };
     use super::{Continuation, SentText, resume_body, resumed};
     use crate::app::{AppState, Components};
@@ -6547,64 +6685,179 @@ mod tests {
     }
 
     #[test]
-    fn the_frame_parser_reads_each_dialects_usage_shape() {
+    fn the_scanner_reads_each_dialects_usage_shape() {
         // The ledger row stores only the sum, so the split is pinned here, at
-        // the parser, where prompt and completion are still separate numbers.
+        // the scanner, where prompt and completion are still separate numbers.
         let usage = |value: serde_json::Value| ar_tokens::NormalizedUsage::from_usage(&value);
+        let scan = |dialect: Dialect, chunks: &[&[u8]]| {
+            let mut scanner = UsageScanner::new(dialect);
+            for chunk in chunks {
+                scanner.feed(chunk);
+            }
+            scanner.finish();
+            scanner.usage()
+        };
 
-        // OpenAI: usage rides in the last data frame that carries one.
-        let tail = [
-            Bytes::from_static(
+        // OpenAI: usage rides in the data frame that carries one.
+        let got = scan(
+            Dialect::OpenAi,
+            &[
                 b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}\n\n",
-            ),
-            Bytes::from_static(b"data: [DONE]\n\n"),
-        ];
-        let got = usage_from_frames(Dialect::OpenAi, None, &tail).expect("openai usage frame");
+                b"data: [DONE]\n\n",
+            ],
+        )
+        .expect("openai usage frame");
         assert_eq!(usage(got), ar_tokens::NormalizedUsage::new(11, 7));
 
         // Anthropic: input in the first frame, output in the last.
-        let head = Bytes::from_static(
-            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":21}}}\n\n",
-        );
-        let tail = [
-            Bytes::from_static(
+        let got = scan(
+            Dialect::Anthropic,
+            &[
+                b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":21}}}\n\n",
                 b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":5}}\n\n",
-            ),
-            Bytes::from_static(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
-        ];
-        let got =
-            usage_from_frames(Dialect::Anthropic, Some(&head), &tail).expect("anthropic compose");
+                b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            ],
+        )
+        .expect("anthropic compose");
         assert_eq!(usage(got), ar_tokens::NormalizedUsage::new(21, 5));
 
         // Responses: the completed event carries the response object with
         // its usage inside.
-        let tail = [
-            Bytes::from_static(
-                b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
-            ),
-        ];
-        let got = usage_from_frames(Dialect::Responses, None, &tail).expect("responses completed");
+        let got = scan(
+            Dialect::Responses,
+            &[b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n"],
+        )
+        .expect("responses completed");
         assert_eq!(usage(got), ar_tokens::NormalizedUsage::new(3, 2));
 
         // Ollama: the final `done:true` NDJSON line carries both counts at
         // its root.
-        let tail = [Bytes::from_static(
-            b"{\"model\":\"m\",\"done\":true,\"prompt_eval_count\":9,\"eval_count\":4}\n",
-        )];
-        let got = usage_from_frames(Dialect::Ollama, None, &tail).expect("ollama final line");
+        let got = scan(
+            Dialect::Ollama,
+            &[b"{\"model\":\"m\",\"done\":true,\"prompt_eval_count\":9,\"eval_count\":4}\n"],
+        )
+        .expect("ollama final line");
         assert_eq!(usage(got), ar_tokens::NormalizedUsage::new(9, 4));
     }
 
     #[test]
-    fn the_frame_parser_stays_silent_when_no_usage_was_seen() {
+    fn the_scanner_stays_silent_when_no_usage_was_seen() {
         // Every dialect's "no counts arrived" answer is the same: nothing,
         // so the tee records nothing rather than a zero row that would read
         // as a free request.
-        let frames = [
-            Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"),
-            Bytes::from_static(b"data: [DONE]\n\n"),
-        ];
-        assert!(usage_from_frames(Dialect::OpenAi, None, &frames).is_none());
+        let mut scanner = UsageScanner::new(Dialect::OpenAi);
+        scanner.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n");
+        scanner.feed(b"data: [DONE]\n\n");
+        scanner.finish();
+
+        assert!(scanner.usage().is_none());
+    }
+
+    #[test]
+    fn the_scanner_reads_a_frame_split_across_chunks() {
+        // `reqwest` yields at network-chunk boundaries, which are not SSE-event
+        // boundaries, so the usage frame can straddle two chunks. A scanner
+        // that only looked at whole chunks would miss it and the ledger would
+        // record nothing.
+        let mut scanner = UsageScanner::new(Dialect::OpenAi);
+        scanner.feed(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,");
+        scanner.feed(b"\"completion_tokens\":7}}\n\n");
+        scanner.feed(b"data: [DONE]\n\n");
+        scanner.finish();
+
+        let got = scanner.usage().expect("the split usage frame");
+        assert_eq!(
+            ar_tokens::NormalizedUsage::from_usage(&got),
+            ar_tokens::NormalizedUsage::new(11, 7)
+        );
+    }
+
+    #[test]
+    fn the_scanner_keeps_a_usage_frame_that_a_keepalive_tail_would_have_evicted() {
+        // The old shape kept a window of the last two frames. An upstream that
+        // sends its usage and then a long tail of keepalives evicted the usage
+        // before the stream ended, and the ledger recorded nothing. Scanning
+        // each line as it arrives cannot evict anything.
+        let mut scanner = UsageScanner::new(Dialect::OpenAi);
+        scanner.feed(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}\n\n");
+        for _ in 0..20 {
+            scanner.feed(b"data: {\"choices\":[]}\n\n");
+        }
+        scanner.feed(b"data: [DONE]\n\n");
+        scanner.finish();
+
+        let got = scanner.usage().expect("the usage frame survived the tail");
+        assert_eq!(
+            ar_tokens::NormalizedUsage::from_usage(&got),
+            ar_tokens::NormalizedUsage::new(11, 7)
+        );
+    }
+
+    #[test]
+    fn the_scanner_reads_a_usage_frame_behind_a_variant_data_prefix() {
+        // The SSE grammar writes `data: ` with one space, but implementations
+        // ship `data:` with no space and with several, and a usage frame behind
+        // a variant spelling is still a usage frame.
+        for prefix in [
+            &b"data: "[..],
+            b"data:",
+            b"data:   ",
+            b"Data: ",
+        ] {
+            let mut scanner = UsageScanner::new(Dialect::OpenAi);
+            let line = [
+                prefix,
+                b"{\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}\n",
+            ]
+            .concat();
+            scanner.feed(&line);
+            scanner.finish();
+
+            let got = scanner
+                .usage()
+                .unwrap_or_else(|| panic!("no usage behind the prefix {prefix:?}"));
+            assert_eq!(
+                ar_tokens::NormalizedUsage::from_usage(&got),
+                ar_tokens::NormalizedUsage::new(11, 7),
+                "the prefix {prefix:?} lost the usage frame"
+            );
+        }
+    }
+
+    #[test]
+    fn the_scanner_reads_a_trailing_line_that_ends_without_a_newline() {
+        // A stream may end without a final newline. Such a line is complete in
+        // every other sense, and dropping it would lose a usage frame the
+        // upstream did send.
+        let mut scanner = UsageScanner::new(Dialect::OpenAi);
+        scanner.feed(b"data: {\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}");
+        // The tee calls `finish` on the terminal poll, before it reads the
+        // usage. The test mirrors that order.
+        scanner.finish();
+
+        let got = scanner.usage().expect("the trailing usage frame");
+        assert_eq!(
+            ar_tokens::NormalizedUsage::from_usage(&got),
+            ar_tokens::NormalizedUsage::new(11, 7)
+        );
+    }
+
+    #[test]
+    fn the_scanner_resynchronises_after_an_oversized_line() {
+        // An upstream that sends an endless line must not be able to grow the
+        // scanner's buffer, and it must not be able to hide the usage frame
+        // that comes after it: the scanner drops the oversized line whole and
+        // resumes on the next one.
+        let mut scanner = UsageScanner::new(Dialect::OpenAi);
+        scanner.feed(&vec![b'x'; USAGE_FRAME_CAP + 1]);
+        scanner.feed(b"\ndata: {\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}\n\n");
+        scanner.finish();
+
+        let got = scanner.usage().expect("the usage frame after the oversized line");
+        assert_eq!(
+            ar_tokens::NormalizedUsage::from_usage(&got),
+            ar_tokens::NormalizedUsage::new(11, 7)
+        );
     }
 
     /// Polls a stream to its terminal `None`, which is when `UsageTee` records.
@@ -6709,22 +6962,20 @@ mod tests {
         );
         let mut tee = UsageTee {
             inner: Box::pin(futures::stream::iter([
-                // The first chunk becomes `head`; OpenAI usage rides in a
-                // later frame, so a single-chunk stream carries none and the
-                // tee correctly records nothing.
+                // The first chunk is a content frame; OpenAI usage rides in a
+                // later frame, and the scanner reads each line as it arrives,
+                // so the usage in the second chunk is seen.
                 Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"),
                 Bytes::from_static(
                     b"data: {\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\n",
                 ),
             ])),
-            head: None,
-            tail: Vec::new(),
+            scanner: UsageScanner::new(Dialect::OpenAi),
             state,
             key_id: "anonymous".to_owned(),
             provider: "soak-stub".to_owned(),
             model: Strng::from("m"),
             combo: "combo-under-test".to_owned(),
-            dialect: Dialect::OpenAi,
             attempts: 2,
             dispatched: Instant::now(),
         };
@@ -6749,35 +7000,19 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_over_the_cap_is_not_kept_for_accounting() {
-        // The cap is what keeps the tee's retention bounded against an
-        // upstream that ships its whole reply in one write: a frame that
-        // big is payload, not bookkeeping, and the tee must drop it rather
-        // than hold it.
-        let huge = Bytes::from(vec![b'x'; USAGE_FRAME_CAP + 1]);
-        let state = routed_with_ledger(
-            Arc::new(CannedExec(vec![])),
-            Arc::new(Mutex::new(
-                ar_tokens::Ledger::open_in_memory().expect("in-memory ledger"),
-            )),
+    fn a_line_over_the_cap_is_not_kept_for_accounting() {
+        // The cap is what keeps the scanner's buffer bounded against an
+        // upstream that ships an endless line: a line that big is payload, not
+        // bookkeeping, and the scanner must drop it rather than hold it.
+        let huge = vec![b'x'; USAGE_FRAME_CAP + 1];
+        let mut scanner = UsageScanner::new(Dialect::OpenAi);
+        scanner.feed(&huge);
+
+        assert!(
+            scanner.pending.is_empty(),
+            "an over-cap line was held in the buffer"
         );
-        let mut tee = UsageTee {
-            inner: Box::pin(futures::stream::iter([Bytes::from_static(
-                b"data: [DONE]\n\n",
-            )])),
-            head: None,
-            tail: Vec::new(),
-            state,
-            key_id: "anonymous".to_owned(),
-            provider: "p".to_owned(),
-            model: Strng::from("m"),
-            combo: "combo-under-test".to_owned(),
-            dialect: Dialect::OpenAi,
-            attempts: 1,
-            dispatched: Instant::now(),
-        };
-        tee.retain(&huge);
-        assert!(tee.head.is_none(), "an over-cap frame was kept");
+        assert!(scanner.usage().is_none());
     }
 
     /// A panel of two that answers distinctly, and (optionally) a judge.
