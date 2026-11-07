@@ -13,6 +13,7 @@
 
 mod auth;
 mod cli;
+mod codex;
 mod commands;
 mod dashboard;
 mod import;

@@ -342,6 +342,35 @@ pub enum Command {
     #[command(verbatim_doc_comment)]
     Dashboard(DashboardArgs),
 
+    /// Write a Codex `model_catalog_json` listing this router's combos.
+    ///
+    /// Codex CLI refuses to *recognise* a model it has no metadata for: it
+    /// prints `Model metadata for `large-stack` not found`, serves the model at
+    /// a fallback 272K window instead of the lane's real one, and adds a hosted
+    /// `web_search` tool to every request — a tool this router cannot run, so
+    /// the request is refused outright.
+    ///
+    /// This writes the catalog that fixes all three. Each entry is a clone of
+    /// the installed Codex's own bundled entry (`codex debug models --bundled`),
+    /// so the version-specific system prompt survives; the slug, the window,
+    /// the visibility and the hosted-tool flags are retargeted at the lane.
+    ///
+    /// Then point Codex at it, at the TOP LEVEL of `config.toml`:
+    ///
+    /// ```toml
+    /// model_catalog_json = "~/.codex/aroute-models.json"
+    /// ```
+    ///
+    /// It is top-level, not under `[model_providers.*]`: the catalog is global,
+    /// not per-provider.
+    ///
+    /// Examples:
+    ///   aroute codex
+    ///   aroute codex --force
+    ///   aroute codex --dry-run
+    #[command(verbatim_doc_comment)]
+    Codex(crate::codex::CodexArgs),
+
     /// Support development 💜
     Donate,
 }
