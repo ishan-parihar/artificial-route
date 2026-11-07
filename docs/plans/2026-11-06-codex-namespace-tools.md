@@ -261,6 +261,40 @@ hint no upstream in the registry reads, `store:false` and the `include` list
 are OpenAI bookkeeping, and `client_metadata` is a Codex-internal routing
 hint. Dropping them changes nothing the model sees.
 
+### 5.7 Carrying the effort breaks the upstreams that reject it
+
+Carrying the effort is only half the work. An OpenAI-compatible upstream that
+does not read `reasoning` answers:
+
+```
+400 {"message":"Validation: Unsupported parameter(s): `reasoning`"}
+```
+
+and the whole request fails with `upstream_request_rejected`. In the
+`large-stack` chain the two nvidia targets (`minimaxai/minimax-m3.1-flash` and
+`stepfun-ai/step-5-preview`) reject it; pgsgrove accepts it.
+
+The repo already has the right seam: `omit_optional_parameters` in
+`provider_settings.<provider>.request_capabilities.<model>` names known OpenAI
+chat fields an operator has verified may be omitted for that target.
+`OpenAiOptionalParameter::Reasoning` joins that enum, and the operator
+declares the omission per model:
+
+```yaml
+provider_settings:
+  nvidia:
+    request_capabilities:
+      minimaxai/minimax-m3.1-flash:
+        omit_optional_parameters: [reasoning]
+      stepfun-ai/step-5-preview:
+        omit_optional_parameters: [reasoning]
+```
+
+The omission is the target's own default for that parameter, which is the same
+trade every other entry in that list makes. Declaring it per model rather than
+per provider is deliberate: another nvidia model may well read `reasoning`,
+and a provider-wide omission would take the effort away from it too.
+
 ## 6. Acceptance
 
 1. `cargo test --release` passes.

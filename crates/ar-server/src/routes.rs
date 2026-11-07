@@ -1030,15 +1030,17 @@ async fn handle_chat_inner(
         buffer_for_accounting(
             state,
             &mut outcome,
-            dialect,
+            ReplyShape {
+                dialect,
+                source,
+                namespaces: &canonical.tool_namespaces,
+            },
             &Accounted {
                 key_id: key_id.as_deref(),
                 combo: &canonical.model,
             },
             dispatched.elapsed(),
             savings_tokens,
-            source,
-            &canonical.tool_namespaces,
         )
         .await
     };
@@ -1091,6 +1093,24 @@ struct Accounted<'a> {
     combo: &'a str,
 }
 
+/// The reply's shape: the dialect the client reads, the wire the upstream
+/// spoke, and the namespaces the request's tools were grouped under.
+///
+/// These three travel together because they are one decision — how the reply
+/// is re-spelled — and bundling them keeps the call sites readable and the
+/// argument count down.
+#[derive(Clone, Copy)]
+struct ReplyShape<'a> {
+    /// The dialect the client reads the reply in.
+    dialect: Dialect,
+    /// The wire the upstream spoke, when the reply has to be re-spelled.
+    source: Option<ar_registry::WireFormat>,
+    /// The namespaces the request's tool declarations were grouped under, so a
+    /// tool call can be handed back with the namespace the client resolves it
+    /// by.
+    namespaces: &'a ar_translate::ToolNamespaces,
+}
+
 /// Drains a non-streaming reply now that its usage can be counted, records it,
 /// and hands back the accounting figures — while the streamed arm keeps
 /// relaying untouched frames.
@@ -1110,13 +1130,16 @@ struct Accounted<'a> {
 async fn buffer_for_accounting(
     state: &AppState,
     outcome: &mut AttemptOutcome,
-    dialect: Dialect,
+    shape: ReplyShape<'_>,
     accounted: &Accounted<'_>,
     elapsed: Duration,
     savings_tokens: u32,
-    source: Option<ar_registry::WireFormat>,
-    namespaces: &ar_translate::ToolNamespaces,
 ) -> ResponseMeta {
+    let ReplyShape {
+        dialect,
+        source,
+        namespaces,
+    } = shape;
     let defaults = || {
         ResponseMeta::default()
             .with_latency(elapsed)

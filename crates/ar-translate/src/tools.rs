@@ -189,7 +189,7 @@ pub(crate) fn responses_reasoning_effort(
         "low" => Ok(Some(ReasoningEffort::Low)),
         "medium" => Ok(Some(ReasoningEffort::Medium)),
         "high" => Ok(Some(ReasoningEffort::High)),
-        other => Err(invalid(&format!(
+        other => Err(invalid(format!(
             "`reasoning.effort` names an effort this build does not run: {other}"
         ))),
     }
