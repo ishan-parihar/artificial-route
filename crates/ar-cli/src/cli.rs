@@ -355,14 +355,12 @@ pub enum Command {
     /// so the version-specific system prompt survives; the slug, the window,
     /// the visibility and the hosted-tool flags are retargeted at the lane.
     ///
-    /// Then point Codex at it, at the TOP LEVEL of `config.toml`:
-    ///
-    /// ```toml
-    /// model_catalog_json = "~/.codex/aroute-models.json"
-    /// ```
-    ///
-    /// It is top-level, not under `[model_providers.*]`: the catalog is global,
-    /// not per-provider.
+    /// It also writes the profile Codex layers over the base config
+    /// (`$CODEX_HOME/aroute.config.toml`, which `codex --profile aroute`
+    /// reads), points the base config's top-level `model_catalog_json` at the
+    /// catalog, and makes sure `[model_providers.aroute]` is complete. An
+    /// existing `base_url` is left alone: that is where the operator pointed
+    /// Codex on purpose.
     ///
     /// Examples:
     ///   aroute codex

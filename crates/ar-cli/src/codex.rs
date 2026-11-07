@@ -75,22 +75,34 @@ const DEFAULT_TEMPLATE_SLUG: &str = "gpt-5.5";
 /// The Codex subcommand that dumps the installed CLI's own bundled catalog.
 const CODEX_BUNDLED_ARGS: [&str; 3] = ["debug", "models", "--bundled"];
 
-/// Fields a non-Codex lane must not inherit from its template.
-const CODE_MODE_OVERRIDES: [(&str, serde_json::Value); 5] = [
-    ("tool_mode", serde_json::Value::Null),
+/// Fields a non-Codex lane must not inherit from its template, and the value
+/// each takes instead.
+///
+/// These two are the ones the schema accepts as `false` and `[]`. The fields
+/// that must *disappear* rather than become `null` are in
+/// [`REMOVED_OVERRIDES`].
+const CODE_MODE_OVERRIDES: [(&str, serde_json::Value); 2] = [
     ("use_responses_lite", serde_json::Value::Bool(false)),
-    (
-        "multi_agent_version",
-        serde_json::Value::Null,
-    ),
-    (
-        "multi_agent_reasoning_effort",
-        serde_json::Value::Null,
-    ),
     (
         "experimental_supported_tools",
         serde_json::Value::Array(Vec::new()),
     ),
+];
+
+/// The fields a non-Codex lane must not inherit, and which are *removed*
+/// rather than set to `null`.
+///
+/// Removing is how Codex's own catalog spells "this lane has no such
+/// feature", and it is the only spelling that parses: `tool_mode`,
+/// `multi_agent_version`, `multi_agent_reasoning_effort` and
+/// `web_search_tool_type` are typed as a string or a map, so a `null` makes
+/// Codex reject the entire catalog file with
+/// `invalid type: null, expected string or map`.
+const REMOVED_OVERRIDES: [&str; 4] = [
+    "tool_mode",
+    "multi_agent_version",
+    "multi_agent_reasoning_effort",
+    "web_search_tool_type",
 ];
 
 /// Options for `aroute codex`.
@@ -556,10 +568,16 @@ fn entry_from(
     // The hosted search tool: see the module docs. It is what makes Codex add a
     // `web_search` declaration the router cannot run.
     object.insert("supports_search_tool".to_owned(), serde_json::Value::Bool(false));
-    object.insert("web_search_tool_type".to_owned(), serde_json::Value::Null);
 
     for (key, value) in CODE_MODE_OVERRIDES {
         object.insert(key.to_owned(), value);
+    }
+
+    // The fields that must disappear rather than become `null`. See
+    // [`REMOVED_OVERRIDES`]: Codex's schema types them as a string or a map,
+    // so a `null` makes it reject the whole catalog file.
+    for key in REMOVED_OVERRIDES {
+        object.remove(key);
     }
 
     // OpenAI's service tiers are an OpenAI concept; a router lane has none.
@@ -1058,7 +1076,34 @@ mod tests {
         let catalog = build(&bundled(), &[lane("large-stack")]).expect("built");
 
         assert_eq!(catalog["models"][0]["supports_search_tool"], false);
-        assert!(catalog["models"][0]["web_search_tool_type"].is_null());
+        // The type is *removed*, not nulled: Codex's schema types it as a
+        // string or a map, and a `null` makes Codex reject the whole file.
+        assert!(
+            catalog["models"][0].get("web_search_tool_type").is_none(),
+            "the search tool's type must be absent, not null"
+        );
+    }
+
+    #[test]
+    fn writes_no_null_where_codex_expects_a_string_or_a_map() {
+        // Codex's schema types `tool_mode`, `multi_agent_version`,
+        // `multi_agent_reasoning_effort` and `web_search_tool_type` as a string
+        // or a map. A `null` there makes Codex refuse the whole catalog with
+        // `invalid type: null, expected string or map`, so the entry is worth
+        // nothing however correct it looks.
+        let catalog = build(&bundled(), &[lane("large-stack")]).expect("built");
+        let entry = &catalog["models"][0];
+
+        for field in REMOVED_OVERRIDES {
+            assert!(
+                entry.get(field).is_none(),
+                "{field} must be absent, not null"
+            );
+        }
+        // The two the schema does accept as `null` are the ones the bundled
+        // catalog itself uses that way.
+        assert!(entry["availability_nux"].is_null());
+        assert!(entry["upgrade"].is_null());
     }
 
     #[test]
@@ -1072,7 +1117,10 @@ mod tests {
         // No window declared, so the template's own stays — but the code-mode
         // flags are cleared either way.
         assert_eq!(catalog["models"][0]["context_window"], 272000);
-        assert!(catalog["models"][0]["tool_mode"].is_null());
+        assert!(
+            catalog["models"][0].get("tool_mode").is_none(),
+            "the code mode flag must be absent, not null"
+        );
         assert_eq!(catalog["models"][0]["use_responses_lite"], false);
     }
 
