@@ -580,6 +580,15 @@ fn entry_from(
         object.remove(key);
     }
 
+    // `freeform` is what makes Codex declare `apply_patch` as a `custom` tool:
+    // a grammar-constrained tool the model writes patch syntax into, rather
+    // than a JSON-argument function. The router cannot relay one — its tool
+    // translation refuses a `custom` declaration with `unsupported tool type` —
+    // and the refusal is a 400 for the whole request, not a dropped tool. The
+    // entry that omits this field keeps the JSON shell tool instead, which is
+    // the one the router can run.
+    object.remove("apply_patch_tool_type");
+
     // OpenAI's service tiers are an OpenAI concept; a router lane has none.
     object.insert(
         "service_tiers".to_owned(),
@@ -1104,6 +1113,22 @@ mod tests {
         // catalog itself uses that way.
         assert!(entry["availability_nux"].is_null());
         assert!(entry["upgrade"].is_null());
+    }
+
+    #[test]
+    fn does_not_ask_codex_for_the_freeform_apply_patch_tool() {
+        // `apply_patch_tool_type = "freeform"` is what makes Codex declare
+        // `apply_patch` as a `custom` tool: a grammar-constrained tool whose
+        // arguments are patch syntax rather than JSON. The router refuses a
+        // `custom` declaration outright — `unsupported tool type "custom":
+        // this build does not run it` — and that refusal is a 400 for the
+        // whole request, so the MCP tools in the same request never run.
+        let catalog = build(&bundled(), &[lane("large-stack")]).expect("built");
+
+        assert!(
+            catalog["models"][0].get("apply_patch_tool_type").is_none(),
+            "the freeform apply_patch tool must not be declared"
+        );
     }
 
     #[test]
