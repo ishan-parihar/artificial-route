@@ -25,9 +25,15 @@ PROMPT='Use the sourcehound MCP server to search for news about the Rust foundat
 # Codex refuses to run outside a trusted directory, so the run happens in the
 # repo, which the base config already trusts.
 cd /home/ishanp/Documents/github/my-projects/agentic-utility/proxy/artificial-route
-export AROUTE_API_KEY="$(grep -oE '^AROUTE_API_KEY=.*' "$HOME/.config/jcode/provider-aroute.env" | cut -d= -f2- | tr -d '"' | tr -d "'")"
 
-out=$(timeout 600 codex exec -m large-stack "$PROMPT" < /dev/null 2>&1)
+# The key is *removed* from the environment rather than exported into it.
+# Exporting it is the condition that hid the bug: a shell that sources the
+# key file has the key, so the missing-variable error never appears there.
+# The router's credential comes from Codex's command-backed auth instead,
+# and a turn has to work with no key in the environment at all.
+unset AROUTE_API_KEY
+
+out=$(env -u AROUTE_API_KEY timeout 600 codex exec -m large-stack "$PROMPT" < /dev/null 2>&1)
 rc=$?
 
 if [ "$rc" = 0 ]; then
@@ -53,6 +59,15 @@ if printf '%s' "$out" | grep -qi "unsupported tool type"; then
   bad "the router refused the request's tool set"
 else
   ok "the router accepted the request's tool set"
+fi
+
+# The turn ran with no key in the environment, so the credential came from
+# Codex's command-backed auth. If the auth command itself failed, the turn
+# would not have reached the router at all.
+if printf '%s' "$out" | grep -qi "provider auth command"; then
+  bad "the auth command failed"
+else
+  ok "the turn authenticated with no key in the environment"
 fi
 
 # The usage must land on the router's ledger, after the `before` row.

@@ -185,6 +185,35 @@ pub struct CodexArgs {
     /// only through `codex --profile aroute`.
     #[arg(long)]
     pub no_default_provider: bool,
+
+    /// Read the router's API key through a command instead of `$AROUTE_API_KEY`.
+    ///
+    /// Codex resolves `env_key` from the process environment, so the key has
+    /// to be in the environment of every shell that starts Codex. A key read
+    /// from a file the shell sources is in *that* shell's environment and no
+    /// other, which is why `Missing environment variable: AROUTE_API_KEY`
+    /// appears in a session started any other way. This flag writes Codex's
+    /// command-backed `auth` instead, and Codex runs the command itself, so
+    /// the key reaches every session whatever started it.
+    #[arg(long)]
+    pub auth_command: bool,
+}
+
+/// The subcommand a Codex provider block names in its `auth.command`.
+///
+/// Codex's command-backed auth has one contract: the command's stdout,
+/// trimmed, is the token. This is that command. It prints the key and nothing
+/// else, so it never becomes a diagnostic the router would reject as a
+/// credential.
+#[derive(Debug, Clone, clap::Args)]
+pub struct TokenArgs {
+    /// Which environment file to read the key from.
+    ///
+    /// The operator's shell sources `~/.config/jcode/provider-aroute.env`,
+    /// so that is where the key lives. The flag names an alternative for a
+    /// key stored somewhere else.
+    #[arg(long, value_name = "PATH")]
+    pub env_file: Option<std::path::PathBuf>,
 }
 
 /// The provider block's own table name in `config.toml`.
@@ -201,6 +230,21 @@ const PROVIDER_ID: &str = "aroute";
 /// switch has to be client-side: the router's refusal arrives after Codex has
 /// already declared the tool, and it takes the whole request down with it.
 const WEB_SEARCH_DISABLED: &str = "disabled";
+
+/// The reasoning efforts the router runs.
+///
+/// The router's own set, in its own words: `crates/ar-translate` reads
+/// `minimal`, `low`, `medium` and `high`, and refuses anything else with
+/// `reasoning.effort names an effort this build does not run`. The catalog
+/// must offer no more than this, because an effort the picker offers and the
+/// router refuses is a request that fails for the whole turn.
+const SUPPORTED_REASONING_EFFORTS: [&str; 4] = ["minimal", "low", "medium", "high"];
+
+/// The reasoning effort a lane uses when nothing else is chosen.
+///
+/// `medium`: the router's middle setting, and the one the operator's own
+/// profile corpus uses most.
+const DEFAULT_REASONING_EFFORT: &str = "medium";
 
 /// The default provider base URL: the local router.
 ///
@@ -301,9 +345,12 @@ pub fn codex(cli: &crate::cli::Cli, args: &CodexArgs) -> Result<()> {
     let (edited, mut notes) = edit_config(
         &config,
         &catalog_path,
-        &base_url,
-        args.base_url.is_some(),
-        !args.no_default_provider,
+        &EditOptions {
+            base_url,
+            explicit_base_url: args.base_url.is_some(),
+            default_provider: !args.no_default_provider,
+            auth_command: args.auth_command,
+        },
     );
     if edited != config {
         backup_once(&config_path, &config)?;
@@ -487,6 +534,13 @@ fn profile_body(lane: &Lane) -> String {
          model_auto_compact_token_limit = {compact}\n\
          tool_output_token_limit        = 32768\n\
          \n\
+         # The reasoning effort is pinned, not inherited. The base config's own\n\
+         # value may name an effort the router refuses — `xhigh` is one — and\n\
+         # the router answers that with a 400 for the whole request. The\n\
+         # catalog offers only the efforts the router runs, so the profile\n\
+         # names one of those.\n\
+         model_reasoning_effort         = \"{effort}\"\n\
+         \n\
          # aroute has no web access and refuses the hosted tool, so Codex must not\n\
          # ask for it. The switch is client-side: it keeps the `web_search` tool out\n\
          # of the request aroute sees.\n\
@@ -494,6 +548,7 @@ fn profile_body(lane: &Lane) -> String {
         id = lane.id,
         window = window,
         compact = compact,
+        effort = DEFAULT_REASONING_EFFORT,
     )
 }
 
@@ -702,6 +757,14 @@ fn build(bundled: &serde_json::Value, lanes: &[Lane]) -> Result<serde_json::Valu
                     "use_responses_lite".to_owned(),
                     serde_json::Value::Bool(false),
                 );
+
+                // The hidden entries are held to the same reasoning rules as
+                // the lanes. The base config makes aroute the active
+                // provider, so a hidden entry is still an entry Codex can
+                // resolve by slug and send to this router — and the router
+                // refuses an effort above `high` with a 400 that fails the
+                // whole turn. See [`entry_from`] for the reasoning cut.
+                cut_reasoning_levels(object);
             }
             row
         })
@@ -830,6 +893,18 @@ fn entry_from(
         serde_json::Value::Array(Vec::new()),
     );
 
+    // The reasoning levels the entry offers. The template is a GPT model's,
+    // and it offers levels this router does not run: `xhigh`, `max` and
+    // `ultra` are OpenAI's, and the router refuses any effort above `high`
+    // with a 400 that reads `reasoning.effort names an effort this build
+    // does not run`. A level the router will refuse is not a level the
+    // catalog may offer, so the list is cut to the router's own.
+    //
+    // The cut is here rather than in the router because the router's refusal
+    // is right: a request that asked for more thinking than it gets should
+    // say so. The catalog is the wrong place to promise it.
+    cut_reasoning_levels(object);
+
     // The template's window belongs to a GPT model. The lane's own figure is
     // the one Codex must compact at, so it wins whenever the combo declared one.
     if let Some(window) = lane.context_length {
@@ -853,6 +928,55 @@ fn entry_from(
     }
 
     Ok(entry)
+}
+
+/// Cuts a catalog entry's reasoning levels down to the router's own.
+///
+/// A Codex model entry offers `xhigh`, `max` and `ultra`; this router runs
+/// `minimal`, `low`, `medium` and `high` and refuses anything else with a
+/// 400 for the whole request. An entry that offers a level the router
+/// refuses is an entry whose picker row produces a request that cannot
+/// work, so the levels are cut and the default is moved onto one the router
+/// runs.
+///
+/// Every entry is cut, the hidden ones included: the base config makes
+/// aroute the active provider, so a hidden entry is still an entry Codex can
+/// resolve by slug and send here.
+fn cut_reasoning_levels(object: &mut serde_json::Map<String, serde_json::Value>) {
+    let levels: Vec<serde_json::Value> = object
+        .get("supported_reasoning_levels")
+        .and_then(serde_json::Value::as_array)
+        .map(|levels| {
+            levels
+                .iter()
+                .filter(|level| {
+                    level
+                        .get("effort")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|effort| SUPPORTED_REASONING_EFFORTS.contains(&effort))
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    object.insert(
+        "supported_reasoning_levels".to_owned(),
+        serde_json::Value::Array(levels),
+    );
+
+    // The default may be a level the list no longer carries. `medium` is the
+    // router's middle setting and the one the operator's own profile corpus
+    // uses most, so it is the default when the entry's own is not offered.
+    let default_is_offered = object
+        .get("default_reasoning_level")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|effort| SUPPORTED_REASONING_EFFORTS.contains(&effort));
+    if !default_is_offered {
+        object.insert(
+            "default_reasoning_level".to_owned(),
+            serde_json::json!(DEFAULT_REASONING_EFFORT),
+        );
+    }
 }
 
 /// Writes `value` to `path` atomically: a temp file beside it, then a rename.
@@ -931,6 +1055,81 @@ fn write_text_atomic(path: &Path, body: &str) -> Result<()> {
     Ok(())
 }
 
+/// The environment variable the router's key is stored under.
+const API_KEY_ENV: &str = "AROUTE_API_KEY";
+
+/// The environment file the operator's shell sources for the router's key.
+///
+/// The same file the jcode provider profile reads through `env_file`, so the
+/// shell, the profile and this command are on one value.
+const DEFAULT_ENV_FILE: &str = ".config/jcode/provider-aroute.env";
+
+/// Prints the router's API key on stdout, for Codex's command-backed auth.
+///
+/// Codex's contract is narrow and this command keeps to it: the key on
+/// stdout, nothing else. A diagnostic on stdout would become part of the
+/// token, and the router would answer the whole request with a 401 that
+/// names a key nobody can read.
+///
+/// The key comes from the environment when it is there, and from the
+/// operator's env file when it is not. The environment is preferred because
+/// a shell that has already sourced the file has the freshest value; the
+/// file is the fallback that makes the key reachable from a session started
+/// any other way.
+pub fn token(args: &TokenArgs) -> Result<()> {
+    if let Ok(value) = std::env::var(API_KEY_ENV) {
+        let value = value.trim();
+        if !value.is_empty() {
+            println!("{value}");
+            return Ok(());
+        }
+    }
+
+    let path = match &args.env_file {
+        Some(path) => path.clone(),
+        None => dirs_home()?.join(DEFAULT_ENV_FILE),
+    };
+    let body = std::fs::read_to_string(&path)
+        .with_context(|| format!("could not read {}", path.display()))?;
+
+    let value = body
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix(API_KEY_ENV))
+        .find_map(|rest| {
+            let rest = rest.trim();
+            let rest = rest.strip_prefix('=')?.trim();
+            let value = rest.trim_matches(|c| c == '"' || c == '\'');
+            (!value.is_empty()).then(|| value.to_owned())
+        })
+        .with_context(|| {
+            format!(
+                "{} holds no {API_KEY_ENV}; the key is not where Codex should look",
+                path.display()
+            )
+        })?;
+
+    println!("{value}");
+    Ok(())
+}
+
+/// What the base-config edit should do.
+///
+/// The options are named rather than positional: there are several, they are
+/// all booleans, and a sixth positional `true`/`false` would say nothing at
+/// the call site.
+#[derive(Debug, Default)]
+struct EditOptions {
+    /// The router's base URL, used when the provider block has none.
+    base_url: String,
+    /// Whether an existing `base_url` may be replaced. Only an explicit
+    /// `--base-url` earns that: the operator's own is a choice.
+    explicit_base_url: bool,
+    /// Whether aroute becomes the active provider.
+    default_provider: bool,
+    /// Whether the provider block gets the command-backed auth.
+    auth_command: bool,
+}
+
 /// Edits `config.toml`: adds the catalog key at the top level, selects the
 /// aroute provider, and makes sure the provider block exists, without
 /// disturbing what is already there.
@@ -939,25 +1138,18 @@ fn write_text_atomic(path: &Path, body: &str) -> Result<()> {
 /// does not depend on a TOML crate and this command must not add one. It only
 /// ever needs to recognise three things: a top-level key, a table header, and
 /// the keys of one table. Everything else it passes through byte for byte.
-///
-/// `explicit_base_url` says the operator named the URL on the command line,
-/// which is the only case where an existing `base_url` is replaced.
-///
-/// `default_provider` says whether aroute should become the active provider.
-/// It should: without it Codex sends the request to OpenAI's own backend,
-/// which rejects the router's model names. The operator can decline with
-/// `--no-default-provider`, and then the router is reachable only through
-/// `codex --profile aroute`.
 fn edit_config(
     body: &str,
     catalog: &Path,
-    base_url: &str,
-    explicit_base_url: bool,
-    default_provider: bool,
+    options: &EditOptions,
 ) -> (String, Vec<String>) {
     let mut notes = Vec::new();
     let mut out = body.to_owned();
     let catalog_value = catalog.display().to_string();
+    let base_url = options.base_url.as_str();
+    let explicit_base_url = options.explicit_base_url;
+    let default_provider = options.default_provider;
+    let auth_command = options.auth_command;
 
     // The catalog key. It is top-level, not under a table: the catalog is
     // global, and a `model_catalog_json` inside `[model_providers.aroute]`
@@ -1035,10 +1227,51 @@ fn edit_config(
                 notes.push(format!("added web_search = {WEB_SEARCH_DISABLED}"));
             }
         }
+
+        // The reasoning effort, for the same reason and the same rule. The
+        // router runs `minimal`, `low`, `medium` and `high`, and refuses
+        // anything else with a 400 for the whole request. The operator's own
+        // base config may name `xhigh` — a level OpenAI's models offer and
+        // this router does not — and every plain `codex` turn would fail on
+        // it. An effort the router runs is left alone: that is a preference
+        // that works.
+        let existing = top_level_value(&out, "model_reasoning_effort");
+        match existing.as_deref() {
+            Some(effort) if SUPPORTED_REASONING_EFFORTS.contains(&effort) => {
+                notes.push(format!("model_reasoning_effort is {effort}, which the router runs"));
+            }
+            Some(other) => {
+                out = replace_top_level(
+                    &out,
+                    "model_reasoning_effort",
+                    DEFAULT_REASONING_EFFORT,
+                );
+                notes.push(format!(
+                    "model_reasoning_effort is now {DEFAULT_REASONING_EFFORT} (was {other}; \
+                     the router refuses any other effort)"
+                ));
+            }
+            None => {
+                out = insert_top_level(
+                    &out,
+                    "model_reasoning_effort",
+                    DEFAULT_REASONING_EFFORT,
+                );
+                notes.push(format!(
+                    "added model_reasoning_effort = {DEFAULT_REASONING_EFFORT}"
+                ));
+            }
+        }
     }
 
     // The provider block.
-    edit_provider(&mut out, base_url, explicit_base_url, &mut notes);
+    edit_provider(
+        &mut out,
+        base_url,
+        explicit_base_url,
+        auth_command,
+        &mut notes,
+    );
 
     // The file's *shape* is the operator's too: a config that did not end
     // with a newline does not gain one. The keys above are written with the
@@ -1061,13 +1294,20 @@ fn edit_config(
 ///
 /// The secret is never written: `env_key` names the environment variable, so
 /// the key itself stays in the operator's shell and never lands in a file.
-fn provider_keys(base_url: &str) -> Vec<(&'static str, String)> {
-    vec![
+///
+/// The command-backed auth replaces `env_key` entirely — Codex refuses a
+/// provider that carries both — so the key is left out when the auth command
+/// owns the credential.
+fn provider_keys(base_url: &str, auth_command: bool) -> Vec<(&'static str, String)> {
+    let mut keys = vec![
         ("name", "aroute".to_owned()),
         ("base_url", base_url.to_owned()),
-        ("env_key", "AROUTE_API_KEY".to_owned()),
-        ("wire_api", "responses".to_owned()),
-    ]
+    ];
+    if !auth_command {
+        keys.push(("env_key", "AROUTE_API_KEY".to_owned()));
+    }
+    keys.push(("wire_api", "responses".to_owned()));
+    keys
 }
 
 /// A TOML basic string, quoted and escaped.
@@ -1136,6 +1376,7 @@ fn edit_provider(
     body: &mut String,
     base_url: &str,
     explicit_base_url: bool,
+    auth_command: bool,
     notes: &mut Vec<String>,
 ) {
     let existing = table_keys(body, PROVIDER_TABLE);
@@ -1150,14 +1391,17 @@ fn edit_provider(
         }
         body.push_str(ending);
         body.push_str(&format!("[model_providers.aroute]{ending}"));
-        for (key, value) in provider_keys(base_url) {
+        for (key, value) in provider_keys(base_url, auth_command) {
             body.push_str(&format!("{key} = {}{ending}", toml_string(&value)));
+        }
+        if auth_command {
+            edit_auth_command(body, notes);
         }
         return;
     }
 
     // The block is there. Add the keys it lacks, and leave the rest.
-    let missing: Vec<(&str, String)> = provider_keys(base_url)
+    let missing: Vec<(&str, String)> = provider_keys(base_url, auth_command)
         .into_iter()
         .filter(|(key, _)| !existing.iter().any(|(name, _)| name == key))
         .collect();
@@ -1181,6 +1425,147 @@ fn edit_provider(
             replace_in_table(body, PROVIDER_TABLE, "base_url", base_url);
             notes.push(format!("base_url in [model_providers.aroute] is now {base_url}"));
         }
+    }
+
+    // The command-backed auth, which replaces the environment-variable form
+    // rather than sitting beside it.
+    //
+    // Codex runs the command itself, so the key reaches every session whatever
+    // started it — which the `env_key` form cannot promise, because Codex
+    // reads `env_key` from the process environment and a key the shell sources
+    // is in one shell's environment only.
+    //
+    // The two forms are mutually exclusive. Codex refuses the combination
+    // outright — `provider auth cannot be combined with env_key` — so a config
+    // that keeps both fails to load *at all*, and every turn fails with it.
+    if auth_command {
+        if table_keys(body, PROVIDER_TABLE)
+            .iter()
+            .any(|(name, _)| name == "env_key")
+        {
+            remove_from_table(body, PROVIDER_TABLE, "env_key");
+            notes.push(
+                "removed env_key from [model_providers.aroute] (auth replaces it)".to_owned(),
+            );
+        }
+        edit_auth_command(body, notes);
+    }
+}
+
+/// The nested table Codex reads the provider's auth command from.
+///
+/// Codex's schema puts `auth` inside the provider block, so the table is
+/// `[model_providers.aroute.auth]`.
+const AUTH_TABLE: &str = "model_providers.aroute.auth";
+
+/// The program Codex runs to fetch the router's API key.
+///
+/// Codex's `auth.command` is a *program path*, and its arguments go in
+/// `auth.args` beside it. A command string with a space in it names a
+/// program with a space in its name, which does not exist: Codex answers
+/// `provider auth command \`aroute token\` failed to start: No such file or
+/// directory`. So the program is `aroute` and the subcommand is an argument.
+const AUTH_COMMAND: &str = "aroute";
+
+/// The argument that makes the program print the key.
+///
+/// `aroute token` reads the key from the environment, or from the file the
+/// operator's shell sources, and prints it on stdout. That is exactly the
+/// contract Codex's command-backed auth has: the command's stdout, trimmed,
+/// is the token.
+const AUTH_ARGS: [&str; 1] = ["token"];
+
+/// Writes the provider's command-backed auth, in place.
+///
+/// The table is written whole rather than filled in key by key: it is a
+/// mechanism this command owns end to end, and a half-written `auth` block
+/// is a provider Codex cannot authenticate against.
+///
+/// `command` and `args` are *replaced* rather than left alone. They are the
+/// one part of the block this command owns, and a value left behind from an
+/// earlier shape is worse than a missing one: a `command = "aroute token"`
+/// names a program with a space in its name, and Codex answers
+/// `provider auth command \`aroute token\` failed to start: No such file or
+/// directory`.
+fn edit_auth_command(body: &mut String, notes: &mut Vec<String>) {
+    let existing = table_keys(body, AUTH_TABLE);
+    let wanted = [
+        ("command", AUTH_COMMAND.to_owned()),
+        ("timeout_ms", "10000".to_owned()),
+    ];
+
+    // The arguments are a TOML array of strings, and are written as one line
+    // so the table stays the shape Codex's own docs show.
+    let args_value = format!(
+        "[{}]",
+        AUTH_ARGS
+            .iter()
+            .map(|argument| toml_string(argument))
+            .collect::<Vec<String>>()
+            .join(", ")
+    );
+
+    let missing: Vec<(&str, String)> = wanted
+        .iter()
+        .filter(|(key, _)| !existing.iter().any(|(name, _)| name == key))
+        .map(|(key, value)| (*key, value.clone()))
+        .collect();
+    let has_args = existing.iter().any(|(name, _)| name == "args");
+    let command_is_wrong = existing
+        .iter()
+        .any(|(name, value)| name == "command" && value.as_str() != AUTH_COMMAND);
+    let args_are_wrong = existing
+        .iter()
+        .any(|(name, value)| name == "args" && value.as_str() != args_value);
+
+    if missing.is_empty() && has_args && !command_is_wrong && !args_are_wrong {
+        notes.push("[model_providers.aroute.auth] already complete".to_owned());
+        return;
+    }
+
+    if existing.is_empty() {
+        notes.push("added [model_providers.aroute.auth]".to_owned());
+        let ending = line_ending(body);
+        if !body.is_empty() && !body.ends_with('\n') {
+            body.push_str(ending);
+        }
+        body.push_str(ending);
+        body.push_str(&format!("[{AUTH_TABLE}]{ending}"));
+        body.push_str(&format!(
+            "command = {}{ending}",
+            toml_string(AUTH_COMMAND)
+        ));
+        body.push_str(&format!("args = {args_value}{ending}"));
+        body.push_str(&format!("timeout_ms = 10000{ending}"));
+        return;
+    }
+
+    // A value that is already there but wrong is replaced. Leaving it would
+    // keep a config Codex cannot authenticate against, and the report would
+    // claim the block is complete.
+    if command_is_wrong {
+        replace_raw_in_table(body, AUTH_TABLE, "command", &toml_string(AUTH_COMMAND));
+        notes.push(format!(
+            "command in [{AUTH_TABLE}] is now {AUTH_COMMAND} (it named a program Codex cannot run)"
+        ));
+    }
+    if args_are_wrong {
+        replace_raw_in_table(body, AUTH_TABLE, "args", &args_value);
+        notes.push(format!("args in [{AUTH_TABLE}] is now {args_value}"));
+    }
+
+    for (key, value) in missing {
+        let value = if key.contains("command") {
+            toml_string(&value)
+        } else {
+            value
+        };
+        insert_into_table(body, AUTH_TABLE, key, &value);
+        notes.push(format!("added {key} to [{AUTH_TABLE}]"));
+    }
+    if !has_args {
+        insert_raw_into_table(body, AUTH_TABLE, "args", &args_value);
+        notes.push(format!("added args to [{AUTH_TABLE}]"));
     }
 }
 
@@ -1235,9 +1620,18 @@ fn line_ending(body: &str) -> &'static str {
 /// The end of the block is the line before the next table header, or the end
 /// of the file when the table is the last one.
 fn insert_into_table(body: &mut String, table: &str, key: &str, value: &str) {
+    insert_raw_into_table(body, table, key, &toml_string(value));
+}
+
+/// Inserts a key whose value is already written the way TOML wants it.
+///
+/// A value that is not a string — an array, a number — is written verbatim,
+/// because quoting it would change its type and a `args = "[\"token\"]"` is a
+/// string where Codex expects an array.
+fn insert_raw_into_table(body: &mut String, table: &str, key: &str, value: &str) {
     let header = format!("[{table}]");
     let ending = line_ending(body);
-    let new_line = format!("{key} = {}{ending}", toml_string(value));
+    let new_line = format!("{key} = {value}{ending}");
     let mut out = String::with_capacity(body.len() + new_line.len());
     let mut inside = false;
     let mut inserted = false;
@@ -1265,6 +1659,14 @@ fn insert_into_table(body: &mut String, table: &str, key: &str, value: &str) {
 
 /// Replaces the value of `key` inside `table`.
 fn replace_in_table(body: &mut String, table: &str, key: &str, value: &str) {
+    replace_raw_in_table(body, table, key, &toml_string(value));
+}
+
+/// Replaces the value of `key` inside `table`, writing it verbatim.
+///
+/// A value that is not a string — an array, a number — is written as it is,
+/// because quoting it would change its type.
+fn replace_raw_in_table(body: &mut String, table: &str, key: &str, value: &str) {
     let header = format!("[{table}]");
     let mut out = String::with_capacity(body.len());
     let mut inside = false;
@@ -1278,11 +1680,33 @@ fn replace_in_table(body: &mut String, table: &str, key: &str, value: &str) {
             && name == key
         {
             // The line keeps its own terminator, so a CRLF file stays CRLF.
-            out.push_str(&format!(
-                "{key} = {}{}",
-                toml_string(value),
-                line_terminator(line)
-            ));
+            out.push_str(&format!("{key} = {value}{}", line_terminator(line)));
+            continue;
+        }
+        out.push_str(line);
+    }
+    *body = out;
+}
+
+/// Removes a key from a table, leaving the rest of the file alone.
+///
+/// The line goes entirely, terminator and all, so the table keeps its shape
+/// and the file keeps its ending. A key that is not there is not an error:
+/// the caller's question is whether the key is present afterwards, and it is
+/// not.
+fn remove_from_table(body: &mut String, table: &str, key: &str) {
+    let header = format!("[{table}]");
+    let mut out = String::with_capacity(body.len());
+    let mut inside = false;
+    for line in lines_with_endings(body) {
+        let trimmed = line_content(line).trim();
+        if trimmed.starts_with('[') {
+            inside = trimmed == header;
+        }
+        if inside
+            && let Some((name, _)) = split_key(trimmed)
+            && name == key
+        {
             continue;
         }
         out.push_str(line);
@@ -1387,6 +1811,16 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The edit options a test wants: the default base URL, no explicit URL,
+    /// aroute as the active provider, and no command-backed auth.
+    fn options() -> EditOptions {
+        EditOptions {
+            base_url: "http://127.0.0.1:20128/v1".to_owned(),
+            explicit_base_url: false,
+            default_provider: true,
+            auth_command: false,
+        }
+    }
     fn bundled() -> serde_json::Value {
         json!({
             "models": [
@@ -1417,6 +1851,15 @@ mod tests {
                     "base_instructions": "the prompt",
                     "service_tiers": ["default"],
                     "upgrade": {"to": "gpt-9"},
+                    "default_reasoning_level": "xhigh",
+                    "supported_reasoning_levels": [
+                        {"effort": "low", "description": "Fast"},
+                        {"effort": "medium", "description": "Balanced"},
+                        {"effort": "high", "description": "Deeper"},
+                        {"effort": "xhigh", "description": "Extra deep"},
+                        {"effort": "max", "description": "Maximum"},
+                        {"effort": "ultra", "description": "Maximum, delegated"},
+                    ],
                 },
             ]
         })
@@ -1607,9 +2050,12 @@ mod tests {
         let (edited, notes) = edit_config(
             "[model_providers.aroute]\nbase_url = \"https://example/v1\"\n",
             Path::new("/home/x/.codex/aroute-models.json"),
-            "http://127.0.0.1:20128/v1",
-            false,
-            false,
+            &EditOptions {
+                base_url: "http://127.0.0.1:20128/v1".to_owned(),
+                explicit_base_url: false,
+                default_provider: false,
+                auth_command: false,
+            },
         );
 
         assert!(
@@ -1624,9 +2070,12 @@ mod tests {
         let (edited, _) = edit_config(
             "[model_providers.aroute]\nbase_url = \"https://aroute.ishanparihar.com/v1\"\nenv_key = \"AROUTE_API_KEY\"\nwire_api = \"responses\"\n",
             Path::new("/home/x/.codex/aroute-models.json"),
-            "http://127.0.0.1:20128/v1",
-            false,
-            false,
+            &EditOptions {
+                base_url: "http://127.0.0.1:20128/v1".to_owned(),
+                explicit_base_url: false,
+                default_provider: false,
+                auth_command: false,
+            },
         );
 
         assert!(
@@ -1641,9 +2090,12 @@ mod tests {
         let (edited, notes) = edit_config(
             "[model_providers.aroute]\nbase_url = \"https://old/v1\"\nenv_key = \"AROUTE_API_KEY\"\nwire_api = \"responses\"\n",
             Path::new("/home/x/.codex/aroute-models.json"),
-            "https://new/v1",
-            true,
-            false,
+            &EditOptions {
+                base_url: "https://new/v1".to_owned(),
+                explicit_base_url: true,
+                default_provider: false,
+                auth_command: false,
+            },
         );
 
         assert!(edited.contains("base_url = \"https://new/v1\""), "got: {edited}");
@@ -1656,9 +2108,12 @@ mod tests {
         let (edited, notes) = edit_config(
             "[model_providers.aroute]\nbase_url = \"https://aroute.ishanparihar.com/v1\"\n\n[profiles.work]\nmodel = \"gpt-5.5\"\n",
             Path::new("/home/x/.codex/aroute-models.json"),
-            "http://127.0.0.1:20128/v1",
-            false,
-            false,
+            &EditOptions {
+                base_url: "http://127.0.0.1:20128/v1".to_owned(),
+                explicit_base_url: false,
+                default_provider: false,
+                auth_command: false,
+            },
         );
 
         // The keys must land inside the provider block, not after the next
@@ -1680,9 +2135,12 @@ mod tests {
         let (edited, notes) = edit_config(
             before,
             Path::new("/home/x/.codex/aroute-models.json"),
-            "https://x/v1",
-            false,
-            false,
+            &EditOptions {
+                base_url: "https://x/v1".to_owned(),
+                explicit_base_url: false,
+                default_provider: false,
+                auth_command: false,
+            },
         );
 
         // Only the catalog key is added; the block is untouched.
@@ -1700,9 +2158,12 @@ mod tests {
         let (edited, _) = edit_config(
             "",
             Path::new("/home/x/.codex/aroute-models.json"),
-            "http://127.0.0.1:20128/v1",
-            false,
-            false,
+            &EditOptions {
+                base_url: "http://127.0.0.1:20128/v1".to_owned(),
+                explicit_base_url: false,
+                default_provider: false,
+                auth_command: false,
+            },
         );
 
         assert!(edited.contains("env_key = \"AROUTE_API_KEY\""));
@@ -1752,9 +2213,12 @@ mod tests {
         let (edited, notes) = edit_config(
             "model_catalog_json = \"/home/x/.codex/other-models.json\"\n",
             Path::new("/home/x/.codex/aroute-models.json"),
-            "http://127.0.0.1:20128/v1",
-            false,
-            false,
+            &EditOptions {
+                base_url: "http://127.0.0.1:20128/v1".to_owned(),
+                explicit_base_url: false,
+                default_provider: false,
+                auth_command: false,
+            },
         );
 
         assert!(
@@ -1778,9 +2242,12 @@ mod tests {
         let (edited, _) = edit_config(
             before,
             Path::new("/home/x/.codex/aroute-models.json"),
-            "http://127.0.0.1:20128/v1",
-            false,
-            true,
+            &EditOptions {
+                base_url: "http://127.0.0.1:20128/v1".to_owned(),
+                explicit_base_url: false,
+                default_provider: true,
+                auth_command: false,
+            },
         );
 
         assert!(
@@ -1799,9 +2266,12 @@ mod tests {
         let (edited, _) = edit_config(
             before,
             Path::new("/home/x/.codex/aroute-models.json"),
-            "http://127.0.0.1:20128/v1",
-            false,
-            true,
+            &EditOptions {
+                base_url: "http://127.0.0.1:20128/v1".to_owned(),
+                explicit_base_url: false,
+                default_provider: true,
+                auth_command: false,
+            },
         );
 
         assert!(
@@ -1820,9 +2290,12 @@ mod tests {
         let (edited, notes) = edit_config(
             "model_reasoning_effort = \"medium\"\n",
             Path::new("/home/x/.codex/aroute-models.json"),
-            "http://127.0.0.1:20128/v1",
-            false,
-            true,
+            &EditOptions {
+                base_url: "http://127.0.0.1:20128/v1".to_owned(),
+                explicit_base_url: false,
+                default_provider: true,
+                auth_command: false,
+            },
         );
 
         assert!(
@@ -1841,9 +2314,12 @@ mod tests {
         let (edited, notes) = edit_config(
             "web_search = \"cached\"\n",
             Path::new("/home/x/.codex/aroute-models.json"),
-            "http://127.0.0.1:20128/v1",
-            false,
-            true,
+            &EditOptions {
+                base_url: "http://127.0.0.1:20128/v1".to_owned(),
+                explicit_base_url: false,
+                default_provider: true,
+                auth_command: false,
+            },
         );
 
         assert!(
@@ -1863,9 +2339,12 @@ mod tests {
         let (edited, _) = edit_config(
             "model_reasoning_effort = \"medium\"\n",
             Path::new("/home/x/.codex/aroute-models.json"),
-            "http://127.0.0.1:20128/v1",
-            false,
-            false,
+            &EditOptions {
+                base_url: "http://127.0.0.1:20128/v1".to_owned(),
+                explicit_base_url: false,
+                default_provider: false,
+                auth_command: false,
+            },
         );
 
         assert!(
@@ -1928,9 +2407,12 @@ mod tests {
         let (edited, notes) = edit_config(
             "",
             Path::new("/home/x/.codex/aroute-models.json"),
-            "http://127.0.0.1:20128/v1",
-            false,
-            true,
+            &EditOptions {
+                base_url: "http://127.0.0.1:20128/v1".to_owned(),
+                explicit_base_url: false,
+                default_provider: true,
+                auth_command: false,
+            },
         );
 
         assert!(
@@ -1977,5 +2459,252 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn offers_only_the_efforts_the_router_runs() {
+        // The bundled template is a GPT model's, and it offers `xhigh`,
+        // `max` and `ultra`. The router refuses every effort above `high`
+        // with a 400 that fails the whole turn, so the catalog must not
+        // promise one. A level the picker offers and the router refuses is
+        // a request that cannot work.
+        let catalog = build(&bundled(), &[lane("large-stack")]).expect("built");
+        let rows = catalog["models"].as_array().expect("an array");
+
+        for row in rows {
+            let levels: Vec<String> = row
+                .get("supported_reasoning_levels")
+                .and_then(serde_json::Value::as_array)
+                .map(|levels| {
+                    levels
+                        .iter()
+                        .filter_map(|level| {
+                            level.get("effort").map(serde_json::Value::to_string)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            for level in &levels {
+                assert!(
+                    SUPPORTED_REASONING_EFFORTS.contains(&level.trim_matches('"')),
+                    "{slug} offers {level}, which the router refuses",
+                    slug = row["slug"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn drops_a_default_effort_the_router_refuses() {
+        // The template's default is `xhigh`. Left as it is, Codex would send
+        // it on every turn that names no effort, and the router would refuse
+        // each one.
+        let catalog = build(&bundled(), &[lane("large-stack")]).expect("built");
+        let rows = catalog["models"].as_array().expect("an array");
+
+        for row in rows {
+            let default = row
+                .get("default_reasoning_level")
+                .and_then(serde_json::Value::as_str)
+                .expect("a default effort");
+            assert!(
+                SUPPORTED_REASONING_EFFORTS.contains(&default),
+                "{slug} defaults to {default}, which the router refuses",
+                slug = row["slug"]
+            );
+        }
+    }
+
+    #[test]
+    fn replaces_a_reasoning_effort_the_router_refuses() {
+        // The operator's own base config may name `xhigh`, and every plain
+        // `codex` turn would fail on it. An effort that works is left alone:
+        // that is a preference worth keeping.
+        let (edited, notes) = edit_config(
+            "model_reasoning_effort = \"xhigh\"\n",
+            Path::new("/home/x/.codex/aroute-models.json"),
+            &EditOptions {
+                base_url: "http://127.0.0.1:20128/v1".to_owned(),
+                explicit_base_url: false,
+                default_provider: true,
+                auth_command: false,
+            },
+        );
+
+        assert!(
+            edited.contains("model_reasoning_effort = \"medium\""),
+            "an effort the router refuses must be replaced, got: {edited}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("model_reasoning_effort")),
+            "the replacement must be reported, got: {notes:?}"
+        );
+
+        let (kept, _) = edit_config(
+            "model_reasoning_effort = \"high\"\n",
+            Path::new("/home/x/.codex/aroute-models.json"),
+            &EditOptions {
+                base_url: "http://127.0.0.1:20128/v1".to_owned(),
+                explicit_base_url: false,
+                default_provider: true,
+                auth_command: false,
+            },
+        );
+        assert!(
+            kept.contains("model_reasoning_effort = \"high\""),
+            "an effort the router runs must be left alone, got: {kept}"
+        );
+    }
+
+    #[test]
+    fn writes_the_command_backed_auth_when_asked() {
+        // Codex reads `env_key` from the process environment, so a key the
+        // shell sources is in one shell's environment only, and a session
+        // started any other way answers `Missing environment variable:
+        // AROUTE_API_KEY`. The command-backed auth is the fix: Codex runs the
+        // command itself, so the key reaches every session.
+        let (edited, notes) = edit_config(
+            "[model_providers.aroute]\nbase_url = \"https://x/v1\"\nenv_key = \"AROUTE_API_KEY\"\nwire_api = \"responses\"\n",
+            Path::new("/home/x/.codex/aroute-models.json"),
+            &EditOptions {
+                auth_command: true,
+                ..options()
+            },
+        );
+
+        assert!(
+            edited.contains("[model_providers.aroute.auth]"),
+            "the auth table must be written, got: {edited}"
+        );
+
+        // `command` is a program path and the arguments go beside it. A single
+        // string with a space names a program with a space in its name, and
+        // Codex answers `failed to start: No such file or directory`.
+        assert!(
+            edited.contains(&format!("command = \"{AUTH_COMMAND}\"")),
+            "the auth program must be named, got: {edited}"
+        );
+        assert!(
+            edited.contains("args = [\"token\"]"),
+            "the token subcommand must be an argument, got: {edited}"
+        );
+        assert!(
+            !edited.contains("aroute token"),
+            "the program and its argument must not be one string, got: {edited}"
+        );
+
+        // The environment-variable form must *go*. Codex's own validator says
+        // `provider auth cannot be combined with env_key`, and a provider it
+        // refuses makes the whole config fail to load — so keeping both is
+        // worse than either alone. Measured against the installed CLI: a
+        // config with both answers
+        // `Error loading config.toml: model_providers.aroute: provider auth
+        // cannot be combined with env_key`.
+        assert!(
+            !edited.contains("env_key"),
+            "env_key must not survive beside the auth table, got: {edited}"
+        );
+
+        assert!(
+            notes.iter().any(|note| note.contains("removed env_key")),
+            "the removal must be reported, got: {notes:?}"
+        );
+        assert!(
+            notes.iter().any(|note| note.contains("auth")),
+            "the addition must be reported, got: {notes:?}"
+        );
+
+        // The block's other keys are the operator's, and they stay.
+        assert!(edited.contains("wire_api = \"responses\""), "got: {edited}");
+        assert!(edited.contains("base_url = \"https://x/v1\""), "got: {edited}");
+    }
+
+    #[test]
+    fn removes_only_the_env_key_and_not_the_rest_of_the_block() {
+        // The removal is surgical: a config with several providers loses the
+        // one key the auth table replaces, and nothing else.
+        let (edited, _) = edit_config(
+            "[model_providers.aroute]\nbase_url = \"https://x/v1\"\nenv_key = \"AROUTE_API_KEY\"\nwire_api = \"responses\"\n\n[model_providers.other]\nenv_key = \"OTHER_KEY\"\n",
+            Path::new("/home/x/.codex/aroute-models.json"),
+            &EditOptions {
+                auth_command: true,
+                ..options()
+            },
+        );
+
+        assert!(
+            edited.contains("env_key = \"OTHER_KEY\""),
+            "the other provider's key is not ours to remove, got: {edited}"
+        );
+        assert!(
+            edited.contains("args = [\"token\"]"),
+            "the auth arguments must be written, got: {edited}"
+        );
+    }
+
+    #[test]
+    fn replaces_a_stale_auth_command_rather_than_keeping_it() {
+        // A config written by an earlier shape of this command carries
+        // `command = "aroute token"`, which names a program with a space in
+        // its name. Codex answers `provider auth command \`aroute token\`
+        // failed to start: No such file or directory`. The command owns this
+        // key, so it replaces the stale value instead of leaving a config
+        // Codex cannot authenticate against.
+        let (edited, notes) = edit_config(
+            "[model_providers.aroute]\nbase_url = \"https://x/v1\"\nwire_api = \"responses\"\n\n[model_providers.aroute.auth]\ncommand = \"aroute token\"\ntimeout_ms = 10000\n",
+            Path::new("/home/x/.codex/aroute-models.json"),
+            &EditOptions {
+                auth_command: true,
+                ..options()
+            },
+        );
+
+        assert!(
+            edited.contains("command = \"aroute\""),
+            "the stale command must be replaced, got: {edited}"
+        );
+        assert!(
+            !edited.contains("\"aroute token\""),
+            "the stale command must not survive, got: {edited}"
+        );
+        assert!(
+            edited.contains("args = [\"token\"]"),
+            "the arguments must be written, got: {edited}"
+        );
+        assert!(
+            notes.iter().any(|note| note.contains("command")),
+            "the replacement must be reported, got: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn leaves_the_command_backed_auth_alone_when_not_asked() {
+        // The mechanism is opt-in: a config the operator built by hand keeps
+        // its own provider block.
+        let (edited, _) = edit_config(
+            "[model_providers.aroute]\nbase_url = \"https://x/v1\"\n",
+            Path::new("/home/x/.codex/aroute-models.json"),
+            &options(),
+        );
+
+        assert!(
+            !edited.contains(AUTH_TABLE),
+            "the auth table must not appear unasked, got: {edited}"
+        );
+    }
+
+    #[test]
+    fn pins_the_effort_in_the_profile_so_the_base_config_cannot_leak_through() {
+        // The profile layers over the base config. Without the pin, the base
+        // config's own `xhigh` would reach the router on the `--profile`
+        // path too.
+        let body = profile_body(&lane("large-stack"));
+
+        assert!(
+            body.contains("model_reasoning_effort         = \"medium\""),
+            "the profile must pin an effort the router runs, got: {body}"
+        );
     }
 }

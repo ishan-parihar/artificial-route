@@ -369,6 +369,25 @@ pub enum Command {
     #[command(verbatim_doc_comment)]
     Codex(crate::codex::CodexArgs),
 
+    /// Print the router's API key on stdout.
+    ///
+    /// This is the command Codex runs when the provider block names a
+    /// command-backed `auth`, which is what `aroute codex --auth-command`
+    /// writes. Codex's contract is narrow: the command's stdout, trimmed, is
+    /// the token, so this prints the key and nothing else.
+    ///
+    /// The key comes from `$AROUTE_API_KEY` when it is set, and from the
+    /// operator's env file when it is not. The file is the fallback that
+    /// makes the key reachable from a session that did not start in a shell
+    /// which sourced it — the difference between a working Codex and
+    /// `Missing environment variable: AROUTE_API_KEY`.
+    ///
+    /// Examples:
+    ///   aroute token
+    ///   aroute token --env-file /path/to/key.env
+    #[command(verbatim_doc_comment)]
+    Token(crate::codex::TokenArgs),
+
     /// Support development 💜
     Donate,
 }
