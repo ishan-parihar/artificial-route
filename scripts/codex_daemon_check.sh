@@ -109,7 +109,12 @@ else
 fi
 
 # --- 5. the command does the restart itself, and says so -------------------
-out=$("$BIN" codex --codex-home "$HOME_DIR" --config "$HOME/.config/ar/config.yaml" --force 2>&1)
+# `--auth-command` is not optional here. Without it the command writes the
+# provider block's `env_key` back, and Codex refuses a provider that carries
+# both `env_key` and `auth` — `provider auth cannot be combined with
+# env_key` — so the *next* session fails to load its config at all. The
+# credential has to come from the same place every time.
+out=$("$BIN" codex --codex-home "$HOME_DIR" --config "$HOME/.config/ar/config.yaml" --auth-command --force 2>&1)
 if printf '%s' "$out" | grep -qi "daemon: restarted"; then
   ok "the command reports the daemon as restarted"
 else
@@ -125,7 +130,7 @@ d["models"] = [x for x in d["models"] if x.get("slug") != probe]
 json.dump(d, open(path, "w"), indent=2)
 print("probe lane removed")
 PY
-"$BIN" codex --codex-home "$HOME_DIR" --config "$HOME/.config/ar/config.yaml" --force >/dev/null 2>&1
+"$BIN" codex --codex-home "$HOME_DIR" --config "$HOME/.config/ar/config.yaml" --auth-command --force >/dev/null 2>&1
 
 echo
 if [ "$fail" = 0 ]; then echo "CODEX_DAEMON_CHECK: PASS"; else echo "CODEX_DAEMON_CHECK: FAIL"; fi

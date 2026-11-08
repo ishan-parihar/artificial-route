@@ -1379,6 +1379,14 @@ fn edit_provider(
     auth_command: bool,
     notes: &mut Vec<String>,
 ) {
+    // The credential form is decided by the config, not only by the flag. A
+    // config that already carries the command-backed auth keeps it: adding
+    // `env_key` beside it produces a config Codex refuses outright
+    // (`provider auth cannot be combined with env_key`), and a refused
+    // provider makes the whole config fail to load. So a run without
+    // `--auth-command` must not undo a run with it.
+    let auth_command = auth_command || !table_keys(body, AUTH_TABLE).is_empty();
+
     let existing = table_keys(body, PROVIDER_TABLE);
     if existing.is_empty() {
         notes.push("added [model_providers.aroute]".to_owned());
@@ -1635,19 +1643,49 @@ fn insert_raw_into_table(body: &mut String, table: &str, key: &str, value: &str)
     let mut out = String::with_capacity(body.len() + new_line.len());
     let mut inside = false;
     let mut inserted = false;
+    // Blank lines inside the block are held back rather than written
+    // immediately: the key's own place is not known until a later line says
+    // whether more keys follow. Holding them back is what puts the key after
+    // the block's last *key* line instead of after a trailing blank line
+    // that a stricter reader would treat as the end of the block.
+    let mut held_blank: Vec<&str> = Vec::new();
+    let flush = |held_blank: &mut Vec<&str>, out: &mut String| {
+        for held in held_blank.drain(..) {
+            out.push_str(held);
+        }
+    };
     for line in lines_with_endings(body) {
         let trimmed = line_content(line).trim();
         if trimmed.starts_with('[') {
-            // The next table starts: the key goes before it.
+            // The next table starts: the key goes before it, and the blanks
+            // that came before the header go with them.
             if inside && !inserted {
+                flush(&mut held_blank, &mut out);
                 out.push_str(&new_line);
                 inserted = true;
             }
             inside = trimmed == header;
+            held_blank.clear();
+            out.push_str(line);
+            continue;
+        }
+        if inside {
+            if trimmed.is_empty() {
+                held_blank.push(line);
+                continue;
+            }
+            if !inserted {
+                out.push_str(&new_line);
+                inserted = true;
+            }
+            flush(&mut held_blank, &mut out);
+        } else {
+            held_blank.clear();
         }
         out.push_str(line);
     }
     if inside && !inserted {
+        flush(&mut held_blank, &mut out);
         // A last line with no terminator would otherwise swallow the key.
         if !out.is_empty() && !out.ends_with('\n') {
             out.push_str(ending);
@@ -2676,6 +2714,85 @@ mod tests {
         assert!(
             notes.iter().any(|note| note.contains("command")),
             "the replacement must be reported, got: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn keeps_the_auth_table_when_the_command_is_run_without_the_flag() {
+        // The credential form is decided by the config, not only by the flag.
+        // A run without `--auth-command` must not write `env_key` back beside
+        // an existing auth table: Codex refuses the combination outright
+        // (`provider auth cannot be combined with env_key`) and a refused
+        // provider makes the whole config fail to load. Measured against the
+        // installed CLI: the next session answers
+        // `Error loading config.toml: model_providers.aroute: provider auth
+        // cannot be combined with env_key`.
+        let before = "[model_providers.aroute]\nbase_url = \"https://x/v1\"\nwire_api = \"responses\"\n\n[model_providers.aroute.auth]\ncommand = \"aroute\"\nargs = [\"token\"]\ntimeout_ms = 10000\n";
+        let (edited, _notes) = edit_config(
+            before,
+            Path::new("/home/x/.codex/aroute-models.json"),
+            &options(),
+        );
+
+        assert!(
+            !edited.contains("env_key"),
+            "env_key must not be written back beside the auth table, got: {edited}"
+        );
+        assert!(
+            edited.contains("args = [\"token\"]"),
+            "the auth table must survive, got: {edited}"
+        );
+    }
+
+    #[test]
+    fn removes_an_env_key_that_sits_beside_an_existing_auth_table() {
+        // The other direction: a config that somehow carries both is broken,
+        // and the command has to repair it. Codex refuses the combination, so
+        // leaving it is a config no session can load.
+        let (edited, notes) = edit_config(
+            "[model_providers.aroute]\nbase_url = \"https://x/v1\"\nenv_key = \"AROUTE_API_KEY\"\nwire_api = \"responses\"\n\n[model_providers.aroute.auth]\ncommand = \"aroute\"\nargs = [\"token\"]\ntimeout_ms = 10000\n",
+            Path::new("/home/x/.codex/aroute-models.json"),
+            &options(),
+        );
+
+        assert!(
+            !edited.contains("env_key"),
+            "env_key must go, got: {edited}"
+        );
+        assert!(
+            notes.iter().any(|note| note.contains("removed env_key")),
+            "the removal must be reported, got: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn writes_a_key_inside_the_block_and_not_after_its_blank_line() {
+        // A block that ends with a blank line still ends at the next header
+        // in TOML, so a key written after the blank line belongs to the block
+        // — but a reader that stops at the blank line does not see it, and
+        // the two readings disagree about what the provider carries. The key
+        // therefore goes after the block's last *key* line.
+        let (edited, _) = edit_config(
+            "[model_providers.aroute]\nbase_url = \"https://x/v1\"\n\n[model_providers.other]\nname = \"other\"\n",
+            Path::new("/home/x/.codex/aroute-models.json"),
+            &EditOptions {
+                auth_command: false,
+                ..options()
+            },
+        );
+
+        let block = edited
+            .split("[model_providers.aroute]")
+            .nth(1)
+            .and_then(|rest| rest.split("[model_providers.other]").next())
+            .unwrap_or_default();
+        assert!(
+            block.contains("env_key = \"AROUTE_API_KEY\""),
+            "the key must be inside the block, got: {block}"
+        );
+        assert!(
+            !block.trim_start().starts_with('\n'),
+            "the key must not be after a blank line, got: {block}"
         );
     }
 
