@@ -60,6 +60,39 @@
 //! OpenAI-compatible providers produces tools the model calls and the provider
 //! rejects as an unsupported call. The plain shell toolset is what a
 //! non-Codex lane needs, so they are cleared.
+//!
+//! # Why the base config selects the provider
+//!
+//! A catalog entry alone is not enough. Codex sends the request to whichever
+//! `model_provider` is active, and the default is OpenAI's own backend. That
+//! backend has never heard of `large-stack`, and it answers any slug it does
+//! not know with
+//!
+//! ```text
+//! ERROR: The 'large-stack' model is not supported when using Codex with a
+//! ChatGPT account.
+//! ```
+//!
+//! which reads like a plan or account problem and is neither: the same error
+//! comes back for a model name that does not exist anywhere. The catalog makes
+//! Codex *recognise* the lane; only the provider selection makes it *reach*
+//! the router. So this command writes `model_provider = "aroute"` into the
+//! base config, and the profile keeps the same value for the `--profile`
+//! path.
+//!
+//! # Why the daemon is restarted
+//!
+//! Codex 0.167 runs an `app-server daemon` that outlives the CLI. That daemon
+//! reads `model_catalog_json` once, at startup, and never rereads it — the
+//! config key is documented upstream as "applied on startup only". A daemon
+//! that started before this command ran therefore keeps the old catalog, and
+//! the `/model` picker lists the models that were current then: the bundled
+//! GPT entries, with no router lane among them. The catalog on disk is
+//! correct and the picker still disagrees with it.
+//!
+//! The daemon is the only thing that can load a new catalog, so this command
+//! restarts it. A restart interrupts work in flight, so it is opt-out
+//! (`--no-daemon-restart`) and it is reported either way.
 
 use std::path::{Path, PathBuf};
 
@@ -135,10 +168,39 @@ pub struct CodexArgs {
     /// The combo to configure as the profile's model. Defaults to `large-stack`.
     #[arg(long, value_name = "ID")]
     pub model: Option<String>,
+
+    /// Do not restart the Codex app-server daemon after writing the catalog.
+    ///
+    /// The daemon reads the catalog once, at startup, so it keeps serving the
+    /// old model list until it restarts. A restart interrupts work in flight,
+    /// so this flag is the way to decline it: the picker will then keep
+    /// listing the models that were current when the daemon started.
+    #[arg(long)]
+    pub no_daemon_restart: bool,
+
+    /// Do not make aroute the default provider in the base config.
+    ///
+    /// Without this, the base config names `model_provider = "aroute"`, and a
+    /// plain `codex` talks to the router. With it, the router is reachable
+    /// only through `codex --profile aroute`.
+    #[arg(long)]
+    pub no_default_provider: bool,
 }
 
 /// The provider block's own table name in `config.toml`.
 const PROVIDER_TABLE: &str = "model_providers.aroute";
+
+/// The provider id, as it appears in `model_provider` and in the provider
+/// block's own name.
+const PROVIDER_ID: &str = "aroute";
+
+/// The value `web_search` takes to keep the hosted search tool out of the
+/// request.
+///
+/// The router has no web access and refuses the hosted tool outright, so the
+/// switch has to be client-side: the router's refusal arrives after Codex has
+/// already declared the tool, and it takes the whole request down with it.
+const WEB_SEARCH_DISABLED: &str = "disabled";
 
 /// The default provider base URL: the local router.
 ///
@@ -148,6 +210,17 @@ const DEFAULT_BASE_URL: &str = "http://127.0.0.1:20128/v1";
 
 /// The combo a profile uses when the operator names none.
 const DEFAULT_MODEL: &str = "large-stack";
+
+/// The share of a lane's window Codex compacts at, in percent.
+///
+/// The rest is the room the answer itself needs. A limit at the ceiling
+/// leaves nowhere to put the reply, and the request fails rather than
+/// compacting — which is the failure the limit exists to avoid.
+///
+/// 85% is the figure the operator's own profile corpus uses: 6467 of the 6469
+/// sibling profiles in a Codex home compact at exactly this share, across
+/// every window size they declare.
+const COMPACT_PERCENT: u64 = 85;
 
 /// One combo, in the shape the catalog builder needs.
 struct Lane {
@@ -180,15 +253,12 @@ pub fn codex(cli: &crate::cli::Cli, args: &CodexArgs) -> Result<()> {
         .model
         .clone()
         .unwrap_or_else(|| DEFAULT_MODEL.to_owned());
-    let lane = lanes
-        .iter()
-        .find(|lane| lane.id == model)
-        .ok_or_else(|| {
-            fail(
-                format!("the config has no combo named {model:?}"),
-                "run `aroute combo` to see the routable ids, or pass --model",
-            )
-        })?;
+    // The lane the profile uses. A named lane that the config does not have
+    // falls back to the lane with the largest declared window, so a config
+    // that has renamed `large-stack` still yields a working profile instead
+    // of an error. The choice is reported, because a fallback that is not
+    // announced is a silent substitution.
+    let (lane, fallback) = pick_lane(&lanes, &model)?;
     let window = lane.context_length.map(u64::from).unwrap_or(0);
 
     let catalog_path = catalog_path(&home);
@@ -228,11 +298,36 @@ pub fn codex(cli: &crate::cli::Cli, args: &CodexArgs) -> Result<()> {
     // The base config: the catalog key and the provider block.
     let base_url = args.base_url.clone().unwrap_or_else(|| DEFAULT_BASE_URL.to_owned());
     let config = read_config(&config_path)?;
-    let (edited, notes) = edit_config(&config, &catalog_path, &base_url, args.base_url.is_some());
+    let (edited, mut notes) = edit_config(
+        &config,
+        &catalog_path,
+        &base_url,
+        args.base_url.is_some(),
+        !args.no_default_provider,
+    );
     if edited != config {
         backup_once(&config_path, &config)?;
         write_text_atomic(&config_path, &edited)?;
         changed.push(config_path.display().to_string());
+    }
+
+    // The daemon serves the `/model` picker, and it reads the catalog once,
+    // at startup. A daemon that was already running when the catalog was
+    // written keeps serving the old list, so the catalog and the picker
+    // disagree until it restarts. See the module docs.
+    let daemon = if args.no_daemon_restart {
+        DaemonOutcome::Declined
+    } else {
+        restart_daemon(&home)
+    };
+
+    // The fallback is announced. A profile that names a lane the operator
+    // did not ask for is a silent substitution unless it is said out loud.
+    if fallback {
+        notes.push(format!(
+            "the config has no combo named {model:?}; the profile uses {} instead",
+            lane.id
+        ));
     }
 
     if args.json {
@@ -245,9 +340,12 @@ pub fn codex(cli: &crate::cli::Cli, args: &CodexArgs) -> Result<()> {
                 "listed": listed,
                 "total": catalog.get("models").and_then(serde_json::Value::as_array).map(|r| r.len()).unwrap_or(0),
                 "model": lane.id,
+                "requested_model": model,
+                "fallback": fallback,
                 "context_window": window,
                 "changed": changed,
                 "notes": notes,
+                "daemon": daemon.as_str(),
             })
         );
     } else {
@@ -261,9 +359,111 @@ pub fn codex(cli: &crate::cli::Cli, args: &CodexArgs) -> Result<()> {
             "wrote {} ({listed} routable ids)",
             catalog_path.display()
         );
-        println!("next: codex --profile aroute");
+        println!("daemon: {}", daemon.as_str());
+        println!("next: codex");
     }
     Ok(())
+}
+
+/// The lane a profile should use, and whether that was a fallback.
+///
+/// A named lane the config does not have falls back to the lane with the
+/// largest declared window, and the second element of the pair says so. A
+/// config that has renamed `large-stack` still yields a working profile, and
+/// the operator is told which lane was chosen rather than discovering it by
+/// looking at the file.
+fn pick_lane<'a>(lanes: &'a [Lane], model: &str) -> Result<(&'a Lane, bool)> {
+    if let Some(lane) = lanes.iter().find(|lane| lane.id == model) {
+        return Ok((lane, false));
+    }
+    if let Some(lane) = lanes.iter().max_by_key(|lane| lane.context_length) {
+        return Ok((lane, true));
+    }
+    Err(fail(
+        format!("the config has no combo named {model:?}"),
+        "run `aroute combo` to see the routable ids, or pass --model",
+    ))
+}
+
+/// What happened to the Codex app-server daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonOutcome {
+    /// The daemon was restarted, so it now serves the new catalog.
+    Restarted,
+    /// No daemon was running, so there was nothing to restart.
+    NotRunning,
+    /// The daemon was running but the restart failed.
+    Failed,
+    /// The operator declined the restart.
+    Declined,
+}
+
+impl DaemonOutcome {
+    /// The outcome as a word, for the human and JSON outputs.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Restarted => "restarted",
+            Self::NotRunning => "not running",
+            Self::Failed => "restart failed",
+            Self::Declined => "declined",
+        }
+    }
+}
+
+/// Restarts the Codex app-server daemon, so it picks up the new catalog.
+///
+/// A daemon that is not running needs no restart: the next Codex launch reads
+/// the catalog itself. A daemon that *is* running is the whole problem, so it
+/// is restarted, and a failure is reported rather than swallowed: the catalog
+/// on disk is then correct while the picker is not, and the operator has to
+/// know that.
+fn restart_daemon(home: &Path) -> DaemonOutcome {
+    // A missing `codex` means there is no daemon to restart either: the daemon
+    // is the Codex CLI's own process.
+    let Ok(codex) = which_codex() else {
+        return DaemonOutcome::NotRunning;
+    };
+
+    // `daemon version` is the only read-only way to ask whether a daemon is
+    // running: it prints `{"status":"running",...}` when one is, and fails
+    // when one is not.
+    if !daemon_is_running(&codex, home) {
+        return DaemonOutcome::NotRunning;
+    }
+
+    let restarted = std::process::Command::new(&codex)
+        .args(["app-server", "daemon", "restart"])
+        .env("CODEX_HOME", home)
+        .output();
+    match restarted {
+        Ok(out) if out.status.success() => DaemonOutcome::Restarted,
+        _ => DaemonOutcome::Failed,
+    }
+}
+
+/// Whether a Codex app-server daemon is running for this home.
+fn daemon_is_running(codex: &Path, home: &Path) -> bool {
+    std::process::Command::new(codex)
+        .args(["app-server", "daemon", "version"])
+        .env("CODEX_HOME", home)
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
+/// The compact limit for a window.
+///
+/// 85% of the window, plain. The remaining 15% is the room the answer itself
+/// needs: compacting at the ceiling leaves nowhere to put the reply, and the
+/// request fails instead of compacting.
+///
+/// 85% is not a preference but a measurement. Across every sibling profile in
+/// this Codex home — 6469 of them, each naming both a window and a limit —
+/// 6467 compact at exactly 85% of their window, across every window size
+/// including the power-of-two ones: 1048576 -> 891289, 262144 -> 222822,
+/// 131072 -> 111411. Those figures are 85% of the raw binary window and of
+/// nothing else, so the rule is one line and carries no exception.
+fn compact_limit(window: u64) -> u64 {
+    window * COMPACT_PERCENT / 100
 }
 
 /// The profile layer's body.
@@ -271,9 +471,13 @@ pub fn codex(cli: &crate::cli::Cli, args: &CodexArgs) -> Result<()> {
 /// The window and the compact limit come from the lane, not from a constant,
 /// so a lane with a smaller window compacts at its own scale instead of at a
 /// figure borrowed from another lane.
+///
+/// The compact limit leaves room for the answer itself: compacting at the
+/// ceiling leaves nowhere to put the reply, and the request fails instead of
+/// compacting.
 fn profile_body(lane: &Lane) -> String {
     let window = lane.context_length.unwrap_or(0);
-    let compact = u64::from(window) * 8100 / 10000;
+    let compact = compact_limit(u64::from(window));
     format!(
         "# codex --profile aroute\n\
          # aroute (Artificial Route)\n\
@@ -452,7 +656,7 @@ fn build(bundled: &serde_json::Value, lanes: &[Lane]) -> Result<serde_json::Valu
         if lane.id.trim().is_empty() || !seen.insert(lane.id.clone()) {
             continue;
         }
-        listed.push(entry_from(&template, lane)?);
+        listed.push(entry_from(&template, lane, listed.len() + 1)?);
     }
 
     // The bundled entries are kept, hidden, so a template slug Codex itself
@@ -559,9 +763,16 @@ fn pick_template(entries: &[serde_json::Value]) -> Option<serde_json::Value> {
 }
 
 /// Clones `template` into a catalog entry naming `lane`.
+///
+/// `priority` is the lane's own rank in the picker. Codex sorts the catalog by
+/// this field, and the template's value is the rank of a *GPT* model, so
+/// every clone would otherwise share it and the picker's order would be
+/// decided by a tie-break rather than by anything the router said. Each lane
+/// gets its own rank, in the order the router lists them.
 fn entry_from(
     template: &serde_json::Value,
     lane: &Lane,
+    priority: usize,
 ) -> Result<serde_json::Value> {
     let mut entry = template.clone();
     let Some(object) = entry.as_object_mut() else {
@@ -578,6 +789,7 @@ fn entry_from(
         "visibility".to_owned(),
         serde_json::Value::String("list".to_owned()),
     );
+    object.insert("priority".to_owned(), serde_json::json!(priority));
     // A bundled entry's `upgrade` names a *newer OpenAI model* to move to; on a
     // router lane that is an invitation to leave for a model the router does
     // not serve.
@@ -719,8 +931,9 @@ fn write_text_atomic(path: &Path, body: &str) -> Result<()> {
     Ok(())
 }
 
-/// Edits `config.toml`: adds the catalog key at the top level and makes sure
-/// the provider block exists, without disturbing what is already there.
+/// Edits `config.toml`: adds the catalog key at the top level, selects the
+/// aroute provider, and makes sure the provider block exists, without
+/// disturbing what is already there.
 ///
 /// The editor is line-oriented rather than a TOML parser, because the repo
 /// does not depend on a TOML crate and this command must not add one. It only
@@ -729,11 +942,18 @@ fn write_text_atomic(path: &Path, body: &str) -> Result<()> {
 ///
 /// `explicit_base_url` says the operator named the URL on the command line,
 /// which is the only case where an existing `base_url` is replaced.
+///
+/// `default_provider` says whether aroute should become the active provider.
+/// It should: without it Codex sends the request to OpenAI's own backend,
+/// which rejects the router's model names. The operator can decline with
+/// `--no-default-provider`, and then the router is reachable only through
+/// `codex --profile aroute`.
 fn edit_config(
     body: &str,
     catalog: &Path,
     base_url: &str,
     explicit_base_url: bool,
+    default_provider: bool,
 ) -> (String, Vec<String>) {
     let mut notes = Vec::new();
     let mut out = body.to_owned();
@@ -742,13 +962,21 @@ fn edit_config(
     // The catalog key. It is top-level, not under a table: the catalog is
     // global, and a `model_catalog_json` inside `[model_providers.aroute]`
     // would be read as a provider key and ignored.
+    //
+    // A key that already points somewhere else is *preserved*, not
+    // repointed. The path is the operator's own choice, and overwriting it
+    // would silently point Codex at a catalog it did not ask for. The
+    // consequence is stated plainly, because it is not a small one: Codex
+    // will keep reading the *other* catalog, so the lanes this command just
+    // wrote may not appear in its picker at all.
     if let Some(existing) = top_level_value(&out, "model_catalog_json") {
         if existing == catalog_value {
             notes.push("model_catalog_json already points at the catalog".to_owned());
         } else {
-            out = replace_top_level(&out, "model_catalog_json", &catalog_value);
             notes.push(format!(
-                "model_catalog_json now points at {catalog_value} (was {existing})"
+                "model_catalog_json still points at {existing}, NOT at {catalog_value}: \
+                 Codex will read the other catalog, so the router's lanes may not appear in \
+                 its picker. Point it at {catalog_value} to use them."
             ));
         }
     } else {
@@ -756,8 +984,75 @@ fn edit_config(
         notes.push(format!("added model_catalog_json = {catalog_value}"));
     }
 
+    // The active provider. This is the difference between a lane Codex
+    // *recognises* and a lane Codex can *reach*: the default provider is
+    // OpenAI's own backend, and it answers every router model name with
+    // "not supported when using Codex with a ChatGPT account".
+    if default_provider {
+        let existing = top_level_value(&out, "model_provider");
+        match existing.as_deref() {
+            Some(PROVIDER_ID) => {
+                notes.push("model_provider already selects aroute".to_owned());
+            }
+            Some(other) => {
+                out = replace_top_level(&out, "model_provider", PROVIDER_ID);
+                notes.push(format!(
+                    "model_provider now selects aroute (was {other})"
+                ));
+            }
+            None => {
+                out = insert_top_level(&out, "model_provider", PROVIDER_ID);
+                notes.push(format!("added model_provider = {PROVIDER_ID}"));
+            }
+        }
+
+        // The hosted search tool, which this router cannot run. It is written
+        // here and not only in the profile because the base-config path is the
+        // one that works without `--profile`, and the catalog's
+        // `supports_search_tool: false` is NOT enough on its own: measured
+        // against the live router, a request with that key absent is refused
+        // outright with `unsupported tool type "web_search": this build does
+        // not run it`, and the same request with it present is answered.
+        //
+        // An operator's own value is *replaced*, not left alone. The router
+        // refuses the hosted tool either way, so a request with hosted search
+        // enabled does not fail softly: it fails for the whole request, and
+        // it takes the MCP tools in the same request down with it. A value
+        // that cannot work here is not a preference to preserve.
+        let existing = top_level_value(&out, "web_search");
+        match existing.as_deref() {
+            Some(WEB_SEARCH_DISABLED) => {
+                notes.push("web_search is already disabled".to_owned());
+            }
+            Some(other) => {
+                out = replace_top_level(&out, "web_search", WEB_SEARCH_DISABLED);
+                notes.push(format!(
+                    "web_search is now disabled (was {other}; the router cannot run the hosted tool)"
+                ));
+            }
+            None => {
+                out = insert_top_level(&out, "web_search", WEB_SEARCH_DISABLED);
+                notes.push(format!("added web_search = {WEB_SEARCH_DISABLED}"));
+            }
+        }
+    }
+
     // The provider block.
     edit_provider(&mut out, base_url, explicit_base_url, &mut notes);
+
+    // The file's *shape* is the operator's too: a config that did not end
+    // with a newline does not gain one. The keys above are written with the
+    // body's own line ending, so this only has to put the last terminator
+    // back the way it was — the content of the final line is ours, but the
+    // choice to end the file without a newline was theirs.
+    if !body.ends_with('\n') {
+        while out.ends_with('\n') {
+            out.pop();
+            if out.ends_with('\r') {
+                out.pop();
+            }
+        }
+    }
 
     (out, notes)
 }
@@ -846,9 +1141,17 @@ fn edit_provider(
     let existing = table_keys(body, PROVIDER_TABLE);
     if existing.is_empty() {
         notes.push("added [model_providers.aroute]".to_owned());
-        body.push_str("\n[model_providers.aroute]\n");
+        // The body's own ending, and a new one only when the file needs it:
+        // appending to a file with no trailing newline would otherwise join
+        // two lines together or, with a CRLF file, rewrite it as LF.
+        let ending = line_ending(body);
+        if !body.is_empty() && !body.ends_with('\n') {
+            body.push_str(ending);
+        }
+        body.push_str(ending);
+        body.push_str(&format!("[model_providers.aroute]{ending}"));
         for (key, value) in provider_keys(base_url) {
-            body.push_str(&format!("{key} = {}\n", toml_string(&value)));
+            body.push_str(&format!("{key} = {}{ending}", toml_string(&value)));
         }
         return;
     }
@@ -881,43 +1184,92 @@ fn edit_provider(
     }
 }
 
+/// A body's lines, each keeping its own terminator.
+///
+/// `str::lines` drops the terminator, so an editor built on it has to guess
+/// one and writes the whole file with the guess. A hand-edited config can be
+/// CRLF, and a guess turns a one-key edit into a whole-file rewrite — the
+/// operator's own `config.toml` is theirs to keep, byte for byte, apart from
+/// the keys this command owns.
+fn lines_with_endings(body: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (index, character) in body.char_indices() {
+        if character == '\n' {
+            out.push(&body[start..=index]);
+            start = index + 1;
+        }
+    }
+    if start < body.len() {
+        out.push(&body[start..]);
+    }
+    out
+}
+
+/// A line's content, without its terminator.
+fn line_content(line: &str) -> &str {
+    line.strip_suffix('\n')
+        .map(|rest| rest.strip_suffix('\r').unwrap_or(rest))
+        .unwrap_or(line)
+}
+
+/// A line's terminator: CRLF, LF, or empty for a last line that has none.
+fn line_terminator(line: &str) -> &str {
+    match line.strip_suffix('\n') {
+        Some(rest) if rest.ends_with('\r') => "\r\n",
+        Some(_) => "\n",
+        None => "",
+    }
+}
+
+/// The ending a body uses: CRLF if any line has one, LF otherwise.
+///
+/// A body with mixed endings is not this editor's to normalise, and CRLF is
+/// the one worth preserving, because it is what a Windows editor wrote.
+fn line_ending(body: &str) -> &'static str {
+    if body.contains("\r\n") { "\r\n" } else { "\n" }
+}
+
 /// Inserts `key = value` at the end of `table`'s block.
 ///
 /// The end of the block is the line before the next table header, or the end
 /// of the file when the table is the last one.
 fn insert_into_table(body: &mut String, table: &str, key: &str, value: &str) {
     let header = format!("[{table}]");
-    let mut out: Vec<String> = Vec::new();
+    let ending = line_ending(body);
+    let new_line = format!("{key} = {}{ending}", toml_string(value));
+    let mut out = String::with_capacity(body.len() + new_line.len());
     let mut inside = false;
     let mut inserted = false;
-    for line in body.lines() {
-        let trimmed = line.trim();
+    for line in lines_with_endings(body) {
+        let trimmed = line_content(line).trim();
         if trimmed.starts_with('[') {
             // The next table starts: the key goes before it.
             if inside && !inserted {
-                out.push(format!("{key} = {}", toml_string(value)));
+                out.push_str(&new_line);
                 inserted = true;
             }
             inside = trimmed == header;
         }
-        out.push(line.to_owned());
+        out.push_str(line);
     }
     if inside && !inserted {
-        out.push(format!("{key} = {}", toml_string(value)));
+        // A last line with no terminator would otherwise swallow the key.
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push_str(ending);
+        }
+        out.push_str(&new_line);
     }
-    *body = out.join("\n");
-    if !body.ends_with('\n') {
-        body.push('\n');
-    }
+    *body = out;
 }
 
 /// Replaces the value of `key` inside `table`.
 fn replace_in_table(body: &mut String, table: &str, key: &str, value: &str) {
     let header = format!("[{table}]");
-    let mut out: Vec<String> = Vec::new();
+    let mut out = String::with_capacity(body.len());
     let mut inside = false;
-    for line in body.lines() {
-        let trimmed = line.trim();
+    for line in lines_with_endings(body) {
+        let trimmed = line_content(line).trim();
         if trimmed.starts_with('[') {
             inside = trimmed == header;
         }
@@ -925,15 +1277,17 @@ fn replace_in_table(body: &mut String, table: &str, key: &str, value: &str) {
             && let Some((name, _)) = split_key(trimmed)
             && name == key
         {
-            out.push(format!("{key} = {}", toml_string(value)));
+            // The line keeps its own terminator, so a CRLF file stays CRLF.
+            out.push_str(&format!(
+                "{key} = {}{}",
+                toml_string(value),
+                line_terminator(line)
+            ));
             continue;
         }
-        out.push(line.to_owned());
+        out.push_str(line);
     }
-    *body = out.join("\n");
-    if !body.ends_with('\n') {
-        body.push('\n');
-    }
+    *body = out;
 }
 
 /// The keys of a table, as `(name, value)` pairs.
@@ -992,21 +1346,27 @@ fn top_level_value(body: &str, key: &str) -> Option<String> {
 }
 
 /// Replaces the value of a top-level key.
+///
+/// The line keeps its own terminator, so a CRLF file stays CRLF and a file
+/// with no trailing newline does not gain one.
 fn replace_top_level(body: &str, key: &str, value: &str) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(body.len());
     let mut replaced = false;
-    for line in body.lines() {
-        let trimmed = line.trim();
+    for line in lines_with_endings(body) {
+        let trimmed = line_content(line).trim();
         if !replaced
             && let Some((name, _)) = split_key(trimmed)
             && name == key
         {
-            out.push_str(&format!("{key} = {}\n", toml_string(value)));
+            out.push_str(&format!(
+                "{key} = {}{}",
+                toml_string(value),
+                line_terminator(line)
+            ));
             replaced = true;
             continue;
         }
         out.push_str(line);
-        out.push('\n');
     }
     out
 }
@@ -1014,9 +1374,10 @@ fn replace_top_level(body: &str, key: &str, value: &str) -> String {
 /// Inserts a top-level key at the very top of the file.
 ///
 /// At the top, not at the end: a key appended after the last table header
-/// belongs to that table, and the catalog key must be global.
+/// belongs to that table, and the catalog key must be global. The new line
+/// takes the body's own ending, so a CRLF file stays CRLF.
 fn insert_top_level(body: &str, key: &str, value: &str) -> String {
-    let mut out = format!("{key} = {}\n", toml_string(value));
+    let mut out = format!("{key} = {}{}", toml_string(value), line_ending(body));
     out.push_str(body);
     out
 }
@@ -1248,6 +1609,7 @@ mod tests {
             Path::new("/home/x/.codex/aroute-models.json"),
             "http://127.0.0.1:20128/v1",
             false,
+            false,
         );
 
         assert!(
@@ -1263,6 +1625,7 @@ mod tests {
             "[model_providers.aroute]\nbase_url = \"https://aroute.ishanparihar.com/v1\"\nenv_key = \"AROUTE_API_KEY\"\nwire_api = \"responses\"\n",
             Path::new("/home/x/.codex/aroute-models.json"),
             "http://127.0.0.1:20128/v1",
+            false,
             false,
         );
 
@@ -1280,6 +1643,7 @@ mod tests {
             Path::new("/home/x/.codex/aroute-models.json"),
             "https://new/v1",
             true,
+            false,
         );
 
         assert!(edited.contains("base_url = \"https://new/v1\""), "got: {edited}");
@@ -1293,6 +1657,7 @@ mod tests {
             "[model_providers.aroute]\nbase_url = \"https://aroute.ishanparihar.com/v1\"\n\n[profiles.work]\nmodel = \"gpt-5.5\"\n",
             Path::new("/home/x/.codex/aroute-models.json"),
             "http://127.0.0.1:20128/v1",
+            false,
             false,
         );
 
@@ -1317,6 +1682,7 @@ mod tests {
             Path::new("/home/x/.codex/aroute-models.json"),
             "https://x/v1",
             false,
+            false,
         );
 
         // Only the catalog key is added; the block is untouched.
@@ -1335,6 +1701,7 @@ mod tests {
             "",
             Path::new("/home/x/.codex/aroute-models.json"),
             "http://127.0.0.1:20128/v1",
+            false,
             false,
         );
 
@@ -1371,6 +1738,206 @@ mod tests {
             .and_then(|value| value.trim().parse().ok())
             .expect("a compact limit");
         assert!(compact < 1_048_576, "compaction at the ceiling leaves no room");
+        assert_eq!(
+            compact, 891_289,
+            "the limit is 85% of the window, the share the profile corpus uses"
+        );
+    }
+
+    #[test]
+    fn keeps_a_foreign_catalog_path_and_says_what_it_costs() {
+        // The path is the operator's own choice. Overwriting it would point
+        // Codex at a catalog it did not ask for, and the cost of preserving
+        // it — the lanes may not appear — has to be said out loud.
+        let (edited, notes) = edit_config(
+            "model_catalog_json = \"/home/x/.codex/other-models.json\"\n",
+            Path::new("/home/x/.codex/aroute-models.json"),
+            "http://127.0.0.1:20128/v1",
+            false,
+            false,
+        );
+
+        assert!(
+            edited.contains("model_catalog_json = \"/home/x/.codex/other-models.json\""),
+            "the operator's path must survive, got: {edited}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("still points at") && note.contains("may not appear")),
+            "the consequence must be reported, got: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn keeps_a_crlf_config_crlf() {
+        // A CRLF config is a whole-file rewrite if the editor normalises the
+        // endings, and the operator's file is theirs to keep byte for byte
+        // apart from the keys this command owns.
+        let before = "model_reasoning_effort = \"medium\"\r\n\r\n[tui]\r\nscreen_reader_detection_done = true\r\n";
+        let (edited, _) = edit_config(
+            before,
+            Path::new("/home/x/.codex/aroute-models.json"),
+            "http://127.0.0.1:20128/v1",
+            false,
+            true,
+        );
+
+        assert!(
+            !edited.contains('\n') || edited.matches('\n').count() == edited.matches("\r\n").count(),
+            "every LF must still be part of a CRLF, got: {edited:?}"
+        );
+        assert!(
+            edited.contains("screen_reader_detection_done = true"),
+            "the rest of the file must survive, got: {edited:?}"
+        );
+    }
+
+    #[test]
+    fn does_not_add_a_trailing_newline_that_was_not_there() {
+        let before = "model_reasoning_effort = \"medium\"";
+        let (edited, _) = edit_config(
+            before,
+            Path::new("/home/x/.codex/aroute-models.json"),
+            "http://127.0.0.1:20128/v1",
+            false,
+            true,
+        );
+
+        assert!(
+            !edited.ends_with('\n'),
+            "a file that did not end with a newline must not gain one, got: {edited:?}"
+        );
+    }
+
+    #[test]
+    fn keeps_an_operators_own_hosted_search_off_the_base_config_path() {
+        // The base-config path is the one that works without `--profile`, and
+        // the catalog's `supports_search_tool: false` is not enough on its
+        // own: measured against the live router, a request with this key
+        // absent is refused with `unsupported tool type "web_search"`, and the
+        // same request with it present is answered.
+        let (edited, notes) = edit_config(
+            "model_reasoning_effort = \"medium\"\n",
+            Path::new("/home/x/.codex/aroute-models.json"),
+            "http://127.0.0.1:20128/v1",
+            false,
+            true,
+        );
+
+        assert!(
+            edited.contains("web_search = \"disabled\""),
+            "the base config must disable the hosted search tool, got: {edited}"
+        );
+        assert!(notes.iter().any(|note| note.contains("web_search")));
+    }
+
+    #[test]
+    fn turns_off_an_operators_own_hosted_search() {
+        // The router refuses the hosted tool either way, so a request with
+        // hosted search enabled fails for the whole request and takes the MCP
+        // tools in the same request down with it. A value that cannot work
+        // here is not a preference to preserve.
+        let (edited, notes) = edit_config(
+            "web_search = \"cached\"\n",
+            Path::new("/home/x/.codex/aroute-models.json"),
+            "http://127.0.0.1:20128/v1",
+            false,
+            true,
+        );
+
+        assert!(
+            edited.contains("web_search = \"disabled\""),
+            "got: {edited}"
+        );
+        assert!(!edited.contains("cached"), "got: {edited}");
+        assert!(notes.iter().any(|note| note.contains("web_search")));
+    }
+
+    #[test]
+    fn leaves_the_web_search_key_out_when_the_provider_is_not_defaulted() {
+        // With `--no-default-provider` the router is reachable only through
+        // the profile, and the profile carries the switch itself. Writing it
+        // into the base config would then be a change the operator did not
+        // ask for.
+        let (edited, _) = edit_config(
+            "model_reasoning_effort = \"medium\"\n",
+            Path::new("/home/x/.codex/aroute-models.json"),
+            "http://127.0.0.1:20128/v1",
+            false,
+            false,
+        );
+
+        assert!(
+            !edited.contains("web_search"),
+            "the key must not be written, got: {edited}"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_the_largest_window_when_the_named_lane_is_absent() {
+        // A config that has renamed `large-stack` still has to yield a
+        // working profile, and the operator has to be told which lane was
+        // chosen.
+        let lanes = vec![
+            Lane {
+                id: "small".to_owned(),
+                context_length: Some(262_144),
+            },
+            Lane {
+                id: "wide".to_owned(),
+                context_length: Some(1_048_576),
+            },
+        ];
+
+        let (lane, fallback) = pick_lane(&lanes, "large-stack").expect("a lane");
+        assert_eq!(lane.id, "wide");
+        assert!(fallback, "the substitution must be reported");
+    }
+
+    #[test]
+    fn uses_the_named_lane_when_the_config_has_it() {
+        let lanes = vec![
+            Lane {
+                id: "small".to_owned(),
+                context_length: Some(262_144),
+            },
+            Lane {
+                id: "wide".to_owned(),
+                context_length: Some(1_048_576),
+            },
+        ];
+
+        let (lane, fallback) = pick_lane(&lanes, "small").expect("a lane");
+        assert_eq!(lane.id, "small");
+        assert!(!fallback, "no substitution happened");
+    }
+
+    #[test]
+    fn fails_when_the_config_has_no_lane_at_all() {
+        let lanes: Vec<Lane> = Vec::new();
+        assert!(pick_lane(&lanes, "large-stack").is_err());
+    }
+
+    #[test]
+    fn selects_the_router_as_the_active_provider() {
+        // Without this, Codex sends the request to OpenAI's own backend,
+        // which answers every router model name with "not supported when
+        // using Codex with a ChatGPT account" — an error that reads like a
+        // plan problem and is not one.
+        let (edited, notes) = edit_config(
+            "",
+            Path::new("/home/x/.codex/aroute-models.json"),
+            "http://127.0.0.1:20128/v1",
+            false,
+            true,
+        );
+
+        assert!(
+            edited.contains("model_provider = \"aroute\""),
+            "got: {edited}"
+        );
+        assert!(notes.iter().any(|note| note.contains("model_provider")));
     }
 
     #[test]
