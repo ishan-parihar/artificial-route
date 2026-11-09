@@ -29,6 +29,12 @@ picker() {
   tmux kill-session -t "$SESSION" 2>/dev/null
   tmux new-session -d -s "$SESSION" -x 200 -y 60 "cd $REPO && codex --no-alt-screen" 2>/dev/null
   sleep 10
+  # A hooks-review notice can be up when the TUI starts, and a `/model` sent
+  # into it does not open the picker: it lands on the notice. Dismiss it
+  # first. Escape is a no-op when nothing is up, so sending it always is
+  # safe.
+  tmux send-keys -t "$SESSION" Escape 2>/dev/null
+  sleep 1
   tmux send-keys -t "$SESSION" "/model" 2>/dev/null
   sleep 2
   tmux send-keys -t "$SESSION" Enter 2>/dev/null
