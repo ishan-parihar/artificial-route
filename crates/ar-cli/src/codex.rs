@@ -595,21 +595,33 @@ fn profile_path(home: &Path) -> PathBuf {
 
 /// The combos that are NOT chat models, and so are not lanes a client can pick.
 ///
-/// These route to decision and systemone endpoints: `/v1/decisions`,
-/// `/v1/systemone`, `/api/alpha/decisions`. They do not speak
+/// These route to decision and systemone endpoints. They do not speak
 /// chat-completions at all — a request to one is refused with a complaint
 /// about a missing `state` or `questions` field, not answered — so a catalog
 /// entry for one offers the `/model` picker something that cannot work.
+///
+/// The path list is [`ar_server::models::DECISION_ENDPOINTS`], the same
+/// constant the server uses to mark a `/v1/models` card's `lane` as
+/// `"decision"`, so the CLI and the catalog can never disagree about which
+/// combos are which.
 ///
 /// The signal is structural rather than a name list: a combo with no declared
 /// context window, whose every target names a custom provider whose endpoint
 /// path is one of the decision paths. A combo that serves a chat model always
 /// declares a window, because the window is what a chat lane is for.
-const DECISION_ENDPOINTS: [&str; 3] = [
-    "/v1/decisions",
-    "/v1/systemone",
-    "/api/alpha/decisions",
-];
+fn decision_providers(cfg: &ar_config::Config) -> std::collections::HashSet<&str> {
+    cfg.custom_providers
+        .iter()
+        .filter(|provider| {
+            provider.endpoint.as_deref().is_some_and(|endpoint| {
+                ar_server::models::DECISION_ENDPOINTS
+                    .iter()
+                    .any(|decision| endpoint.contains(decision))
+            })
+        })
+        .map(|provider| provider.id.as_str())
+        .collect()
+}
 
 /// The router's combos, as lanes Codex can select.
 ///
@@ -618,18 +630,7 @@ const DECISION_ENDPOINTS: [&str; 3] = [
 /// something the `/model` picker cannot usefully switch to. The decision
 /// endpoints are not chat models, so they are absent here by construction.
 fn lanes(cfg: &ar_config::Config) -> Vec<Lane> {
-    let decision_providers: std::collections::HashSet<&str> = cfg
-        .custom_providers
-        .iter()
-        .filter(|provider| {
-            provider.endpoint.as_deref().is_some_and(|endpoint| {
-                DECISION_ENDPOINTS
-                    .iter()
-                    .any(|decision| endpoint.contains(decision))
-            })
-        })
-        .map(|provider| provider.id.as_str())
-        .collect();
+    let decision_providers = decision_providers(cfg);
 
     cfg.combos
         .iter()

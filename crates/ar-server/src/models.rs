@@ -22,7 +22,7 @@ struct NativeProviderRef<'a> {
     base_url: &'a str,
     keys: &'a [String],
 }
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Freshness window for `/v1/models`, per `docs/05-roadmap.md` P0.
 pub const MODELS_TTL: Duration = Duration::from_secs(60);
@@ -57,7 +57,51 @@ pub struct ModelCard {
     pub max_output_tokens: u32,
     /// Whether the model accepts image input.
     pub input_image: bool,
+    /// What the card answers: `"chat"` for a combo that serves
+    /// `/v1/chat/completions`, `"decision"` for one whose every target routes
+    /// through a provider with a decision endpoint (`/v1/decisions`,
+    /// `/v1/systemone`, `/api/alpha/decisions`).
+    ///
+    /// This is the structural signal a harness needs to keep decision models
+    /// out of a streaming picker: a chat request against a decision model
+    /// fails with `all providers failed`, so advertising one makes the picker
+    /// offer a model that can never work. Consumers filter on this field
+    /// rather than on a name list, so whatever combos the router gains, the
+    /// split is always right.
+    pub lane: Lane,
 }
+
+/// What a published model answers.
+///
+/// Serialised as a lowercase string (`"chat"` / `"decision"`) so the card
+/// stays a plain OpenAI-shaped object with one extra field, the same
+/// spelling `ar_upstream_model` already established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Lane {
+    /// A combo that answers chat completions. The default: a card is a chat
+    /// card unless every one of its targets is a decision endpoint.
+    #[default]
+    Chat,
+    /// A combo whose targets all route through a decision endpoint. It is
+    /// published so the split is discoverable from the catalog alone, but a
+    /// streaming harness must not list it.
+    Decision,
+}
+
+/// Endpoint paths that answer decisions rather than chat completions.
+///
+/// A provider whose `endpoint:` contains one of these paths never sees
+/// `/v1/chat/completions`; a combo routing only through such providers is a
+/// [`Lane::Decision`] card. The single list shared by the server (which
+/// publishes the lane on `/v1/models`) and `ar-cli`'s `codex.rs` (which keeps
+/// decision combos out of the Codex picker), so the two never disagree about
+/// which combos are which.
+pub const DECISION_ENDPOINTS: [&str; 3] = [
+    "/v1/decisions",
+    "/v1/systemone",
+    "/api/alpha/decisions",
+];
 
 impl ModelCard {
     /// Builds a card from a provider-local model name.
@@ -130,6 +174,11 @@ impl ModelCard {
             context_length,
             max_output_tokens: known.max_output_tokens,
             input_image: known.input_image,
+            // Provider cards are the flat, no-combos path: every dispatch goes
+            // to the wire's own chat path, so the lane is chat. Only a combo
+            // can be a decision lane, and combos set it in
+            // `ServerConfig::model_cards_with`.
+            lane: Lane::Chat,
         }
     }
 

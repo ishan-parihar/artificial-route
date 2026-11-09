@@ -4304,7 +4304,10 @@ pub async fn metrics(
 /// have. `context_length` is the provider's declared ceiling, and it is always
 /// emitted: a discovery client drops a card that omits it, so leaving it out
 /// would delete the model from every `/v1/models`-driven picker rather than
-/// merely under-report it.
+/// merely under-report it. `lane` is always emitted for the same reason: a
+/// discovery-driven harness filters decision models out of a streaming picker
+/// by reading it, and a card that omitted it would be indistinguishable from a
+/// chat card and land in the picker.
 fn card_json(c: &crate::models::ModelCard) -> serde_json::Value {
     // A zero output ceiling is an absent figure, not a claim: no model emits
     // nothing. Serialised only when known, so a client reading the field can
@@ -4319,6 +4322,7 @@ fn card_json(c: &crate::models::ModelCard) -> serde_json::Value {
         "permission": Vec::<String>::new(),
         "root": c.id,
         "ar_upstream_model": c.upstream_model,
+        "lane": c.lane,
     });
     if c.max_output_tokens > 0 {
         card["max_output_tokens"] = serde_json::json!(c.max_output_tokens);
@@ -5524,6 +5528,22 @@ mod tests {
             ctx >= 128_000,
             "a card reporting {ctx} tokens is smaller than any real agent prompt"
         );
+    }
+
+    #[test]
+    fn every_card_carries_its_lane_so_a_picker_can_filter_decisions_out() {
+        // `lane` is always emitted, like `context_length`: a discovery-driven
+        // harness keeps decision models out of a streaming picker by reading
+        // this field, and a card that omitted it would be indistinguishable
+        // from a chat card and land in the picker — where a chat request
+        // against it fails with `all providers failed`.
+        let chat = card_json(&ModelCard::new("openai", "gpt-4o-mini"));
+        assert_eq!(chat["lane"], serde_json::json!("chat"));
+
+        let mut decision = ModelCard::new("decide", "decide");
+        decision.lane = crate::models::Lane::Decision;
+        let decision = card_json(&decision);
+        assert_eq!(decision["lane"], serde_json::json!("decision"));
     }
 
     #[test]

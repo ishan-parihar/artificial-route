@@ -77,7 +77,7 @@ use ar_tokens::{NormalizedUsage, PricingTable};
 
 use crate::app::REQUEST_TIMEOUT;
 use crate::exec::{OAuthAuth, ProviderConfig};
-use crate::models::ModelCard;
+use crate::models::{Lane, ModelCard, DECISION_ENDPOINTS};
 
 /// Default listen port, matching the OmniRoute-compatible `127.0.0.1:20128`.
 pub const DEFAULT_PORT: u16 = 20128;
@@ -1003,9 +1003,45 @@ impl ServerConfig {
                     .context_length()
                     .or_else(|| self.combo_context(c, discovered))
                     .unwrap_or(card.context_length);
+                card.lane = self.combo_lane(c);
                 card
             })
             .collect()
+    }
+
+    /// Which lane a combo answers: `"decision"` when every one of its targets
+    /// routes through a provider whose `endpoint` is a decision path, `"chat"`
+    /// otherwise.
+    ///
+    /// This is the structural rule, not a name list: a decision endpoint
+    /// answers `/v1/decisions` and friends, never `/v1/chat/completions`, so a
+    /// chat request against such a combo fails with `all providers failed`.
+    /// The path list is the same one `ar-cli`'s `codex.rs` uses to keep
+    /// decision combos out of the Codex picker; it lives here now because this
+    /// function is the one that decides what `/v1/models` advertises, and every
+    /// discovery-driven consumer (omp's `openai-models-list`, the harness
+    /// sync scripts) needs the split from the catalog alone.
+    ///
+    /// A combo with no targets cannot occur: `from_ar_config` rejects it, and
+    /// `any` on an empty iterator would wrongly report chat for one.
+    fn combo_lane(&self, combo: &RouteCombo) -> Lane {
+        let all_decision = !combo.targets.is_empty()
+            && combo.targets.iter().chain(combo.pool.iter()).all(|t| {
+                self.providers
+                    .iter()
+                    .find(|p| p.id == t.provider)
+                    .and_then(|p| p.endpoint.as_deref())
+                    .is_some_and(|endpoint| {
+                        DECISION_ENDPOINTS
+                            .iter()
+                            .any(|decision| endpoint.contains(decision))
+                    })
+            });
+        if all_decision {
+            Lane::Decision
+        } else {
+            Lane::Chat
+        }
     }
 
     /// Whether the operator's `blocked_providers` list drops this provider.
@@ -3198,6 +3234,46 @@ combos:
         assert_eq!(row.endpoint.as_deref(), Some("/api/alpha/decisions"));
         let shape = row.dispatch_for_key(false, "respan/span-01-lite:free", 0);
         assert_eq!(shape.endpoint, Some("/api/alpha/decisions"));
+    }
+
+    #[test]
+    fn marks_a_combo_routing_only_to_decision_endpoints_as_the_decision_lane() {
+        // The structural rule behind the `/v1/models` `lane` field: a combo
+        // whose every target names a provider with a decision endpoint is a
+        // decision card, so a discovery-driven harness can keep it out of a
+        // streaming picker without a name list.
+        let yaml = "keys:\n  k: v\n  c: v\ncustom_providers:\n  - id: or-decisions\n    protocol: openai-compatible\n    base_url: https://openrouter.ai\n    endpoint: /api/alpha/decisions\n    key_ref: k\n  - id: chat-node\n    protocol: openai-compatible\n    base_url: https://api.example.invalid\n    key_ref: c\ncombos:\n  - id: decide\n    strategy: priority\n    targets:\n      - or-decisions/respan/span-01-lite:free\n  - id: mixed\n    strategy: priority\n    targets:\n      - chat-node/some-model\n      - or-decisions/respan/span-01-lite:free\n  - id: chat-lane\n    strategy: priority\n    context_length: 200000\n    targets:\n      - chat-node/some-model\n";
+        let cfg = parse(yaml).expect("config parses");
+        let server =
+            ServerConfig::from_ar_config(&cfg, None, None, false, None).expect("the node merges");
+        let cards = server.model_cards();
+        let lane_of = |id: &str| {
+            cards
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("card {id} published"))
+                .lane
+        };
+        assert_eq!(lane_of("decide"), crate::models::Lane::Decision);
+        // One chat target is enough to make the combo a chat lane: the combo
+        // is answerable by chat, so advertising it as a chat model is right.
+        assert_eq!(lane_of("mixed"), crate::models::Lane::Chat);
+        assert_eq!(lane_of("chat-lane"), crate::models::Lane::Chat);
+    }
+
+    #[test]
+    fn serialises_the_lane_as_a_lowercase_string() {
+        // The wire spelling a discovery client reads: `"chat"` / `"decision"`,
+        // lowercase, so the card stays a plain OpenAI-shaped object with one
+        // extra field.
+        assert_eq!(
+            serde_json::to_value(crate::models::Lane::Decision).expect("serialises"),
+            serde_json::json!("decision")
+        );
+        assert_eq!(
+            serde_json::to_value(crate::models::Lane::Chat).expect("serialises"),
+            serde_json::json!("chat")
+        );
     }
 
     #[test]
