@@ -10,9 +10,14 @@
 //!
 //! # Deliberate simplifications
 //!
-//! * `reasoning_content` is dropped, not rendered as `thinking` blocks: the
-//!   inbound parse rejects a thinking block, so echoing one back on the next turn
-//!   would fail the request.
+//! * On the Anthropic dialect, `reasoning_content` is dropped, not rendered as
+//!   `thinking` blocks: the inbound parse rejects a thinking block, so echoing
+//!   one back on the next turn would fail the request. On the Responses
+//!   dialect it *is* rendered, as `response.reasoning_summary_text.delta`
+//!   events inside a `reasoning` output item: Codex's TUI shows thinking only
+//!   from those events, and a Responses client that received none never echoes
+//!   a `reasoning` item back (the client clears it for non-OpenAI providers),
+//!   so the echo constraint that holds for Anthropic does not hold here.
 //! * The terminal events wait for the upstream to end, because the usage a stream
 //!   reports often rides on a chunk after its `finish_reason`. A stream that ends
 //!   before its finish gets no terminal event, and the relay names the truncation
@@ -218,6 +223,12 @@ struct Open {
 enum OpenKind {
     /// The text so far, so the closing events can repeat the whole of it.
     Text(String),
+    /// The reasoning summary text so far, rendered as Responses `reasoning`
+    /// summary events. Only the Responses dialect opens one: Anthropic drops
+    /// the deltas (its inbound parse rejects a `thinking` block, so an echoed
+    /// one would 400 the next turn) and the OpenAI chat dialect relays the
+    /// chunk unchanged, `reasoning_content` included.
+    Reasoning(String),
     /// A slot into [`Reframer::tools`].
     Tool(usize),
 }
@@ -311,6 +322,19 @@ impl Reframer {
             self.finish_reason = Some(reason.to_owned());
         }
         let delta = choice.get("delta");
+        // The upstream's own thinking, in the `reasoning_content` field GLM,
+        // DeepSeek and friends use. The OpenAI chat dialect relays the chunk
+        // unchanged above, so this branch only serves the dialects that re-frame:
+        // Responses renders it as reasoning-summary events, Anthropic drops it
+        // (its inbound parse would reject an echoed `thinking` block).
+        if let Some(reasoning) = delta
+            .and_then(|d| d.get("reasoning_content"))
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty())
+            && matches!(self.dialect, Dialect::Responses)
+        {
+            self.reasoning(reasoning, &mut out);
+        }
         if let Some(text) = delta
             .and_then(|d| d.get("content"))
             .and_then(Value::as_str)
@@ -486,6 +510,86 @@ impl Reframer {
             }),
         };
         self.emit(data, out);
+    }
+
+    /// Streams one `reasoning_content` delta on the Responses dialect.
+    ///
+    /// Codex's TUI renders thinking from `response.reasoning_summary_text.delta`
+    /// events (and the `reasoning` output item around them); a stream that
+    /// carries none shows no thinking at all, which is the gap this closes.
+    /// The text is accumulated so the closing `done` events can repeat the
+    /// whole summary, the same way `text` accumulates the answer.
+    fn reasoning(&mut self, text: &str, out: &mut Vec<Bytes>) {
+        if !matches!(
+            self.current,
+            Some(Open {
+                kind: OpenKind::Reasoning(_),
+                ..
+            })
+        ) {
+            self.close(out);
+            self.open_reasoning(out);
+        }
+        let index = match self.current.as_mut() {
+            Some(Open {
+                index,
+                kind: OpenKind::Reasoning(acc),
+            }) => {
+                acc.push_str(text);
+                *index
+            }
+            _ => return,
+        };
+        let item_id = self.reasoning_item_id(index);
+        self.emit(
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": item_id,
+                "output_index": index,
+                "summary_index": 0,
+                "delta": text,
+            }),
+            out,
+        );
+    }
+
+    /// Opens a Responses `reasoning` output item: the `output_item.added`
+    /// frame, then the first summary part.
+    fn open_reasoning(&mut self, out: &mut Vec<Bytes>) {
+        let index = self.next_index;
+        self.next_index += 1;
+        self.current = Some(Open {
+            index,
+            kind: OpenKind::Reasoning(String::new()),
+        });
+        let item_id = self.reasoning_item_id(index);
+        self.emit(
+            json!({
+                "type": "response.output_item.added",
+                "output_index": index,
+                "item": {
+                    "type": "reasoning",
+                    "id": item_id,
+                    "summary": [],
+                },
+            }),
+            out,
+        );
+        self.emit(
+            json!({
+                "type": "response.reasoning_summary_part.added",
+                "item_id": item_id,
+                "output_index": index,
+                "summary_index": 0,
+                "part": { "type": "summary_text", "text": "" },
+            }),
+            out,
+        );
+    }
+
+    /// The id a Responses `reasoning` output item carries.
+    fn reasoning_item_id(&self, index: usize) -> String {
+        format!("rs_{}_{index}", self.id())
     }
 
     fn open_text(&mut self, out: &mut Vec<Bytes>) {
@@ -674,6 +778,48 @@ impl Reframer {
                     "status": "completed",
                     "role": "assistant",
                     "content": [part],
+                });
+                self.emit(
+                    json!({
+                        "type": "response.output_item.done",
+                        "output_index": open.index,
+                        "item": item,
+                    }),
+                    out,
+                );
+                self.items.push(item);
+            }
+            (Dialect::Responses, OpenKind::Reasoning(summary)) => {
+                // Close the reasoning item the way the Responses API spells it:
+                // the summary part done, the summary text done, then the item
+                // done carrying the whole summary. The item is pushed into the
+                // terminal output so the completed response carries it too.
+                let item_id = self.reasoning_item_id(open.index);
+                let part = json!({ "type": "summary_text", "text": summary });
+                self.emit(
+                    json!({
+                        "type": "response.reasoning_summary_part.done",
+                        "item_id": item_id,
+                        "output_index": open.index,
+                        "summary_index": 0,
+                        "part": part,
+                    }),
+                    out,
+                );
+                self.emit(
+                    json!({
+                        "type": "response.reasoning_summary_text.done",
+                        "item_id": item_id,
+                        "output_index": open.index,
+                        "summary_index": 0,
+                        "text": summary,
+                    }),
+                    out,
+                );
+                let item = json!({
+                    "type": "reasoning",
+                    "id": item_id,
+                    "summary": [part],
                 });
                 self.emit(
                     json!({
@@ -1076,6 +1222,125 @@ mod tests {
             out.iter()
                 .all(|f| f.pointer("/delta/type") != Some(&json!("thinking_delta"))),
             "{out:?}"
+        );
+    }
+
+    #[test]
+    fn responses_stream_should_render_reasoning_as_summary_events() {
+        // The gap this closes: Codex's TUI shows thinking only from
+        // `response.reasoning_summary_text.delta` events inside a `reasoning`
+        // output item. A responses stream that carried none showed no thinking
+        // at all, even though the upstream's chat stream carried
+        // `reasoning_content` on every delta.
+        let out = frames(
+            Dialect::Responses,
+            &[
+                json!({"id":"r1","model":"m","choices":[{"delta":{"role":"assistant","reasoning_content":"thinking "}}]}),
+                json!({"choices":[{"delta":{"reasoning_content":"hard"}}]}),
+                json!({"choices":[{"delta":{"content":"the answer"}}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}),
+            ],
+        );
+
+        let types: Vec<&str> = out
+            .iter()
+            .filter_map(|f| f.get("type").and_then(Value::as_str))
+            .collect();
+        assert!(
+            types.contains(&"response.output_item.added"),
+            "a reasoning item must open: {types:?}"
+        );
+        assert!(
+            types.contains(&"response.reasoning_summary_part.added"),
+            "the summary part must open: {types:?}"
+        );
+        assert!(
+            types
+                .iter()
+                .filter(|t| **t == "response.reasoning_summary_text.delta")
+                .count()
+                == 2,
+            "one summary delta per reasoning_content delta: {types:?}"
+        );
+        assert!(
+            types.contains(&"response.reasoning_summary_text.done"),
+            "the summary text must close: {types:?}"
+        );
+        assert!(
+            types.contains(&"response.completed"),
+            "the stream must complete: {types:?}"
+        );
+
+        // The reasoning item opens as type "reasoning" and closes carrying the
+        // accumulated summary.
+        let added = out
+            .iter()
+            .find(|f| f.get("type").and_then(Value::as_str) == Some("response.output_item.added"))
+            .and_then(|f| f.get("item"))
+            .unwrap_or(&Value::Null);
+        assert_eq!(added.get("type").and_then(Value::as_str), Some("reasoning"), "{added:?}");
+
+        let completed = out
+            .iter()
+            .find(|f| f.get("type").and_then(Value::as_str) == Some("response.completed"))
+            .and_then(|f| f.get("response"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let empty = Vec::new();
+        let output = completed.get("output").and_then(Value::as_array).unwrap_or(&empty);
+        let reasoning_item = output
+            .iter()
+            .find(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"));
+        let summary_text = reasoning_item
+            .and_then(|i| i.pointer("/summary/0/text"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert_eq!(summary_text, "thinking hard", "the whole summary must be in the item: {output:?}");
+
+        // The answer text still follows, as its own message item.
+        let message = output
+            .iter()
+            .find(|item| item.get("type").and_then(Value::as_str) == Some("message"));
+        assert!(
+            message
+                .and_then(|m| m.pointer("/content/0/text"))
+                .and_then(Value::as_str)
+                .is_some_and(|t| t.contains("the answer")),
+            "the answer must still be there: {output:?}"
+        );
+    }
+
+    #[test]
+    fn responses_whole_reply_should_carry_a_reasoning_item() {
+        // The non-streaming path: `openai_reply_to_responses` builds the whole
+        // response at once, and it must include the reasoning item too, or a
+        // non-streaming Codex turn shows no thinking either.
+        let reply = json!({
+            "id": "r1",
+            "model": "m",
+            "created": 1,
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "the answer",
+                    "reasoning_content": "thinking hard",
+                },
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+        });
+        let out = openai_reply_to_responses(&reply);
+        let empty = Vec::new();
+        let output = out.get("output").and_then(Value::as_array).unwrap_or(&empty);
+        let reasoning = output
+            .iter()
+            .find(|i| i.get("type").and_then(Value::as_str) == Some("reasoning"));
+        assert!(
+            reasoning
+                .and_then(|i| i.pointer("/summary/0/text"))
+                .and_then(Value::as_str)
+                == Some("thinking hard"),
+            "the whole reply must carry the reasoning item: {out:?}"
         );
     }
 

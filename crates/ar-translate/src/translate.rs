@@ -517,7 +517,20 @@ impl ArTranslate<ResponsesApi> for ResponsesInbound {
             }
             ResponsesInput::Items(items) => {
                 for item in items {
-                    messages.push(responses_item(item)?);
+                    let msg = responses_item(item)?;
+                    // A `reasoning` item normalises to an empty assistant
+                    // message *with no tool calls*; it is dropped here rather
+                    // than pushed, so the canonical conversation carries no
+                    // trace of prior thinking and the upstream never sees it.
+                    // A `function_call` item also normalises to an assistant
+                    // turn with empty text, but it carries a tool call, so the
+                    // same test keeps it.
+                    if !(msg.role == Role::Assistant
+                        && msg.content.is_empty()
+                        && msg.tool_calls.is_empty())
+                    {
+                        messages.push(msg);
+                    }
                 }
             }
         }
@@ -1175,6 +1188,16 @@ fn ollama_tool_calls(rest: &serde_json::Value) -> Result<Vec<ToolCall>, Translat
 
 /// Normalises one Responses input item into a canonical turn.
 fn responses_item(item: ResponsesItem) -> Result<Msg, TranslateError> {
+    // A `reasoning` item is a prior turn's thinking, carried back as history.
+    // Codex keeps it in its transcript and re-sends it on the next turn (it
+    // only clears the *encrypted* blob for non-OpenAI providers, and a summary
+    // item carries none). Dropping it is the correct move: canonical has
+    // nowhere to put private reasoning, and folding it into the visible
+    // message would leak it. The item is bookkeeping, not a turn, so it
+    // normalises to an empty message that the caller filters out.
+    if item.kind.as_deref() == Some("reasoning") {
+        return Ok(Msg::new(Role::Assistant, String::new()));
+    }
     // A `function_call` item is a tool call the model made in a PRIOR turn,
     // carried back as conversation history. It is not a message, and it is
     // not refused: a client that replays a tool-calling conversation sends
@@ -1375,6 +1398,31 @@ mod tests {
         assert_eq!(out_turn.role, Role::Tool);
         assert_eq!(out_turn.tool_call_id.as_deref(), Some("c1"));
         assert_eq!(out_turn.content, "5");
+    }
+
+    #[test]
+    fn a_responses_reasoning_item_in_history_is_dropped_not_refused() {
+        // Codex keeps a `reasoning` item in its transcript and re-sends it on
+        // the next turn (it clears only the encrypted blob for non-OpenAI
+        // providers, and a summary item carries none). Refusing it 400'd the
+        // whole conversation over bookkeeping; dropping it is the correct
+        // move, because canonical has nowhere to put private reasoning and
+        // folding it into the visible message would leak it.
+        let raw = r#"{"model":"m","input":[
+            {"role":"user","content":"hi"},
+            {"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"prior thinking"}]},
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]},
+            {"role":"user","content":"bye"}]}"#;
+        let req: ResponsesApi = serde_json::from_str(raw).expect("fixture is valid Responses");
+
+        let canonical = responses_to_canonical(req).expect("a reasoning item must not 400 the request");
+
+        // The reasoning item leaves no message behind: the conversation is
+        // exactly the two user turns and the one assistant turn.
+        assert_eq!(canonical.messages.len(), 3, "{:?}", canonical.messages);
+        assert_eq!(canonical.messages[0].role, Role::User);
+        assert_eq!(canonical.messages[1].role, Role::Assistant);
+        assert_eq!(canonical.messages[2].role, Role::User);
     }
 
     #[test]

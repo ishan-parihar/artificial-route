@@ -905,6 +905,20 @@ fn entry_from(
     // say so. The catalog is the wrong place to promise it.
     cut_reasoning_levels(object);
 
+    // The reasoning *summary* default, the other half of the thinking story.
+    // Codex only sends `reasoning.summary` when the catalog's
+    // `default_reasoning_summary` is not `none` — and the bundled GPT
+    // template ships `none`, which means a lane cloned from it asks for no
+    // summary at all. But the router now renders the upstream's
+    // `reasoning_content` as summary events regardless, and Codex's TUI
+    // shows thinking from those events. Setting the default to `auto` makes
+    // Codex ask for summaries on the request too, which is the honest shape:
+    // the request says what it wants and the reply path can now deliver it.
+    object.insert(
+        "default_reasoning_summary".to_owned(),
+        serde_json::json!("auto"),
+    );
+
     // The template's window belongs to a GPT model. The lane's own figure is
     // the one Codex must compact at, so it wins whenever the combo declared one.
     if let Some(window) = lane.context_length {

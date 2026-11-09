@@ -1337,9 +1337,26 @@ pub fn openai_reply_to_responses(reply: &Value) -> Value {
         .cloned()
         .unwrap_or(Value::Null);
     let text = message.get("content").and_then(Value::as_str).unwrap_or("");
+    // The upstream's own thinking (`reasoning_content`, the field GLM,
+    // DeepSeek and friends use). Rendered as a `reasoning` output item with
+    // the text as its summary, so a Responses client that reads reasoning
+    // summaries (Codex's TUI does) shows the thinking. It is *not* emitted as
+    // `content` on the message: that would leak private reasoning into the
+    // visible answer.
+    let reasoning = message
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .filter(|r| !r.is_empty());
     let id = reply.get("id").and_then(Value::as_str).unwrap_or("resp_0");
 
     let mut output = Vec::new();
+    if let Some(reasoning) = reasoning {
+        output.push(json!({
+            "type": "reasoning",
+            "id": format!("rs_{id}"),
+            "summary": [{ "type": "summary_text", "text": reasoning }],
+        }));
+    }
     if !text.is_empty() {
         output.push(json!({
             "type": "message",
