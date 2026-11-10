@@ -1255,6 +1255,7 @@ pub fn dispatch(cli: &Cli) -> anyhow::Result<()> {
         Some(Command::Mcp(a)) => block_on(crate::mcp::run(cli, a)),
         Some(Command::Dashboard(a)) => crate::dashboard::run(a),
         Some(Command::Codex(a)) => crate::codex::codex(cli, a),
+        Some(Command::Harness(a)) => crate::harness::run(cli, a),
         Some(Command::Token(a)) => crate::codex::token(a),
         Some(Command::Donate) => {
             println!("Star the repo  : https://github.com/ishan-parihar/artificial-route");
@@ -2032,6 +2033,24 @@ pub(crate) const STRATEGIES: &[&str] = &[
 /// which is the evidence the extraction narrowed nothing — the fixture is a
 /// hand-written YAML string with a flow-style `targets:` list, which is the
 /// spelling the repo's own `config.yaml` uses.
+///
+/// The id rule itself lives in [`legal_combo_id`] so the writers that create a
+/// *new* combo and the validator that round-trips an *existing* one share one
+/// definition.
+/// Whether `id` is a legal name for a **new** combo: 1-64 of a-z 0-9 . _ -.
+///
+/// One definition for the two callers that need it: the writers that create a
+/// combo ([`combo_add`]) and the shared validator ([`check_combos`]), which
+/// grants the rule's predecessor ids an exemption because a live file may carry
+/// them (see [`check_combos`]).
+pub(crate) fn legal_combo_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
 pub(crate) fn check_combos(combos: &[Combo], current: &Config) -> Result<(), String> {
     let custom: Vec<&str> = current
         .custom_providers
@@ -2045,12 +2064,16 @@ pub(crate) fn check_combos(combos: &[Combo], current: &Config) -> Result<(), Str
         .copied()
         .chain(current.combos.iter().map(|c| c.strategy.as_str()))
         .collect();
+    // An id the file already holds is accepted even when it would not pass the
+    // strict rule for a *new* name. The same round-trip principle as `allowed`
+    // above: the live config carries ids written before the rule tightened (a
+    // `/`-bearing `pgsgrove/deepseek-v4.1-flash-1017` among them, which the
+    // server publishes and routes), and a validator that refuses the document it
+    // was handed refuses every edit to that file. New ids are held to the rule
+    // by the writers ([`legal_combo_id`]), not by this round-trip check.
+    let existing: BTreeSet<&str> = current.combos.iter().map(|c| c.id.as_str()).collect();
     for c in combos {
-        let id_legal = !c.id.is_empty()
-            && c.id.len() <= 64
-            && c.id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+        let id_legal = legal_combo_id(&c.id) || existing.contains(c.id.as_str());
         if !id_legal {
             return Err(format!(
                 "combo id {:?} is not a legal model name (1-64 of a-z 0-9 . _ -)",
@@ -3969,7 +3992,19 @@ fn combo_add(cli: &Cli, args: &AddComboArgs) -> anyhow::Result<()> {
             "one of the strategies `aroute combo` lists, e.g. priority",
         ));
     }
+    if !legal_combo_id(id) {
+        return Err(fail(
+            format!("combo id {id:?} is not a legal model name"),
+            "use 1-64 of a-z 0-9 . _ -",
+        ));
+    }
     let (targets, weights) = parse_targets(&args.targets)?;
+    if args.context_length == Some(0) {
+        return Err(fail(
+            "--context-length 0 is not a window",
+            "omit the flag, or state the tokens the lane really serves",
+        ));
+    }
 
     let doc = read_config_text(cli)?;
     let cfg = load_edit(cli)?;
@@ -4009,7 +4044,7 @@ fn combo_add(cli: &Cli, args: &AddComboArgs) -> anyhow::Result<()> {
         pool: Vec::new(),
         steps: Vec::new(),
         compression: None,
-        context_length: None,
+        context_length: args.context_length,
         judge_model: None,
     });
     // The candidate is checked too: this is where a target whose provider no
@@ -7062,6 +7097,14 @@ fn rest_is_another_section(rest: &[&str]) -> bool {
 /// the contract test below measures.
 fn append_combo_row(content: &str, rendered: &str) -> String {
     let all: Vec<&str> = content.lines().collect();
+    // The renderer writes a row at the canonical two spaces, but this document
+    // decides its own entry depth. Measured 2026-11-10 on the operator's live
+    // config, whose combos sit at column 0 and whose last row ends with a
+    // `context_length:` rather than a `targets:` list: the canonical row was
+    // appended inside that last mapping, and the loader refused the whole file
+    // (`did not find expected key at line 1072`), taking the proxy down.
+    let rendered = reindent(rendered, combo_entry_indent(&all));
+    let rendered = rendered.as_str();
     let mut out: Vec<String> = Vec::new();
     let mut in_section = false;
     let mut i = 0;
@@ -7120,6 +7163,61 @@ fn append_combo_row(content: &str, rendered: &str) -> String {
     } else {
         joined
     }
+}
+
+/// The indentation this document uses for an entry directly under `combos:`.
+///
+/// Zero for a hand-written file that lists its rows flush left, two for the
+/// canonical rendering. A section with no entries yet falls back to the
+/// canonical two, which is what [`render_combo_block`] emits.
+fn combo_entry_indent(lines: &[&str]) -> usize {
+    let mut in_section = false;
+    for line in lines {
+        let line = *line;
+        if line == "combos:" {
+            in_section = true;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if is_section_header(line) {
+            break;
+        }
+        if trimmed.starts_with("- ") {
+            return line.len() - trimmed.len();
+        }
+        break;
+    }
+    2
+}
+
+/// Re-bases every line of a rendered row from its own base indent to `indent`,
+/// so a row rendered canonically can be placed in a document that indents
+/// differently.
+fn reindent(rendered: &str, indent: usize) -> String {
+    let base = rendered
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.len() - line.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    rendered
+        .lines()
+        .map(|line| {
+            if line.trim().is_empty() {
+                return String::new();
+            }
+            let lead = line.len() - line.trim_start().len();
+            let skip = lead.min(base);
+            format!("{}{}", " ".repeat(indent), &line[skip..])
+        })
+        .collect::<Vec<String>>()
+        .join("\n")
 }
 
 /// Drops one combo row from `combos:` by its id, keeping every other line.
@@ -8009,6 +8107,32 @@ mod tests {
     /// flow-style `targets:` list, and the strategies an operator actually chose
     /// while tuning the routing table. A validator that rejects the repo's own
     /// config is a validator nobody can use, and this is the test that catches it.
+    #[test]
+    fn check_combos_accepts_a_legacy_slash_id_when_the_file_already_holds_it() {
+        // Measured live 2026-11-10: the operator's config carries
+        // `pgsgrove/deepseek-v4.1-flash-1017`, which the server publishes and
+        // routes. Refusing it made `aroute combo add` unusable on that host.
+        let yaml = "keys:\n  k: v\ncombos:\n  - id: legacy/route\n    strategy: priority\n    targets: [openai/gpt-5.4]\n";
+        let cfg = Config::parse(yaml, no_expansion).expect("fixture parses");
+        assert!(check_combos(&cfg.combos, &cfg).is_ok());
+    }
+
+    /// The append must adopt the document's own entry depth.
+    ///
+    /// Measured 2026-11-10: a config whose combos sit at column 0 and whose last
+    /// row ends with `context_length:` took the canonical two-space row *inside*
+    /// that mapping, and the result did not parse at all.
+    #[test]
+    fn append_combo_row_adopts_a_flush_left_document() {
+        let doc = "combos:\n- id: a\n  strategy: priority\n  targets:\n  - a/m\n  context_length: 10\n";
+        let row = "  - id: new\n    strategy: priority\n    targets:\n      - a/m\n";
+        let added = append_combo_row(doc, row);
+        assert!(
+            serde_yaml::from_str::<serde_yaml::Value>(&added).is_ok(),
+            "the appended row must leave valid YAML: {added}"
+        );
+    }
+
     #[test]
     fn check_combos_accepts_the_repos_own_config() {
         // Relative to this source file: `crates/ar-cli/src/commands.rs` -> the

@@ -134,6 +134,14 @@ jobs:
         # The Racknerd production host does not expose BMI2. Pin both Rust and
         # C compilation to the x86-64 baseline so a newer release runner cannot
         # emit host-only instructions into the portable musl artifact.
+        #
+        # `--features mcp` is not optional here: it is the accept gate's other
+        # half. `ar-cli/Cargo.toml` keeps `default = []` so no library consumer
+        # pulls `rmcp`, and states that the *release artifact* is built with the
+        # feature so `aroute mcp` exists in what users download. This line was
+        # missing, so every release through v0.1.26 shipped without the verb
+        # while the manifest and the docs said otherwise — measured on the
+        # v0.1.26 asset: `aroute --help | grep -c '^  mcp'` returned 0.
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "-C target-cpu=x86-64"
           CFLAGS_x86_64_unknown_linux_musl: "-march=x86-64 -mtune=generic"
@@ -142,6 +150,7 @@ jobs:
             --release \
             --locked \
             --target x86_64-unknown-linux-musl \
+            --features mcp \
             --bin aroute
           strip target/x86_64-unknown-linux-musl/release/aroute || true
 
@@ -153,6 +162,11 @@ jobs:
           BIN=target/x86_64-unknown-linux-musl/release/aroute
           chmod +x "$BIN"
           "$BIN" --version
+          # The artifact must carry the surface the manifest promises. A release
+          # without `aroute mcp` breaks every `claude mcp add ar -- aroute mcp`
+          # that `install.sh` prints, and no other check would notice.
+          "$BIN" --help | grep -qE '^  mcp' \
+            || { echo "::error::the release binary has no 'mcp' subcommand; build it with --features mcp"; exit 1; }
           # Match `static` rather than `statically linked`: a PIE binary reports
           # as "static-pie linked", and the first version of this check demanded
           # the non-PIE wording and rejected a perfectly good artifact.

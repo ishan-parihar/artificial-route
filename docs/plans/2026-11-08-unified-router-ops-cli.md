@@ -1,7 +1,74 @@
 # Unified router-ops CLI: folding seven vendored scripts into `aroute`
 
-**Status: plan, written 2026-11-08.** No code changed by this document.
+**Status: plan, written 2026-11-08. G1 landed in part 2026-11-10; coverage completed 2026-11-11.**
 **Tracking: ledger `F2` family, `docs/36` §4.**
+
+> **2026-11-11 update — coverage audit.** Asked whether the sync reaches every
+> harness, `harness list` reported seven of them and three findings were real:
+>
+> * **dsh was not known at all.** It keeps a static list of its own in
+>   `~/.dsh/profiles/web/cordis.patch.yml` and was missing `mistral-1t`. It is
+>   now an eighth harness of kind `external`: read and reported, never rewritten,
+>   because that list also carries the decision lanes the chat catalog excludes
+>   (rewriting it would delete `jev`/`clef`/`span-01-lite`).
+> * **Codex's catalog was stale.** `aroute codex` refuses to overwrite without
+>   `--force`, so the `mistral-1t` lane added the day before was absent from its
+>   `/model` picker. `check` now reads `model_catalog_json` and names missing
+>   lanes; the catalog was regenerated (25 entries, 14 routable).
+> * **`harness apply` could read the wrong config.** `--config` defaults to
+>   `./config.yaml`, so running it from this checkout renders the repository's
+>   3-combo fixture into every harness. A config with no chat lane is now
+>   refused instead of written as an empty catalog.
+>
+> Also fixed: jcode carried six duplicate `[[providers.aroute.models]]` blocks
+> that a map comparison could not see, and `render_jcode` kept the *next* header
+> when removing a block, so adjacent blocks survived and doubled on apply
+> (14 unique ids, 20 blocks). `check` counts blocks beside ids, and `apply`
+> rewrites when the body differs even though the ids match.
+>
+> **2026-11-11, second pass — dsh is now written.** Report-only was a holding
+> position, not the end state: a lane could still be added to the router and
+> never reach dsh without an operator remembering. `Kind::External` became
+> `Kind::Merged`, and `render_dsh` edits only the `providers.<name>.models`
+> sequence of the profile patch layer: a catalog id gets its `contextWindow`
+> corrected in place, a row whose id the router does not publish (the five
+> decision lanes) is copied through verbatim, a missing catalog id is inserted
+> before the first foreign row, and nothing outside that sequence is
+> re-serialised (a YAML round-trip would delete the comments and `!!js`
+> expressions the document is made of). Two defects were caught by rehearsing
+> against a copy before touching the live file: inserting every not-yet-emitted
+> id at the first foreign row duplicated the lanes that sit after it, and the
+> file has to be compared as a body, not just as an id map.
+>
+> Removal is the third half. A row may be kept only when its id is a *declared*
+> decision combo (`decision_ids(cfg)`); any other id the catalog does not publish
+> is a lane removed from `combos:`, so `check` names it and `apply` drops it —
+> otherwise a deleted combo would keep being advertised in dsh and 404 on
+> selection. Rehearsed on a copy: a synthetic `retired-lane` row is reported and
+> removed, the five decision lanes survive, and a second `apply` is a no-op.
+> Final state: opencode/jcode/pi/omo 14 models written, dsh 19 rows merged
+> (14 catalog + 5 decision), codex 25 entries, omp and claude on live discovery —
+> all eight `in sync`, and `router-ops-doctor` now defers its harness check to
+> the CLI instead of covering four of the eight.
+
+> **2026-11-10 update.** `aroute harness list|check|apply` now exists
+> (`crates/ar-cli/src/harness.rs`): it renders the four static lists
+> (opencode, jcode, pi, omo) from the router's own `combos:`, reports omp and
+> claude as live discovery, and leaves `codex` to `aroute codex` — G1 and G7 in
+> the table below. The catalog rule is codex's: a combo needs a declared
+> `context_length:` to be a chat lane, and `check` names any chat combo that
+> declares none rather than publishing the 128K floor. `aroute combo add`
+> gained `--context-length` for the same reason: a lane added without a window
+> is invisible to every harness.
+>
+> Two defects found while closing that: the row writer appended canonical
+> 2-space rows into a column-0 config (producing unparseable YAML and a dead
+> proxy), and `check_combos` refused ids the file already served. Both are fixed
+> with regression tests in `commands.rs`. The vendored
+> `harness-models-sync` now delegates its sync/check verbs to the CLI and keeps
+> only the gateway fallback and its `--routes` surface. G2 (no published
+> `max_output_tokens`) is still open — the lists seed a new row with the
+> combo's window and preserve an operator's ceiling.
 
 Companions: [`docs/36-cli-agentic-workflow-plan.md`](../36-cli-agentic-workflow-plan.md)
 (the CLI as an agent-facing surface — this plan is the harness half of it),

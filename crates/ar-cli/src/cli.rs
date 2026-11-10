@@ -369,6 +369,35 @@ pub enum Command {
     #[command(verbatim_doc_comment)]
     Codex(crate::codex::CodexArgs),
 
+    /// Own the harness model lists from this router's own combos.
+    ///
+    /// opencode, jcode, pi and omo keep a static copy of the catalog because
+    /// they cannot resolve it live. A missing entry means the harness cannot ask
+    /// for the model at all, and a wrong window is worse: the harness sizes a
+    /// request off it and the upstream refuses one it would have accepted.
+    ///
+    /// This renders those lists from `combos:` — the router is the authority, so
+    /// nothing is re-derived over HTTP and no gate token is needed. Windows come
+    /// from each combo's declared `context_length:`; a lane that declares none is
+    /// reported by `check` rather than published at the server's 128K floor.
+    ///
+    /// dsh keeps extra rows its own decision lanes need, so its list is merged
+    /// rather than replaced: the router's lanes are written in place, a declared
+    /// decision combo is preserved, and any other id this router no longer
+    /// publishes is dropped.
+    ///
+    /// omp and claude resolve the catalog live, and `codex` has its own catalog
+    /// owned by `aroute codex`; `list` reports both kinds so their absence is a
+    /// decision rather than an omission.
+    ///
+    /// Examples:
+    ///   aroute harness list
+    ///   aroute harness check
+    ///   aroute harness apply --dry-run
+    ///   aroute harness apply --harness pi
+    #[command(verbatim_doc_comment)]
+    Harness(crate::harness::HarnessArgs),
+
     /// Print the router's API key on stdout.
     ///
     /// This is the command Codex runs when the provider block names a
@@ -1351,6 +1380,14 @@ pub struct AddComboArgs {
     /// way the panel accepts one.
     #[arg(long, value_name = "a/m,b/m@2")]
     pub targets: String,
+
+    /// The context window this combo advertises, in tokens.
+    ///
+    /// Without it the server publishes a 128K floor and every harness list
+    /// either omits the lane or advertises a window its targets do not have. A
+    /// single-target lane should state its provider's real window here.
+    #[arg(long, value_name = "TOKENS")]
+    pub context_length: Option<u32>,
 }
 
 /// Options for `aroute combo remove`.

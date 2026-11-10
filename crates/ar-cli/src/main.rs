@@ -16,6 +16,7 @@ mod cli;
 mod codex;
 mod commands;
 mod dashboard;
+mod harness;
 mod import;
 #[cfg(feature = "mcp")]
 mod mcp;
