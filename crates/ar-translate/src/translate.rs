@@ -1243,8 +1243,20 @@ fn responses_item(item: ResponsesItem) -> Result<Msg, TranslateError> {
                     // `refusal` carries its text in `refusal` rather than `text`.
                     "input_text" | "output_text" => text.push(part.text.unwrap_or_default()),
                     "refusal" => text.push(part.refusal.unwrap_or_default()),
+                    // A part that names no modality is client-side bookkeeping,
+                    // not content the upstream has to see. `reasoning` is the
+                    // one Codex re-sends inside an assistant message's content
+                    // array on every later turn (the item form above is dropped,
+                    // but the part form reaches this arm), so rejecting it 400s
+                    // the whole request — same outage shape as the Anthropic
+                    // `thinking` block, fixed in 22c6413. Dropped, not carried:
+                    // a carried part is re-spelled verbatim for the upstream
+                    // wire, and an OpenAI-shaped upstream answers a Responses-
+                    // only part with its own 400, moving the failure downstream.
                     other => {
-                        require_routable(other)?;
+                        if Modality::of_part(other).is_none() {
+                            continue;
+                        }
                         media.push(MediaPart::new(other, part.rest));
                     }
                 }
@@ -1423,6 +1435,32 @@ mod tests {
         assert_eq!(canonical.messages[0].role, Role::User);
         assert_eq!(canonical.messages[1].role, Role::Assistant);
         assert_eq!(canonical.messages[2].role, Role::User);
+    }
+
+    #[test]
+    fn a_responses_reasoning_part_inside_a_message_is_dropped_not_refused() {
+        // The part form of the same bookkeeping: Codex also re-sends a
+        // `reasoning` part inside an assistant message's content array. It
+        // names no routable modality, so the old `require_routable` arm 400'd
+        // the whole request with `unsupported content part type "reasoning":
+        // not a routed modality`. Dropped like the item form, and not carried:
+        // a carried part is re-spelled verbatim for an OpenAI-shaped upstream,
+        // which answers it with its own 400.
+        let raw = r#"{"model":"m","input":[
+            {"type":"message","role":"assistant","content":[
+                {"type":"reasoning","text":"prior thought"},
+                {"type":"output_text","text":"hello"}]},
+            {"role":"user","content":"bye"}]}"#;
+        let req: ResponsesApi = serde_json::from_str(raw).expect("fixture is valid Responses");
+
+        let canonical =
+            responses_to_canonical(req).expect("a reasoning part must not 400 the request");
+
+        // The assistant turn survives with its text and no carried media.
+        assert_eq!(canonical.messages.len(), 2, "{:?}", canonical.messages);
+        assert_eq!(canonical.messages[0].role, Role::Assistant);
+        assert_eq!(canonical.messages[0].content, "hello");
+        assert!(canonical.messages[0].media.is_empty(), "{:?}", canonical.messages[0].media);
     }
 
     #[test]
