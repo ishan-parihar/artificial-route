@@ -524,6 +524,7 @@ mod tests {
             stream: true,
             headers: &headers,
             openai_chat_capabilities: None,
+            stream_start_timeout: None,
         };
         let canonical =
             br#"{"model":"combo","messages":[{"role":"user","content":"hi"}],"stream":true}"#;

@@ -270,6 +270,12 @@ pub struct ProviderConfig {
     /// Populated from `provider_settings.<id>.request_capabilities`; empty means
     /// the existing passthrough renderer applies.
     pub openai_chat_capabilities: BTreeMap<String, OpenAiChatCapabilities>,
+    /// This provider's own streaming start budget, if it has one.
+    ///
+    /// Populated from `provider_settings.<id>.stream_start_timeout_secs`. `None`
+    /// keeps the build-wide cap. It is a provider's **measured** time to first
+    /// byte, so it can only raise that cap, never lower it.
+    pub stream_start_timeout: Option<std::time::Duration>,
 }
 
 impl ProviderConfig {
@@ -304,6 +310,7 @@ impl ProviderConfig {
             anonymous: false,
             continue_on_cut: false,
             openai_chat_capabilities: BTreeMap::new(),
+            stream_start_timeout: None,
         }
     }
 
@@ -314,6 +321,17 @@ impl ProviderConfig {
         capabilities: BTreeMap<String, OpenAiChatCapabilities>,
     ) -> Self {
         self.openai_chat_capabilities = capabilities;
+        self
+    }
+
+    /// Sets this provider's own streaming start budget.
+    ///
+    /// `None` keeps the build-wide cap. A set value is clamped up to that cap
+    /// by the executor, so a number below it is a mistake rather than a tighter
+    /// budget and does not need to be refused here.
+    #[must_use]
+    pub fn with_stream_start_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
+        self.stream_start_timeout = timeout;
         self
     }
 
@@ -507,6 +525,7 @@ impl ProviderConfig {
             stream,
             headers: &self.headers,
             openai_chat_capabilities: Some(&self.openai_chat_capabilities),
+            stream_start_timeout: self.stream_start_timeout,
         }
     }
 

@@ -1646,6 +1646,16 @@ fn resolve_target(
                     settings.request_capabilities.clone()
                 }),
         );
+        // The provider's own streaming start budget, from
+        // `provider_settings.<id>.stream_start_timeout_secs`. The executor
+        // clamps it up to the build-wide cap, so a number below that is a
+        // mistake rather than a tighter budget and needs no refusal here.
+        entry = entry.with_stream_start_timeout(
+            cfg.provider_settings
+                .get(provider)
+                .and_then(ar_config::ProviderSettings::stream_start_timeout_secs)
+                .map(std::time::Duration::from_secs),
+        );
         // The flat table's model is a display default only; a combo target always
         // carries its own spelling.
         entry.continue_on_cut = cfg.continue_on_cut.iter().any(|id| id == provider);
@@ -2244,6 +2254,31 @@ combos:
             caps.omit_optional_parameters
                 .contains(&ar_config::OpenAiOptionalParameter::Temperature)
         );
+    }
+
+    #[test]
+    fn carries_a_provider_stream_start_timeout_into_the_dispatcher() {
+        let cfg = parse(
+            "keys:\n  openai: k\nproviders:\n  - id: openai\n    key: openai\ncombos:\n  - id: stack\n    strategy: priority\n    targets: [openai/gpt-4o-mini]\nprovider_settings:\n  openai:\n    stream_start_timeout_secs: 600\n",
+        )
+        .expect("config parses");
+        let server = ServerConfig::from_ar_config(&cfg, None, None, false, None)
+            .expect("dispatch config resolves");
+        assert_eq!(
+            server.providers[0].stream_start_timeout,
+            Some(std::time::Duration::from_secs(600))
+        );
+    }
+
+    #[test]
+    fn leaves_the_provider_stream_start_timeout_unset_when_not_written() {
+        let cfg = parse(
+            "keys:\n  openai: k\nproviders:\n  - id: openai\n    key: openai\ncombos:\n  - id: stack\n    strategy: priority\n    targets: [openai/gpt-4o-mini]\n",
+        )
+        .expect("config parses");
+        let server = ServerConfig::from_ar_config(&cfg, None, None, false, None)
+            .expect("dispatch config resolves");
+        assert_eq!(server.providers[0].stream_start_timeout, None);
     }
 
     #[test]

@@ -114,6 +114,14 @@ pub enum ConfigError {
         /// Provider id whose request-capability map has an empty key.
         provider: String,
     },
+    /// A provider's streaming start budget is not a usable duration.
+    #[error("provider_settings {provider:?} stream_start_timeout_secs {value:?} is not a duration")]
+    BadStreamStartTimeout {
+        /// Provider id whose row carried the bad value.
+        provider: String,
+        /// The value as written.
+        value: String,
+    },
     /// The filesystem watcher could not be installed.
     #[error("cannot watch {path}: {cause}")]
     Watch {
@@ -1053,6 +1061,27 @@ pub struct ProviderSettings {
     /// request content.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub request_capabilities: BTreeMap<String, OpenAiChatCapabilities>,
+    /// This provider's streaming start budget, in seconds.
+    ///
+    /// The window between a dispatch leaving the router and the upstream
+    /// sending its first byte. It is a **provider** fact, because it is the
+    /// upstream's own time-to-first-byte: `nvidia/z-ai/glm-5.3-flash` has
+    /// measured first bytes at 198 s, 278 s and 287 s, so a budget below that
+    /// cannot succeed however long the client waits.
+    ///
+    /// `None` keeps the build-wide default (`ar_exec`'s
+    /// `DEFAULT_STREAM_START_TIMEOUT_CAP`, 110 s). The cap only ever applies to
+    /// a **streamed** dispatch; a non-streamed one already has the full
+    /// `ar_exec` `DEFAULT_START_TIMEOUT` (600 s), because a whole reply
+    /// legitimately takes as long as it takes and the cap exists to stop a
+    /// *silent* stream from hanging forever.
+    ///
+    /// A value here **raises** the cap for this provider only. It cannot lower
+    /// it below the build-wide default, because the default is the floor every
+    /// provider was measured to need and a smaller number is the defect this
+    /// field exists to remove.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_start_timeout_secs: Option<u64>,
 }
 
 /// The standard OpenAI chat request shape a capability row describes.
@@ -1180,6 +1209,17 @@ impl ProviderSettings {
         }
         let candidates = [model, &*format!("{provider}/{model}")];
         list_matches_any(&list, &candidates)
+    }
+
+    /// This provider's streaming start budget, in seconds.
+    ///
+    /// `None` means the caller keeps the build-wide default. The number is
+    /// returned as written rather than as a `Duration` because `ar-config` does
+    /// not depend on the executor that would consume it, and the dependency
+    /// must not run backwards.
+    #[must_use]
+    pub fn stream_start_timeout_secs(&self) -> Option<u64> {
+        self.stream_start_timeout_secs
     }
 }
 
@@ -1569,6 +1609,16 @@ impl Config {
             {
                 return Err(ConfigError::EmptyCapabilityModel {
                     provider: provider.clone(),
+                });
+            }
+            // A zero budget would abandon every streamed dispatch to this
+            // provider before the socket could answer, which is a config that
+            // looks like an intent and is a dead lane. Refused at load rather
+            // than discovered on the first request.
+            if settings.stream_start_timeout_secs == Some(0) {
+                return Err(ConfigError::BadStreamStartTimeout {
+                    provider: provider.clone(),
+                    value: "0".to_owned(),
                 });
             }
         }
@@ -2114,6 +2164,36 @@ combos:
         let err = Config::parse(yaml, stub_lookup).expect_err("empty model rejected");
         assert!(
             matches!(err, ConfigError::EmptyCapabilityModel { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parses_a_provider_stream_start_timeout() {
+        let yaml = "provider_settings:\n  nvidia:\n    stream_start_timeout_secs: 600\n";
+        let cfg = Config::parse(yaml, stub_lookup).expect("stream start timeout parses");
+        assert_eq!(
+            cfg.provider_settings["nvidia"].stream_start_timeout_secs(),
+            Some(600)
+        );
+    }
+
+    #[test]
+    fn omits_a_provider_stream_start_timeout_when_not_written() {
+        let yaml = "provider_settings:\n  nvidia:\n    excluded_models: [z-ai/*]\n";
+        let cfg = Config::parse(yaml, stub_lookup).expect("settings parse");
+        assert_eq!(
+            cfg.provider_settings["nvidia"].stream_start_timeout_secs(),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_a_zero_provider_stream_start_timeout() {
+        let yaml = "provider_settings:\n  nvidia:\n    stream_start_timeout_secs: 0\n";
+        let err = Config::parse(yaml, stub_lookup).expect_err("zero rejected");
+        assert!(
+            matches!(err, ConfigError::BadStreamStartTimeout { .. }),
             "got: {err:?}"
         );
     }

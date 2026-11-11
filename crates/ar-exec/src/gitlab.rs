@@ -94,6 +94,7 @@ mod tests {
             stream: false,
             headers: &headers,
             openai_chat_capabilities: None,
+            stream_start_timeout: None,
         };
         let canonical = br#"{"model":"m","messages":[{"role":"user","content":"look","media":[{"kind":"image_url","body":{"image_url":{"url":"data:image/png;base64,QUJD"}}}]}]}"#;
 

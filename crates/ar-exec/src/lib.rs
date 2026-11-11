@@ -197,7 +197,18 @@ fn idle_body_timeout_from_env() -> Duration {
 /// take longer than this to produce its first byte, even when the provider
 /// configures a longer budget. Providers that buffer whole generations behind a
 /// gateway override it (`fetchStartTimeoutCapMs` in the TS registry).
-const STREAM_START_TIMEOUT_CAP: Duration = Duration::from_secs(110);
+///
+/// Public because a provider's own measured time-to-first-byte is the fact
+/// that decides whether this cap is the right one for it, and the operator
+/// reads this number to set the override.
+pub const STREAM_START_TIMEOUT_CAP: Duration = Duration::from_secs(110);
+
+/// The same ceiling under its public name, for callers that configure it.
+///
+/// `ar-config` carries the operator's number and `ar-exec` spends it, and the
+/// two crates cannot depend on each other in both directions, so the value
+/// crosses as a plain `Duration` rather than as a shared type.
+pub const DEFAULT_STREAM_START_TIMEOUT_CAP: Duration = STREAM_START_TIMEOUT_CAP;
 
 /// Ceiling on how much of a non-2xx body is read before giving up.
 ///
@@ -400,6 +411,7 @@ impl ArExec {
             stream: chat.stream,
             headers: &provider.headers,
             openai_chat_capabilities: None,
+            stream_start_timeout: None,
         };
         let encoded = serde_json::to_vec(chat)?;
         let start = self.post(&dispatch, &encoded, abort).await?;
@@ -498,7 +510,7 @@ impl ArExec {
                 .headers(build_headers(d.wire_format, d.api_key, d.stream, d.headers))
                 .body(body),
             abort,
-            start_timeout(d.stream),
+            start_timeout(d.stream, d.stream_start_timeout),
         )
         .await?;
 
@@ -704,6 +716,14 @@ pub struct Dispatch<'a> {
     /// Only an exact provider-local model match is used. With no matching row,
     /// the historical byte-preserving model rewrite remains in force.
     pub openai_chat_capabilities: Option<&'a BTreeMap<String, OpenAiChatCapabilities>>,
+    /// This provider's own streaming start budget, if it has one.
+    ///
+    /// `None` keeps the build-wide cap. A `Some` value can only raise it: the
+    /// default is the floor every provider was measured to need, so a smaller
+    /// number is a mistake rather than a tighter budget. It applies to a
+    /// streamed dispatch only — a non-streamed one already has the full base
+    /// budget, because a whole reply legitimately takes as long as it takes.
+    pub stream_start_timeout: Option<Duration>,
 }
 
 impl<'a> Dispatch<'a> {
@@ -746,6 +766,7 @@ impl<'a> Dispatch<'a> {
             stream: self.stream,
             headers: self.headers,
             openai_chat_capabilities: self.openai_chat_capabilities,
+            stream_start_timeout: self.stream_start_timeout,
         }
     }
 }
@@ -1345,9 +1366,18 @@ fn attach_header(headers: &mut reqwest::header::HeaderMap, name: &'static str, s
 /// Response-start budget: the provider cap for a stream, the base budget
 /// otherwise. Mirrors `resolveFetchStartTimeout` in
 /// `utils/fetchStartTimeoutPolicy.ts`.
-fn start_timeout(stream: bool) -> Duration {
+///
+/// `provider_cap` is the provider's own measured ceiling, if it has one. It can
+/// only ever **raise** the build-wide cap: the default is the floor every
+/// provider was measured to need, so a configured number below it is a mistake,
+/// not a tighter budget. A non-streamed dispatch is never affected — a whole
+/// reply legitimately takes as long as it takes.
+fn start_timeout(stream: bool, provider_cap: Option<Duration>) -> Duration {
     if stream {
-        BASE_START_TIMEOUT.min(STREAM_START_TIMEOUT_CAP)
+        let cap = provider_cap.map_or(STREAM_START_TIMEOUT_CAP, |c| {
+            c.max(STREAM_START_TIMEOUT_CAP)
+        });
+        BASE_START_TIMEOUT.min(cap)
     } else {
         BASE_START_TIMEOUT
     }
@@ -1777,6 +1807,7 @@ mod tests {
             stream: true,
             headers: &NO_HEADERS,
             openai_chat_capabilities: None,
+            stream_start_timeout: None,
         }
     }
 
@@ -2168,12 +2199,34 @@ mod tests {
 
     #[test]
     fn caps_stream_start_budget_at_provider_cap() {
-        assert_eq!(start_timeout(true), STREAM_START_TIMEOUT_CAP);
+        assert_eq!(start_timeout(true, None), STREAM_START_TIMEOUT_CAP);
     }
 
     #[test]
     fn uses_base_start_budget_when_not_streaming() {
-        assert_eq!(start_timeout(false), BASE_START_TIMEOUT);
+        assert_eq!(start_timeout(false, None), BASE_START_TIMEOUT);
+    }
+
+    #[test]
+    fn raises_stream_start_budget_for_a_provider_that_needs_it() {
+        // `nvidia/z-ai/glm-5.3-flash` has measured first bytes at 198 s, 278 s
+        // and 287 s, so the build-wide 110 s cap cannot serve it at all.
+        let cap = Duration::from_secs(600);
+        assert_eq!(start_timeout(true, Some(cap)), cap);
+    }
+
+    #[test]
+    fn a_provider_cap_below_the_build_wide_cap_does_not_lower_it() {
+        // The build-wide cap is the floor every provider was measured to need,
+        // so a smaller configured number is a mistake, not a tighter budget.
+        let cap = Duration::from_secs(30);
+        assert_eq!(start_timeout(true, Some(cap)), STREAM_START_TIMEOUT_CAP);
+    }
+
+    #[test]
+    fn a_provider_cap_does_not_affect_a_non_streamed_dispatch() {
+        let cap = Duration::from_secs(600);
+        assert_eq!(start_timeout(false, Some(cap)), BASE_START_TIMEOUT);
     }
 
     #[test]
