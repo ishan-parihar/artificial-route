@@ -966,7 +966,17 @@ pub async fn attempt_loop_with_pins<E: Executor + ?Sized>(
         // The per-attempt request: same body, same session, this target's model.
         // One clone per attempt (at most [`MAX_ATTEMPTS`]) is cheaper than
         // teaching the executor that a request can disagree with its own body.
-        let attempt = canonical.clone().with_model(model);
+        //
+        // The deadline rides along, and the executor bounds this attempt by
+        // what is left of it. The budget is **split** across the targets still
+        // to try rather than given whole to the first one: a target that
+        // holds its connection would otherwise spend the entire deadline
+        // before the chain ever reached the healthy sibling behind it.
+        let remaining_targets = fallback_chain.len() - index;
+        let attempt = canonical
+            .clone()
+            .with_model(model)
+            .with_deadline(canonical.deadline.map(|d| d.split_for(remaining_targets)));
         // The live load: this target now has one more request in flight, and
         // the router's load-shaped strategies can see it. The release is
         // paired with every exit below, so a target never looks busy because

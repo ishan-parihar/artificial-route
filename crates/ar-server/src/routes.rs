@@ -588,6 +588,37 @@ pub(crate) fn note_failure(
     }
 }
 
+/// Runs `fut` under the request's own deadline.
+///
+/// The deadline is an **absolute instant** captured when the request entered
+/// the router, and this is the one place it is spent. A relative
+/// `tokio::time::timeout` would start a fresh timer here, so the work already
+/// done before this point would not count against the client's budget — and
+/// worse, the timer would start at the same instant as the attempt loop's own
+/// bounds, so the first attempt would consume the whole budget and the
+/// timeout would fire before the loop could try its next target.
+///
+/// `fallback` is the budget to use when the request carries no deadline: the
+/// same number the relative timeout would have used.
+async fn deadline_timeout<F>(
+    deadline: Option<ar_route::Deadline>,
+    fallback: Duration,
+    fut: F,
+) -> Result<F::Output, tokio::time::error::Elapsed>
+where
+    F: std::future::Future,
+{
+    // A deadline already spent is a deadline of zero, and `timeout` with a
+    // zero budget fires on the first poll rather than waiting — which is what
+    // "the budget is gone" means. The future is dropped, so the socket it
+    // held is released rather than left running.
+    let budget = match deadline {
+        Some(deadline) => deadline.remaining().unwrap_or(Duration::ZERO),
+        None => fallback,
+    };
+    tokio::time::timeout(budget, fut).await
+}
+
 /// The one chat pipeline, for every inbound dialect.
 ///
 /// Order is the module doc's seven steps, and each is where it is because the
@@ -717,6 +748,18 @@ async fn handle_chat_inner(
             .with_guard(guard_verdict);
         }
     };
+
+    // The request's own budget, attached before anything is dispatched.
+    //
+    // The model deadline is enforced *around* the attempt loop, so an attempt
+    // that may wait longer than the whole budget would consume all of it and
+    // the chain would never reach its fallback. The executor reads the
+    // remaining budget on each attempt and bounds its start timeout by it,
+    // which is what lets a slow first target hand the request to a healthy
+    // sibling instead of eating the whole deadline.
+    canonical.deadline = Some(ar_route::Deadline::from_now(
+        state.config.stream_deadline(canonical.model.as_ref()),
+    ));
 
     // Compression runs after the guard, so a rewrite cannot un-redact anything,
     // and before the cache lookup, so the key covers exactly what is dispatched.
@@ -924,7 +967,8 @@ async fn handle_chat_inner(
             .await
             .with_guard(guard_verdict);
     }
-    let mut outcome = match tokio::time::timeout(
+    let mut outcome = match deadline_timeout(
+        canonical.deadline,
         state.config.stream_deadline(canonical.model.as_ref()),
         ar_route::attempt_loop_with_pins(
             &canonical,
@@ -1888,7 +1932,8 @@ async fn pipeline_response(
         Ok(candidates) => candidates,
         Err(refusal) => return *refusal,
     };
-    let outcome = match tokio::time::timeout(
+    let outcome = match deadline_timeout(
+        canonical.deadline,
         state.config.stream_deadline(canonical.model.as_ref()),
         ar_route::dispatch_pipeline(&stage_candidates, canonical, state.exec.as_ref()),
     )
@@ -2009,7 +2054,8 @@ async fn fusion_response(
         Ok(candidates) => candidates,
         Err(refusal) => return *refusal,
     };
-    let mut outcome = match tokio::time::timeout(
+    let mut outcome = match deadline_timeout(
+        canonical.deadline,
         state.config.stream_deadline(canonical.model.as_ref()),
         ar_route::dispatch_fusion(
             canonical.session.as_deref(),
@@ -5041,6 +5087,7 @@ mod tests {
                 stream: false,
                 session: Some(Strng::from("sess-1")),
                 tool_namespaces: ar_translate::ToolNamespaces::default(),
+                deadline: None,
             },
         )
         .expect("the combo resolves");
@@ -5066,6 +5113,7 @@ mod tests {
                 stream: false,
                 session: None,
                 tool_namespaces: ar_translate::ToolNamespaces::default(),
+                deadline: None,
             },
         )
         .expect("the combo resolves");

@@ -276,6 +276,13 @@ pub struct ProviderConfig {
     /// keeps the build-wide cap. It is a provider's **measured** time to first
     /// byte, so it can only raise that cap, never lower it.
     pub stream_start_timeout: Option<std::time::Duration>,
+    /// The request's total time budget, when it has one.
+    ///
+    /// The model deadline is enforced around the whole attempt loop, so an
+    /// attempt that could wait longer than this would spend the whole budget
+    /// on one target and never reach the chain's fallback. The dispatch reads
+    /// what is left of it and bounds the attempt's start timeout by that.
+    pub deadline: Option<ar_route::Deadline>,
 }
 
 impl ProviderConfig {
@@ -311,6 +318,7 @@ impl ProviderConfig {
             continue_on_cut: false,
             openai_chat_capabilities: BTreeMap::new(),
             stream_start_timeout: None,
+            deadline: None,
         }
     }
 
@@ -332,6 +340,16 @@ impl ProviderConfig {
     #[must_use]
     pub fn with_stream_start_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
         self.stream_start_timeout = timeout;
+        self
+    }
+
+    /// Sets the request's total time budget, which bounds each attempt.
+    ///
+    /// `None` means no deadline was declared, and every attempt keeps its
+    /// provider's own budget.
+    #[must_use]
+    pub fn with_deadline(mut self, deadline: Option<ar_route::Deadline>) -> Self {
+        self.deadline = deadline;
         self
     }
 
@@ -516,6 +534,21 @@ impl ProviderConfig {
         upstream_model: &'a str,
         key: usize,
     ) -> Dispatch<'a> {
+        self.dispatch_for_key_with_budget(stream, upstream_model, key, None)
+    }
+
+    /// [`Self::dispatch_for_key`] carrying the request's own remaining budget.
+    ///
+    /// The budget is read here rather than off a provider field because it is
+    /// a **request** fact, and one provider row serves many requests. The
+    /// deadline is on the canonical, so this is the one place the two meet.
+    pub(crate) fn dispatch_for_key_with_budget<'a>(
+        &'a self,
+        stream: bool,
+        upstream_model: &'a str,
+        key: usize,
+        deadline: Option<ar_route::Deadline>,
+    ) -> Dispatch<'a> {
         Dispatch {
             base_url: &self.base_url,
             endpoint: self.endpoint.as_deref(),
@@ -526,6 +559,11 @@ impl ProviderConfig {
             headers: &self.headers,
             openai_chat_capabilities: Some(&self.openai_chat_capabilities),
             stream_start_timeout: self.stream_start_timeout,
+            remaining_budget: self
+                .deadline
+                .as_ref()
+                .and_then(ar_route::Deadline::remaining)
+                .or_else(|| deadline.as_ref().and_then(ar_route::Deadline::remaining)),
         }
     }
 
@@ -942,7 +980,16 @@ impl ArRouteExec for HttpExec {
             // index can be handed the verdict below: one key per attempt, the
             // next usable one when an earlier key is still cooling.
             let key = cfg.pick_key();
-            let shape = cfg.dispatch_for_key(canonical.stream, requested, key);
+            // The request's own remaining budget bounds this attempt: the
+            // model deadline is enforced around the whole loop, so an attempt
+            // allowed to wait longer than it would spend the entire budget on
+            // one target and the chain would never reach its fallback.
+            let shape = cfg.dispatch_for_key_with_budget(
+                canonical.stream,
+                requested,
+                key,
+                canonical.deadline,
+            );
             // The provider's wire is rendered by `ar-exec`, not by the caller: the canonical
             // body is a provider-neutral shape, and translating it into the
             // registry's declared dialect is the executor's job. The OpenAI arm is

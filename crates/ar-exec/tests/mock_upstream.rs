@@ -272,6 +272,7 @@ async fn carries_the_callers_bearer_on_an_oauth_dispatch() {
         headers: &BTreeMap::new(),
         openai_chat_capabilities: None,
         stream_start_timeout: None,
+        remaining_budget: None,
     };
 
     let stream = exec

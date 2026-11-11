@@ -1981,6 +1981,10 @@ fn chained_request(canonical: &CanonicalRequest, answer: &str) -> Option<Canonic
         // The stage body carries no tool declarations, so there is no namespace
         // to put back on its reply.
         tool_namespaces: ar_translate::ToolNamespaces::default(),
+        // The stage runs inside the same request's budget, so it inherits the
+        // deadline: a stage that could wait past it would spend the whole
+        // budget and never reach the stage that follows.
+        deadline: canonical.deadline,
     })
 }
 

@@ -286,6 +286,78 @@ pub struct CanonicalRequest {
     /// only do that from what the request declared. Empty for every request
     /// that declares no namespace, which is what the field has always meant.
     pub tool_namespaces: ToolNamespaces,
+    /// How long this request may still take, measured from when it entered the
+    /// router.
+    ///
+    /// The model deadline is enforced *around* the whole attempt loop, so an
+    /// attempt that is allowed to wait longer than this leaves no time for the
+    /// chain to fail over: the deadline fires while the first target is still
+    /// being waited on, and the healthy sibling never gets its turn. That is
+    /// not a hypothetical — `nvidia/poolside/laguna-xs-2.1` holds its
+    /// connection until its own 302 s gateway timeout, and a 120 s deadline
+    /// that spent all of it there never reached the 1.2 s sibling.
+    ///
+    /// So the executor reads this and bounds each attempt's start budget by
+    /// what is left. `None` means no deadline was declared, and the attempt
+    /// keeps its provider's own budget.
+    ///
+    /// This is the request's *total* budget, not a per-attempt one. The
+    /// executor tracks what each attempt consumed, so the second attempt in a
+    /// chain sees the remainder rather than the whole.
+    pub deadline: Option<Deadline>,
+}
+
+/// A request's remaining time budget, and the clock it is measured against.
+///
+/// The instant is captured when the request enters the router, so the budget
+/// is a wall-clock deadline rather than a per-attempt allowance that every
+/// attempt would restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Deadline {
+    /// When the request must be finished.
+    pub at: std::time::Instant,
+}
+
+impl Deadline {
+    /// A deadline `budget` from now.
+    #[must_use]
+    pub fn from_now(budget: std::time::Duration) -> Self {
+        Self {
+            at: std::time::Instant::now() + budget,
+        }
+    }
+
+    /// How much time is left, or [`None`] once the deadline has passed.
+    #[must_use]
+    pub fn remaining(&self) -> Option<std::time::Duration> {
+        self.at.checked_duration_since(std::time::Instant::now())
+    }
+
+    /// This deadline, sharing its budget across `targets` attempts.
+    ///
+    /// The request's whole remaining budget is not given to the first target:
+    /// a target that holds its connection would spend all of it and the chain
+    /// would never reach the healthy sibling behind it. Each attempt gets an
+    /// equal share of what is left, so the last target still has a budget of
+    /// its own.
+    ///
+    /// The share is of what is left *now*, not of the original budget, so the
+    /// targets after the first one see the remainder rather than their
+    /// original slice of a budget that is already partly spent.
+    ///
+    /// `targets` is the number of attempts still to try. One means this
+    /// attempt gets everything, which is the honest answer when it is the
+    /// only one left.
+    #[must_use]
+    pub fn split_for(&self, targets: usize) -> Self {
+        let targets = targets.max(1);
+        let share = self
+            .remaining()
+            .map_or(std::time::Duration::ZERO, |left| left / targets as u32);
+        Self {
+            at: std::time::Instant::now() + share,
+        }
+    }
 }
 
 impl CanonicalRequest {
@@ -298,6 +370,7 @@ impl CanonicalRequest {
             stream: false,
             session: None,
             tool_namespaces: ToolNamespaces::default(),
+            deadline: None,
         }
     }
 
@@ -332,6 +405,16 @@ impl CanonicalRequest {
     #[must_use]
     pub fn with_tool_namespaces(mut self, namespaces: ToolNamespaces) -> Self {
         self.tool_namespaces = namespaces;
+        self
+    }
+
+    /// Attaches the request's total time budget.
+    ///
+    /// The executor bounds each attempt by what is left of it, so one slow
+    /// target cannot consume the whole budget and starve the chain.
+    #[must_use]
+    pub fn with_deadline(mut self, deadline: Option<Deadline>) -> Self {
+        self.deadline = deadline;
         self
     }
 }
@@ -629,12 +712,44 @@ pub trait Executor: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::{Candidate, ProviderId, QuotaWindow, Strng};
+    use super::{Candidate, Deadline, ProviderId, QuotaWindow, Strng};
 
     #[test]
     fn provider_id_borrows_without_cloning() {
         let id = ProviderId::new("openai");
         assert_eq!(id.as_str(), "openai");
+    }
+
+    #[test]
+    fn a_deadline_splits_its_budget_across_the_targets_left() {
+        // The request's whole budget must not go to the first target: a
+        // target that holds its connection would spend all of it and the
+        // chain would never reach the healthy sibling behind it.
+        let deadline = Deadline::from_now(std::time::Duration::from_secs(10));
+        let half = deadline.split_for(2);
+        let left = half.remaining().expect("a fresh share has time left");
+        assert!(
+            left >= std::time::Duration::from_secs(4) && left <= std::time::Duration::from_secs(5),
+            "half of 10s was {left:?}"
+        );
+    }
+
+    #[test]
+    fn the_last_target_gets_the_whole_remaining_budget() {
+        let deadline = Deadline::from_now(std::time::Duration::from_secs(10));
+        let only = deadline.split_for(1);
+        let left = only.remaining().expect("a fresh share has time left");
+        assert!(
+            left >= std::time::Duration::from_secs(9),
+            "the last target was given {left:?}"
+        );
+    }
+
+    #[test]
+    fn a_spent_deadline_splits_to_nothing() {
+        let deadline = Deadline::from_now(std::time::Duration::ZERO);
+        let share = deadline.split_for(2);
+        assert_eq!(share.remaining(), None);
     }
 
     #[test]

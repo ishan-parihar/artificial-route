@@ -74,6 +74,7 @@ fn dispatch(base_url: &str) -> Dispatch<'_> {
         headers: &NO_HEADERS,
         openai_chat_capabilities: None,
         stream_start_timeout: None,
+        remaining_budget: None,
     }
 }
 

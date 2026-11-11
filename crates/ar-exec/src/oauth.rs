@@ -3813,6 +3813,7 @@ mod tests {
             headers: &BTreeMap::new(),
             openai_chat_capabilities: None,
             stream_start_timeout: None,
+            remaining_budget: None,
         };
         let stream = conn
             .dispatch(
@@ -3866,6 +3867,7 @@ mod tests {
             headers: &BTreeMap::new(),
             openai_chat_capabilities: None,
             stream_start_timeout: None,
+            remaining_budget: None,
         };
         let err = conn
             .dispatch(
@@ -3925,6 +3927,7 @@ mod tests {
             headers: &BTreeMap::new(),
             openai_chat_capabilities: None,
             stream_start_timeout: None,
+            remaining_budget: None,
         };
         let err = conn
             .dispatch(
@@ -5915,6 +5918,7 @@ mod tests {
             headers: &no_headers,
             openai_chat_capabilities: None,
             stream_start_timeout: None,
+            remaining_budget: None,
         };
         let canonical = br#"{"model":"auto","messages":[{"role":"user","content":"hi"}]}"#;
         super::post_as(

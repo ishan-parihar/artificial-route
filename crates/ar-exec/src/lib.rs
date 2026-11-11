@@ -412,6 +412,7 @@ impl ArExec {
             headers: &provider.headers,
             openai_chat_capabilities: None,
             stream_start_timeout: None,
+            remaining_budget: None,
         };
         let encoded = serde_json::to_vec(chat)?;
         let start = self.post(&dispatch, &encoded, abort).await?;
@@ -510,7 +511,7 @@ impl ArExec {
                 .headers(build_headers(d.wire_format, d.api_key, d.stream, d.headers))
                 .body(body),
             abort,
-            start_timeout(d.stream, d.stream_start_timeout),
+            start_timeout(d.stream, d.stream_start_timeout, d.remaining_budget),
         )
         .await?;
 
@@ -724,6 +725,17 @@ pub struct Dispatch<'a> {
     /// streamed dispatch only — a non-streamed one already has the full base
     /// budget, because a whole reply legitimately takes as long as it takes.
     pub stream_start_timeout: Option<Duration>,
+    /// How much of the request's total budget is still unspent.
+    ///
+    /// The model deadline is enforced around the whole attempt loop, so an
+    /// attempt that may wait longer than this leaves no time for the chain to
+    /// fail over. The executor reads the remaining budget here and bounds the
+    /// attempt's start timeout by it, so a slow first target cannot starve a
+    /// healthy sibling.
+    ///
+    /// `None` means no deadline was declared, and the attempt keeps its
+    /// provider's own budget.
+    pub remaining_budget: Option<Duration>,
 }
 
 impl<'a> Dispatch<'a> {
@@ -767,6 +779,7 @@ impl<'a> Dispatch<'a> {
             headers: self.headers,
             openai_chat_capabilities: self.openai_chat_capabilities,
             stream_start_timeout: self.stream_start_timeout,
+            remaining_budget: self.remaining_budget,
         }
     }
 }
@@ -1372,14 +1385,31 @@ fn attach_header(headers: &mut reqwest::header::HeaderMap, name: &'static str, s
 /// provider was measured to need, so a configured number below it is a mistake,
 /// not a tighter budget. A non-streamed dispatch is never affected — a whole
 /// reply legitimately takes as long as it takes.
-fn start_timeout(stream: bool, provider_cap: Option<Duration>) -> Duration {
-    if stream {
+///
+/// `remaining` is what is left of the request's total budget. It is the
+/// **lower** bound of the two: an attempt that could wait past the request's
+/// own deadline would spend the whole budget on one target and leave the
+/// chain no time to fail over to a healthy sibling. This is the two-stall
+/// case `docs/22` D10 records, and the bound is what makes it recoverable.
+fn start_timeout(
+    stream: bool,
+    provider_cap: Option<Duration>,
+    remaining: Option<Duration>,
+) -> Duration {
+    let budget = if stream {
         let cap = provider_cap.map_or(STREAM_START_TIMEOUT_CAP, |c| {
             c.max(STREAM_START_TIMEOUT_CAP)
         });
         BASE_START_TIMEOUT.min(cap)
     } else {
         BASE_START_TIMEOUT
+    };
+    match remaining {
+        // A budget already spent is no budget: the attempt is abandoned at
+        // once, which is what lets the loop move to the next target rather
+        // than wait out a deadline that has already passed.
+        Some(left) => budget.min(left),
+        None => budget,
     }
 }
 
@@ -1808,6 +1838,7 @@ mod tests {
             headers: &NO_HEADERS,
             openai_chat_capabilities: None,
             stream_start_timeout: None,
+            remaining_budget: None,
         }
     }
 
@@ -2199,12 +2230,12 @@ mod tests {
 
     #[test]
     fn caps_stream_start_budget_at_provider_cap() {
-        assert_eq!(start_timeout(true, None), STREAM_START_TIMEOUT_CAP);
+        assert_eq!(start_timeout(true, None, None), STREAM_START_TIMEOUT_CAP);
     }
 
     #[test]
     fn uses_base_start_budget_when_not_streaming() {
-        assert_eq!(start_timeout(false, None), BASE_START_TIMEOUT);
+        assert_eq!(start_timeout(false, None, None), BASE_START_TIMEOUT);
     }
 
     #[test]
@@ -2212,7 +2243,7 @@ mod tests {
         // `nvidia/z-ai/glm-5.3-flash` has measured first bytes at 198 s, 278 s
         // and 287 s, so the build-wide 110 s cap cannot serve it at all.
         let cap = Duration::from_secs(600);
-        assert_eq!(start_timeout(true, Some(cap)), cap);
+        assert_eq!(start_timeout(true, Some(cap), None), cap);
     }
 
     #[test]
@@ -2220,13 +2251,43 @@ mod tests {
         // The build-wide cap is the floor every provider was measured to need,
         // so a smaller configured number is a mistake, not a tighter budget.
         let cap = Duration::from_secs(30);
-        assert_eq!(start_timeout(true, Some(cap)), STREAM_START_TIMEOUT_CAP);
+        assert_eq!(
+            start_timeout(true, Some(cap), None),
+            STREAM_START_TIMEOUT_CAP
+        );
     }
 
     #[test]
     fn a_provider_cap_does_not_affect_a_non_streamed_dispatch() {
         let cap = Duration::from_secs(600);
-        assert_eq!(start_timeout(false, Some(cap)), BASE_START_TIMEOUT);
+        assert_eq!(start_timeout(false, Some(cap), None), BASE_START_TIMEOUT);
+    }
+
+    #[test]
+    fn the_remaining_budget_bounds_an_attempt() {
+        // The model deadline is enforced around the whole attempt loop, so an
+        // attempt allowed to wait longer than the remaining budget would spend
+        // all of it on one target and never reach the chain's fallback.
+        let cap = Duration::from_secs(600);
+        let left = Duration::from_secs(20);
+        assert_eq!(start_timeout(true, Some(cap), Some(left)), left);
+    }
+
+    #[test]
+    fn a_spent_budget_bounds_an_attempt_to_nothing() {
+        // A budget already spent is no budget: the attempt is abandoned at
+        // once, which is what lets the loop move to the next target.
+        let cap = Duration::from_secs(600);
+        let left = Duration::ZERO;
+        assert_eq!(start_timeout(true, Some(cap), Some(left)), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_non_streamed_dispatch_is_still_bounded_by_the_remaining_budget() {
+        // The base budget is 600 s, but the request's own deadline still
+        // applies: a deadline that has already passed must not be spent.
+        let left = Duration::from_secs(5);
+        assert_eq!(start_timeout(false, None, Some(left)), left);
     }
 
     #[test]

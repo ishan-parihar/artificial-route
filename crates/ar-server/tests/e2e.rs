@@ -903,3 +903,72 @@ async fn e2e_fails_over_when_a_streamed_200_dies_before_its_first_byte() {
         "decision was: {decision}"
     );
 }
+
+/// An upstream that never answers: it accepts the request and holds it.
+///
+/// This is the shape of the failure that made the two budgets interact — a
+/// provider that holds its connection instead of refusing it. `nvidia`'s
+/// `poolside/laguna-xs-2.1` does exactly this: no headers for 115 s, and an
+/// upstream 504 at 302 s.
+async fn hanging_upstream() -> String {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            // Held until the client gives up, which is the whole point: the
+            // router must not spend the request's whole budget here.
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            fallback(StatusCode::GATEWAY_TIMEOUT)
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr: SocketAddr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}/v1")
+}
+
+#[tokio::test]
+async fn e2e_a_hanging_first_target_does_not_eat_the_whole_deadline() {
+    // p1 holds the connection; p2 answers immediately. The request's deadline
+    // is 5 s.
+    //
+    // Before the deadline was carried into the attempt, the first attempt's
+    // start budget was its provider's own (110 s by default, or whatever
+    // `provider_settings` raised it to), so the whole 5 s deadline was spent
+    // waiting on p1 and the chain never reached p2. The client got a 504
+    // `model_deadline` even though a healthy target was sitting right there.
+    //
+    // Now the attempt is bounded by what is left of the request's budget, so
+    // p1 is abandoned at the deadline and p2 answers.
+    let hanging = hanging_upstream().await;
+    let healthy = mock_upstream().await;
+    let mut config = ServerConfig::single(
+        20128,
+        Strategy::Priority,
+        vec![
+            ProviderConfig::new(ProviderId::new("p1"), &hanging, "k").with_model("m1"),
+            ProviderConfig::new(ProviderId::new("p2"), &healthy, "k").with_model("m2"),
+        ],
+    );
+    // The model's own deadline: 5 s.
+    config
+        .timeouts
+        .insert("m1".to_owned(), std::time::Duration::from_secs(5));
+    let (router, _state) = boot_with(config, vec![]);
+    let (status, headers, text) =
+        call(&router, post_chat(r#"{"model":"m1","stream":true}"#, &[])).await;
+
+    assert_eq!(status, 200, "the healthy member must serve: {text}");
+    assert!(
+        text.contains("\"delta\":{\"content\":\"Hel\"}"),
+        "p2's stream did not arrive: {text}"
+    );
+    let decision = header_of(&headers, "x-ar-decision");
+    assert!(
+        decision.contains("provider=p2"),
+        "the healthy member did not serve: {decision}"
+    );
+}
