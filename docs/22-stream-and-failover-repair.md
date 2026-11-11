@@ -101,6 +101,31 @@ That changes what existing clients see on failure. Left open for an explicit
 decision. The stall itself is now bounded by D1: the sibling is tried after
 one stall, and no longer skipped.
 
+**D8 ruling, shipped v0.1.29 — the start cap is a per-provider budget.** The
+110 s cap stayed, and the pre-commit silence stayed with it: a client still
+sees silence, not a premature 200, and the status contract did not change.
+What changed is that the cap is no longer the same number for every provider.
+`provider_settings.<id>.stream_start_timeout_secs` raises it for one
+provider, and the number it must be set to is that provider's own measured
+time-to-first-byte.
+
+The measurement that forced the ruling: `nvidia/z-ai/glm-5.3-flash`, direct to
+nvidia, streamed, six samples on 2026-11-11 — first bytes at 173 s, 198 s,
+236 s, 278 s, 287 s and 302 s, every one of them a 200. A 110 s cap does not
+make that model slow, it makes it **unservable**: the router abandons the
+attempt at 110 s, the upstream answers at 240 s, and the client sees a 502 at
+exactly 110.0 s on both hosts. The earlier note that a lower start cap "needs
+more samples first" was about lowering it, and the samples say the opposite —
+this model needs a much higher one.
+
+So the cap is now read per provider, it can only ever be **raised** (the
+build-wide 110 s is the floor every provider was measured to need, so a
+smaller configured number is a mistake rather than a tighter budget), and a
+zero is refused at config load. A non-streamed dispatch is unaffected: it
+already had the full 600 s base budget, because a whole reply legitimately
+takes as long as it takes and the cap exists to stop a *silent* stream from
+hanging forever.
+
 **D10 — Two stalls outlast the stream deadline (open).** The start cap is 110s
 per attempt (`ar-exec` `STREAM_START_TIMEOUT_CAP`) and the router deadline is
 120s (`AR_STREAM_TIMEOUT_SECS`, default 120s everywhere). One stall fails over
