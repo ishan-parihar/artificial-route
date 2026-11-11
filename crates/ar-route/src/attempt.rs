@@ -735,7 +735,37 @@ fn charge_failure(
         // provider still has allowance on its other keys, so the model stays
         // routable and the capped key re-probes once per its own cooldown
         // rather than holding the model to the day boundary.
+        //
+        // An explicit `Retry-After` wins over the day boundary. Upstream's
+        // `accountFallback.ts` checks the retry hint *first* for every
+        // rate-limit reason, quota included: a 429 carrying `Retry-After: 60`
+        // locks for 60 s, and the until-midnight default is reached only when
+        // no upstream hint exists (`recordModelLockoutFailure` takes
+        // `exactCooldownMs` and fills it with `getMsUntilTomorrow()` only
+        // when it is not a number). Without this, a provider whose quota
+        // answer carries a short retry window has its model locked until
+        // midnight over a one-minute limit.
+        //
+        // A 402 has no such header in practice, so the day boundary still
+        // applies to it — which is the case the day lockout exists for.
         Fault::QuotaExhausted => {
+            // An upstream-stated window is exact: it is not a base to
+            // escalate, so it takes the non-escalating lock.
+            if let Some(after) = retry_after {
+                let cooldown = after.max(DEFAULT_BASE_BACKOFF);
+                if multi {
+                    return (cooldown, true);
+                }
+                return (
+                    resilience.lock_model_exact(
+                        provider,
+                        model,
+                        LockReason::QuotaExhausted,
+                        cooldown,
+                    ),
+                    true,
+                );
+            }
             if multi {
                 (quota_cooldown(), true)
             } else {
@@ -1413,6 +1443,10 @@ mod tests {
         OkChunks(&'static [&'static str]),
         RateLimited(Option<Duration>),
         Status(u16, &'static str),
+        /// A refusal with a body *and* an upstream-stated window. The two
+        /// travel together in reality — a 429 carries both its body and its
+        /// `Retry-After` — so a scripted verdict has to be able to say so.
+        StatusWithRetryAfter(u16, &'static str, Duration),
         Transport(&'static str),
         /// The client hung up. Not the provider's fault.
         Aborted,
@@ -1441,6 +1475,11 @@ mod tests {
                     StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY),
                     Bytes::from_static(body.as_bytes()),
                     None,
+                )),
+                Self::StatusWithRetryAfter(code, body, after) => Ok(Upstream::failure(
+                    StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY),
+                    Bytes::from_static(body.as_bytes()),
+                    Some(after),
                 )),
                 Self::Transport(msg) => Err(ExecError::Transport(msg.to_owned())),
                 Self::Aborted => Err(ExecError::Aborted),
@@ -2591,6 +2630,80 @@ mod tests {
         let _clock = QuotaClockGuard::fixed(NOON);
         let r = Resilience::new();
         let exec = Scripted::new(vec![PAYMENT_402, PAYMENT_402]);
+        let Ok(AttemptOutcome::Retry { after, .. }) =
+            block(attempt_loop(&req(), &chain(&["p1", "p2"]), &exec, &r))
+        else {
+            panic!("expected retry");
+        };
+        assert!(after > Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn a_quota_429_with_a_retry_after_takes_that_window_not_the_day() {
+        // The bug this closes: a 429 whose body classifies as a quota
+        // exhaustion but which states its own window used to lock the model
+        // until midnight. Upstream's `accountFallback.ts` checks the retry
+        // hint first for every rate-limit reason, quota included, and only
+        // falls back to `getMsUntilTomorrow()` when no hint exists.
+        let _clock = QuotaClockGuard::fixed(NOON);
+        let r = Resilience::new();
+        let exec = Scripted::new(vec![
+            Verdict::StatusWithRetryAfter(
+                429,
+                r#"{"error":{"code":"insufficient_quota"}}"#,
+                Duration::from_secs(60),
+            ),
+            Verdict::StatusWithRetryAfter(
+                429,
+                r#"{"error":{"code":"insufficient_quota"}}"#,
+                Duration::from_secs(60),
+            ),
+        ]);
+        let Ok(AttemptOutcome::Retry { after, .. }) =
+            block(attempt_loop(&req(), &chain(&["p1", "p2"]), &exec, &r))
+        else {
+            panic!("expected retry");
+        };
+        assert!(
+            after <= Duration::from_secs(300),
+            "a quota 429 with Retry-After: 60 locked for {after:?}, not its stated window"
+        );
+    }
+
+    #[test]
+    fn a_quota_429_with_a_retry_after_does_not_escalate_across_failures() {
+        // The stated window is exact, not a base to double: eleven refusals
+        // in a row must not walk a 60 s window back up to the day boundary.
+        let _clock = QuotaClockGuard::fixed(NOON);
+        let r = Resilience::new();
+        let refusal = Verdict::StatusWithRetryAfter(
+            429,
+            r#"{"error":{"code":"insufficient_quota"}}"#,
+            Duration::from_secs(60),
+        );
+        let mut script = Vec::new();
+        for _ in 0..12 {
+            script.push(refusal.clone());
+        }
+        let exec = Scripted::new(script);
+        let Ok(AttemptOutcome::Retry { after, .. }) =
+            block(attempt_loop(&req(), &chain(&["p1", "p2"]), &exec, &r))
+        else {
+            panic!("expected retry");
+        };
+        assert!(
+            after <= Duration::from_secs(300),
+            "twelve refusals with Retry-After: 60 locked for {after:?}"
+        );
+    }
+
+    #[test]
+    fn a_quota_429_without_a_retry_after_still_takes_the_day() {
+        // The fix must not weaken the day lockout the quota arm exists for:
+        // a refusal that states no window still runs to the day boundary.
+        let _clock = QuotaClockGuard::fixed(NOON);
+        let r = Resilience::new();
+        let exec = Scripted::new(vec![QUOTA_429, QUOTA_429]);
         let Ok(AttemptOutcome::Retry { after, .. }) =
             block(attempt_loop(&req(), &chain(&["p1", "p2"]), &exec, &r))
         else {

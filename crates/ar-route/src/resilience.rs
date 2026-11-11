@@ -339,6 +339,66 @@ impl Resilience {
 
     // ─── model lockout ───────────────────────────────────────────────
 
+    /// Locks one `provider:model` for exactly `cooldown`, with no escalation.
+    ///
+    /// This is the upstream-reset path: when the provider states the window
+    /// itself — a `Retry-After` header — that window is the answer, and
+    /// doubling it on each consecutive refusal would invent a longer outage
+    /// than the provider asked for. Upstream's `recordModelLockoutFailure`
+    /// does the same: an `exactCooldownMs` from an authoritative reset is
+    /// used as-is and never goes through `getScaledCooldown`.
+    ///
+    /// The failure count still advances, so the *next* refusal without an
+    /// upstream hint resumes the ordinary escalation from where this left off
+    /// rather than restarting at one.
+    ///
+    /// A lock already longer than the new one is preserved, matching
+    /// [`Resilience::lock_model`].
+    pub fn lock_model_exact(
+        &self,
+        provider: &str,
+        model: &str,
+        reason: LockReason,
+        cooldown: Duration,
+    ) -> Duration {
+        if reason == LockReason::Terminal {
+            self.retire_model(provider, model);
+            return Duration::ZERO;
+        }
+        let Ok(mut scopes) = self.scopes.lock() else {
+            tracing::warn!("resilience scopes poisoned, model not locked");
+            return Duration::ZERO;
+        };
+        let now = Instant::now();
+        scopes.locks.retain(|_, l| l.until > now);
+        let key = model_key(provider, model);
+        let previous = scopes.locks.get(&key).copied();
+        let failures = previous.map_or(1, |p| {
+            let window = self.lock_window + p.applied;
+            if now.saturating_duration_since(p.last_failure) <= window {
+                p.failures.saturating_add(1)
+            } else {
+                1
+            }
+        });
+        let until = now + cooldown;
+        if let Some(p) = previous
+            && p.until > until
+        {
+            return p.until.saturating_duration_since(now);
+        }
+        scopes.locks.insert(
+            key,
+            ModelLock {
+                until,
+                failures,
+                last_failure: now,
+                applied: cooldown,
+            },
+        );
+        cooldown
+    }
+
     /// Locks one `provider:model` and returns the cooldown now in effect.
     ///
     /// `cooldown` is the *base* for this class, escalated per consecutive
@@ -1114,6 +1174,58 @@ mod tests {
             "a spent allowance waits for the day"
         );
         assert!(quota <= QUOTA_COOLDOWN_CAP);
+    }
+
+    #[test]
+    fn an_exact_lock_does_not_escalate() {
+        // The upstream-stated window is the answer: it must not double on
+        // each refusal, or a 60s window walks back to the day boundary.
+        let r = Resilience::new();
+        let first = r.lock_model_exact(
+            "p",
+            "m",
+            LockReason::QuotaExhausted,
+            Duration::from_secs(60),
+        );
+        let second = r.lock_model_exact(
+            "p",
+            "m",
+            LockReason::QuotaExhausted,
+            Duration::from_secs(60),
+        );
+        let third = r.lock_model_exact(
+            "p",
+            "m",
+            LockReason::QuotaExhausted,
+            Duration::from_secs(60),
+        );
+        assert_eq!(first, Duration::from_secs(60));
+        assert_eq!(second, Duration::from_secs(60));
+        assert_eq!(third, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn an_exact_lock_does_not_shorten_a_longer_one() {
+        // Same guard as `lock_model`: a caller offering a small window
+        // cannot cut a long lock short.
+        let r = Resilience::new();
+        let long = r.lock_model(
+            "p",
+            "m",
+            LockReason::QuotaExhausted,
+            quota_cooldown_at(NOON),
+        );
+        let exact = r.lock_model_exact(
+            "p",
+            "m",
+            LockReason::QuotaExhausted,
+            Duration::from_secs(60),
+        );
+        assert!(long > Duration::from_secs(3600));
+        assert!(
+            exact > Duration::from_secs(300),
+            "an exact 60s lock shortened a day-long one, got {exact:?}"
+        );
     }
 
     #[test]
