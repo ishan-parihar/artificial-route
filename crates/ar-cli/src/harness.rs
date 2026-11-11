@@ -376,7 +376,10 @@ fn list(selected: &[&Harness], models: &[Model], home: &Path) -> anyhow::Result<
             let (count, state) = match harness.kind {
                 Kind::Codex => match codex_ids(home) {
                     Some(ids) => {
-                        let missing = models.iter().filter(|model| !ids.contains(&model.id)).count();
+                        let missing = models
+                            .iter()
+                            .filter(|model| !ids.contains(&model.id))
+                            .count();
                         (
                             ids.len().to_string(),
                             if missing == 0 {
@@ -386,7 +389,10 @@ fn list(selected: &[&Harness], models: &[Model], home: &Path) -> anyhow::Result<
                             },
                         )
                     }
-                    None => ("-".to_owned(), "no model_catalog_json in ~/.codex/config.toml".to_owned()),
+                    None => (
+                        "-".to_owned(),
+                        "no model_catalog_json in ~/.codex/config.toml".to_owned(),
+                    ),
                 },
                 _ => ("-".to_owned(), "resolves the catalog live".to_owned()),
             };
@@ -401,7 +407,10 @@ fn list(selected: &[&Harness], models: &[Model], home: &Path) -> anyhow::Result<
         };
         let current = current_models(harness, path);
         let (count, state) = match current {
-            Some(have) => (have.len().to_string(), state_of(&have, models, harness.kind)),
+            Some(have) => (
+                have.len().to_string(),
+                state_of(&have, models, harness.kind),
+            ),
             None => ("-".to_owned(), "not installed on this host".to_owned()),
         };
         rows.push(vec![
@@ -479,7 +488,9 @@ fn check(selected: &[&Harness], models: &[Model], cfg: &Config, home: &Path) -> 
                             );
                         }
                     }
-                    None => println!("codex: no model_catalog_json in ~/.codex/config.toml, skipped"),
+                    None => {
+                        println!("codex: no model_catalog_json in ~/.codex/config.toml, skipped")
+                    }
                 }
                 continue;
             }
@@ -542,7 +553,13 @@ fn check(selected: &[&Harness], models: &[Model], cfg: &Config, home: &Path) -> 
         for (label, items) in findings {
             if !items.is_empty() {
                 drift += items.len();
-                println!("{}: {} {}: {}", harness.name, items.len(), label, items.join(", "));
+                println!(
+                    "{}: {} {}: {}",
+                    harness.name,
+                    items.len(),
+                    label,
+                    items.join(", ")
+                );
             }
         }
     }
@@ -621,8 +638,12 @@ fn apply(
             continue;
         }
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| fail(format!("could not create {}: {e}", parent.display()), "check the directory's permissions"))?;
+            std::fs::create_dir_all(parent).map_err(|e| {
+                fail(
+                    format!("could not create {}: {e}", parent.display()),
+                    "check the directory's permissions",
+                )
+            })?;
         }
         backup(path)?;
         write_atomic(path, &body)?;
@@ -679,8 +700,12 @@ fn rendered(
     models: &[Model],
     keep: &BTreeSet<String>,
 ) -> anyhow::Result<(String, BTreeMap<String, u32>)> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| fail(format!("could not read {}: {e}", path.display()), "check the file's permissions"))?;
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        fail(
+            format!("could not read {}: {e}", path.display()),
+            "check the file's permissions",
+        )
+    })?;
     match harness.name {
         "opencode" => {
             let mut doc: Value = serde_json::from_str(&text).map_err(|e| {
@@ -697,14 +722,20 @@ fn rendered(
                 .and_then(Value::as_object_mut)
                 .ok_or_else(|| {
                     fail(
-                        format!("{} has no provider.{OPENCODE_PROVIDER} block", path.display()),
+                        format!(
+                            "{} has no provider.{OPENCODE_PROVIDER} block",
+                            path.display()
+                        ),
                         "point opencode at this router first, then re-run",
                     )
                 })?;
             provider.insert("models".to_owned(), Value::Object(rows.clone()));
             let after = windows_from_object(&rows);
             let body = serde_json::to_string_pretty(&doc).map_err(|e| {
-                fail(format!("the opencode config is not serialisable: {e}"), "report this")
+                fail(
+                    format!("the opencode config is not serialisable: {e}"),
+                    "report this",
+                )
             })?;
             Ok((body + "\n", after))
         }
@@ -718,7 +749,11 @@ fn rendered(
             Ok((body, after))
         }
         "pi" | "omo" => {
-            let provider_name = if harness.name == "pi" { PI_PROVIDER } else { OMO_PROVIDER };
+            let provider_name = if harness.name == "pi" {
+                PI_PROVIDER
+            } else {
+                OMO_PROVIDER
+            };
             let output_default = if harness.name == "pi" {
                 PI_OUTPUT_DEFAULT
             } else {
@@ -738,10 +773,7 @@ fn rendered(
                     .and_then(Value::as_object_mut)
                     .ok_or_else(|| {
                         fail(
-                            format!(
-                                "{} has no providers.{provider_name} block",
-                                path.display()
-                            ),
+                            format!("{} has no providers.{provider_name} block", path.display()),
                             "point the harness at this router first, then re-run",
                         )
                     })?;
@@ -756,7 +788,10 @@ fn rendered(
             };
             let after = windows_from_rows(&rows);
             let body = serde_json::to_string_pretty(&doc).map_err(|e| {
-                fail(format!("the harness config is not serialisable: {e}"), "report this")
+                fail(
+                    format!("the harness config is not serialisable: {e}"),
+                    "report this",
+                )
             })?;
             Ok((body + "\n", after))
         }
@@ -909,11 +944,7 @@ fn set_model_catalog_false(text: &str) -> String {
 /// not publish (dsh's decision lanes) is copied through verbatim, and a catalog
 /// id the list is missing is inserted before the first foreign row so the
 /// router's own lanes stay contiguous.
-fn render_dsh(
-    text: &str,
-    models: &[Model],
-    keep: &BTreeSet<String>,
-) -> anyhow::Result<String> {
+fn render_dsh(text: &str, models: &[Model], keep: &BTreeSet<String>) -> anyhow::Result<String> {
     /// The id a list row starts with, if the chunk is a row at all.
     fn chunk_id(chunk: &[&str]) -> Option<String> {
         chunk.iter().find_map(|line| {
@@ -1140,12 +1171,20 @@ fn current_models(harness: &Harness, path: &Path) -> Option<BTreeMap<String, u32
         }
         "pi" => {
             let doc: Value = serde_json::from_str(&text).ok()?;
-            let rows = doc.get("providers")?.get(PI_PROVIDER)?.get("models")?.as_array()?;
+            let rows = doc
+                .get("providers")?
+                .get(PI_PROVIDER)?
+                .get("models")?
+                .as_array()?;
             Some(windows_from_rows(rows))
         }
         "omo" => {
             let doc: Value = serde_json::from_str(&text).ok()?;
-            let rows = doc.get("providers")?.get(OMO_PROVIDER)?.get("models")?.as_array()?;
+            let rows = doc
+                .get("providers")?
+                .get(OMO_PROVIDER)?
+                .get("models")?
+                .as_array()?;
             Some(windows_from_rows(rows))
         }
         "jcode" => Some(jcode_models(&text)),
@@ -1410,7 +1449,11 @@ fn codex_ids(home: &Path) -> Option<BTreeSet<String>> {
         .lines()
         .map(str::trim)
         .find_map(|line| line.strip_prefix("model_catalog_json"))?;
-    let path = path.trim_start().strip_prefix('=')?.trim().trim_matches('"');
+    let path = path
+        .trim_start()
+        .strip_prefix('=')?
+        .trim()
+        .trim_matches('"');
     let doc: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
     let models = doc.get("models")?;
     // Codex writes `models` as an array of entries carrying `slug`; older
@@ -1437,9 +1480,12 @@ fn codex_ids(home: &Path) -> Option<BTreeSet<String>> {
 /// Copies the file aside before a rewrite, over the previous sync's backup.
 fn backup(path: &Path) -> anyhow::Result<()> {
     let target = PathBuf::from(format!("{}{BACKUP_SUFFIX}", path.display()));
-    std::fs::copy(path, &target)
-        .map(|_| ())
-        .map_err(|e| fail(format!("could not back up {}: {e}", path.display()), "check the directory's permissions"))
+    std::fs::copy(path, &target).map(|_| ()).map_err(|e| {
+        fail(
+            format!("could not back up {}: {e}", path.display()),
+            "check the directory's permissions",
+        )
+    })
 }
 
 /// Writes `body` to `path` through a temp file in the same directory, then a
@@ -1453,10 +1499,18 @@ fn write_atomic(path: &Path, body: &str) -> anyhow::Result<()> {
         .and_then(|name| name.to_str())
         .unwrap_or("models");
     let temp = parent.join(format!(".{name}.tmp"));
-    std::fs::write(&temp, body)
-        .map_err(|e| fail(format!("could not write {}: {e}", temp.display()), "check the directory's permissions"))?;
-    std::fs::rename(&temp, path)
-        .map_err(|e| fail(format!("could not move {} into place: {e}", temp.display()), "check the directory's permissions"))
+    std::fs::write(&temp, body).map_err(|e| {
+        fail(
+            format!("could not write {}: {e}", temp.display()),
+            "check the directory's permissions",
+        )
+    })?;
+    std::fs::rename(&temp, path).map_err(|e| {
+        fail(
+            format!("could not move {} into place: {e}", temp.display()),
+            "check the directory's permissions",
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1551,23 +1605,25 @@ mod tests {
 
     #[test]
     fn render_dsh_corrects_a_window_without_touching_the_row() {
-        let out = render_dsh(dsh_patch(), &models(), &decisions())
-            .expect("fixture has a provider list");
+        let out =
+            render_dsh(dsh_patch(), &models(), &decisions()).expect("fixture has a provider list");
         assert_eq!(dsh_models(&out).get("large-stack"), Some(&1_048_576));
     }
 
     #[test]
     fn render_dsh_keeps_a_decision_lane_the_catalog_excludes() {
-        let out = render_dsh(dsh_patch(), &models(), &decisions())
-            .expect("fixture has a provider list");
+        let out =
+            render_dsh(dsh_patch(), &models(), &decisions()).expect("fixture has a provider list");
         assert_eq!(dsh_models(&out).get("jev"), Some(&128_000));
     }
 
     #[test]
     fn render_dsh_inserts_a_new_lane_before_the_foreign_rows() {
-        let out = render_dsh(dsh_patch(), &models(), &decisions())
-            .expect("fixture has a provider list");
-        let added = out.find("- id: mistral-1t").expect("the missing lane is added");
+        let out =
+            render_dsh(dsh_patch(), &models(), &decisions()).expect("fixture has a provider list");
+        let added = out
+            .find("- id: mistral-1t")
+            .expect("the missing lane is added");
         let foreign = out.find("- id: jev").expect("the decision lane is kept");
         assert!(added < foreign);
     }
@@ -1575,22 +1631,21 @@ mod tests {
     #[test]
     fn render_dsh_does_not_duplicate_a_lane_that_sits_after_a_foreign_row() {
         let text = "- id: llm-pi-ai\n  config:\n    providers:\n      aroute:\n        models:\n          - id: jev\n            contextWindow: 128000\n          - id: large-stack\n            contextWindow: 1\n";
-        let out = render_dsh(text, &models(), &decisions())
-            .expect("fixture has a provider list");
+        let out = render_dsh(text, &models(), &decisions()).expect("fixture has a provider list");
         assert_eq!(out.matches("- id: large-stack").count(), 1);
     }
 
     #[test]
     fn render_dsh_leaves_the_rest_of_the_patch_document_alone() {
-        let out = render_dsh(dsh_patch(), &models(), &decisions())
-            .expect("fixture has a provider list");
+        let out =
+            render_dsh(dsh_patch(), &models(), &decisions()).expect("fixture has a provider list");
         assert!(out.starts_with("# patch layer comment\n- id: agent-default-model\n"));
     }
 
     #[test]
     fn render_dsh_is_idempotent_when_the_list_already_matches() {
-        let once = render_dsh(dsh_patch(), &models(), &decisions())
-            .expect("fixture has a provider list");
+        let once =
+            render_dsh(dsh_patch(), &models(), &decisions()).expect("fixture has a provider list");
         let twice = render_dsh(&once, &models(), &decisions())
             .expect("rendered list still has the provider");
         assert_eq!(once, twice);
@@ -1599,8 +1654,7 @@ mod tests {
     #[test]
     fn render_dsh_drops_a_row_the_router_no_longer_publishes() {
         let text = "- id: llm-pi-ai\n  config:\n    providers:\n      aroute:\n        models:\n          - id: large-stack\n            contextWindow: 1048576\n          - id: retired-lane\n            contextWindow: 1\n";
-        let out = render_dsh(text, &models(), &decisions())
-            .expect("fixture has a provider list");
+        let out = render_dsh(text, &models(), &decisions()).expect("fixture has a provider list");
         assert!(!out.contains("retired-lane"));
     }
 
@@ -1650,7 +1704,12 @@ mod tests {
         let repeated = repeated_ids(&harness, &path).expect("the file parses");
         assert_eq!(repeated, vec!["large-stack".to_owned()]);
         // The map itself is blind to the repeat, which is the whole defect.
-        assert_eq!(current_models(&harness, &path).expect("the file parses").len(), 2);
+        assert_eq!(
+            current_models(&harness, &path)
+                .expect("the file parses")
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -1675,7 +1734,10 @@ mod tests {
         .expect("fixture is writable");
         let harness = harness_for("pi", &path);
         let repeated = repeated_ids(&harness, &path).expect("the file parses");
-        assert!(repeated.is_empty(), "a clean list repeats nothing: {repeated:?}");
+        assert!(
+            repeated.is_empty(),
+            "a clean list repeats nothing: {repeated:?}"
+        );
     }
 
     /// The writer must leave one row per id, whichever row came first.

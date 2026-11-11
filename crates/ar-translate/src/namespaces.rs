@@ -126,7 +126,10 @@ mod tests {
     fn should_split_a_flat_name_on_the_declared_namespace() {
         let map = ToolNamespaces::from_declarations(&[namespaced("compress", "mcp__headroom")]);
         assert!(!map.is_empty());
-        assert_eq!(map.namespace_of("mcp__headroom__compress"), Some("mcp__headroom"));
+        assert_eq!(
+            map.namespace_of("mcp__headroom__compress"),
+            Some("mcp__headroom")
+        );
     }
 
     #[test]

@@ -775,9 +775,7 @@ fn rename_reasoning_effort(body: &[u8]) -> Cow<'_, [u8]> {
         "reasoning".to_owned(),
         serde_json::json!({ "effort": effort }),
     );
-    Cow::Owned(
-        serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec()),
-    )
+    Cow::Owned(serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec()))
 }
 
 /// Applies only an explicitly configured, allowlisted optional-parameter
@@ -823,7 +821,8 @@ fn omits_parameter(
     capabilities: Option<&OpenAiChatCapabilities>,
     parameter: OpenAiOptionalParameter,
 ) -> bool {
-    capabilities.is_some_and(|capabilities| capabilities.omit_optional_parameters.contains(&parameter))
+    capabilities
+        .is_some_and(|capabilities| capabilities.omit_optional_parameters.contains(&parameter))
 }
 
 /// Asks a streaming OpenAI request for the usage counts it will not send
@@ -855,10 +854,7 @@ fn include_usage(body: Bytes) -> Result<Bytes, ExecError> {
         Some(serde_json::Value::Object(existing)) => existing,
         _ => serde_json::Map::new(),
     };
-    options.insert(
-        "include_usage".to_owned(),
-        serde_json::Value::Bool(true),
-    );
+    options.insert("include_usage".to_owned(), serde_json::Value::Bool(true));
     object.insert(
         "stream_options".to_owned(),
         serde_json::Value::Object(options),
@@ -1639,11 +1635,9 @@ mod tests {
         rows.insert(
             "strict-target".to_owned(),
             ar_config::OpenAiChatCapabilities {
-                omit_optional_parameters: [
-                    ar_config::OpenAiOptionalParameter::StreamOptions,
-                ]
-                .into_iter()
-                .collect(),
+                omit_optional_parameters: [ar_config::OpenAiOptionalParameter::StreamOptions]
+                    .into_iter()
+                    .collect(),
                 ..Default::default()
             },
         );
@@ -1718,7 +1712,10 @@ mod tests {
                 .expect("rendered");
             let value: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
 
-            assert!(value.get("stream_options").is_none(), "{dialect:?}: {value}");
+            assert!(
+                value.get("stream_options").is_none(),
+                "{dialect:?}: {value}"
+            );
         }
     }
 

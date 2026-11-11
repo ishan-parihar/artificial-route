@@ -8124,7 +8124,8 @@ mod tests {
     /// that mapping, and the result did not parse at all.
     #[test]
     fn append_combo_row_adopts_a_flush_left_document() {
-        let doc = "combos:\n- id: a\n  strategy: priority\n  targets:\n  - a/m\n  context_length: 10\n";
+        let doc =
+            "combos:\n- id: a\n  strategy: priority\n  targets:\n  - a/m\n  context_length: 10\n";
         let row = "  - id: new\n    strategy: priority\n    targets:\n      - a/m\n";
         let added = append_combo_row(doc, row);
         assert!(

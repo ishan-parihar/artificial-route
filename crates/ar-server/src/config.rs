@@ -77,7 +77,7 @@ use ar_tokens::{NormalizedUsage, PricingTable};
 
 use crate::app::REQUEST_TIMEOUT;
 use crate::exec::{OAuthAuth, ProviderConfig};
-use crate::models::{Lane, ModelCard, DECISION_ENDPOINTS};
+use crate::models::{DECISION_ENDPOINTS, Lane, ModelCard};
 
 /// Default listen port, matching the OmniRoute-compatible `127.0.0.1:20128`.
 pub const DEFAULT_PORT: u16 = 20128;

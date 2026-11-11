@@ -97,11 +97,8 @@ pub enum Lane {
 /// publishes the lane on `/v1/models`) and `ar-cli`'s `codex.rs` (which keeps
 /// decision combos out of the Codex picker), so the two never disagree about
 /// which combos are which.
-pub const DECISION_ENDPOINTS: [&str; 3] = [
-    "/v1/decisions",
-    "/v1/systemone",
-    "/api/alpha/decisions",
-];
+pub const DECISION_ENDPOINTS: [&str; 3] =
+    ["/v1/decisions", "/v1/systemone", "/api/alpha/decisions"];
 
 impl ModelCard {
     /// Builds a card from a provider-local model name.

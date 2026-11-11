@@ -1427,7 +1427,8 @@ mod tests {
             {"role":"user","content":"bye"}]}"#;
         let req: ResponsesApi = serde_json::from_str(raw).expect("fixture is valid Responses");
 
-        let canonical = responses_to_canonical(req).expect("a reasoning item must not 400 the request");
+        let canonical =
+            responses_to_canonical(req).expect("a reasoning item must not 400 the request");
 
         // The reasoning item leaves no message behind: the conversation is
         // exactly the two user turns and the one assistant turn.
@@ -1460,7 +1461,11 @@ mod tests {
         assert_eq!(canonical.messages.len(), 2, "{:?}", canonical.messages);
         assert_eq!(canonical.messages[0].role, Role::Assistant);
         assert_eq!(canonical.messages[0].content, "hello");
-        assert!(canonical.messages[0].media.is_empty(), "{:?}", canonical.messages[0].media);
+        assert!(
+            canonical.messages[0].media.is_empty(),
+            "{:?}",
+            canonical.messages[0].media
+        );
     }
 
     #[test]

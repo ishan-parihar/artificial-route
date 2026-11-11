@@ -461,7 +461,9 @@ fn json_error_has_code(body: &str, accepted: &[&str]) -> bool {
                 object
                     .get(key)
                     .and_then(serde_json::Value::as_str)
-                    .is_some_and(|value| accepted.iter().any(|code| value.eq_ignore_ascii_case(code)))
+                    .is_some_and(|value| {
+                        accepted.iter().any(|code| value.eq_ignore_ascii_case(code))
+                    })
             })
         })
 }

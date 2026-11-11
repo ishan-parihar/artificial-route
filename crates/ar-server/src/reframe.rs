@@ -82,10 +82,7 @@ pub(crate) fn reply_with_namespaces(
         return reply(dialect, completion);
     }
     let mut out = reply(dialect, completion);
-    let Some(calls) = out
-        .get_mut("output")
-        .and_then(Value::as_array_mut)
-    else {
+    let Some(calls) = out.get_mut("output").and_then(Value::as_array_mut) else {
         return out;
     };
     for item in calls {
@@ -242,12 +239,7 @@ struct Tool {
 }
 
 impl Reframer {
-    fn new(
-        dialect: Dialect,
-        model: &str,
-        source: WireFormat,
-        namespaces: &ToolNamespaces,
-    ) -> Self {
+    fn new(dialect: Dialect, model: &str, source: WireFormat, namespaces: &ToolNamespaces) -> Self {
         Self {
             dialect,
             model: model.to_owned(),
@@ -924,11 +916,7 @@ mod tests {
     }
 
     /// The same, with the request's own namespace map.
-    fn frames_with(
-        dialect: Dialect,
-        chunks: &[Value],
-        namespaces: &ToolNamespaces,
-    ) -> Vec<Value> {
+    fn frames_with(dialect: Dialect, chunks: &[Value], namespaces: &ToolNamespaces) -> Vec<Value> {
         let mut reframer = Reframer::new(dialect, "served", WireFormat::Openai, namespaces);
         let mut out: Vec<Bytes> = Vec::new();
         for chunk in chunks {
@@ -1168,11 +1156,7 @@ mod tests {
                 "finish_reason":"tool_calls"}],
         });
 
-        let out = reply_with_namespaces(
-            Dialect::Responses,
-            completion,
-            &ToolNamespaces::default(),
-        );
+        let out = reply_with_namespaces(Dialect::Responses, completion, &ToolNamespaces::default());
 
         assert_eq!(out["output"][0]["name"], "exec_command", "{out}");
         assert!(out["output"][0].get("namespace").is_none(), "{out}");
@@ -1278,7 +1262,11 @@ mod tests {
             .find(|f| f.get("type").and_then(Value::as_str) == Some("response.output_item.added"))
             .and_then(|f| f.get("item"))
             .unwrap_or(&Value::Null);
-        assert_eq!(added.get("type").and_then(Value::as_str), Some("reasoning"), "{added:?}");
+        assert_eq!(
+            added.get("type").and_then(Value::as_str),
+            Some("reasoning"),
+            "{added:?}"
+        );
 
         let completed = out
             .iter()
@@ -1287,7 +1275,10 @@ mod tests {
             .cloned()
             .unwrap_or(Value::Null);
         let empty = Vec::new();
-        let output = completed.get("output").and_then(Value::as_array).unwrap_or(&empty);
+        let output = completed
+            .get("output")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty);
         let reasoning_item = output
             .iter()
             .find(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"));
@@ -1295,7 +1286,10 @@ mod tests {
             .and_then(|i| i.pointer("/summary/0/text"))
             .and_then(Value::as_str)
             .unwrap_or("");
-        assert_eq!(summary_text, "thinking hard", "the whole summary must be in the item: {output:?}");
+        assert_eq!(
+            summary_text, "thinking hard",
+            "the whole summary must be in the item: {output:?}"
+        );
 
         // The answer text still follows, as its own message item.
         let message = output
@@ -1331,7 +1325,10 @@ mod tests {
         });
         let out = openai_reply_to_responses(&reply);
         let empty = Vec::new();
-        let output = out.get("output").and_then(Value::as_array).unwrap_or(&empty);
+        let output = out
+            .get("output")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty);
         let reasoning = output
             .iter()
             .find(|i| i.get("type").and_then(Value::as_str) == Some("reasoning"));
@@ -1363,8 +1360,8 @@ mod tests {
             WireFormat::Openai,
             &ToolNamespaces::default(),
         )
-            .collect()
-            .await;
+        .collect()
+        .await;
 
         assert!(
             got.iter()
@@ -1392,8 +1389,8 @@ mod tests {
             WireFormat::Openai,
             &ToolNamespaces::default(),
         )
-            .collect()
-            .await;
+        .collect()
+        .await;
         let text: String = got
             .iter()
             .map(|f| String::from_utf8_lossy(f).into_owned())
@@ -1426,8 +1423,8 @@ mod tests {
             WireFormat::Anthropic,
             &ToolNamespaces::default(),
         )
-            .collect()
-            .await;
+        .collect()
+        .await;
         let text: String = got
             .iter()
             .map(|f| String::from_utf8_lossy(f).into_owned())

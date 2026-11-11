@@ -2099,8 +2099,8 @@ combos:
         // so the omission has to be declarable the same way `temperature` is.
         let yaml = "provider_settings:\n  nvidia:\n    request_capabilities:\n      minimaxai/minimax-m3.1-flash:\n        omit_optional_parameters: [reasoning]\n";
         let cfg = Config::parse(yaml, stub_lookup).expect("a typed capability row");
-        let row = &cfg.provider_settings["nvidia"].request_capabilities
-            ["minimaxai/minimax-m3.1-flash"];
+        let row =
+            &cfg.provider_settings["nvidia"].request_capabilities["minimaxai/minimax-m3.1-flash"];
         assert!(
             row.omit_optional_parameters
                 .contains(&OpenAiOptionalParameter::Reasoning),

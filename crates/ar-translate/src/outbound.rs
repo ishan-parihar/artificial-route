@@ -439,7 +439,10 @@ pub fn render_openai_responses_body(chat: &CanonicalChat) -> Vec<u8> {
     if let Some(effort) = chat.reasoning_effort {
         // The Responses wire spells the effort as a bare string inside a
         // `reasoning` object.
-        body.insert("reasoning".to_owned(), json!({ "effort": effort.as_wire() }));
+        body.insert(
+            "reasoning".to_owned(),
+            json!({ "effort": effort.as_wire() }),
+        );
     }
     encode(Value::Object(body))
 }
@@ -1530,8 +1533,8 @@ mod tests {
         OutboundWire, render_for_wire, render_openai_wire_body, to_anthropic_response,
         to_responses_response,
     };
-    use crate::canonical::render_openai_body;
     use crate::anthropic::AnthropicMessages;
+    use crate::canonical::render_openai_body;
     use crate::canonical::{
         CanonicalChat, CanonicalResponse, FinishReason, MediaPart, Msg, Role, Usage,
     };

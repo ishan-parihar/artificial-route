@@ -43,7 +43,11 @@ fn str_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
 /// `namespace` is the namespace the declaration was grouped under, when the
 /// client groups its tools into namespaces. It is `None` for a plain
 /// declaration.
-fn declared(decl: &Value, schema_key: &str, namespace: Option<&str>) -> Result<CanonicalTool, TranslateError> {
+fn declared(
+    decl: &Value,
+    schema_key: &str,
+    namespace: Option<&str>,
+) -> Result<CanonicalTool, TranslateError> {
     let name = str_field(decl, "name").ok_or_else(|| invalid("a tool has no `name`"))?;
     Ok(CanonicalTool {
         name: name.to_owned(),
@@ -523,7 +527,10 @@ mod tests {
         let body = render(&render_openai_responses_body(&chat));
 
         assert_eq!(body["tools"][0]["type"], "function", "{body}");
-        assert_eq!(body["tools"][0]["name"], "mcp__serena__activate_project", "{body}");
+        assert_eq!(
+            body["tools"][0]["name"], "mcp__serena__activate_project",
+            "{body}"
+        );
     }
 
     /// A namespace container with an inner tool this build does not run is

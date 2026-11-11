@@ -1590,8 +1590,7 @@ impl UsageScanner {
 /// payload's own leading whitespace is trimmed either way.
 fn data_json(line: &[u8]) -> Option<serde_json::Value> {
     const PREFIX: &[u8] = b"data:";
-    let payload = if line.len() >= PREFIX.len()
-        && line[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
+    let payload = if line.len() >= PREFIX.len() && line[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
     {
         // The prefix's case is not fixed by every SSE implementation, and a
         // usage frame that arrives as `Data:` is still a usage frame.
@@ -2387,9 +2386,11 @@ fn reframed_body(
 ) -> Option<Bytes> {
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
     let completion = reframe::completion(source, value)?;
-    serde_json::to_vec(&reframe::reply_with_namespaces(dialect, completion, namespaces))
-        .ok()
-        .map(Bytes::from)
+    serde_json::to_vec(&reframe::reply_with_namespaces(
+        dialect, completion, namespaces,
+    ))
+    .ok()
+    .map(Bytes::from)
 }
 
 /// The continuation a streamed reply may take, when one is allowed. The first
@@ -4526,10 +4527,11 @@ mod tests {
         CACHE_HEADER, COMPRESSION_ECHO, CacheControl, CutRecord, DENY_HEADER, Dialect,
         FALLBACK_ATTEMPTS_HEADER, FailNote, FailureSink, Keepalive, LATENCY_MS_HEADER,
         MODEL_HEADER, PROVIDER_HEADER, RESPONSE_COST_HEADER, SAVINGS_TOKENS_HEADER, Stages,
-        TOKENS_IN_HEADER, TOKENS_OUT_HEADER, TOKENS_PER_SECOND_HEADER, USAGE_FRAME_CAP, UsageScanner,
-        UsageTee, VERSION_HEADER, accept_forces_stream, build_chain, card_json, completion_seen,
-        declares_stream, decorate, epoch_now, error, error_because, kind_for, model, models_head,
-        not_found, note_failure, outcome_label, require_json, resolve, unknown_model,
+        TOKENS_IN_HEADER, TOKENS_OUT_HEADER, TOKENS_PER_SECOND_HEADER, USAGE_FRAME_CAP,
+        UsageScanner, UsageTee, VERSION_HEADER, accept_forces_stream, build_chain, card_json,
+        completion_seen, declares_stream, decorate, epoch_now, error, error_because, kind_for,
+        model, models_head, not_found, note_failure, outcome_label, require_json, resolve,
+        unknown_model,
     };
     use super::{Continuation, SentText, resume_body, resumed};
     use crate::app::{AppState, Components};
@@ -6508,8 +6510,7 @@ mod tests {
         )
         .await;
         drain_body(resp).await;
-        let row = only_row(&ledger)
-            .expect("the incomplete response's usage was recorded");
+        let row = only_row(&ledger).expect("the incomplete response's usage was recorded");
         assert_eq!(row.total_tokens, 5);
     }
 
@@ -7027,7 +7028,9 @@ mod tests {
         // before the stream ended, and the ledger recorded nothing. Scanning
         // each line as it arrives cannot evict anything.
         let mut scanner = UsageScanner::new(Dialect::OpenAi);
-        scanner.feed(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}\n\n");
+        scanner.feed(
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}\n\n",
+        );
         for _ in 0..20 {
             scanner.feed(b"data: {\"choices\":[]}\n\n");
         }
@@ -7046,12 +7049,7 @@ mod tests {
         // The SSE grammar writes `data: ` with one space, but implementations
         // ship `data:` with no space and with several, and a usage frame behind
         // a variant spelling is still a usage frame.
-        for prefix in [
-            &b"data: "[..],
-            b"data:",
-            b"data:   ",
-            b"Data: ",
-        ] {
+        for prefix in [&b"data: "[..], b"data:", b"data:   ", b"Data: "] {
             let mut scanner = UsageScanner::new(Dialect::OpenAi);
             let line = [
                 prefix,
@@ -7101,7 +7099,9 @@ mod tests {
         scanner.feed(b"\ndata: {\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}\n\n");
         scanner.finish();
 
-        let got = scanner.usage().expect("the usage frame after the oversized line");
+        let got = scanner
+            .usage()
+            .expect("the usage frame after the oversized line");
         assert_eq!(
             ar_tokens::NormalizedUsage::from_usage(&got),
             ar_tokens::NormalizedUsage::new(11, 7)
@@ -7333,7 +7333,9 @@ mod tests {
         // the newline that ended it.
         let mut chunk = vec![b'x'; USAGE_FRAME_CAP + 1];
         chunk.push(b'\n');
-        chunk.extend_from_slice(b"data: {\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}\n\n");
+        chunk.extend_from_slice(
+            b"data: {\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}\n\n",
+        );
 
         let mut scanner = UsageScanner::new(Dialect::OpenAi);
         scanner.feed(&chunk);

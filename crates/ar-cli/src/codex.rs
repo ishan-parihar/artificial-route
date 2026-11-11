@@ -288,7 +288,9 @@ pub fn codex(cli: &crate::cli::Cli, args: &CodexArgs) -> Result<()> {
         .and_then(serde_json::Value::as_array)
         .map(|rows| {
             rows.iter()
-                .filter(|row| row.get("visibility").and_then(serde_json::Value::as_str) == Some("list"))
+                .filter(|row| {
+                    row.get("visibility").and_then(serde_json::Value::as_str) == Some("list")
+                })
                 .count()
         })
         .unwrap_or(0);
@@ -340,7 +342,10 @@ pub fn codex(cli: &crate::cli::Cli, args: &CodexArgs) -> Result<()> {
     changed.push(profile_path.display().to_string());
 
     // The base config: the catalog key and the provider block.
-    let base_url = args.base_url.clone().unwrap_or_else(|| DEFAULT_BASE_URL.to_owned());
+    let base_url = args
+        .base_url
+        .clone()
+        .unwrap_or_else(|| DEFAULT_BASE_URL.to_owned());
     let config = read_config(&config_path)?;
     let (edited, mut notes) = edit_config(
         &config,
@@ -402,10 +407,7 @@ pub fn codex(cli: &crate::cli::Cli, args: &CodexArgs) -> Result<()> {
         for note in &notes {
             println!("note: {note}");
         }
-        println!(
-            "wrote {} ({listed} routable ids)",
-            catalog_path.display()
-        );
+        println!("wrote {} ({listed} routable ids)", catalog_path.display());
         println!("daemon: {}", daemon.as_str());
         println!("next: codex");
     }
@@ -551,7 +553,6 @@ fn profile_body(lane: &Lane) -> String {
         effort = DEFAULT_REASONING_EFFORT,
     )
 }
-
 
 /// The Codex home this command writes into.
 fn codex_home(args: &CodexArgs) -> Result<PathBuf> {
@@ -703,8 +704,8 @@ fn build(bundled: &serde_json::Value, lanes: &[Lane]) -> Result<serde_json::Valu
         .get("models")
         .and_then(serde_json::Value::as_array)
         .context("Codex's bundled catalog has no `models` array")?;
-    let template = pick_template(entries)
-        .context("Codex's bundled catalog has no usable template entry")?;
+    let template =
+        pick_template(entries).context("Codex's bundled catalog has no usable template entry")?;
 
     let mut listed = Vec::with_capacity(lanes.len());
     let mut seen = std::collections::HashSet::new();
@@ -794,16 +795,17 @@ fn pick_template(entries: &[serde_json::Value]) -> Option<serde_json::Value> {
     };
     let is_code_mode = |row: &serde_json::Value| {
         row.get("tool_mode").and_then(serde_json::Value::as_str) == Some("code_mode_only")
-            || row.get("use_responses_lite").and_then(serde_json::Value::as_bool) == Some(true)
+            || row
+                .get("use_responses_lite")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
     };
 
     entries
         .iter()
         .filter(|row| is_entry(row))
         .find(|row| {
-            row.get("slug")
-                .and_then(serde_json::Value::as_str)
-                == Some(DEFAULT_TEMPLATE_SLUG)
+            row.get("slug").and_then(serde_json::Value::as_str) == Some(DEFAULT_TEMPLATE_SLUG)
         })
         .or_else(|| {
             entries
@@ -862,7 +864,10 @@ fn entry_from(
 
     // The hosted search tool: see the module docs. It is what makes Codex add a
     // `web_search` declaration the router cannot run.
-    object.insert("supports_search_tool".to_owned(), serde_json::Value::Bool(false));
+    object.insert(
+        "supports_search_tool".to_owned(),
+        serde_json::Value::Bool(false),
+    );
 
     for (key, value) in CODE_MODE_OVERRIDES {
         object.insert(key.to_owned(), value);
@@ -924,10 +929,7 @@ fn entry_from(
     // the one Codex must compact at, so it wins whenever the combo declared one.
     if let Some(window) = lane.context_length {
         object.insert("context_window".to_owned(), serde_json::json!(window));
-        object.insert(
-            "max_context_window".to_owned(),
-            serde_json::json!(window),
-        );
+        object.insert("max_context_window".to_owned(), serde_json::json!(window));
         // A percentage of a window Codex applies on top; keeping the template's
         // is right, but it must not outlive a window we just replaced.
         if let Some(percent) = object
@@ -1027,9 +1029,7 @@ fn read_config(path: &Path) -> Result<String> {
     match std::fs::read_to_string(path) {
         Ok(body) => Ok(body),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(error) => {
-            Err(error).with_context(|| format!("could not read {}", path.display()))
-        }
+        Err(error) => Err(error).with_context(|| format!("could not read {}", path.display())),
     }
 }
 
@@ -1153,11 +1153,7 @@ struct EditOptions {
 /// does not depend on a TOML crate and this command must not add one. It only
 /// ever needs to recognise three things: a top-level key, a table header, and
 /// the keys of one table. Everything else it passes through byte for byte.
-fn edit_config(
-    body: &str,
-    catalog: &Path,
-    options: &EditOptions,
-) -> (String, Vec<String>) {
+fn edit_config(body: &str, catalog: &Path, options: &EditOptions) -> (String, Vec<String>) {
     let mut notes = Vec::new();
     let mut out = body.to_owned();
     let catalog_value = catalog.display().to_string();
@@ -1203,9 +1199,7 @@ fn edit_config(
             }
             Some(other) => {
                 out = replace_top_level(&out, "model_provider", PROVIDER_ID);
-                notes.push(format!(
-                    "model_provider now selects aroute (was {other})"
-                ));
+                notes.push(format!("model_provider now selects aroute (was {other})"));
             }
             None => {
                 out = insert_top_level(&out, "model_provider", PROVIDER_ID);
@@ -1253,25 +1247,19 @@ fn edit_config(
         let existing = top_level_value(&out, "model_reasoning_effort");
         match existing.as_deref() {
             Some(effort) if SUPPORTED_REASONING_EFFORTS.contains(&effort) => {
-                notes.push(format!("model_reasoning_effort is {effort}, which the router runs"));
+                notes.push(format!(
+                    "model_reasoning_effort is {effort}, which the router runs"
+                ));
             }
             Some(other) => {
-                out = replace_top_level(
-                    &out,
-                    "model_reasoning_effort",
-                    DEFAULT_REASONING_EFFORT,
-                );
+                out = replace_top_level(&out, "model_reasoning_effort", DEFAULT_REASONING_EFFORT);
                 notes.push(format!(
                     "model_reasoning_effort is now {DEFAULT_REASONING_EFFORT} (was {other}; \
                      the router refuses any other effort)"
                 ));
             }
             None => {
-                out = insert_top_level(
-                    &out,
-                    "model_reasoning_effort",
-                    DEFAULT_REASONING_EFFORT,
-                );
+                out = insert_top_level(&out, "model_reasoning_effort", DEFAULT_REASONING_EFFORT);
                 notes.push(format!(
                     "added model_reasoning_effort = {DEFAULT_REASONING_EFFORT}"
                 ));
@@ -1446,7 +1434,9 @@ fn edit_provider(
             .map(|(_, value)| value);
         if current.as_deref() != Some(base_url) {
             replace_in_table(body, PROVIDER_TABLE, "base_url", base_url);
-            notes.push(format!("base_url in [model_providers.aroute] is now {base_url}"));
+            notes.push(format!(
+                "base_url in [model_providers.aroute] is now {base_url}"
+            ));
         }
     }
 
@@ -1554,10 +1544,7 @@ fn edit_auth_command(body: &mut String, notes: &mut Vec<String>) {
         }
         body.push_str(ending);
         body.push_str(&format!("[{AUTH_TABLE}]{ending}"));
-        body.push_str(&format!(
-            "command = {}{ending}",
-            toml_string(AUTH_COMMAND)
-        ));
+        body.push_str(&format!("command = {}{ending}", toml_string(AUTH_COMMAND)));
         body.push_str(&format!("args = {args_value}{ending}"));
         body.push_str(&format!("timeout_ms = 10000{ending}"));
         return;
@@ -1929,7 +1916,10 @@ mod tests {
     fn prefers_the_plain_shell_template_over_a_code_mode_entry() {
         let template = pick_template(bundled().get("models").unwrap().as_array().unwrap());
         assert_eq!(
-            template.and_then(|row| row.get("slug").and_then(serde_json::Value::as_str).map(str::to_owned)),
+            template.and_then(|row| row
+                .get("slug")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)),
             Some(DEFAULT_TEMPLATE_SLUG.to_owned()),
         );
     }
@@ -2017,9 +2007,13 @@ mod tests {
         let rows = catalog["models"].as_array().expect("an array");
 
         for row in rows {
-            let slug = row.get("slug").and_then(serde_json::Value::as_str).unwrap_or("?");
+            let slug = row
+                .get("slug")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
             assert_eq!(
-                row.get("supports_search_tool").and_then(serde_json::Value::as_bool),
+                row.get("supports_search_tool")
+                    .and_then(serde_json::Value::as_bool),
                 Some(false),
                 "{slug} declares the hosted search tool"
             );
@@ -2038,10 +2032,13 @@ mod tests {
 
     #[test]
     fn clears_code_mode_behaviour_a_non_codex_lane_cannot_use() {
-        let catalog = build(&bundled(), &[Lane {
-            id: "copycat".to_owned(),
-            context_length: None,
-        }])
+        let catalog = build(
+            &bundled(),
+            &[Lane {
+                id: "copycat".to_owned(),
+                context_length: None,
+            }],
+        )
         .expect("built");
 
         // No window declared, so the template's own stays — but the code-mode
@@ -2135,7 +2132,10 @@ mod tests {
             edited.contains("base_url = \"https://aroute.ishanparihar.com/v1\""),
             "the operator's own base URL must survive, got: {edited}"
         );
-        assert!(!edited.contains("127.0.0.1:20128"), "the default must not overwrite it");
+        assert!(
+            !edited.contains("127.0.0.1:20128"),
+            "the default must not overwrite it"
+        );
     }
 
     #[test]
@@ -2151,7 +2151,10 @@ mod tests {
             },
         );
 
-        assert!(edited.contains("base_url = \"https://new/v1\""), "got: {edited}");
+        assert!(
+            edited.contains("base_url = \"https://new/v1\""),
+            "got: {edited}"
+        );
         assert!(!edited.contains("https://old/v1"));
         assert!(notes.iter().any(|note| note.contains("base_url")));
     }
@@ -2176,7 +2179,10 @@ mod tests {
             .nth(1)
             .and_then(|tail| tail.split("[profiles.work]").next())
             .expect("the provider block");
-        assert!(block.contains("env_key = \"AROUTE_API_KEY\""), "got: {block}");
+        assert!(
+            block.contains("env_key = \"AROUTE_API_KEY\""),
+            "got: {block}"
+        );
         assert!(block.contains("wire_api = \"responses\""), "got: {block}");
         assert!(block.contains("name = \"aroute\""), "got: {block}");
         assert!(notes.iter().any(|note| note.contains("env_key")));
@@ -2248,10 +2254,16 @@ mod tests {
 
         let compact: u64 = body
             .lines()
-            .find_map(|line| line.trim().strip_prefix("model_auto_compact_token_limit = "))
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("model_auto_compact_token_limit = ")
+            })
             .and_then(|value| value.trim().parse().ok())
             .expect("a compact limit");
-        assert!(compact < 1_048_576, "compaction at the ceiling leaves no room");
+        assert!(
+            compact < 1_048_576,
+            "compaction at the ceiling leaves no room"
+        );
         assert_eq!(
             compact, 891_289,
             "the limit is 85% of the window, the share the profile corpus uses"
@@ -2304,7 +2316,8 @@ mod tests {
         );
 
         assert!(
-            !edited.contains('\n') || edited.matches('\n').count() == edited.matches("\r\n").count(),
+            !edited.contains('\n')
+                || edited.matches('\n').count() == edited.matches("\r\n").count(),
             "every LF must still be part of a CRLF, got: {edited:?}"
         );
         assert!(
@@ -2531,9 +2544,7 @@ mod tests {
                 .map(|levels| {
                     levels
                         .iter()
-                        .filter_map(|level| {
-                            level.get("effort").map(serde_json::Value::to_string)
-                        })
+                        .filter_map(|level| level.get("effort").map(serde_json::Value::to_string))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -2671,7 +2682,10 @@ mod tests {
 
         // The block's other keys are the operator's, and they stay.
         assert!(edited.contains("wire_api = \"responses\""), "got: {edited}");
-        assert!(edited.contains("base_url = \"https://x/v1\""), "got: {edited}");
+        assert!(
+            edited.contains("base_url = \"https://x/v1\""),
+            "got: {edited}"
+        );
     }
 
     #[test]
