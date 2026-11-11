@@ -492,6 +492,21 @@ fn check(selected: &[&Harness], models: &[Model], cfg: &Config, home: &Path) -> 
             println!("{}: not installed on this host, skipped", harness.name);
             continue;
         };
+        // A map of ids cannot see a second row for an id it already holds, so
+        // a list that carries the same model twice looks clean here while the
+        // picker shows it twice and the router serves it once. The rows are
+        // what tells the two apart.
+        if let Some(repeated) = repeated_ids(harness, path) {
+            let extra = repeated.len();
+            if extra > 0 {
+                drift += extra;
+                println!(
+                    "{}: {extra} duplicate model row(s): {}",
+                    harness.name,
+                    repeated.join(", ")
+                );
+            }
+        }
         let missing: Vec<&str> = wanted
             .keys()
             .filter(|id| !have.contains_key(**id))
@@ -528,18 +543,6 @@ fn check(selected: &[&Harness], models: &[Model], cfg: &Config, home: &Path) -> 
             if !items.is_empty() {
                 drift += items.len();
                 println!("{}: {} {}: {}", harness.name, items.len(), label, items.join(", "));
-            }
-        }
-        if harness.name == "jcode"
-            && let Ok(text) = std::fs::read_to_string(path)
-        {
-            let duplicates = jcode_block_count(&text).saturating_sub(have.len());
-            if duplicates > 0 {
-                drift += duplicates;
-                println!(
-                    "jcode: {duplicates} duplicate model block(s) beside {} unique id(s)",
-                    have.len()
-                );
             }
         }
     }
@@ -598,14 +601,19 @@ fn apply(
             // The ids can already agree while the file still needs the write:
             // jcode carries duplicate blocks a map cannot see, and dsh's rows
             // can be right in a document whose list this writer just normalised.
-            changes.push(if harness.name == "jcode" {
-                format!(
-                    "{}: removed {} duplicate model block(s)",
-                    harness.name,
-                    jcode_block_count(&text).saturating_sub(after.len())
-                )
-            } else {
+            // The duplicate rows are named when there are any, so an operator
+            // can see which id was listed twice rather than only that the file
+            // changed shape.
+            let duplicates = repeated_ids(harness, path).unwrap_or_default();
+            changes.push(if duplicates.is_empty() {
                 format!("{}: normalized its list in place", harness.name)
+            } else {
+                format!(
+                    "{}: removed {} duplicate model row(s): {}",
+                    harness.name,
+                    duplicates.len(),
+                    duplicates.join(", ")
+                )
             });
         }
         changes.extend(diff_lines(harness.name, &before, &after));
@@ -1146,6 +1154,144 @@ fn current_models(harness: &Harness, path: &Path) -> Option<BTreeMap<String, u32
     }
 }
 
+/// The ids a harness's list holds more than once, in the order they repeat.
+///
+/// [`current_models`] answers with a map, and a map cannot hold two entries
+/// for the same id: the second row collapses into the first, so the file
+/// looks clean while the picker still offers the model twice.
+///
+/// Reproduced 2026-11-11 on a copy of this host's pi and omo configs: one
+/// duplicated row in each file, and `harness check` still reported "no drift"
+/// and exited 0. The duplicate was invisible because only the map was
+/// compared, so nothing ever removed it.
+///
+/// The rows are counted rather than deduplicated in place, because the
+/// writer keeps the first occurrence and drops the rest: that is the same
+/// rule dsh's merge already follows, so every harness ends up with one row
+/// per id.
+///
+/// A clean list returns an empty vector rather than `None`, so `check` can
+/// report nothing for a file with no repeats.
+fn repeated_ids(harness: &Harness, path: &Path) -> Option<Vec<String>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut repeated: Vec<String> = Vec::new();
+    let mut note = |id: String| {
+        if !seen.insert(id.clone()) && !repeated.contains(&id) {
+            repeated.push(id);
+        }
+    };
+    match harness.name {
+        // opencode's list is a JSON object, so the key is the id and the
+        // serializer itself refuses a second one. Nothing to count.
+        "opencode" => return None,
+        "pi" => {
+            let doc: Value = serde_json::from_str(&text).ok()?;
+            for row in doc
+                .get("providers")?
+                .get(PI_PROVIDER)?
+                .get("models")?
+                .as_array()?
+            {
+                if let Some(id) = row.get("id").and_then(Value::as_str) {
+                    note(id.to_owned());
+                }
+            }
+        }
+        "omo" => {
+            let doc: Value = serde_json::from_str(&text).ok()?;
+            for row in doc
+                .get("providers")?
+                .get(OMO_PROVIDER)?
+                .get("models")?
+                .as_array()?
+            {
+                if let Some(id) = row.get("id").and_then(Value::as_str) {
+                    note(id.to_owned());
+                }
+            }
+        }
+        "dsh" => {
+            for id in dsh_row_ids(&text) {
+                note(id);
+            }
+        }
+        "jcode" => {
+            for id in jcode_block_ids(&text) {
+                note(id);
+            }
+        }
+        _ => return None,
+    }
+    Some(repeated)
+}
+
+/// The ids of dsh's provider list rows, in file order.
+fn dsh_row_ids(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_provider = false;
+    let mut list_indent = 0_usize;
+    let mut in_list = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let indent = line.len() - line.trim_start().len();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed == "ar:" || trimmed == "aroute:" {
+            in_provider = true;
+            in_list = false;
+            continue;
+        }
+        if indent == 0 {
+            in_provider = false;
+            in_list = false;
+            continue;
+        }
+        if in_provider && trimmed == "models:" {
+            in_list = true;
+            list_indent = indent;
+            continue;
+        }
+        if !in_list {
+            continue;
+        }
+        if indent <= list_indent {
+            in_list = false;
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("- id:") {
+            out.push(rest.trim().to_owned());
+        }
+    }
+    out
+}
+
+/// The ids of jcode's aroute model blocks, in file order.
+fn jcode_block_ids(text: &str) -> Vec<String> {
+    let header = format!("[[providers.{JCODE_PROVIDER}.models]]");
+    let mut out = Vec::new();
+    let mut in_block = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed == header {
+            in_block = true;
+            continue;
+        }
+        if in_block && trimmed.starts_with('[') {
+            in_block = false;
+            continue;
+        }
+        if !in_block {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("id = ") {
+            out.push(rest.trim().trim_matches('"').to_owned());
+        }
+    }
+    out
+}
+
 /// The `(id, context_window)` pairs inside jcode's aroute model blocks.
 fn jcode_models(text: &str) -> BTreeMap<String, u32> {
     let header = format!("[[providers.{JCODE_PROVIDER}.models]]");
@@ -1184,6 +1330,10 @@ fn jcode_models(text: &str) -> BTreeMap<String, u32> {
 /// A file can hold more blocks than unique ids when an older writer appended a
 /// second set; [`jcode_models`] returns a map, so the duplicates are invisible
 /// without counting the headers as well.
+///
+/// The production path counts the repeated *ids* instead ([`repeated_ids`]),
+/// which names the id that repeats rather than only the number of blocks.
+#[cfg(test)]
 fn jcode_block_count(text: &str) -> usize {
     let header = format!("[[providers.{JCODE_PROVIDER}.models]]");
     text.lines().filter(|line| line.trim() == header).count()
@@ -1459,6 +1609,103 @@ mod tests {
         let text = "[[providers.aroute.models]]\nid = \"a\"\ncontext_window = 1\n\n\
                     [[providers.aroute.models]]\nid = \"a\"\ncontext_window = 1\n";
         assert_eq!(jcode_block_count(text), 2);
+    }
+
+    /// A harness that lists the same id twice.
+    fn harness_for(name: &'static str, path: &Path) -> Harness {
+        Harness {
+            name,
+            kind: Kind::Static,
+            path: Some(path.to_path_buf()),
+        }
+    }
+
+    /// A pi-shaped config holding the same model id twice.
+    fn pi_with_duplicate() -> String {
+        serde_json::to_string_pretty(&json!({
+            "providers": {
+                "aroute": {
+                    "models": [
+                        {"id": "large-stack", "contextWindow": 1_048_576, "maxTokens": 32_000},
+                        {"id": "mistral-1t", "contextWindow": 1_048_576, "maxTokens": 32_000},
+                        {"id": "large-stack", "contextWindow": 1_048_576, "maxTokens": 32_000},
+                    ]
+                }
+            }
+        }))
+        .expect("fixture is JSON")
+    }
+
+    /// The duplicate row must be visible even though the map of ids is clean.
+    ///
+    /// Reproduced 2026-11-11: a pi config with one duplicated row made
+    /// `harness check` report "no drift", because only the map was compared.
+    #[test]
+    fn repeated_ids_names_a_row_the_id_map_hides() {
+        let dir = std::env::temp_dir().join("aroute-harness-dupe-test");
+        std::fs::create_dir_all(&dir).expect("scratch dir is writable");
+        let path = dir.join("models.json");
+        std::fs::write(&path, pi_with_duplicate()).expect("fixture is writable");
+        let harness = harness_for("pi", &path);
+        let repeated = repeated_ids(&harness, &path).expect("the file parses");
+        assert_eq!(repeated, vec!["large-stack".to_owned()]);
+        // The map itself is blind to the repeat, which is the whole defect.
+        assert_eq!(current_models(&harness, &path).expect("the file parses").len(), 2);
+    }
+
+    #[test]
+    fn repeated_ids_is_empty_for_a_clean_list() {
+        let dir = std::env::temp_dir().join("aroute-harness-clean-test");
+        std::fs::create_dir_all(&dir).expect("scratch dir is writable");
+        let path = dir.join("models.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&json!({
+                "providers": {
+                    "aroute": {
+                        "models": [
+                            {"id": "large-stack", "contextWindow": 1_048_576, "maxTokens": 32_000},
+                            {"id": "mistral-1t", "contextWindow": 1_048_576, "maxTokens": 32_000},
+                        ]
+                    }
+                }
+            }))
+            .expect("fixture is JSON"),
+        )
+        .expect("fixture is writable");
+        let harness = harness_for("pi", &path);
+        let repeated = repeated_ids(&harness, &path).expect("the file parses");
+        assert!(repeated.is_empty(), "a clean list repeats nothing: {repeated:?}");
+    }
+
+    /// The writer must leave one row per id, whichever row came first.
+    #[test]
+    fn render_rows_drops_a_duplicated_row_from_the_current_list() {
+        let doc: Value = serde_json::from_str(&pi_with_duplicate()).expect("fixture is JSON");
+        let current = doc["providers"]["aroute"]["models"]
+            .as_array()
+            .expect("the fixture has a model list")
+            .clone();
+        let rows = render_rows(&current, &models(), OMO_OUTPUT_DEFAULT);
+        let ids: Vec<&str> = rows
+            .iter()
+            .filter_map(|row| row.get("id").and_then(Value::as_str))
+            .collect();
+        assert_eq!(ids, vec!["large-stack", "mistral-1t"]);
+    }
+
+    /// dsh's merge already dropped repeats; the count must agree.
+    #[test]
+    fn dsh_row_ids_finds_a_repeated_row() {
+        let text = "- id: llm-pi-ai\n  config:\n    providers:\n      aroute:\n        models:\n          - id: large-stack\n            contextWindow: 1\n          - id: large-stack\n            contextWindow: 1\n";
+        assert_eq!(dsh_row_ids(text), vec!["large-stack", "large-stack"]);
+    }
+
+    #[test]
+    fn jcode_block_ids_finds_a_repeated_block() {
+        let text = "[[providers.aroute.models]]\nid = \"a\"\ncontext_window = 1\n\n\
+                    [[providers.aroute.models]]\nid = \"a\"\ncontext_window = 1\n";
+        assert_eq!(jcode_block_ids(text), vec!["a", "a"]);
     }
 
     #[test]
