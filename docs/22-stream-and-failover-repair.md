@@ -126,13 +126,37 @@ already had the full 600 s base budget, because a whole reply legitimately
 takes as long as it takes and the cap exists to stop a *silent* stream from
 hanging forever.
 
-**D10 — Two stalls outlast the stream deadline (open).** The start cap is 110s
+**D10 — Two stalls outlast the stream deadline (ruled, shipped v0.1.30).** The start cap is 110s
 per attempt (`ar-exec` `STREAM_START_TIMEOUT_CAP`) and the router deadline is
 120s (`AR_STREAM_TIMEOUT_SECS`, default 120s everywhere). One stall fails over
 in time. A second stall in the same request is cut at 120s with an empty 504.
 Options, for an explicit choice: lower the per-attempt start cap, make the
 router deadline longer than the chain's start budgets, or give the attempt loop
 the deadline so it skips a target it cannot finish.
+
+**The ruling: give the attempt loop the deadline, and split it.** The deadline
+is now an absolute instant carried on the request (`CanonicalRequest::deadline`)
+rather than a relative `tokio::time::timeout` that started its timer at the call
+site, and each attempt is bounded by what is left of it. The remaining budget
+is then **split across the targets still to try**, so a target that holds its
+connection gets its share and is abandoned instead of eating the whole
+deadline.
+
+What forced it, measured on the VPS after the v0.1.29 deploy:
+`laguna-s-2-1` answered 504 `model_deadline` at exactly 120 s, where before
+that deploy it answered 200 at 111.8 s. The cause is a specific upstream:
+`nvidia/poolside/laguna-xs-2.1` holds its connection rather than refusing it —
+no headers in 115 s, an upstream 504 at 302 s. The old 110 s cap made the
+router abandon it and reach `kilocode/nvidia/nemotron-3-ultra-550b-a55b:free`,
+which answers in 1.2 s. Raising the cap to 600 s made the router wait out the
+whole deadline on the dead target instead.
+
+So the three options in the earlier text are not equally sound: **lowering the
+per-attempt cap is not available any more**, because v0.1.29 made it a
+per-provider measurement that goes the other way for the models that need it.
+Making the router deadline longer does not help, because a longer deadline
+buys the dead target more time, not the healthy one. Splitting the remaining
+budget is the option that gives the fallback a budget of its own.
 
 **Measured on 2026-10-18, direct to nvidia, three samples each, streamed:**
 `z-ai/glm-5.3` sent headers in 1.37–2.09s and its first byte in 1.47–4.01s.
