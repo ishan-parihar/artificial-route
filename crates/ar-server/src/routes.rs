@@ -649,8 +649,14 @@ async fn handle_chat_inner(
     // client should not cost the router a translation, and keyed by the
     // credential the gate authenticated — anonymous traffic shares the
     // `default` row, which is what that row is for.
+    //
+    // The row's `model:` scope is against the model the client asked for, so
+    // the model is read off the raw bytes here — before the dialect parse,
+    // which is what the "before any body work" rule is about. A row scoped to
+    // `model: jev` must not rate-limit a request for `glm-5.3`.
     let policy_key = key_id.as_deref().unwrap_or("anonymous");
-    if let Some(wait) = state.policy.rate_wait(policy_key) {
+    let asked_model = model_asked(&body);
+    if let Some(wait) = state.policy.rate_wait(policy_key, &asked_model) {
         let mut resp = error_because(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limited",
@@ -842,23 +848,41 @@ async fn handle_chat_inner(
     // its own budget must hand the request to a sibling rather than take the
     // whole request down with it.
     let mut plan = plan;
+    // The scope key is the model the client asked for — the combo id.
+    // `canonical.model` is exactly that at this point: the dialect head's
+    // `model`, which a combo id is resolved against and never rewritten.
+    let asked = canonical.model.clone();
     if let Some(ledger) = state.ledger.as_ref() {
+        // Two rows, two windows, because the scope governs one arm and not the
+        // other: the key-wide arm reads the SCOPED row (a `model:` scope is
+        // exactly a statement about which combo its ceiling applies to), and
+        // the per-target arm reads the UNSCOPED row (each `model_tokens` entry
+        // names the target it governs, so the map's keys are the scope there).
+        //
+        // So there are two breakdowns, not one: the key-wide arm's windowed
+        // figure is measured over its own window, and the per-target arm's over
+        // its own. A single `since` would give one of them the other's figure.
         let window = state.policy.spend_window(policy_key);
-        let since = window.map(|w| epoch_now().saturating_sub(w.as_secs() as i64));
-        let breakdown = {
+        let key_window = state.policy.key_spend_window(policy_key, asked.as_ref());
+        let (breakdown, key_breakdown) = {
             // Poisoned is the record path's convention too: a ledger that
             // panicked mid-write is a bug to surface, not a ceiling to guess.
             let guard = ledger
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.spend_breakdown(policy_key, since)
+            let target_since = window.map(|w| epoch_now().saturating_sub(w.as_secs() as i64));
+            let key_since = key_window.map(|w| epoch_now().saturating_sub(w.as_secs() as i64));
+            (
+                guard.spend_breakdown(policy_key, target_since),
+                guard.spend_breakdown(policy_key, key_since),
+            )
         };
-        let breakdown = match breakdown {
-            Ok(breakdown) => breakdown,
-            Err(e) => {
+        let (breakdown, key_breakdown) = match (breakdown, key_breakdown) {
+            (Ok(a), Ok(b)) => (a, b),
+            _ => {
                 // A ledger that cannot be read cannot evaluate a ceiling, and a
                 // cap that fails open is not a cap.
-                tracing::warn!(error = %e, "spend ledger could not be read");
+                tracing::warn!("spend ledger could not be read");
                 let mut resp = error_because(
                     StatusCode::PAYMENT_REQUIRED,
                     "payment_required",
@@ -877,11 +901,16 @@ async fn handle_chat_inner(
         //
         // The comparison itself is `ar-tokens`' own, so the refusal the client
         // sees and the one the store's cap produces are the same words.
-        if let Some(cap) = state.policy.key_cap(policy_key) {
-            let spend = if window.is_some() {
-                breakdown.windowed
+        //
+        // The key-wide arm reads the SCOPED row and the SCOPED window: this is
+        // the arm a `model:` scope governs, so a ceiling written for one combo
+        // must neither refuse another combo nor measure this request over a
+        // window it does not apply to.
+        if let Some(cap) = state.policy.key_cap(policy_key, asked.as_ref()) {
+            let spend = if key_window.is_some() {
+                key_breakdown.windowed
             } else {
-                breakdown.total
+                key_breakdown.total
             };
             let projection = crate::policy::Projection {
                 provider: plan.chain.first().map_or("", |t| t.provider.as_str()),
@@ -8091,6 +8120,38 @@ mod tests {
         (state, ledger)
     }
 
+    /// A two-combo server, so a `model:` scope has two models to tell apart.
+    ///
+    /// `m` and `m2` are separate combos over separate targets, so a limits
+    /// row scoped to `m` can be asked to refuse `m` and leave `m2` alone.
+    fn scoped_two_combo(limits: &str, exec: Arc<dyn ArExec>) -> AppState {
+        let mut config = two_target_config();
+        config.combos = vec![
+            crate::config::RouteCombo::new(
+                "m",
+                Strategy::Priority,
+                vec![ComboTarget::new(ProviderId::new("p"), "m")],
+            ),
+            crate::config::RouteCombo::new(
+                "m2",
+                Strategy::Priority,
+                vec![ComboTarget::new(ProviderId::new("q"), "m2")],
+            ),
+        ];
+        config.limits = ar_config::Config::parse(limits, |_| Ok(None))
+            .expect("test limits parse")
+            .limits;
+        let ledger = Arc::new(Mutex::new(
+            ar_tokens::Ledger::open_in_memory().expect("in-memory ledger"),
+        ));
+        Components {
+            exec,
+            ledger: Some(ledger),
+            ..Components::unconfigured(config)
+        }
+        .into_state()
+    }
+
     /// Records what each dispatch was asked for, so a handover is observable.
     ///
     /// The list is shared with the test rather than owned by the executor: the
@@ -8376,6 +8437,54 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
         assert_eq!(body_of(resp).await["error"]["reason"], "token_cap");
+    }
+
+    #[tokio::test]
+    async fn a_ceiling_scoped_to_one_model_refuses_only_that_model() {
+        // The whole point of `model:`: a ceiling written for one combo must not
+        // refuse every other combo the same key asks for. Before the scope was
+        // applied at request time, the scoped row was read unscoped and the
+        // ceiling below refused BOTH requests.
+        let (exec, seen) = RecordingProviders::new();
+        let router = crate::app::app(scoped_two_combo(
+            "limits:\n  default:\n    tokens: 1\n    model: m\n",
+            exec,
+        ));
+
+        // The scoped model: over its ceiling, so refused.
+        let refused = drive(
+            &router,
+            chat("{\"model\":\"m\",\"messages\":[],\"max_tokens\":50}", &[]),
+        )
+        .await;
+        assert_eq!(
+            refused.status(),
+            StatusCode::PAYMENT_REQUIRED,
+            "the scoped ceiling must still bite the model it names"
+        );
+        assert_eq!(body_of(refused).await["error"]["reason"], "token_cap");
+
+        // A different model: the scoped ceiling does not apply, so it is
+        // served.
+        let served = drive(
+            &router,
+            chat("{\"model\":\"m2\",\"messages\":[],\"max_tokens\":50}", &[]),
+        )
+        .await;
+        assert_eq!(
+            served.status(),
+            StatusCode::OK,
+            "a ceiling scoped to `m` must not refuse `m2`: {}",
+            body_of(served).await
+        );
+        let seen = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            seen.len(),
+            1,
+            "only the unscoped model was dispatched: {seen:?}"
+        );
     }
 
     #[tokio::test]

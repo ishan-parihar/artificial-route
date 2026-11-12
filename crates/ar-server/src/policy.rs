@@ -80,9 +80,14 @@ impl Policy {
     ///
     /// The key is the authenticated client key. Anonymous traffic shares the
     /// `default` row, which is what that row is for.
+    ///
+    /// `asked` is the model the client asked for — the combo id — and it is
+    /// what the row's `model:` scope is written against, so a row scoped to
+    /// `model: jev` does not rate-limit a request for `glm-5.3`. See
+    /// [`Self::key_cap`] for why the scope governs this arm.
     #[must_use]
-    pub fn rate_wait(&self, key_id: &str) -> Option<u64> {
-        let rpm = self.limits.for_key(key_id).rpm?;
+    pub fn rate_wait(&self, key_id: &str, asked: &str) -> Option<u64> {
+        let rpm = self.limits.for_request(key_id, asked).rpm?;
         let bucket = self.buckets.iter().find(|(value, _)| *value == rpm)?;
         bucket.1.check(key_id).err()
     }
@@ -92,16 +97,23 @@ impl Policy {
     /// `None` when the row arms no spend ceiling, which is the state every
     /// config written before the block existed.
     ///
-    /// Read from the **unscoped** row, for the same reason the per-target arm
-    /// is: the window that measures both arms comes from the key's own row,
-    /// and a row whose `model:` scope names another combo must not lose its
-    /// ceiling over that.
+    /// Read from the **scope-filtered** row: the `model:` scope says *when*
+    /// this key-wide ceiling applies, and a ceiling written for one combo
+    /// must not refuse every other combo the key asks for. The scope is
+    /// against the model the client asked for (the combo id), not the
+    /// upstream model that ends up serving it — `docs/23` G3 and the
+    /// `Limits::row_for` doc agree.
+    ///
+    /// The **per-target** arms are the opposite case and keep their own
+    /// scope: each `model_tokens` entry names the `provider/model` it
+    /// governs, so the map's keys are the scope there, and a row carrying
+    /// them must not lose them to a `model:` mismatch.
     #[must_use]
-    pub fn key_cap(&self, key_id: &str) -> Option<Cap> {
+    pub fn key_cap(&self, key_id: &str, asked: &str) -> Option<Cap> {
         if !self.armed {
             return None;
         }
-        let limit = self.limits.row_for(key_id);
+        let limit = self.limits.for_request(key_id, asked);
         if limit.usd_micros.is_none() && limit.tokens.is_none() && !limit.refuse_unpriced {
             return None;
         }
@@ -146,9 +158,31 @@ impl Policy {
     ///
     /// `None` is the cumulative case, which is also the case for every config
     /// written before the arm existed.
+    ///
+    /// Read from the **unscoped** row, because this window measures the
+    /// per-target arm's spend too and that arm keeps its own scope: a row
+    /// scoped to another model must not lose the window its `model_tokens`
+    /// entries are measured over. The key-wide arm's own window is
+    /// [`Self::key_spend_window`].
     #[must_use]
     pub fn spend_window(&self, key_id: &str) -> Option<Duration> {
         self.limits.row_for(key_id).spend_window()
+    }
+
+    /// The window the **key-wide** spend arm is measured over.
+    ///
+    /// Read from the **scope-filtered** row, because the key-wide ceiling is
+    /// the arm the `model:` scope governs. A row scoped to another model must
+    /// not measure this request's spend over a window it does not apply to.
+    ///
+    /// This can differ from [`Self::spend_window`], and the two arms use their
+    /// own deliberately: the key-wide arm compares one figure measured over
+    /// *its* window, and the per-target arm compares each target's figure
+    /// measured over *theirs*. Neither window leaks into the other's
+    /// comparison.
+    #[must_use]
+    pub fn key_spend_window(&self, key_id: &str, asked: &str) -> Option<Duration> {
+        self.limits.for_request(key_id, asked).spend_window()
     }
 }
 
@@ -216,17 +250,17 @@ mod tests {
     #[test]
     fn disabled_answers_nothing_limited() {
         let p = Policy::disabled();
-        assert!(p.rate_wait("anyone").is_none());
-        assert!(p.key_cap("anyone").is_none());
+        assert!(p.rate_wait("anyone", "m").is_none());
+        assert!(p.key_cap("anyone", "m").is_none());
     }
 
     #[test]
     fn the_429_arm_counts_one_key_independently() {
         let p = Policy::from_limits(&limits_yaml("limits:\n  default:\n    rpm: 1\n"), true);
-        assert!(p.rate_wait("k1").is_none(), "first request passes");
-        assert!(p.rate_wait("k1").is_some(), "second is told to wait");
+        assert!(p.rate_wait("k1", "m").is_none(), "first request passes");
+        assert!(p.rate_wait("k1", "m").is_some(), "second is told to wait");
         assert!(
-            p.rate_wait("k2").is_none(),
+            p.rate_wait("k2", "m").is_none(),
             "another key has its own bucket"
         );
     }
@@ -237,18 +271,24 @@ mod tests {
             &limits_yaml("limits:\n  default:\n    rpm: 5\n  keys:\n    needy:\n      rpm: 1\n"),
             true,
         );
-        assert!(p.rate_wait("needy").is_none());
+        assert!(p.rate_wait("needy", "m").is_none());
         assert!(
-            p.rate_wait("needy").is_some(),
+            p.rate_wait("needy", "m").is_some(),
             "the per-key bucket is its own"
         );
-        assert!(p.rate_wait("other").is_none(), "default bucket untouched");
+        assert!(
+            p.rate_wait("other", "m").is_none(),
+            "default bucket untouched"
+        );
     }
 
     #[test]
     fn a_response_only_row_arms_no_cap() {
         let p = Policy::from_limits(&limits_yaml("limits:\n  default:\n    rpm: 3\n"), true);
-        assert!(p.key_cap("k").is_none(), "rpm alone is not a spend ceiling");
+        assert!(
+            p.key_cap("k", "m").is_none(),
+            "rpm alone is not a spend ceiling"
+        );
     }
 
     #[test]
@@ -284,16 +324,91 @@ mod tests {
     }
 
     #[test]
-    fn a_scoped_row_still_arms_its_own_ceiling() {
-        // The scope names the COMBO the row applies to, not the arm's reach:
-        // the row's own ceiling governs the key it names, and the scope only
-        // decides which requests it is consulted for. A scope must not silently
-        // disarm the row.
+    fn a_scoped_row_arms_its_own_ceiling_for_its_own_model() {
+        // The scope names the COMBO the row applies to. The row's own ceiling
+        // governs the key it names, and the scope decides which requests it is
+        // consulted for — so the ceiling is armed for the scoped model and NOT
+        // for any other. Before the scope was applied at request time, a row
+        // scoped to `jev` refused every model that key asked for, which is the
+        // defect this test pins.
         let p = Policy::from_limits(
             &limits_yaml("limits:\n  keys:\n    k:\n      tokens: 100\n      model: jev\n"),
             true,
         );
-        assert_eq!(p.key_cap("k").and_then(|c| c.tokens), Some(100));
+        assert_eq!(
+            p.key_cap("k", "jev").and_then(|c| c.tokens),
+            Some(100),
+            "the scoped ceiling applies to the model it names"
+        );
+        assert!(
+            p.key_cap("k", "glm-5.3").is_none(),
+            "and to no other model: a ceiling written for one combo must not \
+             refuse every other combo the key asks for"
+        );
+    }
+
+    #[test]
+    fn a_scoped_row_does_not_rate_limit_another_model() {
+        // The 429 arm is a key-wide arm, so the scope governs it the same way
+        // the key-wide spend ceiling is governed.
+        let p = Policy::from_limits(
+            &limits_yaml("limits:\n  keys:\n    k:\n      rpm: 1\n      model: jev\n"),
+            true,
+        );
+        assert!(p.rate_wait("k", "jev").is_none(), "first request passes");
+        assert!(
+            p.rate_wait("k", "jev").is_some(),
+            "the scoped bucket still bites its own model"
+        );
+        assert!(
+            p.rate_wait("k", "glm-5.3").is_none(),
+            "and it does not bite a model the scope does not name"
+        );
+    }
+
+    #[test]
+    fn a_scoped_row_keeps_its_per_target_ceilings() {
+        // The per-target arms keep their OWN scope: each `model_tokens` entry
+        // names the `provider/model` it governs, so the map's keys are the
+        // scope there and a `model:` mismatch must not disarm them.
+        let p = Policy::from_limits(
+            &limits_yaml(
+                "limits:\n  keys:\n    k:\n      model: jev\n      model_tokens:\n        \"nvidia/z-ai/glm-5.3\": 500\n",
+            ),
+            true,
+        );
+        assert_eq!(
+            p.target_cap("k", "nvidia/z-ai/glm-5.3"),
+            Some(500),
+            "the per-target ceiling survives the scope mismatch"
+        );
+        assert!(p.has_target_caps("k"));
+    }
+
+    #[test]
+    fn a_scoped_row_keeps_the_window_its_per_target_ceilings_are_measured_over() {
+        // The window measures the per-target arm's spend, so it comes from the
+        // unscoped row; the key-wide arm's own window comes from the scoped
+        // one. A row that names both must not lose either.
+        let p = Policy::from_limits(
+            &limits_yaml("limits:\n  keys:\n    k:\n      model: jev\n      spend_window: 24h\n"),
+            true,
+        );
+        assert_eq!(
+            p.spend_window("k"),
+            Some(std::time::Duration::from_secs(24 * 3600)),
+            "the per-target arm's window is the unscoped one"
+        );
+        assert_eq!(
+            p.key_spend_window("k", "jev"),
+            Some(std::time::Duration::from_secs(24 * 3600)),
+            "and the key-wide arm reads its own"
+        );
+        assert_eq!(
+            p.key_spend_window("k", "other"),
+            None,
+            "a row scoped elsewhere has no window for this request"
+        );
     }
 
     #[test]
@@ -302,16 +417,19 @@ mod tests {
             &limits_yaml("limits:\n  default:\n    refuse_unpriced: true\n"),
             true,
         );
-        assert!(p.key_cap("k").is_some());
-        assert!(p.key_cap("k").unwrap().refuse_unpriced);
+        assert!(p.key_cap("k", "m").is_some());
+        assert!(p.key_cap("k", "m").unwrap().refuse_unpriced);
     }
 
     #[test]
     fn a_cap_without_a_ledger_is_not_a_cap() {
         let p = Policy::from_limits(&limits_yaml("limits:\n  default:\n    tokens: 10\n"), true);
-        assert!(p.key_cap("k").is_some(), "armed with a ledger behind it");
+        assert!(
+            p.key_cap("k", "m").is_some(),
+            "armed with a ledger behind it"
+        );
         let p = Policy::from_limits(&limits_yaml("limits:\n  default:\n    tokens: 10\n"), false);
-        assert!(p.key_cap("k").is_none());
+        assert!(p.key_cap("k", "m").is_none());
     }
 
     #[test]
@@ -322,7 +440,7 @@ mod tests {
             ),
             true,
         );
-        let cap = p.key_cap("k").expect("armed");
+        let cap = p.key_cap("k", "m").expect("armed");
         assert_eq!(cap.usd_micros, Some(7));
         assert_eq!(cap.tokens, Some(9));
         assert!(cap.refuse_unpriced);
