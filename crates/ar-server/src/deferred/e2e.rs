@@ -310,3 +310,55 @@ async fn a_non_streaming_request_is_never_deferred() {
         "a non-streaming body is not an event stream"
     );
 }
+
+/// A window at or above the request deadline can never fire: the deadline
+/// produces a typed 504 first, and a window longer than the deadline is
+/// silently inert. The clamp keeps the deferral usable.
+///
+/// The observable consequence is that the request still succeeds with a real
+/// status rather than committing to `200`.
+#[tokio::test]
+async fn a_window_at_or_above_the_deadline_does_not_defer() {
+    let exec = Arc::new(SlowSuccessExec {
+        delay: Duration::from_millis(400),
+    });
+    // The default request deadline is well under a second in this fixture's
+    // config? No: it is the built-in REQUEST_TIMEOUT, so a window of an hour
+    // is far above it.
+    let app = server_with(exec, Some(Duration::from_secs(3600)));
+    let response = drive(&app, chat()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_of(response).await;
+    assert!(
+        !body.contains("chat.completion.chunk"),
+        "no keepalive was emitted, so the window never fired: {body}"
+    );
+}
+
+/// The deferred body runs its own copy of the attempt loop, and that copy
+/// needs a **fresh** deadline. The request's deadline is an absolute instant
+/// set before the loop ran, so by the time the body starts it is spent — and
+/// a spent deadline makes `deadline_timeout` fire on the first poll, which
+/// would drop the body's attempt loop and report a failure for a request whose
+/// upstream was about to answer.
+///
+/// The proof is that the upstream's answer arrives even though the request's
+/// own deadline was already gone by the time the window closed.
+#[tokio::test]
+async fn the_deferred_body_gets_a_fresh_deadline() {
+    let exec = Arc::new(SlowSuccessExec {
+        delay: Duration::from_millis(400),
+    });
+    let app = server_with(exec, Some(WINDOW));
+    let response = drive(&app, chat()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_of(response).await;
+    assert!(
+        body.contains("[DONE]"),
+        "the body's attempt loop ran and relayed the answer: {body}"
+    );
+    assert!(
+        !body.contains("stream_error"),
+        "the answer arrived, so no failure was reported: {body}"
+    );
+}

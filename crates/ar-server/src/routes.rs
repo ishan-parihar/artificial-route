@@ -1050,11 +1050,29 @@ async fn handle_chat_inner(
     // frame. Ollama's stream is NDJSON, so a comment would corrupt it too, and
     // a deferred failure there would be a bare JSON line a client cannot
     // distinguish from a partial answer.
-    let commit_window = if canonical.stream && dialect.keepalive().is_some() {
-        state.config.deferred_headers
-    } else {
-        None
-    };
+    //
+    // The window is also clamped to stay strictly under the request deadline.
+    // The deadline is an absolute instant set before the attempt loop runs, so
+    // a window equal to it races the deadline evenly — and the deadline
+    // produces a typed 504, which is the answer the deployment already has.
+    // A window LONGER than the deadline can never fire at all. Either way the
+    // deferral is wasted, so the window is capped at the deadline less a
+    // margin, and an operator who sets a window at or above the deadline gets
+    // one that still defers rather than one that is silently inert.
+    let deadline_budget = canonical
+        .deadline
+        .map(|d| {
+            d.remaining()
+                .unwrap_or(Duration::ZERO)
+                .min(state.config.stream_deadline(canonical.model.as_ref()))
+        })
+        .unwrap_or_else(|| state.config.stream_deadline(canonical.model.as_ref()));
+    let commit_window = state.config.deferred_headers.filter(|window| {
+        canonical.stream
+            && dialect.keepalive().is_some()
+            && !deadline_budget.is_zero()
+            && *window < deadline_budget
+    });
 
     // The attempt loop, raced against the window.
     //
@@ -1075,8 +1093,21 @@ async fn handle_chat_inner(
     let deferred_resilience = Arc::clone(&state.resilience);
     let deferred_lkgp = Arc::clone(&state.lkgp);
     let deferred_exec = Arc::clone(&state.exec);
-    let deferred_deadline = canonical.deadline;
+    // The body's own deadline, not the request's.
+    //
+    // `canonical.deadline` is an absolute instant set before the attempt loop
+    // ran, so by the time the body starts it is already spent down to whatever
+    // the window left. Handing that to the body's own attempt loop would give
+    // it a near-zero budget, and `deadline_timeout` treats a spent deadline as
+    // zero — which fires on the first poll and drops the future. The body
+    // therefore gets a full, fresh deadline from the same budget the request
+    // was configured with, measured from when it actually starts.
     let deferred_fallback = state.config.stream_deadline(canonical.model.as_ref());
+    let deferred_canonical = {
+        let mut c = deferred_canonical;
+        c.deadline = Some(ar_route::Deadline::from_now(deferred_fallback));
+        c
+    };
 
     let attempt_fut = ar_route::attempt_loop_with_pins(
         &canonical,
@@ -1107,7 +1138,7 @@ async fn handle_chat_inner(
         let keepalive = dialect.keepalive();
         let body = async_stream::stream! {
             let outcome = deadline_timeout(
-                deferred_deadline,
+                deferred_canonical.deadline,
                 deferred_fallback,
                 ar_route::attempt_loop_with_pins(
                     &deferred_canonical,
