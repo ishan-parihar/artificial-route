@@ -1839,26 +1839,6 @@ impl Config {
         self.providers.iter().any(|p| p.id == id)
             || self.custom_providers.iter().any(|c| c.id == id)
     }
-
-    /// Whether `(provider, model)` may appear in `/v1/models`.
-    ///
-    /// Every per-model rule that lives in this crate, in the order
-    /// `ar_server::config::ServerConfig` applies them: the provider's own
-    /// exclusion list, then the operator's deny/allow lists. Deliberately *not*
-    /// the free-tier rule — that one needs the generated budget table, which
-    /// lives in `ar-registry`, and a method on `Config` cannot reach it without
-    /// making this crate own a second copy of the same table.
-    #[must_use]
-    pub fn exposes_model(&self, provider: &str, model: &str) -> bool {
-        if self
-            .provider_settings
-            .get(provider)
-            .is_some_and(|s| s.excludes(provider, model))
-        {
-            return false;
-        }
-        self.visibility.exposes(provider, model)
-    }
 }
 
 /// The device-code placeholder a `device_poll_url` may carry: `{code}`.
