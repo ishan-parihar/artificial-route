@@ -347,7 +347,7 @@ impl Dialect {
     /// `delta: {}` is what makes the frame inert: an empty delta has no `content`
     /// and no `role`, so it cannot be concatenated into an answer, and
     /// `finish_reason: null` keeps it from being read as the end of the stream.
-    fn keepalive(self) -> Option<&'static str> {
+    pub(crate) fn keepalive(self) -> Option<&'static str> {
         match self {
             Self::Anthropic => Some("event: ping\ndata: {\"type\":\"ping\"}\n\n"),
             Self::Responses => Some(RESPONSES_IN_PROGRESS),
@@ -381,6 +381,48 @@ impl Dialect {
             Self::Responses => Some(concat!(
                 "data: {\"type\":\"error\",\"code\":\"stream_error\",",
                 "\"message\":\"the upstream stream ended before it was complete\"}\n\n"
+            )),
+            Self::Ollama => None,
+        }
+    }
+
+    /// The frame naming a failure the server only learned after it had already
+    /// committed to `200` and started streaming.
+    ///
+    /// This is the deferred-headers path: when the commit window arms and the
+    /// window closes while the request is still unresolved, the response has
+    /// already told the client `200` + `text/event-stream`, and the keepalives
+    /// that follow are real bytes the edge is holding the connection open on. A
+    /// failure from that point on therefore cannot be a status code — it has to
+    /// be a frame.
+    ///
+    /// The frame carries the same `error` object the JSON path serializes, so a
+    /// client that already parses an error from a body sees the same shape here.
+    /// `code` is `stream_error`, the one code that means "the story changed after
+    /// the headers", which is why it is distinct from `upstream_unavailable`: a
+    /// client branching on `code` can tell a request that failed outright from
+    /// one whose stream was promised and then withdrawn.
+    ///
+    /// Ollama's is `None`: NDJSON has no comment and no event frame, and a
+    /// deferred failure there would be a bare JSON line a client cannot
+    /// distinguish from a partial answer.
+    pub(crate) fn deferred_error(self) -> Option<&'static str> {
+        match self {
+            Self::Anthropic => Some(concat!(
+                "event: error\n",
+                "data: {\"type\":\"error\",\"error\":{\"type\":\"stream_error\",",
+                "\"code\":\"stream_error\",\"reason\":\"deferred_failure\",",
+                "\"message\":\"the request failed after the response had started\"}}\n\n"
+            )),
+            Self::OpenAi => Some(concat!(
+                "data: {\"error\":{\"type\":\"stream_error\",\"code\":\"stream_error\",",
+                "\"reason\":\"deferred_failure\",",
+                "\"message\":\"the request failed after the response had started\"}}\n\n"
+            )),
+            Self::Responses => Some(concat!(
+                "data: {\"type\":\"error\",\"code\":\"stream_error\",",
+                "\"reason\":\"deferred_failure\",",
+                "\"message\":\"the request failed after the response had started\"}\n\n"
             )),
             Self::Ollama => None,
         }
@@ -993,19 +1035,114 @@ async fn handle_chat_inner(
             .await
             .with_guard(guard_verdict);
     }
-    let mut outcome = match deadline_timeout(
-        canonical.deadline,
-        state.config.stream_deadline(canonical.model.as_ref()),
-        ar_route::attempt_loop_with_pins(
-            &canonical,
-            &plan.chain,
-            state.exec.as_ref(),
-            &state.resilience,
-            Some(&state.lkgp),
-        ),
+    // The commit window: how long a streaming request may wait for its
+    // upstream's headers before the server commits to `200` and starts keeping
+    // the connection alive itself.
+    //
+    // `None` — the default — means "wait for the real status however long the
+    // deadline says", which is every behaviour that predates the field. It is
+    // also the answer for a **non-streaming** request, whose body is one JSON
+    // chunk that a keepalive comment would corrupt: there is no way to keep
+    // that alive without changing its shape, so the deadline still applies
+    // there and the typed 502 it produces today is still the answer.
+    //
+    // A window is also only meaningful for a dialect that HAS a keepalive
+    // frame. Ollama's stream is NDJSON, so a comment would corrupt it too, and
+    // a deferred failure there would be a bare JSON line a client cannot
+    // distinguish from a partial answer.
+    let commit_window = if canonical.stream && dialect.keepalive().is_some() {
+        state.config.deferred_headers
+    } else {
+        None
+    };
+
+    // The attempt loop, raced against the window.
+    //
+    // The loop is the thing that produces the upstream's real status, so it
+    // cannot be abandoned when the window closes — it is *moved* into the
+    // response body, which then relays whatever it produced. A failure that
+    // arrives after the commitment is named in-band, because the status that
+    // would have carried it has already been sent.
+    //
+    // The future owns what it borrows. A deferred future outlives this
+    // function's stack frame — it runs inside the response body, which the
+    // client may still be reading long after the handler has returned — so the
+    // canonical request and the chain are cloned into it and the shared state
+    // is moved in as the `Arc` it already is. A future that borrowed the
+    // handler's locals could not be handed to the body at all.
+    let deferred_canonical = canonical.clone();
+    let deferred_chain = plan.chain.clone();
+    let deferred_resilience = Arc::clone(&state.resilience);
+    let deferred_lkgp = Arc::clone(&state.lkgp);
+    let deferred_exec = Arc::clone(&state.exec);
+    let deferred_deadline = canonical.deadline;
+    let deferred_fallback = state.config.stream_deadline(canonical.model.as_ref());
+
+    let attempt_fut = ar_route::attempt_loop_with_pins(
+        &canonical,
+        &plan.chain,
+        state.exec.as_ref(),
+        &state.resilience,
+        Some(&state.lkgp),
+    );
+    let (commit, pending) = crate::deferred::race_window(
+        commit_window,
+        Box::pin(deadline_timeout(
+            canonical.deadline,
+            state.config.stream_deadline(canonical.model.as_ref()),
+            attempt_fut,
+        )),
     )
-    .await
-    {
+    .await;
+
+    // The deferred branch: the window closed with the request unresolved, so
+    // the response commits to `200` + `text/event-stream` now and the attempt
+    // loop continues in the background.
+    if let crate::deferred::Commit::Deferred = commit {
+        // The pending future borrowed the handler's locals, so it cannot be
+        // moved into the response body. The body therefore runs its own copy
+        // of the attempt loop over the owned clones — the same loop, the same
+        // chain, the same state, and the request it abandons is dropped when
+        // the body is dropped.
+        let keepalive = dialect.keepalive();
+        let body = async_stream::stream! {
+            let outcome = deadline_timeout(
+                deferred_deadline,
+                deferred_fallback,
+                ar_route::attempt_loop_with_pins(
+                    &deferred_canonical,
+                    &deferred_chain,
+                    deferred_exec.as_ref(),
+                    deferred_resilience.as_ref(),
+                    Some(deferred_lkgp.as_ref()),
+                ),
+            )
+            .await;
+            // A success relays its chunks. Anything else — a deadline, a
+            // routing error, or a failover the chain exhausted — produced no
+            // outcome to relay, so there is nothing to name: the deferred
+            // frame says the request failed, which is the truth.
+            if let Ok(Ok(AttemptOutcome::Succeeded { upstream, .. })) = outcome {
+                let mut stream = upstream.stream;
+                while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+                    yield Ok::<bytes::Bytes, std::convert::Infallible>(chunk);
+                }
+            }
+        };
+        return crate::deferred::deferred_response(dialect, keepalive, body)
+            .with_guard(guard_verdict);
+    }
+
+    let outcome = match pending {
+        Some(pending) => pending.await,
+        None => match commit {
+            crate::deferred::Commit::Resolved(done) => done,
+            crate::deferred::Commit::Deferred => {
+                unreachable!("the deferred branch returns above")
+            }
+        },
+    };
+    let mut outcome = match outcome {
         // The model-aware deadline is the narrower of the two, so it is the one
         // the client sees: the router-wide layer is set to the widest deadline
         // any model asked for precisely so it cannot pre-empt this.

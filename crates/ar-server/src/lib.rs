@@ -62,6 +62,7 @@
 
 pub mod app;
 pub mod config;
+pub mod deferred;
 pub mod exec;
 pub mod keys;
 pub mod media;

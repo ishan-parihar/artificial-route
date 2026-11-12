@@ -121,6 +121,29 @@ pub const AUTH_MODE_VAR: &str = "AR_AUTH_MODE";
 /// needs a fork of the fetch, and a half-honoured URL is worse than none.
 pub const DISCOVERY_VAR: &str = "AR_MODEL_DISCOVERY";
 
+/// Environment variable carrying the deferred-headers commit window.
+///
+/// The number of seconds a streaming request may wait for its upstream's
+/// headers before the server commits to `200` + `text/event-stream` and keeps
+/// the connection alive with keepalives instead.
+///
+/// This exists because an HTTP edge in front of the proxy has its own
+/// time-to-first-byte limit — Cloudflare's Proxy Read Timeout is 125 s — and
+/// that limit is an *idle* timeout: it resets whenever the origin sends a
+/// byte. A server that sends nothing until its upstream answers therefore
+/// fails at the edge even when the upstream would have answered in time, and
+/// the failure is invisible as a 524 rather than as the upstream's own error.
+///
+/// Committing early is not free, so the window is deliberate: a status the
+/// upstream sends *quickly* (a 429, a 402, a 400) still reaches the client as
+/// that status, because it arrives long before the window closes. Only a
+/// request that is still unresolved when the window closes commits to 200.
+///
+/// Off by default (`0` or unset): a deployment that is not behind such an
+/// edge has no reason to give up a real status code, and the default must
+/// leave every existing behaviour exactly as it was.
+pub const DEFERRED_HEADERS_VAR: &str = "AR_DEFERRED_HEADERS_SECS";
+
 /// The key [`STREAM_TIMEOUT_VAR`]'s bare-number form writes under.
 ///
 /// A real model could be named `*`, so the fallback slot is not a model id — it is
@@ -498,6 +521,19 @@ pub struct ServerConfig {
     /// The home for a provider's own `excluded_models` globs — upstream's
     /// `provider_specific_data.excludedModels`.
     pub provider_settings: BTreeMap<String, ProviderSettings>,
+
+    /// How long a streaming request may wait before the server commits to
+    /// `200` and starts keeping the connection alive itself.
+    ///
+    /// `None` — the default, and the answer when
+    /// [`DEFERRED_HEADERS_VAR`] is unset or `0` — means "wait for the upstream's
+    /// real status however long the deadline says", which is every behaviour that
+    /// predates the field.
+    ///
+    /// A `Some(window)` deployment is one behind an edge with its own
+    /// time-to-first-byte limit, where the window is that limit minus a margin.
+    /// See [`DEFERRED_HEADERS_VAR`] for what the window does and does not give up.
+    pub deferred_headers: Option<Duration>,
 }
 
 impl ServerConfig {
@@ -523,6 +559,7 @@ impl ServerConfig {
             model_discovery: false,
             visibility: ModelVisibility::default(),
             provider_settings: BTreeMap::new(),
+            deferred_headers: None,
         }
     }
 
@@ -649,6 +686,39 @@ impl ServerConfig {
                 raw.trim().to_ascii_lowercase().as_str(),
                 "1" | "true" | "on" | "yes"
             );
+        }
+        self
+    }
+
+    /// Reads [`DEFERRED_HEADERS_VAR`] into [`Self::deferred_headers`].
+    ///
+    /// A positive number of seconds arms the window. `0`, a missing value, or a
+    /// value that is not a number leaves the feature off, which is the default
+    /// and the answer for a deployment with no edge in front of it.
+    ///
+    /// A bad value is dropped with a warning rather than refusing the config, on
+    /// the same grounds as [`Self::with_timeouts_from_env`]: refusing here would
+    /// let one typo take down a server that was routing fine.
+    #[must_use]
+    pub fn with_deferred_headers_from_env(mut self) -> Self {
+        let Some(raw) = env(DEFERRED_HEADERS_VAR) else {
+            return self;
+        };
+        let trimmed = raw.trim();
+        match trimmed.parse::<u64>() {
+            Ok(secs) if secs > 0 => {
+                self.deferred_headers = Some(Duration::from_secs(secs));
+            }
+            Ok(_) => {
+                tracing::warn!(
+                    "ar: {DEFERRED_HEADERS_VAR} ignored the zero window: the feature stays off"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "ar: {DEFERRED_HEADERS_VAR} ignored {trimmed:?}: not a positive number of seconds"
+                );
+            }
         }
         self
     }
@@ -821,11 +891,13 @@ impl ServerConfig {
             model_discovery: false,
             visibility: cfg.visibility.clone(),
             provider_settings: cfg.provider_settings.clone(),
+            deferred_headers: None,
         }
         .with_http_master_key_from_env()
         .with_auth_mode_from_env()
         .with_timeouts_from_env()
-        .with_model_discovery_from_env())
+        .with_model_discovery_from_env()
+        .with_deferred_headers_from_env())
     }
 
     /// The combo a client's `model` names.
@@ -1276,6 +1348,7 @@ impl ServerConfig {
         .with_auth_mode_from_env()
         .with_timeouts_from_env()
         .with_model_discovery_from_env()
+        .with_deferred_headers_from_env()
     }
 
     /// Builds a single-chain config from already-resolved values.
