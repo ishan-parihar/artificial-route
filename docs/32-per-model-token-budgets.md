@@ -164,6 +164,16 @@ ledger's spend **for that target only**.
 - **The key-wide ceiling still binds the key as a whole.** A key whose total
   spend passes `tokens` is refused for every target. The per-target arm is an
   *additional* constraint, not a replacement for the total.
+- **A row's `model:` scope governs the whole row, per-target ceilings
+  included.** *(Corrected 2026-11-12.)* This document's original text implied
+  the per-target ceilings keep a scope of their own, so a row scoped to one
+  combo would still govern every other combo's targets. It does not: a row is
+  a unit, and the scope that selects the row selects every arm in it. The
+  per-target arm keeps its own **axis** — each ceiling is measured against
+  that target's spend, not the key's whole history — but the axis is not a
+  second scope. `ar-config`'s `Limit.model` doc says the scope covers "the
+  spend arms" and that "a scoped row is skipped for any other model, so the
+  key is unrestricted there", and that is the contract.
 - **A zero is refused at parse**, like every other arm: `0` reads as "never" to
   an operator and "unlimited" to the engine.
 - **An unknown target is refused at load** — a `model_tokens` key naming a

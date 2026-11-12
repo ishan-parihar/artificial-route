@@ -13,6 +13,16 @@
 //! records against. Both arms are opt-in: a config that never mentions
 //! `limits:` gets [`Policy::disabled`], which answers everything without
 //! touching a lock.
+//!
+//! **One scope governs the whole row.** `Limit.model` is read by every arm —
+//! the 429 bucket, the key-wide ceiling and the per-target ceilings included —
+//! as *the row that applies to this request*, which is [`Limits::for_request`]:
+//! the key's own row when its scope names the combo the client asked for, else
+//! `default`, else nothing. A row scoped to one combo therefore governs that
+//! combo's 429 bucket, its key-wide ceiling and the targets that combo routes
+//! to, and governs nothing else. Each arm keeps its own **axis** inside that:
+//! the key-wide arms are measured against the key's whole spend, and a
+//! per-target ceiling against the spend recorded for the target it names.
 
 use std::time::Duration;
 
@@ -102,12 +112,11 @@ impl Policy {
     /// must not refuse every other combo the key asks for. The scope is
     /// against the model the client asked for (the combo id), not the
     /// upstream model that ends up serving it — `docs/23` G3 and the
-    /// `Limits::row_for` doc agree.
+    /// `Limits::for_request` doc agree.
     ///
-    /// The **per-target** arms are the opposite case and keep their own
-    /// scope: each `model_tokens` entry names the `provider/model` it
-    /// governs, so the map's keys are the scope there, and a row carrying
-    /// them must not lose them to a `model:` mismatch.
+    /// The per-target arms read the same row: a row is a unit, so the scope
+    /// that picks the row picks every arm in it. What differs between the
+    /// arms is the **axis** they measure over, not the row they come from.
     #[must_use]
     pub fn key_cap(&self, key_id: &str, asked: &str) -> Option<Cap> {
         if !self.armed {
@@ -132,14 +141,22 @@ impl Policy {
     /// uses. The model half may itself contain `/`, so the provider is the
     /// **first** segment and the rest is the model.
     ///
-    /// Read from the **unscoped** row: each entry names the target it governs,
-    /// so the map's own keys are the scope. A row whose `model:` scope names
-    /// a different combo still governs the targets it names — otherwise a
-    /// scoped row would silently lose its per-target ceilings.
+    /// Read from the **scope-filtered** row, the same row the key-wide arm
+    /// reads: the `model:` scope is a statement about the whole row, so a row
+    /// scoped to one combo must not reach across and govern another combo's
+    /// targets. `Limit.model`'s own doc says the scope covers "the spend arms"
+    /// — plural — and that "a scoped row is skipped for any other model, so
+    /// the key is unrestricted there".
+    ///
+    /// What the per-target arm keeps is its own **axis**: the ceiling is
+    /// measured against the spend recorded for that target alone, not the
+    /// key's whole history. That is a statement about *what* it counts, and it
+    /// is orthogonal to the scope's statement about *when* the row applies.
+    /// Two axes, one scope.
     #[must_use]
-    pub fn target_cap(&self, key_id: &str, target: &str) -> Option<u64> {
+    pub fn target_cap(&self, key_id: &str, asked: &str, target: &str) -> Option<u64> {
         self.limits
-            .row_for(key_id)
+            .for_request(key_id, asked)
             .model_tokens
             .get(target)
             .copied()
@@ -150,8 +167,12 @@ impl Policy {
     /// The arm is opt-in, so a caller that has no per-target ceiling must not
     /// pay to read the ledger on its behalf.
     #[must_use]
-    pub fn has_target_caps(&self, key_id: &str) -> bool {
-        !self.limits.row_for(key_id).model_tokens.is_empty()
+    pub fn has_target_caps(&self, key_id: &str, asked: &str) -> bool {
+        !self
+            .limits
+            .for_request(key_id, asked)
+            .model_tokens
+            .is_empty()
     }
 
     /// The window this key's spend arms are measured over.
@@ -159,29 +180,18 @@ impl Policy {
     /// `None` is the cumulative case, which is also the case for every config
     /// written before the arm existed.
     ///
-    /// Read from the **unscoped** row, because this window measures the
-    /// per-target arm's spend too and that arm keeps its own scope: a row
-    /// scoped to another model must not lose the window its `model_tokens`
-    /// entries are measured over. The key-wide arm's own window is
-    /// [`Self::key_spend_window`].
-    #[must_use]
-    pub fn spend_window(&self, key_id: &str) -> Option<Duration> {
-        self.limits.row_for(key_id).spend_window()
-    }
-
-    /// The window the **key-wide** spend arm is measured over.
+    /// Read from the **scope-filtered** row: the window measures the spend
+    /// arms' spend, and both arms belong to the row the scope selects. A row
+    /// scoped to another combo must not measure this request's spend over a
+    /// window it does not apply to.
     ///
-    /// Read from the **scope-filtered** row, because the key-wide ceiling is
-    /// the arm the `model:` scope governs. A row scoped to another model must
-    /// not measure this request's spend over a window it does not apply to.
-    ///
-    /// This can differ from [`Self::spend_window`], and the two arms use their
-    /// own deliberately: the key-wide arm compares one figure measured over
-    /// *its* window, and the per-target arm compares each target's figure
-    /// measured over *theirs*. Neither window leaks into the other's
-    /// comparison.
+    /// Both arms read this one window, because both arms live in the same row
+    /// and a row's window is that row's window. That is what makes the two
+    /// arms comparable: the key-wide figure and the per-target figure are
+    /// both measured over the same span, so a ceiling written against one is
+    /// not silently compared against a figure from the other.
     #[must_use]
-    pub fn key_spend_window(&self, key_id: &str, asked: &str) -> Option<Duration> {
+    pub fn spend_window(&self, key_id: &str, asked: &str) -> Option<Duration> {
         self.limits.for_request(key_id, asked).spend_window()
     }
 }
@@ -367,10 +377,11 @@ mod tests {
     }
 
     #[test]
-    fn a_scoped_row_keeps_its_per_target_ceilings() {
-        // The per-target arms keep their OWN scope: each `model_tokens` entry
-        // names the `provider/model` it governs, so the map's keys are the
-        // scope there and a `model:` mismatch must not disarm them.
+    fn a_scoped_row_keeps_its_per_target_ceilings_for_its_own_model() {
+        // The scope governs the WHOLE row: the per-target ceilings in it apply
+        // to the combo the scope names, and to no other. The per-target arm
+        // keeps its own AXIS — each ceiling is measured against that target's
+        // spend — but the axis is not a second scope.
         let p = Policy::from_limits(
             &limits_yaml(
                 "limits:\n  keys:\n    k:\n      model: jev\n      model_tokens:\n        \"nvidia/z-ai/glm-5.3\": 500\n",
@@ -378,34 +389,52 @@ mod tests {
             true,
         );
         assert_eq!(
-            p.target_cap("k", "nvidia/z-ai/glm-5.3"),
+            p.target_cap("k", "jev", "nvidia/z-ai/glm-5.3"),
             Some(500),
-            "the per-target ceiling survives the scope mismatch"
+            "the per-target ceiling governs the combo the scope names"
         );
-        assert!(p.has_target_caps("k"));
+        assert!(p.has_target_caps("k", "jev"));
+    }
+
+    #[test]
+    fn a_scoped_row_does_not_reach_another_models_per_target_ceilings() {
+        // The defect this pins: the per-target arm read the UNSCOPED row, so a
+        // row scoped to `jev` still governed the targets of every other combo
+        // the key asked for. The scope is a statement about the row, and a
+        // scoped row is skipped for any other model.
+        let p = Policy::from_limits(
+            &limits_yaml(
+                "limits:\n  keys:\n    k:\n      model: jev\n      model_tokens:\n        \"nvidia/z-ai/glm-5.3\": 500\n",
+            ),
+            true,
+        );
+        assert_eq!(
+            p.target_cap("k", "glm-5.3", "nvidia/z-ai/glm-5.3"),
+            None,
+            "a row scoped to `jev` must not govern another model's target"
+        );
+        assert!(
+            !p.has_target_caps("k", "glm-5.3"),
+            "and it arms nothing for that model"
+        );
     }
 
     #[test]
     fn a_scoped_row_keeps_the_window_its_per_target_ceilings_are_measured_over() {
-        // The window measures the per-target arm's spend, so it comes from the
-        // unscoped row; the key-wide arm's own window comes from the scoped
-        // one. A row that names both must not lose either.
+        // One row, one window. The window measures the spend arms' spend, and
+        // both arms live in the row the scope selects, so both read the same
+        // window — the two cannot disagree about which spend is in force.
         let p = Policy::from_limits(
             &limits_yaml("limits:\n  keys:\n    k:\n      model: jev\n      spend_window: 24h\n"),
             true,
         );
         assert_eq!(
-            p.spend_window("k"),
+            p.spend_window("k", "jev"),
             Some(std::time::Duration::from_secs(24 * 3600)),
-            "the per-target arm's window is the unscoped one"
+            "the scoped row's window measures its own arms"
         );
         assert_eq!(
-            p.key_spend_window("k", "jev"),
-            Some(std::time::Duration::from_secs(24 * 3600)),
-            "and the key-wide arm reads its own"
-        );
-        assert_eq!(
-            p.key_spend_window("k", "other"),
+            p.spend_window("k", "other"),
             None,
             "a row scoped elsewhere has no window for this request"
         );
@@ -455,42 +484,31 @@ mod tests {
             true,
         );
         assert_eq!(
-            p.target_cap("k", "nvidia/z-ai/glm-5.3"),
+            p.target_cap("k", "m", "nvidia/z-ai/glm-5.3"),
             Some(500),
             "the named target is governed"
         );
         assert_eq!(
-            p.target_cap("k", "nvidia/other"),
+            p.target_cap("k", "m", "nvidia/other"),
             None,
             "a target the row does not name is not governed by it"
         );
     }
 
     #[test]
-    fn a_per_target_ceiling_survives_a_row_scoped_to_another_combo() {
-        // The scope names the combo the row applies to; each entry in
-        // `model_tokens` names the target it governs. Dropping the row for a
-        // scope mismatch would silently lose the per-target ceilings.
-        let p = Policy::from_limits(
-            &limits_yaml(
-                "limits:\n  keys:\n    k:\n      model: jev\n      model_tokens:\n        \"nvidia/z-ai/glm-5.3\": 500\n",
-            ),
-            true,
-        );
-        assert_eq!(p.target_cap("k", "nvidia/z-ai/glm-5.3"), Some(500));
-    }
-
-    #[test]
     fn the_window_is_read_from_the_keys_own_row() {
-        // One window per key, and it measures BOTH spend arms, so the two can
+        // One window per row, and it measures BOTH spend arms, so the two can
         // never disagree about which spend is in force.
         let p = Policy::from_limits(
             &limits_yaml("limits:\n  keys:\n    k:\n      spend_window: 24h\n"),
             true,
         );
-        assert_eq!(p.spend_window("k"), Some(Duration::from_secs(24 * 3_600)));
         assert_eq!(
-            p.spend_window("other"),
+            p.spend_window("k", "m"),
+            Some(Duration::from_secs(24 * 3_600))
+        );
+        assert_eq!(
+            p.spend_window("other", "m"),
             None,
             "a key without a row inherits the DEFAULT row, and that row names no window"
         );
@@ -502,7 +520,7 @@ mod tests {
             &limits_yaml("limits:\n  keys:\n    k:\n      tokens: 10\n"),
             true,
         );
-        assert_eq!(p.spend_window("k"), None);
+        assert_eq!(p.spend_window("k", "m"), None);
     }
 
     #[test]

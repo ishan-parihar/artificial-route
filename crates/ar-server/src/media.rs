@@ -399,26 +399,23 @@ async fn respond_media(
     // The scope key is the model the client asked for — `model`, which is the
     // combo id the route resolved — so a `model:`-scoped row governs this
     // request exactly as it governs a chat request for the same combo.
+    // One row, one window: the scope selects the row that applies to this
+    // request, and both spend arms in that row are measured over its window.
     if let Some(ledger) = state.ledger.as_ref() {
-        let window = state.policy.spend_window(policy_key);
-        let key_window = state.policy.key_spend_window(policy_key, model);
-        let (breakdown, key_breakdown) = {
+        let window = state.policy.spend_window(policy_key, model);
+        let since = window.map(|w| epoch_now().saturating_sub(w.as_secs() as i64));
+        let breakdown = {
             let guard = ledger
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let target_since = window.map(|w| epoch_now().saturating_sub(w.as_secs() as i64));
-            let key_since = key_window.map(|w| epoch_now().saturating_sub(w.as_secs() as i64));
-            (
-                guard.spend_breakdown(policy_key, target_since),
-                guard.spend_breakdown(policy_key, key_since),
-            )
+            guard.spend_breakdown(policy_key, since)
         };
-        let (breakdown, key_breakdown) = match (breakdown, key_breakdown) {
-            (Ok(a), Ok(b)) => (a, b),
-            _ => {
+        let breakdown = match breakdown {
+            Ok(breakdown) => breakdown,
+            Err(e) => {
                 // A ledger that cannot be read cannot evaluate a ceiling, and
                 // a cap that fails open is not a cap.
-                tracing::warn!("spend ledger could not be read");
+                tracing::warn!(error = %e, "spend ledger could not be read");
                 let mut resp = error_because(
                     StatusCode::PAYMENT_REQUIRED,
                     "payment_required",
@@ -436,10 +433,10 @@ async fn respond_media(
         // route. An unpriced model projects UNPRICED, which is what
         // `refuse_unpriced` denies.
         if let Some(cap) = state.policy.key_cap(policy_key, model) {
-            let spend = if key_window.is_some() {
-                key_breakdown.windowed
+            let spend = if window.is_some() {
+                breakdown.windowed
             } else {
-                key_breakdown.total
+                breakdown.total
             };
             let projection = crate::policy::Projection {
                 provider: plan.chain.first().map_or("", |t| t.provider.as_str()),
@@ -484,7 +481,7 @@ async fn respond_media(
         let mut refused = Vec::new();
         for target in &plan.chain {
             let name = format!("{}/{}", target.provider.as_str(), target.model);
-            let Some(cap) = state.policy.target_cap(policy_key, &name) else {
+            let Some(cap) = state.policy.target_cap(policy_key, model, &name) else {
                 kept.push(target.clone());
                 continue;
             };

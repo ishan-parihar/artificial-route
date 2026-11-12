@@ -853,36 +853,28 @@ async fn handle_chat_inner(
     // `model`, which a combo id is resolved against and never rewritten.
     let asked = canonical.model.clone();
     if let Some(ledger) = state.ledger.as_ref() {
-        // Two rows, two windows, because the scope governs one arm and not the
-        // other: the key-wide arm reads the SCOPED row (a `model:` scope is
-        // exactly a statement about which combo its ceiling applies to), and
-        // the per-target arm reads the UNSCOPED row (each `model_tokens` entry
-        // names the target it governs, so the map's keys are the scope there).
-        //
-        // So there are two breakdowns, not one: the key-wide arm's windowed
-        // figure is measured over its own window, and the per-target arm's over
-        // its own. A single `since` would give one of them the other's figure.
-        let window = state.policy.spend_window(policy_key);
-        let key_window = state.policy.key_spend_window(policy_key, asked.as_ref());
-        let (breakdown, key_breakdown) = {
+        // One row, one window. The scope selects the row that applies to this
+        // request (`Limits::for_request`), and every arm in that row — the
+        // key-wide ceiling and the per-target ceilings — is measured over the
+        // row's own window. So there is one breakdown, not two: a second one
+        // would compare a figure measured over one window against a ceiling
+        // written for another.
+        let window = state.policy.spend_window(policy_key, asked.as_ref());
+        let since = window.map(|w| epoch_now().saturating_sub(w.as_secs() as i64));
+        let breakdown = {
             // Poisoned is the record path's convention too: a ledger that
             // panicked mid-write is a bug to surface, not a ceiling to guess.
             let guard = ledger
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let target_since = window.map(|w| epoch_now().saturating_sub(w.as_secs() as i64));
-            let key_since = key_window.map(|w| epoch_now().saturating_sub(w.as_secs() as i64));
-            (
-                guard.spend_breakdown(policy_key, target_since),
-                guard.spend_breakdown(policy_key, key_since),
-            )
+            guard.spend_breakdown(policy_key, since)
         };
-        let (breakdown, key_breakdown) = match (breakdown, key_breakdown) {
-            (Ok(a), Ok(b)) => (a, b),
-            _ => {
+        let breakdown = match breakdown {
+            Ok(breakdown) => breakdown,
+            Err(e) => {
                 // A ledger that cannot be read cannot evaluate a ceiling, and a
                 // cap that fails open is not a cap.
-                tracing::warn!("spend ledger could not be read");
+                tracing::warn!(error = %e, "spend ledger could not be read");
                 let mut resp = error_because(
                     StatusCode::PAYMENT_REQUIRED,
                     "payment_required",
@@ -902,15 +894,15 @@ async fn handle_chat_inner(
         // The comparison itself is `ar-tokens`' own, so the refusal the client
         // sees and the one the store's cap produces are the same words.
         //
-        // The key-wide arm reads the SCOPED row and the SCOPED window: this is
-        // the arm a `model:` scope governs, so a ceiling written for one combo
-        // must neither refuse another combo nor measure this request over a
-        // window it does not apply to.
+        // The key-wide arm reads the SCOPED row: this is the arm a `model:`
+        // scope governs, so a ceiling written for one combo must neither
+        // refuse another combo nor measure this request over a window it does
+        // not apply to.
         if let Some(cap) = state.policy.key_cap(policy_key, asked.as_ref()) {
-            let spend = if key_window.is_some() {
-                key_breakdown.windowed
+            let spend = if window.is_some() {
+                breakdown.windowed
             } else {
-                key_breakdown.total
+                breakdown.total
             };
             let projection = crate::policy::Projection {
                 provider: plan.chain.first().map_or("", |t| t.provider.as_str()),
@@ -948,8 +940,13 @@ async fn handle_chat_inner(
         // The per-target arm: a target that has reached its own ceiling is
         // dropped from the chain, and the request continues on a sibling that
         // has budget left. Only a chain with nothing left is refused.
-        let (kept, refused) =
-            filter_by_target_budget(&state.policy, policy_key, &plan.chain, &breakdown);
+        let (kept, refused) = filter_by_target_budget(
+            &state.policy,
+            policy_key,
+            asked.as_ref(),
+            &plan.chain,
+            &breakdown,
+        );
         if !refused.is_empty() && kept.is_empty() {
             let mut resp = error_because(
                 StatusCode::PAYMENT_REQUIRED,
@@ -1957,7 +1954,12 @@ async fn pipeline_response(
     // The per-target budget reaches the pipeline too: a stage whose own
     // budget is spent would fail the whole chain, and the stages are not a
     // fallback chain — each one answers a different question.
-    let stage_candidates = match budget_filtered_candidates(state, policy_key, &stage_candidates) {
+    let stage_candidates = match budget_filtered_candidates(
+        state,
+        policy_key,
+        canonical.model.as_ref(),
+        &stage_candidates,
+    ) {
         Ok(candidates) => candidates,
         Err(refusal) => return *refusal,
     };
@@ -2079,7 +2081,12 @@ async fn fusion_response(
     }
     // The per-target budget reaches the panel too: a member whose own budget
     // is spent would spend the operator's money for an answer nobody can use.
-    let panel_candidates = match budget_filtered_candidates(state, policy_key, &panel_candidates) {
+    let panel_candidates = match budget_filtered_candidates(
+        state,
+        policy_key,
+        canonical.model.as_ref(),
+        &panel_candidates,
+    ) {
         Ok(candidates) => candidates,
         Err(refusal) => return *refusal,
     };
@@ -3159,18 +3166,24 @@ struct RefusedTarget {
 /// The spend compared is the windowed figure when the key's row names a
 /// window, and the cumulative figure otherwise — the same window the key-wide
 /// arm uses, so the two cannot disagree about which spend is in force.
+///
+/// The ceiling is read from the row the scope selects, exactly as the key-wide
+/// arm's is: a row scoped to one combo governs the targets that combo routes
+/// to and no others, and each named ceiling is still measured against that
+/// target's own spend.
 fn filter_by_target_budget(
     policy: &crate::policy::Policy,
     key_id: &str,
+    asked: &str,
     chain: &[ChainTarget],
     breakdown: &ar_tokens::SpendBreakdown,
 ) -> (Vec<ChainTarget>, Vec<RefusedTarget>) {
-    let windowed = policy.spend_window(key_id).is_some();
+    let windowed = policy.spend_window(key_id, asked).is_some();
     let mut kept = Vec::with_capacity(chain.len());
     let mut refused = Vec::new();
     for target in chain {
         let name = format!("{}/{}", target.provider.as_str(), target.model);
-        let Some(cap) = policy.target_cap(key_id, &name) else {
+        let Some(cap) = policy.target_cap(key_id, asked, &name) else {
             kept.push(target.clone());
             continue;
         };
@@ -3217,17 +3230,22 @@ fn target_cap_message(refused: &[RefusedTarget]) -> String {
 fn budget_filtered_candidates(
     state: &AppState,
     key_id: &str,
+    asked: &str,
     candidates: &[ar_route::Candidate],
 ) -> Result<Vec<ar_route::Candidate>, Box<Response>> {
     let Some(ledger) = state.ledger.as_ref() else {
         return Ok(candidates.to_vec());
     };
     // A key with no per-target ceiling is never filtered: the arm is opt-in,
-    // and reading the ledger for it would be a cost for nothing.
-    if state.policy.spend_window(key_id).is_none() && !state.policy.has_target_caps(key_id) {
+    // and reading the ledger for it would be a cost for nothing. The check is
+    // against the row the scope selects, so a row scoped to another combo
+    // leaves this request unfiltered.
+    if state.policy.spend_window(key_id, asked).is_none()
+        && !state.policy.has_target_caps(key_id, asked)
+    {
         return Ok(candidates.to_vec());
     }
-    let window = state.policy.spend_window(key_id);
+    let window = state.policy.spend_window(key_id, asked);
     let since = window.map(|w| epoch_now().saturating_sub(w.as_secs() as i64));
     let breakdown = {
         let guard = ledger
@@ -3252,6 +3270,7 @@ fn budget_filtered_candidates(
     let (kept, refused) = filter_candidates_by_budget(
         &state.policy,
         key_id,
+        asked,
         candidates,
         &breakdown,
         window.is_some(),
@@ -3276,13 +3295,14 @@ fn budget_filtered_candidates(
 fn target_within_budget(
     policy: &crate::policy::Policy,
     key_id: &str,
+    asked: &str,
     provider: &str,
     model: &str,
     breakdown: &ar_tokens::SpendBreakdown,
     windowed: bool,
 ) -> bool {
     let name = format!("{provider}/{model}");
-    let Some(cap) = policy.target_cap(key_id, &name) else {
+    let Some(cap) = policy.target_cap(key_id, asked, &name) else {
         return true;
     };
     let spend = breakdown.target(provider, model);
@@ -3305,6 +3325,7 @@ fn target_within_budget(
 fn filter_candidates_by_budget(
     policy: &crate::policy::Policy,
     key_id: &str,
+    asked: &str,
     candidates: &[ar_route::Candidate],
     breakdown: &ar_tokens::SpendBreakdown,
     windowed: bool,
@@ -3314,7 +3335,7 @@ fn filter_candidates_by_budget(
     for candidate in candidates {
         let provider = candidate.provider.as_str();
         let model = candidate.model.as_ref();
-        if target_within_budget(policy, key_id, provider, model, breakdown, windowed) {
+        if target_within_budget(policy, key_id, asked, provider, model, breakdown, windowed) {
             kept.push(candidate.clone());
         } else {
             refused.push(RefusedTarget {
@@ -8485,6 +8506,57 @@ mod tests {
             1,
             "only the unscoped model was dispatched: {seen:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_scoped_row_with_a_per_target_ceiling_still_leaves_other_models_alone() {
+        // The scope is a statement about the whole row: a row scoped to `m` is
+        // the row that governs `m`, and `m2` is governed by the default row (or
+        // by nothing). A per-target ceiling carried by the scoped row must not
+        // reach across and refuse `m2` — that is the same defect C5 fixed for
+        // the key-wide arm, one arm over.
+        //
+        // The per-target ceiling is given a target that `m2` routes to, so a
+        // scope-blind per-target arm WOULD refuse `m2` here.
+        let (exec, seen) = RecordingProviders::new();
+        let state = scoped_two_combo(
+            "limits:\n  default:\n    model: m\n    model_tokens:\n      \"q/m2\": 1\n",
+            exec,
+        );
+        // Seed the spend that puts `q/m2` over its own ceiling.
+        {
+            let ledger = state.ledger.as_ref().expect("a ledger").clone();
+            ledger
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .record(&ar_tokens::Entry {
+                    key_id: "anonymous",
+                    provider: "q",
+                    model: "m2",
+                    combo: "m2",
+                    usage: ar_tokens::NormalizedUsage::new(100, 0),
+                    cost: ar_tokens::Cost::UNPRICED,
+                    created_at: 1_700_000_000,
+                })
+                .expect("seed the spend");
+        }
+        let router = crate::app::app(state);
+
+        let served = drive(
+            &router,
+            chat("{\"model\":\"m2\",\"messages\":[],\"max_tokens\":50}", &[]),
+        )
+        .await;
+        assert_eq!(
+            served.status(),
+            StatusCode::OK,
+            "a row scoped to `m` must not refuse `m2` through its per-target ceiling: {}",
+            body_of(served).await
+        );
+        let seen = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(seen.len(), 1, "the unscoped model was dispatched: {seen:?}");
     }
 
     #[tokio::test]

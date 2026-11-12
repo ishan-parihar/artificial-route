@@ -1316,30 +1316,30 @@ impl Limits {
 
     /// The ceiling in force for one client key: its own row if present, then
     /// `default`, then the empty limit.
+    ///
+    /// This is the **display** accessor: it names the row a key carries,
+    /// scope and all, which is what a config viewer wants to show. It is not
+    /// the accessor an enforcement path wants — that is
+    /// [`Limits::for_request`], because a row scoped to one model does not
+    /// apply to a request for another.
     #[must_use]
     pub fn for_key(&self, key_id: &str) -> &Limit {
         self.keys.get(key_id).unwrap_or(&self.default)
     }
 
-    /// The row that governs one key, with no scope filter.
-    ///
-    /// [`Limits::for_request`] drops a row whose `model:` scope does not match
-    /// the request. The **per-target** arms are scoped by their own keys —
-    /// each entry names the `provider/model` it governs — so a row that
-    /// carries them must not be dropped for a scope mismatch: the target in
-    /// the map is the scope, and the `model:` scope is about the *combo* the
-    /// client asked for, which is a different axis.
+    /// The row that governs one request, with the scope applied.
     ///
     /// The key's own row wins over the default row, exactly as
-    /// [`Limits::for_key`] does.
-    #[must_use]
-    pub fn row_for(&self, key_id: &str) -> &Limit {
-        self.keys.get(key_id).unwrap_or(&self.default)
-    }
-
-    /// [`Limits::for_key`] for a request that asked for `asked`: a key row or
-    /// default scoped to a different model does not apply, and the request
-    /// falls through to the next row (key row, then `default`, then nothing).
+    /// [`Limits::for_key`] does, and a row whose `model:` scope names a
+    /// different model is skipped: the request falls through to the next row
+    /// (key row, then `default`, then nothing).
+    ///
+    /// **Every arm reads this one accessor.** A row is a unit: its `rpm`, its
+    /// key-wide ceilings, its per-target ceilings and its window all belong to
+    /// the same row, so a scope that skips the row skips all of them. An
+    /// accessor that returned the row *without* the scope would let a scoped
+    /// row's arms reach across to the models it does not name — which is
+    /// exactly the defect this accessor's shape exists to prevent.
     #[must_use]
     pub fn for_request(&self, key_id: &str, asked: &str) -> &Limit {
         self.keys
@@ -1369,9 +1369,16 @@ pub struct Limit {
     /// `ar_tokens::Cap` carries: a budget cannot police an unknown cost.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub refuse_unpriced: bool,
-    /// Scope for the spend arms: the model (a combo id, or `provider/model`)
-    /// the client asked for. `None` governs every request. A scoped row is
+    /// Scope for this row: the model (a combo id, or `provider/model`) the
+    /// client asked for. `None` governs every request. A scoped row is
     /// skipped for any other model, so the key is unrestricted there.
+    ///
+    /// The scope governs the **whole row**: its `rpm`, its key-wide ceilings,
+    /// its per-target ceilings and its window all belong to it, and a scope
+    /// that skips the row skips all of them. Each arm keeps its own *axis*
+    /// inside the row — the key-wide arms are measured against the key's whole
+    /// spend, and a per-target ceiling against the spend recorded for the
+    /// target it names — but the axis is not a second scope.
     ///
     /// The spend measured is still the key's cumulative total — the ledger
     /// records the provider-local model that served a request, not the combo
@@ -1393,6 +1400,10 @@ pub struct Limit {
     /// spent. A target with no entry here is unchanged: it falls under the
     /// key-wide `tokens` arm, counted over the whole key.
     ///
+    /// The entries live in the row `model` scopes, so they apply to the combo
+    /// that scope names and to no other — the scope picks the row, and the row
+    /// carries these ceilings.
+    ///
     /// The key is spelled `provider/model` — the same spelling a combo target
     /// uses, so the operator reads one vocabulary everywhere. The model half may
     /// itself contain `/` (`kilocode/minimax/minimax-m3.1-flash:free`), so the
@@ -1411,9 +1422,10 @@ pub struct Limit {
     /// other stays cumulative against an append-only ledger, so it is blown
     /// forever and the window never rescues the key.
     ///
-    /// It is read from the key's **own** row (the `keys:` entry, else
-    /// `default`), and the same window measures both arms — so the two can
-    /// never disagree about which spend is in force.
+    /// It is read from the row the scope selects (the `keys:` entry when its
+    /// scope names the requested model, else `default`), and that one window
+    /// measures both arms — so the two can never disagree about which spend is
+    /// in force.
     ///
     /// Rolling, not calendar: the window is the last N hours of recorded spend,
     /// not the current hour bucket. A calendar window needs a reset job that
