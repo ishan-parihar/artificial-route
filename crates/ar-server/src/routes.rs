@@ -1295,7 +1295,7 @@ fn price_family(meta: &ar_tokens::ResponseMeta) -> ar_obs::Family {
 ///
 /// Clock skew degrades to a zero timestamp rather than a panic: a row with no
 /// timestamp is an accounting nuisance, an accounting panic is an outage.
-fn epoch_now() -> i64 {
+pub(crate) fn epoch_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
@@ -4282,7 +4282,7 @@ fn declared_output_ceiling(body: &[u8]) -> u32 {
         .unwrap_or(0)
 }
 
-fn stamp(resp: &mut Response, name: &str, value: &str) {
+pub(crate) fn stamp(resp: &mut Response, name: &str, value: &str) {
     if let (Ok(n), Ok(v)) = (HeaderName::try_from(name), HeaderValue::from_str(value)) {
         resp.headers_mut().insert(n, v);
     }

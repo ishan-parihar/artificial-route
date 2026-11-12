@@ -39,8 +39,8 @@ use ar_keys::Lane;
 
 use crate::app::AppState;
 use crate::routes::{
-    DECISION_HEADER, RouteReject, SESSION_HEADER, admit, authorize, error_because, hold_lease,
-    model_asked, note_failure, require_json, resolve,
+    DECISION_HEADER, DENY_HEADER, RouteReject, SESSION_HEADER, admit, authorize, epoch_now,
+    error_because, hold_lease, model_asked, note_failure, require_json, resolve, stamp,
 };
 
 /// `POST /v1/embeddings` — text in, vectors out, response re-rendered.
@@ -169,6 +169,28 @@ async fn audio_route_inner(
         Err(reason) => return *reason,
     };
     seen_key.clone_from(&key_id);
+    // The policy layer's 429 arm, right after the gate and before any body
+    // work — the same order the chat path uses (`routes.rs`). The media
+    // family used to consult no policy at all, so the one arm that is NOT
+    // gated on a configured ledger was the one that would have bitten first.
+    //
+    // The scope key is the model the client asked for: the audio routes take
+    // it from `?model=`, and a `model:`-scoped row must not rate-limit a
+    // request for a model it does not name.
+    let policy_key = key_id.as_deref().unwrap_or("anonymous");
+    let asked_model = query.get("model").map(String::as_str).unwrap_or_default();
+    if let Some(wait) = state.policy.rate_wait(policy_key, asked_model) {
+        let mut resp = error_because(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "rate_limited",
+            &format!(
+                "this key is past its requests-per-minute ceiling; its next token lands in {wait}s"
+            ),
+        );
+        stamp(&mut resp, "retry-after", &wait.to_string());
+        return resp;
+    }
     match admit(state, Lane::Heavy, key_id.as_deref().unwrap_or("anonymous")).await {
         Ok(granted) => *lease = granted,
         Err(refusal) => return *refusal,
@@ -193,7 +215,16 @@ async fn audio_route_inner(
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream");
-    respond_media(state, headers, model, endpoint, content_type, body).await
+    respond_media(
+        state,
+        headers,
+        model,
+        endpoint,
+        content_type,
+        body,
+        policy_key,
+    )
+    .await
 }
 
 /// The shared body of the three JSON routes. Logs a failed request to the
@@ -238,6 +269,27 @@ async fn json_route_inner(
         Err(reason) => return *reason,
     };
     seen_key.clone_from(&key_id);
+    // The policy layer's 429 arm, right after the gate and before any body
+    // work — the same order the chat path uses (`routes.rs`).
+    //
+    // The scope key is the model the client asked for, which for these routes
+    // is the body's `model` field. It is read here, before the format check
+    // and before the full parse, because the arm must be cheap: a
+    // rate-limited client should not cost the router a translation.
+    let policy_key = key_id.as_deref().unwrap_or("anonymous");
+    let asked_model = model_asked(&body);
+    if let Some(wait) = state.policy.rate_wait(policy_key, &asked_model) {
+        let mut resp = error_because(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "rate_limited",
+            &format!(
+                "this key is past its requests-per-minute ceiling; its next token lands in {wait}s"
+            ),
+        );
+        stamp(&mut resp, "retry-after", &wait.to_string());
+        return resp;
+    }
     if let Some(reason) = require_json(headers) {
         return reason;
     }
@@ -272,7 +324,16 @@ async fn json_route_inner(
             );
         }
     };
-    respond_media(state, headers, &model, endpoint, "application/json", body).await
+    respond_media(
+        state,
+        headers,
+        &model,
+        endpoint,
+        "application/json",
+        body,
+        policy_key,
+    )
+    .await
 }
 
 /// The upstream's answer, as the relay hands it to the client.
@@ -301,6 +362,7 @@ async fn respond_media(
     endpoint: &'static str,
     content_type: &str,
     body: Bytes,
+    policy_key: &str,
 ) -> Response {
     if !state.config.has_provider() {
         return error_because(
@@ -316,7 +378,7 @@ async fn respond_media(
         .filter(|v| !v.is_empty())
         .map(|v| ar_route::Strng::from(v.to_owned()));
     let shell = ar_route::CanonicalRequest::new(model, Bytes::new()).with_session(session);
-    let plan = match resolve(state, &shell) {
+    let mut plan = match resolve(state, &shell) {
         Ok(plan) => plan,
         Err(RouteReject::UnknownModel(reason)) => {
             return error_because(
@@ -327,6 +389,136 @@ async fn respond_media(
             );
         }
     };
+
+    // The spend arms, under the same ceiling the chat path enforces. The
+    // media family used to consult no policy at all, which meant a
+    // `limits:` block was not a complete statement of what the proxy
+    // refuses: a key over its ceiling was refused on `/v1/chat/completions`
+    // and spent freely on `/v1/embeddings`.
+    //
+    // The scope key is the model the client asked for — `model`, which is the
+    // combo id the route resolved — so a `model:`-scoped row governs this
+    // request exactly as it governs a chat request for the same combo.
+    if let Some(ledger) = state.ledger.as_ref() {
+        let window = state.policy.spend_window(policy_key);
+        let key_window = state.policy.key_spend_window(policy_key, model);
+        let (breakdown, key_breakdown) = {
+            let guard = ledger
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let target_since = window.map(|w| epoch_now().saturating_sub(w.as_secs() as i64));
+            let key_since = key_window.map(|w| epoch_now().saturating_sub(w.as_secs() as i64));
+            (
+                guard.spend_breakdown(policy_key, target_since),
+                guard.spend_breakdown(policy_key, key_since),
+            )
+        };
+        let (breakdown, key_breakdown) = match (breakdown, key_breakdown) {
+            (Ok(a), Ok(b)) => (a, b),
+            _ => {
+                // A ledger that cannot be read cannot evaluate a ceiling, and
+                // a cap that fails open is not a cap.
+                tracing::warn!("spend ledger could not be read");
+                let mut resp = error_because(
+                    StatusCode::PAYMENT_REQUIRED,
+                    "payment_required",
+                    "unauditable",
+                    "the spend ledger could not be read, so this key's ceilings cannot be checked",
+                );
+                stamp(&mut resp, DENY_HEADER, "unauditable");
+                return resp;
+            }
+        };
+
+        // The key-wide arm. The projection is the media request's own shape:
+        // the body is the client's payload, so its token count is what the
+        // client sent, and there is no declared output ceiling for a media
+        // route. An unpriced model projects UNPRICED, which is what
+        // `refuse_unpriced` denies.
+        if let Some(cap) = state.policy.key_cap(policy_key, model) {
+            let spend = if key_window.is_some() {
+                key_breakdown.windowed
+            } else {
+                key_breakdown.total
+            };
+            let projection = crate::policy::Projection {
+                provider: plan.chain.first().map_or("", |t| t.provider.as_str()),
+                model: plan.chain.first().map_or("", |t| t.model.as_ref()),
+                tokens_in: ar_tokens::count_text(&String::from_utf8_lossy(&body)),
+                tokens_out: 0,
+                prices: &state.config.prices,
+            };
+            let verdict = {
+                let guard = ledger
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.admit_against(
+                    policy_key,
+                    &cap,
+                    &spend,
+                    crate::policy::projected_cost(&projection),
+                    projection.tokens_in,
+                )
+            };
+            if let Ok(ar_tokens::Verdict::Deny(reason)) = verdict {
+                let mut resp = error_because(
+                    reason.status(),
+                    "payment_required",
+                    reason.code(),
+                    &reason.to_string(),
+                );
+                stamp(&mut resp, DENY_HEADER, reason.code());
+                return resp;
+            }
+        }
+
+        // The per-target arm: a target over its own ceiling is dropped from
+        // the chain and the request continues on a sibling with budget left.
+        // Only a chain with nothing left is refused.
+        //
+        // The one decision the chat path's `filter_by_target_budget` also
+        // makes, spelled out here because that helper is private to `routes`
+        // and the media chain is the same shape.
+        let windowed = window.is_some();
+        let mut kept = Vec::with_capacity(plan.chain.len());
+        let mut refused = Vec::new();
+        for target in &plan.chain {
+            let name = format!("{}/{}", target.provider.as_str(), target.model);
+            let Some(cap) = state.policy.target_cap(policy_key, &name) else {
+                kept.push(target.clone());
+                continue;
+            };
+            let spend = breakdown.target(target.provider.as_str(), target.model.as_ref());
+            let spent = if windowed {
+                spend.windowed.tokens
+            } else {
+                spend.total.tokens
+            };
+            if spent >= cap {
+                refused.push((target.provider.clone(), target.model.clone()));
+            } else {
+                kept.push(target.clone());
+            }
+        }
+        if !refused.is_empty() && kept.is_empty() {
+            let mut resp = error_because(
+                StatusCode::PAYMENT_REQUIRED,
+                "payment_required",
+                "model_token_cap",
+                &format!(
+                    "every media target has reached its own ceiling: {}",
+                    refused
+                        .iter()
+                        .map(|(p, m)| format!("{p}/{m}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            );
+            stamp(&mut resp, DENY_HEADER, "model_token_cap");
+            return resp;
+        }
+        plan.chain = kept;
+    }
 
     let mut last_reply: Option<ar_route::MediaReply> = None;
     let mut last_error: Option<String> = None;
@@ -532,6 +724,51 @@ mod tests {
         app.clone().oneshot(req).await.expect("router answers")
     }
 
+    /// The same server, with a `limits:` block and the in-memory ledger the
+    /// spend arms read.
+    ///
+    /// The ledger is what arms the spend arms: without one they are inert by
+    /// construction, so a test that wants them to bite has to configure one.
+    fn limited_over(
+        limits: &str,
+        exec: Arc<dyn ArExec>,
+        width: usize,
+    ) -> (AppState, Arc<Mutex<ar_tokens::Ledger>>) {
+        let providers = (0..width)
+            .map(|i| {
+                crate::exec::ProviderConfig::new(
+                    ProviderId::new(format!("p{i}")),
+                    format!("http://127.0.0.1:1/v{i}"),
+                    "k",
+                )
+                .with_model("row-model")
+            })
+            .collect();
+        let mut config = crate::config::ServerConfig::single(0, Strategy::Priority, providers);
+        config.combos = vec![crate::config::RouteCombo::new(
+            "m",
+            Strategy::Priority,
+            (0..width)
+                .map(|i| {
+                    crate::config::ComboTarget::new(ProviderId::new(format!("p{i}")), "t-model")
+                })
+                .collect(),
+        )];
+        config.limits = ar_config::Config::parse(limits, |_| Ok(None))
+            .expect("test limits parse")
+            .limits;
+        let ledger = Arc::new(Mutex::new(
+            ar_tokens::Ledger::open_in_memory().expect("in-memory ledger"),
+        ));
+        let state = crate::app::Components {
+            exec,
+            ledger: Some(ledger.clone()),
+            ..crate::app::Components::unconfigured(config)
+        }
+        .into_state();
+        (state, ledger)
+    }
+
     fn post(path: &str, body: &str) -> axum::http::Request<axum::body::Body> {
         axum::http::Request::builder()
             .header("host", "127.0.0.1:20128")
@@ -655,6 +892,137 @@ mod tests {
         let body = body_of(resp).await;
         assert_eq!(body["error"]["code"], "model_not_found");
         assert!(seen.lock().expect("recorder").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_media_route_over_its_keys_ceiling_is_refused_before_any_dispatch() {
+        // `docs/40` P3: every route that can spend is under the same arms. The
+        // media family used to consult no policy at all, so a key past its
+        // ceiling was refused on `/v1/chat/completions` and spent freely here.
+        let (exec, seen) = recording_media();
+        let (state, ledger) = limited_over("limits:\n  default:\n    tokens: 1\n", exec, 1);
+        // Spend a token against the anonymous key so the ceiling is reached.
+        ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(&ar_tokens::Entry {
+                key_id: "anonymous",
+                provider: "p0",
+                model: "t-model",
+                combo: "m",
+                usage: ar_tokens::NormalizedUsage::new(1, 0),
+                cost: ar_tokens::Cost::UNPRICED,
+                created_at: 1_700_000_000,
+            })
+            .expect("seed the spend");
+        let router = crate::app::app(state);
+        let resp = drive(
+            &router,
+            post("/v1/embeddings", r#"{"model":"m","input":"soak"}"#),
+        )
+        .await;
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYMENT_REQUIRED,
+            "a media route must refuse a key past its ceiling: {}",
+            body_of(resp).await
+        );
+        let seen = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(seen.is_empty(), "dispatched past the ceiling: {seen:?}");
+    }
+
+    #[tokio::test]
+    async fn a_media_route_with_no_limits_block_behaves_as_before() {
+        // The inert case, which is the deployed system's state on both hosts:
+        // no `limits:` block, so the arms must change NOTHING.
+        let (exec, seen) = recording_media();
+        let router = crate::app::app(routed_under(exec));
+        let resp = drive(
+            &router,
+            post("/v1/embeddings", r#"{"model":"m","input":"soak"}"#),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK, "{}", body_of(resp).await);
+        let seen = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(seen.len(), 1, "the request still dispatched: {seen:?}");
+    }
+
+    #[tokio::test]
+    async fn a_media_request_inside_its_keys_ceiling_is_dispatched() {
+        // The companion to the refusal: the arm is a ceiling, not a blanket
+        // refusal. A key with a ceiling it is under still gets served.
+        let (exec, seen) = recording_media();
+        let (state, _ledger) = limited_over("limits:\n  default:\n    tokens: 10000\n", exec, 1);
+        let router = crate::app::app(state);
+        let resp = drive(
+            &router,
+            post("/v1/embeddings", r#"{"model":"m","input":"soak"}"#),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK, "{}", body_of(resp).await);
+        let seen = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(seen.len(), 1, "the request dispatched: {seen:?}");
+    }
+
+    #[tokio::test]
+    async fn a_media_request_past_its_keys_rpm_is_answered_with_retry_after() {
+        // The 429 arm, and the one that matters most here: it is the single
+        // arm NOT gated on a configured ledger, so without this a media route
+        // is uncapped the moment any `limits:` block exists. A ledger is not
+        // even needed to prove it, because the bucket is built from the rows.
+        let (exec, _seen) = recording_media();
+        let (state, _ledger) = limited_over("limits:\n  default:\n    rpm: 1\n", exec, 1);
+        let router = crate::app::app(state);
+
+        // The bucket is per credential, and anonymous traffic shares it, so the
+        // first request spends the one token and the second is told to wait.
+        let first = drive(
+            &router,
+            post("/v1/embeddings", r#"{"model":"m","input":"a"}"#),
+        )
+        .await;
+        assert_eq!(
+            first.status(),
+            StatusCode::OK,
+            "the first request is inside its bucket: {}",
+            body_of(first).await
+        );
+        let second = drive(
+            &router,
+            post("/v1/embeddings", r#"{"model":"m","input":"b"}"#),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry = second
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        assert!(!retry.is_empty(), "the 429 names when the next token lands");
+    }
+
+    /// The recorder the media-tests above share, so each one only states its
+    /// own limits and its own assertions.
+    fn recording_media() -> (Arc<MediaExec>, Seen) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let exec = Arc::new(MediaExec {
+            seen: Arc::clone(&seen),
+            reply: r#"{"object":"list","data":[]}"#,
+            status: StatusCode::OK,
+            error: false,
+            refuse: None,
+        });
+        (exec, seen)
     }
 
     #[tokio::test]
