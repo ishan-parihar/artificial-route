@@ -783,22 +783,31 @@ fn charge_failure(
             }
         }
         // A throttle answers to both scopes at their own widths: the key takes
-        // the backoff and honours `Retry-After`, the model takes a long lockout
-        // so one model riding a shared limit stops being re-selected. Both
-        // charges assume the key *is* the provider — with more credentials the
-        // executor cools the refused key and rotates, so the router cools
-        // nothing and a fresh key's very next request still routes. The retry
-        // hint stays honest: the window upstream asked for is what a same-key
-        // retry must wait out.
+        // the backoff and honours `Retry-After`. For multi-credential providers,
+        // the executor cools the refused key and rotates, so the router cools
+        // nothing and a fresh key's very next request still routes.
         Fault::Throttled if multi => (retry_after.unwrap_or(DEFAULT_BASE_BACKOFF), true),
+        // A throttle (429) on a single-credential provider is one model's rate
+        // limit until proven otherwise. Upstream rate limits (RPM/TPM, model
+        // concurrency, or free-tier quotas) are per-model; cooling the provider
+        // key would poison every healthy sibling model and combo on that
+        // provider (the rate-limit cascade defect).
+        //
+        // An explicit `Retry-After` header locks the model for that exact duration.
+        // When absent, the model takes `LOCKOUT_BASE_COOLDOWN` (120s).
+        // Neither branch cools the provider key.
         Fault::Throttled => {
-            let cooldown = resilience.record_failure(provider, retry_after);
-            resilience.lock_model(
-                provider,
-                model,
-                LockReason::Throttled,
-                LOCKOUT_BASE_COOLDOWN,
-            );
+            let cooldown = if let Some(after) = retry_after {
+                let d = after.max(DEFAULT_BASE_BACKOFF);
+                resilience.lock_model_exact(provider, model, LockReason::Throttled, d)
+            } else {
+                resilience.lock_model(
+                    provider,
+                    model,
+                    LockReason::Throttled,
+                    LOCKOUT_BASE_COOLDOWN,
+                )
+            };
             (cooldown, true)
         }
         // Everything else — 5xx, transport, a stall, an auth refusal — is one
@@ -2128,14 +2137,15 @@ mod tests {
     }
 
     #[test]
-    fn puts_rate_limited_provider_in_cooldown() {
+    fn puts_rate_limited_model_in_cooldown_sparing_provider() {
         let exec = Scripted::new(vec![
             Verdict::RateLimited(Some(Duration::from_secs(30))),
-            Verdict::Ok,
+            Verdict::OkBody(r#"{"choices":[{"message":{"content":"ok"}}]}"#),
         ]);
         let r = Resilience::new();
         let _ = block(attempt_loop(&req(), &chain(&["p1", "p2"]), &exec, &r));
-        assert!(r.is_cooling("p1"));
+        assert!(r.is_cooling_for("p1", "m"), "the throttled model is locked");
+        assert!(!r.is_cooling("p1"), "the provider itself is not cooled");
     }
 
     #[test]
@@ -2922,21 +2932,96 @@ mod tests {
     }
 
     #[test]
-    fn single_credential_throttle_stops_at_the_provider() {
-        // Without the mark, one key *is* the provider (the P0 semantics): its
-        // 429 cools the provider string and the sibling model is a
-        // known-dead target the loop must skip rather than spend on.
+    fn single_credential_throttle_locks_the_model_and_serves_the_sibling() {
+        // Upstream rate limits (429) are model-scoped. A 429 on the first model
+        // locks that model, but does NOT cool the provider key; the sibling
+        // model dispatches in the same request and succeeds.
         let r = Resilience::new();
-        let exec = Scripted::new(vec![PLAIN_429, Verdict::Ok]);
-        let Ok(AttemptOutcome::Retry { .. }) = block(attempt_loop(
+        let exec = Scripted::new(vec![
+            PLAIN_429,
+            Verdict::OkBody(r#"{"choices":[{"message":{"content":"ok"}}]}"#),
+        ]);
+        let got = block(attempt_loop(
             &req(),
             &targets(&[("nvidia", "glm-5.3"), ("nvidia", "kimi-k3")]),
             &exec,
             &r,
-        )) else {
-            panic!("expected retry");
+        ));
+        let Ok(AttemptOutcome::Succeeded {
+            attempts, provider, ..
+        }) = got
+        else {
+            panic!("expected sibling model to serve, got: {got:?}");
         };
-        assert_eq!(exec.seen().len(), 1, "the sibling must be skipped");
+        assert_eq!(attempts, 2, "seen: {:?}", exec.seen());
+        assert_eq!(provider.as_str(), "nvidia");
+        assert!(
+            r.is_cooling_for("nvidia", "glm-5.3"),
+            "the throttled model must be locked"
+        );
+        assert!(
+            !r.is_cooling_for("nvidia", "kimi-k3"),
+            "the sibling model must stay usable"
+        );
+        assert!(
+            !r.is_cooling("nvidia"),
+            "the provider itself must not be cooled"
+        );
+        assert!(r.is_usable("nvidia"));
+    }
+
+    #[test]
+    fn throttle_on_one_model_does_not_cascade_and_fails_over_to_sibling_models() {
+        // Three models on one single-credential provider (e.g. large-stack):
+        // minimax -> step-5-preview -> mistral-large.
+        // minimax throttles (429), step-5-preview answers 200 clean.
+        // The first request succeeds on step-5-preview.
+        // The next request immediately routes to step-5-preview without
+        // even attempting minimax.
+        let r = Resilience::new();
+        let chain_targets = targets(&[
+            ("experiential", "minimax"),
+            ("experiential", "step-5-preview"),
+            ("experiential", "mistral-large"),
+        ]);
+        let exec1 = Scripted::new(vec![
+            PLAIN_429,
+            Verdict::OkBody(r#"{"choices":[{"message":{"content":"hello from step-5"}}]}"#),
+        ]);
+        let got1 = block(attempt_loop(&req(), &chain_targets, &exec1, &r));
+        let Ok(AttemptOutcome::Succeeded {
+            attempts,
+            provider,
+            model,
+            ..
+        }) = got1
+        else {
+            panic!("expected step-5-preview to serve: {got1:?}");
+        };
+        assert_eq!(attempts, 2);
+        assert_eq!(provider.as_str(), "experiential");
+        assert_eq!(&*model, "step-5-preview");
+
+        // Minimax is locked out, but the provider is usable and other models are available.
+        assert!(r.is_cooling_for("experiential", "minimax"));
+        assert!(!r.is_cooling_for("experiential", "step-5-preview"));
+        assert!(!r.is_cooling("experiential"));
+        assert!(r.is_usable("experiential"));
+
+        // Second request: minimax is skipped immediately; step-5-preview is tried directly.
+        let exec2 = Scripted::new(vec![Verdict::OkBody(
+            r#"{"choices":[{"message":{"content":"second request"}}]}"#,
+        )]);
+        let got2 = block(attempt_loop(&req(), &chain_targets, &exec2, &r));
+        let Ok(AttemptOutcome::Succeeded {
+            attempts, model, ..
+        }) = got2
+        else {
+            panic!("expected direct hit on step-5-preview: {got2:?}");
+        };
+        assert_eq!(attempts, 1);
+        assert_eq!(&*model, "step-5-preview");
+        assert_eq!(exec2.models(), ["step-5-preview"]);
     }
 
     #[test]
