@@ -485,8 +485,16 @@ struct Verdict {
 impl Drop for Verdict {
     fn drop(&mut self) {
         if self.cut.load(std::sync::atomic::Ordering::SeqCst) {
-            self.resilience
-                .record_provider_failure(&self.provider, BreakerClass::default());
+            // A multi-credential provider fails one credential at a time: a
+            // stream cut on one model must not open the shared provider
+            // breaker and cool every healthy sibling model (the live
+            // `glm-5.3-flash` outage). Single-credential providers keep the
+            // P0 semantics unchanged — there is nothing for a dead key to
+            // fall back to.
+            if !self.resilience.is_multi(&self.provider) {
+                self.resilience
+                    .record_provider_failure(&self.provider, BreakerClass::default());
+            }
         } else {
             self.resilience.record_provider_success(&self.provider);
         }
@@ -825,6 +833,34 @@ mod tests {
             drop(stream);
         }
         assert_eq!(resilience.breaker_state("p1"), BreakerState::Open);
+    }
+
+    #[test]
+    fn settle_stream_cut_on_multi_provider_does_not_open_provider_breaker() {
+        use super::{CutFlag, settle_stream};
+        use crate::resilience::{BreakerClass, BreakerState, Resilience};
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+        let resilience = Arc::new(Resilience::new());
+        resilience.mark_multi("nvidia");
+        // A stream cut on one model of a multi-credential provider must not
+        // open the shared provider breaker and cool every healthy sibling.
+        for _ in 0..BreakerClass::default().threshold() {
+            let cut = CutFlag::default();
+            cut.store(true, Ordering::SeqCst);
+            let stream = settle_stream(
+                Box::pin(futures::stream::empty()),
+                Arc::clone(&resilience),
+                "nvidia",
+                cut,
+            );
+            drop(stream);
+        }
+        assert_eq!(
+            resilience.breaker_state("nvidia"),
+            BreakerState::Closed,
+            "multi-credential stream cuts must not open the provider breaker"
+        );
     }
 
     #[test]

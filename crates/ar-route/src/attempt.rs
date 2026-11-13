@@ -821,7 +821,13 @@ fn charge_failure(
             // Upstream carves out the same class (`isModelCapacityOverloadError`
             // in `circuitBreaker.ts`). All dispatched 400s reach here only
             // after classifier rules have decided to advance.
-            if status != 400 {
+            // A multi-credential provider fails one credential at a time: the
+            // executor's per-key cycling owns that scope, and the model lockout
+            // below owns this model. Tripping the shared provider breaker would
+            // cool every healthy sibling model for one model's 5xx (the live
+            // `glm-5.3-flash` outage), so only single-credential providers tick
+            // it here.
+            if status != 400 && !multi {
                 resilience.record_provider_failure(provider, BreakerClass::default());
             }
             (cooldown, false)
@@ -3052,5 +3058,82 @@ mod tests {
             "upstream's window is the hint"
         );
         assert!(!r.is_cooling("p"), "the router charged nothing");
+    }
+
+    #[test]
+    fn provider_breaker_from_unrelated_model_poisons_sibling_model() {
+        // Live regression: minimax-m3.1-flash on `nvidia` keeps returning 503.
+        // On a multi-credential provider one model's failures must not tick the
+        // shared provider breaker, so glm-5.3-flash (never failed) still serves.
+        let r = Resilience::new();
+        r.mark_multi("nvidia");
+        let exec = Scripted::new(
+            std::iter::repeat_n(
+                Verdict::Status(503, "upstream down"),
+                BreakerClass::Key.threshold() as usize,
+            )
+            .collect::<Vec<_>>(),
+        );
+        // minimax-m3.1-flash fails through dispatches; each 503 locks that model
+        // but must not open the nvidia provider breaker.
+        for _ in 0..BreakerClass::Key.threshold() {
+            let _ = block(attempt_loop(
+                &req(),
+                &targets(&[("nvidia", "minimax-m3.1-flash")]),
+                &exec,
+                &r,
+            ));
+        }
+        assert!(
+            r.is_usable("nvidia"),
+            "multi-credential 5xx must not open the provider breaker: {:?}",
+            r.breaker_state("nvidia")
+        );
+
+        // glm-5.3-flash on the same provider never failed and still serves.
+        let exec = Scripted::new(vec![Verdict::Ok]);
+        let Ok(AttemptOutcome::Succeeded { provider, .. }) = block(attempt_loop(
+            &req(),
+            &targets(&[("nvidia", "glm-5.3-flash")]),
+            &exec,
+            &r,
+        )) else {
+            panic!(
+                "expected glm-5.3-flash to serve while breaker closed: {:?}",
+                r.breaker_state("nvidia")
+            );
+        };
+        assert_eq!(provider.as_str(), "nvidia");
+    }
+
+    #[test]
+    fn provider_breaker_from_unrelated_model_blocks_sibling_in_chain() {
+        // Open the provider breaker directly (simulating
+        // minimax-m3.1-flash's 503s ticking the breaker to open).
+        let r = Resilience::new();
+        r.mark_multi("nvidia");
+        for _ in 0..BreakerClass::Key.threshold() {
+            r.record_provider_failure("nvidia", BreakerClass::default());
+        }
+        assert!(!r.is_usable("nvidia"));
+
+        // glm-5.3-flash is healthy but the breaker makes every nvidia target
+        // unusable, so the chain aborts instead of serving glm-5.3-flash.
+        let exec = Scripted::new(vec![Verdict::Ok]);
+        let got = block(attempt_loop(
+            &req(),
+            &targets(&[("nvidia", "glm-5.3-flash")]),
+            &exec,
+            &r,
+        ));
+        match got {
+            Ok(AttemptOutcome::Abort { .. }) => {}
+            other => panic!("expected abort on open-breaker chain, got {other:?}"),
+        }
+        assert_eq!(
+            exec.seen().len(),
+            0,
+            "glm-5.3-flash must be skipped without spending"
+        );
     }
 }
