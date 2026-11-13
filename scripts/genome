@@ -153,7 +153,7 @@ ERR = 2
 MIN_CHUNK = 5  # lines; `ask` hits narrower than this point at a lead line without its content
 HUB_NODE_CAP = 3000  # nodes; above this `graph hubs` ranks by degree and says betweenness was not computed
 _TMP_SEQ = itertools.count()  # makes each atomic_write temp name unique within this process too
-VERSION = "2026.11.05-15"
+VERSION = "2026.11.05-21"
 # every key genome reads: an unknown key is a typo that would silently switch a check off (E017)
 CONFIG_KEYS = {
     "genome": {"modules", "schema_version"},
@@ -1458,6 +1458,16 @@ def lint_core(cfg: Cfg) -> list[str]:
             for f in d.glob("*.md"):
                 if f.name in ("README.md", "INDEX.md"):  # a directory's index is not a plan
                     continue
+                body = read(f)
+                if is_tombstone(body):
+                    # A tombstone is the ARCHIVE's record of a file, not a plan (see
+                    # cmd_archive), so the date rule does not apply to it.  The
+                    # exemption must not be a blind spot: the tombstone's TARGET is
+                    # checked instead, so a stub whose archived file is gone is named.
+                    m = TOMBSTONE.search(body)
+                    if m and not (cfg.root / m.group(1)).exists():
+                        out.append(f"E019 {role} tombstone points at missing `{m.group(1)}`: {cfg.rel(f)}")
+                    continue
                 if cfg.rel(f) not in living and pat.search(f.name) and not re.search(r"\d{4}-\d{2}-\d{2}", f.name):
                     out.append(f"E004 {role} file without a date stamp: {cfg.rel(f)}")
     # living plans
@@ -2603,6 +2613,168 @@ def _changed_since(root: Path, named: str, head: str) -> list[str] | None:
     return [ln for ln in r.stdout.splitlines() if ln]
 
 
+def _append_only_hunks(root: Path, rel: str) -> list[tuple[str, str, list[list[tuple[str, str]]]]]:
+    """The history of one append-only file as (commit, subject, hunks), oldest first.
+
+    A hunk is a list of (kind, line) pairs with kind "+" or "-"; context lines are
+    dropped.  Renames are followed, so a renamed entry keeps its history.
+
+    MERGES ARE INCLUDED.  `git log -p` omits a merge's diff by default, so a
+    removal introduced ONLY by a merge's conflict resolution was invisible —
+    measured 2026-11-05: a published line dropped by the merge and by no branch
+    commit yielded 0 violations, and `--diff-merges=first-parent` yields 1.
+    The flag is added only if this git understands it (it landed in git 2.31),
+    so an older git still gets a working check rather than an error.
+    """
+    args = ["git", "log", "--reverse", "--format=@@@COMMIT %H %s", "-p", "--no-color",
+            "--find-renames", "--follow"]
+    probe = subprocess.run(args + ["--diff-merges=first-parent", "--", rel],
+                           cwd=root, capture_output=True, text=True, timeout=60)
+    if probe.returncode == 0:
+        out = probe
+    else:
+        out = subprocess.run(args + ["--", rel],
+                             cwd=root, capture_output=True, text=True, timeout=60)
+        if out.returncode != 0:
+            return []
+    commits: list[tuple[str, str, list[list[tuple[str, str]]]]] = []
+    sha = subj = None
+    hunks: list[list[tuple[str, str]]] = []
+    hunk: list[tuple[str, str]] | None = None
+    for line in out.stdout.splitlines():
+        if line.startswith("@@@COMMIT "):
+            if sha:
+                commits.append((sha, subj, hunks))
+            _, sha, subj = line.split(" ", 2)
+            hunks, hunk = [], None
+        elif line.startswith("@@"):
+            hunk = []
+            hunks.append(hunk)
+        elif line.startswith(("--- ", "+++ ", "diff --git", "index ", "similarity ", "rename ",
+                              "old mode", "new mode", "deleted file", "new file", "Binary",
+                              "\\ No newline")):
+            continue
+        elif hunk is not None and line.startswith("+"):
+            hunk.append(("+", line[1:]))
+        elif hunk is not None and line.startswith("-"):
+            hunk.append(("-", line[1:]))
+    if sha:
+        commits.append((sha, subj, hunks))
+    return commits
+
+
+def _published_and_removed(hunks_per_commit) -> tuple[set[str], list[tuple[str, str, str, bool]]]:
+    """Split a file's history into what was PUBLISHED and what was removed.
+
+    A line added in a hunk that ALSO removed lines is REPLACEMENT TEXT: it was
+    never a legitimate publication, because that hunk was an in-place rewrite.
+    Removing replacement text later is the REPAIR of an illegal rewrite, not a
+    second violation — so only lines added in PURE-APPEND hunks count as
+    published, and only their removal can be a violation.
+
+    Attribution is CHRONOLOGICAL: a removal is judged against what had been
+    published UP TO THAT COMMIT.  A line first published at commit 9 cannot
+    make its own removal at commit 5 a violation.
+
+    Returns (published_lines, [(commit, subject, removed_line, was_published_then), ...]).
+    """
+    published: set[str] = set()
+    removed: list[tuple[str, str, str, bool]] = []
+    for sha, subj, hunks in hunks_per_commit:
+        for h in hunks:
+            mixed = any(k == "-" for k, _ in h)
+            for k, line in h:
+                if k == "+" and not mixed:
+                    published.add(line)
+        for h in hunks:
+            for k, line in h:
+                if k == "-":
+                    removed.append((sha, subj, line, line in published))
+    return published, removed
+
+
+def _append_only_paths(cfg: Cfg, role: str) -> list[str]:
+    """The repo-relative paths an append-only role covers, or [] when it is not a
+    plain path in this repo (a native/overlay role is owned elsewhere and the
+    append-only law does not apply to it here)."""
+    form, target = cfg.form(role)
+    if form != "file":
+        return []
+    rel = target.split("#", 1)[0].rstrip("/")
+    if not rel:
+        return []
+    if (cfg.root / rel).is_dir():
+        return [rel]
+    return [rel]
+
+
+def _append_only_violations(cfg: Cfg, window: int, head: str) -> list[str]:
+    """Append-only violations, attributed to the commit that made them.
+
+    The rule, validated on 2026-11-05 against a repo whose doctor was red on a
+    fully compliant repair:
+
+      - A line was legitimately PUBLISHED iff it was added in a pure-append hunk.
+      - A VIOLATION is a PUBLISHED line, removed inside the window, that is
+        absent from the current content.
+      - A compliant REPAIR (restore the original, append the correction as an
+        AMENDED block) is silent: the original is published AND present now.
+      - Removing REPLACEMENT TEXT — a line added by an earlier in-place
+        rewrite — is silent: that is the repair of the earlier violation, not
+        a second one.
+
+    Two defects of the net-diff-over-a-window rule this replaces, both measured:
+
+      1. FALSE POSITIVE.  The window's base was `rev-list --max-count=11 |
+         tail -1`, which could itself BE the violating commit; the compliant
+         repair then read as a removal against it (base a7265eea was the
+         violation commit, so its repair raised "3 line(s) removed").
+      2. FALSE NEGATIVE.  A net diff cannot see an in-place edit inside a file
+         ADDED after the base.  11fbbedc removed a published line from 0542
+         (born 5f0637e0, inside the window) and the check never reported it.
+
+    Per-commit attribution fixes both: each removed line is judged against what
+    was published and what is present now, never against an arbitrary base.
+    Only files the window touched can violate, so only those are read — the
+    publication reference still spans each one's WHOLE history (a line may be
+    removed in the window long after it was published).
+    """
+    findings: list[str] = []
+    if not head:
+        return findings
+    window_commits = set(sh(cfg.root, "git", "rev-list", f"--max-count={window}", "HEAD").split())
+    if not window_commits:
+        return findings
+    # The append-only roles that live as plain paths in this repo.  A native or
+    # overlay role is owned by another organ, so the law does not apply here.
+    roles = {r: p for r in APPEND_ONLY for p in _append_only_paths(cfg, r)}
+    if not roles:
+        return findings
+    # Every append-only path the window touched.  A numbered worklog entry may
+    # be RENAMED freely (R4), so the window's file names are followed, not compared.
+    touched = sh(cfg.root, "git", "log", f"--max-count={window}", "--name-only", "--format=", "--",
+                 *sorted(set(roles.values())))
+    for path in sorted({ln for ln in touched.splitlines() if ln}):
+        role = next((r for r, p in roles.items() if path == p or path.startswith(p + "/")), None)
+        if role is None:
+            continue
+        p = cfg.root / path
+        if not p.is_file():
+            continue
+        if role == "worklog" and path == cfg.rel(worklog_index(cfg)):
+            continue          # the index is generated
+        now = set(read(p).splitlines())
+        published, removed = _published_and_removed(_append_only_hunks(cfg.root, path))
+        lost = [(sha, subj) for sha, subj, line, was_pub in removed
+                if sha in window_commits and was_pub and line not in now]
+        if lost:
+            findings.append(f"append-only violation: {len(lost)} line(s) removed from {path} "
+                            f"in the last {window} commits")
+            for sha, subj in lost:
+                findings.append(f"    committed {sha[:8]}: {subj[:70]}")
+    return findings
+
+
 def doctor_findings(cfg: Cfg) -> tuple[list[str], list[str]]:
     finds, info = [], []
     head = sh(cfg.root, "git", "rev-parse", "HEAD").strip()
@@ -2634,21 +2806,38 @@ def doctor_findings(cfg: Cfg) -> tuple[list[str], list[str]]:
                                  f"({len(code_touched)} non-documentation path(s) changed since)")
                 else:
                     info.append(f"state snapshot {named[:8]} is current: only documentation changed since it")
-    # append-only roles: no line removed over the last core.append_window commits, nor in the working tree.
+    # append-only roles: no PUBLISHED line removed over the last core.append_window commits.
     # A numbered worklog is a directory: its entries are append-only (renames allowed), its index is generated.
+    # The rule is per-commit and publication-aware (see _append_only_violations): a compliant
+    # repair is silent and an in-place rewrite is still caught.
     window = int(cfg.get("core", "append_window", 10))
-    base = (sh(cfg.root, "git", "rev-list", f"--max-count={window + 1}", "HEAD").split() or [""])[-1]
+    finds += _append_only_violations(cfg, window, head)
+    # The working tree: a published line removed but not yet committed.  Judged
+    # against the same publication reference, so restoring a published line in
+    # the working tree (the compliant repair, staged or not) is silent.
     for role in APPEND_ONLY:
-        if not (cfg.has(role) and head):
-            continue
-        rel = cfg.paths[role].rstrip("/")
-        spec = [rel] + ([f":(exclude){cfg.rel(worklog_index(cfg))}"] if cfg.path(role).is_dir() else [])
-        ranges = [(f"the last {window} commits", [base, "HEAD"])] if base and base != head else []
-        for label, rng in ranges + [("the working tree", ["HEAD"])]:
-            diff = sh(cfg.root, "git", "diff", "-M", "--diff-filter=DM", *rng, "--", *spec)
-            removed = sum(1 for ln in diff.splitlines() if ln.startswith("-") and not ln.startswith("---"))
-            if removed:
-                finds.append(f"append-only violation: {removed} line(s) removed from {rel} in {label}")
+        for path in _append_only_paths(cfg, role):
+            if (cfg.root / path).is_dir():
+                paths = [ln for ln in sh(cfg.root, "git", "ls-files", path).splitlines() if ln]
+            else:
+                paths = [path]
+            for f in paths:
+                if role == "worklog" and f == cfg.rel(worklog_index(cfg)):
+                    continue
+                p = cfg.root / f
+                if not p.is_file():
+                    continue
+                diff = sh(cfg.root, "git", "diff", "-M", "--diff-filter=DM", "HEAD", "--", f)
+                removed = [ln[1:] for ln in diff.splitlines()
+                           if ln.startswith("-") and not ln.startswith("---")]
+                if not removed:
+                    continue
+                published, _ = _published_and_removed(_append_only_hunks(cfg.root, f))
+                now = set(read(p).splitlines())
+                lost = [ln for ln in removed if ln in published and ln not in now]
+                if lost:
+                    finds.append(f"append-only violation: {len(lost)} line(s) removed from {f} "
+                                 f"in the working tree")
     for mod in sorted(cfg.modules):
         for role in MODULE_ROLES[mod]:
             form, target = cfg.form(role)
@@ -3192,7 +3381,21 @@ def cmd_init(args) -> None:
     # README pointing at docs/OUTLINE.md on a `core`-only repo is a pointer at a file
     # that does not exist, which is the same defect as a role nobody fills. Outward pages
     # are the ones W009 watches, so this is the set that decides.
+    #
+    # EVERY PAGE THE SCAFFOLD CREATES MUST BE LINKED FROM HERE. Measured 2026-11-05:
+    # the README linked only docs/handoff/README.md, while init also creates
+    # docs/RUNBOOK.md (every profile) and docs/INDEX.md (the ops module). The docs
+    # gate's D003 calls a docs page "orphan" when no README and no doc page links it,
+    # so the scaffold init produced FAILED THE KERNEL'S OWN DOCS GATE on every
+    # profile: 1 hard failure for software and team, 2 for research. The gate was
+    # not run on the scaffold, so the defect sat there. A README that names the
+    # files it created is the docs index; a README that names one of them is a
+    # pointer with orphans.
     readme = README_TPL.replace("{{NAME}}", root.name)
+    if "core" in mods:  # the core profile always creates the runbook
+        readme += "\n- [docs/RUNBOOK.md](docs/RUNBOOK.md) — the exact commands and the environment traps\n"
+    if "ops" in mods:
+        readme += "\n- [docs/INDEX.md](docs/INDEX.md) — the map of this knowledge base\n"
     if "outline" in mods:
         readme += "\n- [docs/OUTLINE.md](docs/OUTLINE.md) — the architecture and the reading order\n"
     write("README.md", readme)
@@ -3930,6 +4133,35 @@ def _verify_against_shipped(rows: list) -> None:
         print(f"note: {len(uncommitted)} row(s) hold the shipped bytes but have not committed them — "
               f"verify reads the disk, git holds the history, and only the owner knows which one is "
               f"authoritative")
+    # The FIFTH question, added 2026-11-05: the rung above. A copy can be committed
+    # AND clean AND still be nowhere the remote can reach it. `_uncommitted_cli`
+    # asks about the working tree, and a committed copy has a clean working tree,
+    # so that check is blind to this case by construction. Measured over the fleet
+    # that same day: 62 of 63 repos with a reachable remote were ahead of it, 46
+    # carrying an unpushed dispatch commit, and NO check anywhere reported it.
+    # A copy the remote does not hold is a copy a fresh clone loses, so this is
+    # the rung that says whether "the fleet carries it" is true of the REMOTE or
+    # only of this machine. Like the rung above it is a report, not a gate: whose
+    # commits belong on whose remote is the owner's call, and 46 owners hold it.
+    unpushed = []
+    for r in rows:
+        if r.get("kind") not in ("vendored", "bin"):
+            continue
+        p = Path(r["path"])
+        found = _unpushed_cli(p)
+        if found:
+            unpushed.append((r, found))
+    for r, (cli, detail) in unpushed:
+        try:
+            shown = cli.relative_to(Path(r["path"]))
+        except ValueError:
+            shown = cli
+        print(f"UNPUSHED  {r['kind']:6} {r['path']} — {shown}: {detail}; "
+              f"a fresh clone of the remote does not have it")
+    if unpushed:
+        print(f"note: {len(unpushed)} row(s) hold a commit the remote does not — "
+              f"verify reads the disk, the remote holds what everyone else gets, and only the owner "
+              f"knows whether that commit belongs there")
     if not behind and not unknown and not tampered:
         if patched:
             print(f"verify: all {len(rows)} registered install(s) at the shipped version {ref} "
@@ -4175,6 +4407,136 @@ def _uncommitted_cli(repo: Path) -> tuple[Path, str] | None:
         return None
     out = r.stdout.strip()
     return (cli, out) if out else None
+
+
+def _push_remote(repo: Path) -> str | None:
+    """The remote this repo's branch actually pushes to, or None.
+
+    The remote NAME varies across the fleet and is not always `origin`: measured
+    2026-11-05, automaton has `github` and `gitlab` and NO `origin`. Asking only
+    for `origin` reported 25 repos that DO have a remote as having none at all.
+    The order is the branch's own upstream, else `origin`, else the first remote
+    that answers — the same resolution the fleet's push audit settled on.
+
+    The upstream's remote NAME is not enough: `@{u}` is a local tracking ref that
+    may be stale, and it names a REMOTE/BRANCH pair, so only the remote half is
+    taken from it.
+    """
+    up = subprocess.run(["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "@{u}"],
+                        capture_output=True, text=True, timeout=10)
+    if up.returncode == 0 and up.stdout.strip():
+        name = up.stdout.strip().split("/")[0]
+        has = subprocess.run(["git", "-C", str(repo), "remote", "get-url", name],
+                             capture_output=True, text=True, timeout=10)
+        if has.returncode == 0:
+            return name
+    names = subprocess.run(["git", "-C", str(repo), "remote"],
+                           capture_output=True, text=True, timeout=10)
+    if names.returncode != 0:
+        return None
+    remotes = names.stdout.split()
+    if "origin" in remotes:
+        return "origin"
+    for n in remotes:
+        probe = subprocess.run(["git", "-C", str(repo), "ls-remote", n, "HEAD"],
+                               capture_output=True, text=True, timeout=30)
+        if probe.returncode == 0 and probe.stdout.strip():
+            return n
+    return None
+
+
+def _unpushed_cli(repo: Path) -> tuple[Path, str] | None:
+    """(cli file, detail) when a repo's vendored CLI is committed but its commit is
+    not on the remote, else None.
+
+    This is the rung ABOVE `_uncommitted_cli`, and it exists because that rung is
+    blind to this case BY CONSTRUCTION: it asks whether the working tree is
+    modified, and a committed-but-unpushed copy has a CLEAN working tree. So the
+    check that exists says nothing about the check that was missing.
+
+    Measured 2026-11-05 over the whole fleet (77 vendored rows): 62 of the 63
+    repos with a reachable remote are AHEAD of it, and 46 of those carry an
+    unpushed dispatch commit — the fleet's own upgrade, committed and not pushed.
+    The kernel had NO check for this at all: grepping all of `src/` for
+    `ls-remote`, `rev-parse @{` and `upstream` finds nothing that compares a
+    vendored repo to its remote, and no repo in the fleet has a genome `pre-push`
+    hook (the one `pre-push` in the estate is git-lfs's). So the dispatch's
+    promise — "the commit carries the CLI and nothing else" — was true only
+    LOCALLY, and a fresh clone of any of those remotes got the old CLI.
+
+    Like `_uncommitted_cli`, this is deliberately a *report*, not a fix, and it
+    does NOT gate the exit code: whether a fleet repo's commits belong on its
+    remote is the owner's call, and 46 owners hold it. What was missing was the
+    FACT being visible at all.
+
+    A repo with no remote is not unpushed, it is unversioned — the same
+    distinction `_uncommitted_cli` draws for a repo with no .git. A repo whose
+    remote cannot be reached is reported as UNKNOWN, never as clean."""
+    if not (repo / ".git").exists():
+        return None
+    cli = _repo_cli(repo)
+    if not cli:
+        return None
+    remote = _push_remote(repo)
+    if not remote:
+        return None
+    try:
+        ls = subprocess.run(["git", "-C", str(repo), "ls-remote", remote, "HEAD"],
+                            capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if ls.returncode != 0:
+        # The remote did not answer. That is NOT "clean" and NOT "unpushed" — it
+        # is a measurement that could not be taken, and it must not be reported
+        # as either. A network failure must not read as a pass.
+        return (cli, f"remote {remote} did not answer (git ls-remote failed)")
+    lines = ls.stdout.split()
+    if not lines:
+        return (cli, f"remote {remote} has no HEAD to compare against")
+    remote_head = lines[0]
+    head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                          capture_output=True, text=True, timeout=10)
+    if head.returncode != 0:
+        return None
+    local_head = head.stdout.strip()
+    if local_head == remote_head:
+        return None
+    # The remote's HEAD is the tip of its default branch. A local commit is
+    # unpushed when it is not reachable from it, which `git merge-base` answers
+    # without fetching: `--is-ancestor` exits 0 when the local HEAD is an
+    # ancestor of the remote's.
+    #
+    # THE OBJECT MUST BE PRESENT LOCALLY. `merge-base` exits 128 (not 1) when it
+    # cannot find a commit, and treating 128 as "not an ancestor" would report
+    # every repo whose local objects predate the remote's tip as unpushed — a
+    # false alarm on exactly the repos that are merely behind. The local TRACKING
+    # ref (`refs/remotes/<remote>/HEAD`) holds the remote's objects in every
+    # fleet repo, so it is used when it exists; the remote's sha is used only
+    # when the object is already local, and a repo that has neither is reported
+    # as UNKNOWN rather than guessed at.
+    anc = subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor",
+                           local_head, remote_head],
+                          capture_output=True, text=True, timeout=10)
+    if anc.returncode == 0:
+        # The local HEAD IS on the remote's history. The remote's default branch
+        # may simply point elsewhere — a different branch, or a newer one. That
+        # is not an unpushed commit.
+        return None
+    if anc.returncode != 1:
+        # 128: the remote's commit is not in this repository's object store, so
+        # ancestry CANNOT be decided. That is a measurement that could not be
+        # taken, and it must not read as "not an ancestor" any more than a
+        # network failure reads as clean.
+        have = subprocess.run(["git", "-C", str(repo), "cat-file", "-e", remote_head],
+                               capture_output=True, text=True, timeout=10)
+        if have.returncode != 0:
+            return (cli, f"the remote's HEAD is not in this checkout, so whether the local "
+                         f"commit is pushed cannot be decided (remote {remote})")
+    count = subprocess.run(["git", "-C", str(repo), "rev-list", "--count",
+                             f"{remote_head}..{local_head}"],
+                            capture_output=True, text=True, timeout=10)
+    n = count.stdout.strip() if count.returncode == 0 else "?"
+    return (cli, f"{n} commit(s) on HEAD are not on {remote}")
 
 
 def _repo_cli(path: Path) -> Path | None:

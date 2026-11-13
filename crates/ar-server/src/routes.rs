@@ -1093,19 +1093,28 @@ async fn handle_chat_inner(
     let deferred_resilience = Arc::clone(&state.resilience);
     let deferred_lkgp = Arc::clone(&state.lkgp);
     let deferred_exec = Arc::clone(&state.exec);
-    // The body's own deadline, not the request's.
+    // The body's own deadline BUDGET, not the request's.
     //
     // `canonical.deadline` is an absolute instant set before the attempt loop
     // ran, so by the time the body starts it is already spent down to whatever
     // the window left. Handing that to the body's own attempt loop would give
     // it a near-zero budget, and `deadline_timeout` treats a spent deadline as
-    // zero — which fires on the first poll and drops the future. The body
-    // therefore gets a full, fresh deadline from the same budget the request
-    // was configured with, measured from when it actually starts.
-    let deferred_fallback = state.config.stream_deadline(canonical.model.as_ref());
+    // zero — which fires on the first poll and drops the future.
+    //
+    // The deadline itself is built INSIDE the body, not here. `Deadline::from_now`
+    // captures `Instant::now()` at the point the expression is evaluated, and
+    // this expression runs while the handler is still holding the request —
+    // seconds before the HTTP layer polls the body at all. A deadline built here
+    // is stale by exactly the time the commitment cost, and `remaining()` gives
+    // back less than the model was configured with: a 330 s deadline with a 30 s
+    // window hands the body 300 s, which is a budget no operator asked for and
+    // one that silently eats into a slow model's own headroom. Passing the
+    // BUDGET down and letting the body measure it from its own first poll makes
+    // the number on the wire the number the config declares.
+    let deferred_budget = state.config.stream_deadline(canonical.model.as_ref());
     let deferred_canonical = {
         let mut c = deferred_canonical;
-        c.deadline = Some(ar_route::Deadline::from_now(deferred_fallback));
+        c.deadline = None;
         c
     };
 
@@ -1137,11 +1146,20 @@ async fn handle_chat_inner(
         // the body is dropped.
         let keepalive = dialect.keepalive();
         let body = async_stream::stream! {
+            // The body's deadline is measured from HERE — the body's first
+            // poll, which is the moment the body actually starts running — not
+            // from the handler. `Deadline::from_now` captures `Instant::now()`
+            // where it is written, and the HTTP layer polls this stream only
+            // after the handler has returned and the commitment has been
+            // flushed, so a deadline written in the handler is already spent
+            // by the time it is honoured.
+            let mut body_canonical = deferred_canonical.clone();
+            body_canonical.deadline = Some(ar_route::Deadline::from_now(deferred_budget));
             let outcome = deadline_timeout(
-                deferred_canonical.deadline,
-                deferred_fallback,
+                body_canonical.deadline,
+                deferred_budget,
                 ar_route::attempt_loop_with_pins(
-                    &deferred_canonical,
+                    &body_canonical,
                     &deferred_chain,
                     deferred_exec.as_ref(),
                     deferred_resilience.as_ref(),

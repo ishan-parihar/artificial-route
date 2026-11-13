@@ -362,3 +362,81 @@ async fn the_deferred_body_gets_a_fresh_deadline() {
         "the answer arrived, so no failure was reported: {body}"
     );
 }
+
+/// The deferred body's deadline is measured from the body's OWN start, not
+/// from the handler's.
+///
+/// `Deadline::from_now` captures `Instant::now()` where the expression is
+/// written. When the deadline was written in the handler — before the window
+/// closed and before the HTTP layer ever polled the body — it was already
+/// spent by the time the body began, and `remaining()` handed the body's own
+/// attempt loop a budget that was short by exactly the cost of the
+/// commitment.
+///
+/// The gap is invisible at a tiny window: an 80 ms commitment against a 120 s
+/// deadline is a rounding error. It is not invisible at production values. A
+/// 330 s deadline with a 30 s window handed the body 300 s, and a model whose
+/// upstream needs 302 s to produce headers then failed one attempt short of
+/// what the operator configured.
+///
+/// So the test scales the window until the staleness is the whole answer: the
+/// deadline is set to `window + margin`, and the upstream needs longer than
+/// `window` but less than `window + margin`. With the deadline measured from
+/// the handler, the body gets `window + margin - window = margin` and the
+/// upstream misses it. Measured from the body's own start, the body gets the
+/// full `window + margin` and the answer arrives.
+#[tokio::test]
+async fn the_deferred_body_deadline_is_measured_from_the_body_not_the_handler() {
+    use crate::config::{ComboTarget, RouteCombo, ServerConfig};
+    use crate::exec::ProviderConfig;
+
+    // The commitment costs real time, and the upstream answers after it.
+    let window = Duration::from_millis(300);
+    let margin = Duration::from_millis(200);
+    // The upstream answers at `window + margin/2`: after the commitment, but
+    // within the margin. A handler-measured deadline gives the body only
+    // `margin`, which this answer narrowly misses.
+    let exec = Arc::new(SlowSuccessExec {
+        delay: window + margin / 2,
+    });
+    let mut config = ServerConfig::single(
+        0,
+        Strategy::Priority,
+        vec![
+            ProviderConfig::new(ProviderId::new("p"), "http://127.0.0.1:1/v1", "k").with_model("m"),
+        ],
+    );
+    config.combos = vec![RouteCombo::new(
+        "m",
+        Strategy::Priority,
+        vec![ComboTarget::new(ProviderId::new("p"), "m")],
+    )];
+    config.deferred_headers = Some(window);
+    // The model's whole budget: the window plus the margin. The window must
+    // be strictly under it, or the window never fires at all.
+    config.timeouts.insert("m".to_owned(), window + margin);
+
+    let state = crate::app::Components {
+        config,
+        exec,
+        ..crate::app::Components::unconfigured(ServerConfig::single(
+            0,
+            Strategy::Priority,
+            Vec::new(),
+        ))
+    }
+    .into_state();
+    let app = crate::app::app(state);
+
+    let response = drive(&app, chat()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_of(response).await;
+    assert!(
+        body.contains("[DONE]"),
+        "the body got the full budget and the answer arrived: {body}"
+    );
+    assert!(
+        !body.contains("stream_error"),
+        "the answer arrived, so no failure was reported: {body}"
+    );
+}
