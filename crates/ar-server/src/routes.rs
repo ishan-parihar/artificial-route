@@ -2459,15 +2459,23 @@ fn fusion_empty_panel(outcome: &ar_route::FusionOutcome) -> Response {
 /// one place: the compression plan resolved, then the cache consulted, then
 /// whatever the cache said about this request. Threading them as four parameters
 /// is what let [`decorate`] reach eight arguments.
-/// What a cut stream needs to resume on another target: the executor, the
-/// canonical body the client sent, and the one target that takes over. Built only
-/// for a streamed OpenAI chat request, served by an OpenAI-wire provider, when a
-/// later target on the chain is marked `continue_on_cut` and also speaks OpenAI.
+/// A fallback target available to take over a cut stream.
 #[derive(Clone)]
-struct Continuation {
-    exec: Arc<dyn ArExec>,
-    body: Bytes,
-    target: (ProviderId, Strng),
+pub(crate) struct ContinuationTarget {
+    pub(crate) provider: ProviderId,
+    pub(crate) model: Strng,
+    pub(crate) continue_on_cut: bool,
+}
+
+/// What a cut stream needs to resume on another target: the executor, the
+/// canonical body the client sent, and the remaining chain targets that speak OpenAI.
+/// For a zero-token cut, any sibling target can take over transparently.
+/// For a mid-stream cut, targets marked `continue_on_cut` can resume with prefill.
+#[derive(Clone)]
+pub(crate) struct Continuation {
+    pub(crate) exec: Arc<dyn ArExec>,
+    pub(crate) body: Bytes,
+    pub(crate) targets: Vec<ContinuationTarget>,
 }
 
 /// The assistant text a streamed OpenAI chat reply had already sent, read from its
@@ -2502,19 +2510,33 @@ impl SentText {
             let Ok(frame) = serde_json::from_str::<serde_json::Value>(data) else {
                 continue;
             };
-            let Some(choice) = frame.pointer("/choices/0") else {
-                continue;
-            };
-            if let Some(piece) = choice
-                .pointer("/delta/content")
+            if let Some(choice) = frame.pointer("/choices/0") {
+                if let Some(piece) = choice
+                    .pointer("/delta/content")
+                    .or_else(|| choice.pointer("/delta/reasoning_content"))
+                    .or_else(|| choice.pointer("/delta/reasoning"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    self.text.push_str(piece);
+                }
+                if choice.pointer("/delta/tool_calls").is_some() {
+                    self.tools = true;
+                }
+                if choice.get("finish_reason").is_some_and(|f| !f.is_null()) {
+                    self.finished = true;
+                }
+            }
+            if let Some(piece) = frame
+                .pointer("/delta/text")
                 .and_then(serde_json::Value::as_str)
             {
                 self.text.push_str(piece);
             }
-            if choice.pointer("/delta/tool_calls").is_some() {
-                self.tools = true;
-            }
-            if choice.get("finish_reason").is_some_and(|f| !f.is_null()) {
+            if frame
+                .pointer("/delta/stop_reason")
+                .is_some_and(|s| !s.is_null())
+                || frame.get("type").and_then(serde_json::Value::as_str) == Some("message_stop")
+            {
                 self.finished = true;
             }
         }
@@ -2540,12 +2562,13 @@ fn resume_body(body: &[u8], prefill: &str, model: &str) -> Option<Bytes> {
     serde_json::to_vec(&request).ok().map(Bytes::from)
 }
 
-/// Splices a second target onto a cut OpenAI chat stream, so the client reads one
-/// reply. Returns the stream to relay and the cut flag that decides how it ends.
+/// Splices a sibling target onto a cut OpenAI chat stream, so the client reads one
+/// unbroken reply. Returns the stream to relay and the cut flag that decides how it ends.
 ///
-/// One continuation per request: if the second target is cut too, the reply ends
-/// cut. If the continuation cannot be dispatched, the reply ends cut, and the
-/// relay's truncation frame says so, as it does without this wrapper.
+/// For a zero-token cut (upstream returned headers but terminated before sending tokens),
+/// the original prompt is dispatched transparently to sibling targets.
+/// For a mid-stream cut with partial tokens sent, the first target with `continue_on_cut`
+/// takes over with prefill.
 fn resumed(stream: ChunkStream, cut: CutFlag, plan: Continuation) -> (ChunkStream, CutFlag) {
     let ends_cut: CutFlag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let out = Arc::clone(&ends_cut);
@@ -2556,20 +2579,62 @@ fn resumed(stream: ChunkStream, cut: CutFlag, plan: Continuation) -> (ChunkStrea
             sent.feed(&chunk);
             yield chunk;
         }
-        if !cut.load(std::sync::atomic::Ordering::SeqCst) {
+        let was_cut = cut.load(std::sync::atomic::Ordering::SeqCst) || !sent.finished;
+        if !was_cut {
             return;
         }
-        let (provider, model) = plan.target.clone();
+
+        // Case 1: Zero-token cut.
+        // The upstream returned HTTP 200, but terminated without sending any content
+        // tokens. The client's buffer is completely clean, so we can transparently
+        // dispatch sibling targets with the original request body.
+        if sent.text.is_empty() {
+            for target in &plan.targets {
+                let canonical = CanonicalRequest::new(&target.model, plan.body.clone()).with_stream(true);
+                let Ok(upstream) = plan.exec.post_chat(&target.provider, &canonical).await else {
+                    continue;
+                };
+                if !upstream.status.is_success() {
+                    continue;
+                }
+                let mut sibling = upstream.stream;
+                let mut healed_sent = SentText::default();
+                while let Some(chunk) = sibling.next().await {
+                    healed_sent.feed(&chunk);
+                    yield chunk;
+                }
+                let sibling_cut = upstream.cut.load(std::sync::atomic::Ordering::SeqCst) || !healed_sent.finished;
+                if !sibling_cut {
+                    // Sibling stream finished cleanly!
+                    out.store(false, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+                // If the sibling sent partial text before cutting, we cannot transparently try another sibling.
+                if !healed_sent.text.is_empty() {
+                    out.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+            }
+            out.store(true, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
+
+        // Case 2: Mid-stream cut with partial text already sent to the client.
+        // Can only resume on targets that explicitly allow prefill continuation (`continue_on_cut`).
+        let Some(target) = plan.targets.iter().find(|t| t.continue_on_cut) else {
+            out.store(true, std::sync::atomic::Ordering::SeqCst);
+            return;
+        };
         let Some(prefill) = sent.resumable().map(str::to_owned) else {
             out.store(true, std::sync::atomic::Ordering::SeqCst);
             return;
         };
-        let Some(body) = resume_body(&plan.body, &prefill, &model) else {
+        let Some(body) = resume_body(&plan.body, &prefill, &target.model) else {
             out.store(true, std::sync::atomic::Ordering::SeqCst);
             return;
         };
-        let canonical = CanonicalRequest::new(&model, body).with_stream(true);
-        let upstream = match plan.exec.post_chat(&provider, &canonical).await {
+        let canonical = CanonicalRequest::new(&target.model, body).with_stream(true);
+        let upstream = match plan.exec.post_chat(&target.provider, &canonical).await {
             Ok(upstream) if upstream.status.is_success() => upstream,
             _ => {
                 out.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -2577,10 +2642,12 @@ fn resumed(stream: ChunkStream, cut: CutFlag, plan: Continuation) -> (ChunkStrea
             }
         };
         let mut second = upstream.stream;
+        let mut second_sent = SentText::default();
         while let Some(chunk) = second.next().await {
+            second_sent.feed(&chunk);
             yield chunk;
         }
-        if upstream.cut.load(std::sync::atomic::Ordering::SeqCst) {
+        if upstream.cut.load(std::sync::atomic::Ordering::SeqCst) || !second_sent.finished {
             out.store(true, std::sync::atomic::Ordering::SeqCst);
         }
     });
@@ -2686,22 +2753,31 @@ fn continuation_for(
     if !openai(served) {
         return None;
     }
-    let target = chain
+    let targets: Vec<ContinuationTarget> = chain
         .iter()
         .skip_while(|t| &t.provider != served)
         .skip(1)
-        .find(|t| {
-            state
+        .filter(|t| openai(&t.provider))
+        .map(|t| {
+            let continue_on_cut = state
                 .config
                 .providers
                 .iter()
-                .any(|p| p.id == t.provider && p.continue_on_cut)
-                && openai(&t.provider)
-        })?;
+                .any(|p| p.id == t.provider && p.continue_on_cut);
+            ContinuationTarget {
+                provider: t.provider.clone(),
+                model: t.model.clone(),
+                continue_on_cut,
+            }
+        })
+        .collect();
+    if targets.is_empty() {
+        return None;
+    }
     Some(Continuation {
         exec: Arc::clone(&state.exec),
         body: body.clone(),
-        target: (target.provider.clone(), target.model.clone()),
+        targets,
     })
 }
 
@@ -3169,21 +3245,17 @@ fn observe_target_outcome(outcome: &AttemptOutcome, chain: &[ChainTarget], elaps
         Some(share) => (share * 3.0 + observed) / 4.0,
         None => observed,
     };
-    // The latency factor is relative to the target's own best: the first
-    // observation is `1.0` (nothing to compare against), and a later, slower
-    // answer pulls it down.
+    // Latency factor using inverse-latency shape (1.0 at 0ms, 0.5 at 1000ms),
+    // smoothed via 75/25 EWMA to avoid noise swings while decaying on slow responses.
+    let millis = elapsed.as_millis() as f64;
+    let current_inv = if millis <= 0.0 {
+        1.0
+    } else {
+        1.0 / (1.0 + millis / 1000.0)
+    };
     let latency_inv = match previous.latency_inv {
-        Some(previous_best) => {
-            let millis = elapsed.as_millis() as f64;
-            if millis <= 0.0 {
-                previous_best
-            } else {
-                // `1 / (1 + millis/1000)` is the inverse-latency shape the
-                // auto scorer uses: 1.0 at zero, 0.5 at one second.
-                (1.0 / (1.0 + millis / 1000.0)).min(previous_best.max(1.0))
-            }
-        }
-        None => 1.0,
+        Some(prev) => (prev * 0.75 + current_inv * 0.25).clamp(0.0, 1.0),
+        None => current_inv,
     };
     loads.observe_outcome(&candidate, reliability, latency_inv);
 }
@@ -4815,7 +4887,7 @@ mod tests {
         model, models_head, not_found, note_failure, outcome_label, require_json, resolve,
         unknown_model,
     };
-    use super::{Continuation, SentText, resume_body, resumed};
+    use super::{Continuation, ContinuationTarget, SentText, resume_body, resumed};
     use crate::app::{AppState, Components};
     use crate::config::{ComboTarget, ServerConfig};
     use crate::models::ModelCard;
@@ -9126,7 +9198,11 @@ mod tests {
             body: Bytes::from(
                 r#"{"model":"combo","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
             ),
-            target: (ProviderId::new("p2"), Strng::from("m2")),
+            targets: vec![ContinuationTarget {
+                provider: ProviderId::new("p2"),
+                model: Strng::from("m2"),
+                continue_on_cut: true,
+            }],
         };
         let cut: CutFlag = Arc::new(std::sync::atomic::AtomicBool::new(true));
         (Box::pin(futures::stream::iter(frames)), cut, plan, exec)
@@ -9207,6 +9283,36 @@ mod tests {
         let (out, ends_cut) = resumed(first, cut, plan);
         let _ = out.collect::<Vec<_>>().await;
         assert!(ends_cut.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn resumed_should_heal_zero_token_cut_by_dispatching_sibling_targets() {
+        use futures::StreamExt;
+        let second = Upstream::success(Box::pin(futures::stream::iter(vec![
+            openai_frame("Healed without prefill!"),
+            Bytes::from("data: [DONE]\n\n"),
+        ])));
+        // First stream sent only keepalive line, 0 text tokens, then cut
+        let (first, cut, plan, exec) =
+            cut_after(vec![Bytes::from(": keepalive\n\n")], Some(second));
+        let (out, ends_cut) = resumed(first, cut, plan);
+        let joined: String = out
+            .map(|c: Bytes| String::from_utf8_lossy(&c).into_owned())
+            .collect::<Vec<_>>()
+            .await
+            .concat();
+        assert!(joined.contains("Healed without prefill!"));
+        assert!(joined.contains("[DONE]"));
+        assert!(!ends_cut.load(std::sync::atomic::Ordering::SeqCst));
+        let seen = exec
+            .seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(seen.len(), 1);
+        // Original body dispatched without assistant prefix prefill
+        assert!(!seen[0].contains("assistant"));
+        assert!(seen[0].contains(r#""content":"hi""#));
     }
 
     fn cut_rows(cut: bool) -> usize {

@@ -43,6 +43,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use ar_config::OpenAiChatCapabilities;
 use ar_registry::WireFormat;
@@ -151,6 +152,12 @@ struct KeySlot {
     /// Consecutive auth refusals (401/403). The lockout doubles per strike,
     /// so a dead key is probed geometrically less often, not forgotten.
     auth_strikes: u16,
+    /// Consecutive throttles (429). Exponential backoff when Retry-After is absent.
+    throttle_strikes: u16,
+    /// Number of concurrent requests currently in flight on this key.
+    in_flight: u32,
+    /// Exponential weighted moving average latency (ms) for this key.
+    latency_ewma_ms: Option<f64>,
 }
 
 /// The rotating cursor over one provider's credential list.
@@ -171,6 +178,28 @@ struct KeyCursor {
 /// the default, or the credential comes back before the target it would
 /// dispatch for does.
 const KEY_THROTTLE: std::time::Duration = std::time::Duration::from_secs(3);
+const KEY_THROTTLE_CAP: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// An RAII stream wrapper that releases the provider key's in-flight counter on drop.
+struct KeyReleaseStream<S> {
+    inner: S,
+    cfg: ProviderConfig,
+    key: usize,
+}
+
+impl<S: futures::Stream<Item = Bytes> + Send + Unpin> futures::Stream for KeyReleaseStream<S> {
+    type Item = Bytes;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Bytes>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+impl<S> Drop for KeyReleaseStream<S> {
+    fn drop(&mut self) {
+        self.cfg.release_key(self.key);
+    }
+}
 
 /// The base lockout for an auth refusal, doubling per strike and capped at
 /// thirty minutes — the same shape as `ar_route`'s lockout ladder, kept
@@ -588,24 +617,91 @@ impl ProviderConfig {
         let now = std::time::Instant::now();
         let usable = |slot: &KeySlot| !slot.blocked_until.is_some_and(|t| t > now);
         let n = state.len();
-        // The scan starts at `last + 1` so the same credential never serves
-        // twice in a row while a healthy sibling exists; before the first
-        // dispatch it starts at the top of the list.
-        let start = cursor.last.map_or(0, |l| (l + 1) % n.max(1));
+        if n == 0 {
+            return 0;
+        }
+
+        // 1. Collect all unblocked key indices.
+        let usable_indices: Vec<usize> = (0..n).filter(|&i| usable(&state[i])).collect();
+
+        // 2. If all keys are cooling, pick the one soonest to recover.
+        if usable_indices.is_empty() {
+            return state
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, slot)| slot.blocked_until.unwrap_or(now))
+                .map_or(0, |(idx, _)| idx);
+        }
+
+        if usable_indices.len() == 1 {
+            cursor.last = Some(usable_indices[0]);
+            return usable_indices[0];
+        }
+
+        // 3. Among unblocked keys, prioritize those with the minimum in-flight load.
+        let min_in_flight = usable_indices
+            .iter()
+            .map(|&i| state[i].in_flight)
+            .min()
+            .unwrap_or(0);
+
+        let least_loaded: Vec<usize> = usable_indices
+            .iter()
+            .copied()
+            .filter(|&i| state[i].in_flight == min_in_flight)
+            .collect();
+
+        // 4. Spread requests via round-robin among the least-loaded keys.
+        let start = cursor.last.map_or(0, |l| (l + 1) % n);
         for off in 0..n {
             let idx = (start + off) % n;
-            if usable(&state[idx]) {
+            if least_loaded.contains(&idx) {
                 cursor.last = Some(idx);
                 return idx;
             }
         }
-        // All cooling: soonest to recover, without advancing the cursor —
-        // the rotation resumes where it left off once windows expire.
-        state
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, slot)| slot.blocked_until.unwrap_or(now))
-            .map_or(0, |(idx, _)| idx)
+
+        let winner = least_loaded[0];
+        cursor.last = Some(winner);
+        winner
+    }
+
+    /// Increments the in-flight concurrency count for `key`.
+    pub fn acquire_key(&self, key: usize) {
+        let mut state = self
+            .key_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(slot) = state.get_mut(key) {
+            slot.in_flight = slot.in_flight.saturating_add(1);
+        }
+    }
+
+    /// Decrements the in-flight concurrency count for `key`.
+    pub fn release_key(&self, key: usize) {
+        let mut state = self
+            .key_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(slot) = state.get_mut(key) {
+            slot.in_flight = slot.in_flight.saturating_sub(1);
+        }
+    }
+
+    /// Records time-to-headers latency for `key` into its EWMA tracker.
+    pub fn record_key_latency(&self, key: usize, elapsed: std::time::Duration) {
+        let mut state = self
+            .key_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(slot) = state.get_mut(key) {
+            let millis = elapsed.as_millis() as f64;
+            let ewma = match slot.latency_ewma_ms {
+                Some(prev) => prev * 0.75 + millis * 0.25,
+                None => millis,
+            };
+            slot.latency_ewma_ms = Some(ewma);
+        }
     }
 
     /// Charges or clears the credential an attempt used, per its verdict.
@@ -638,12 +734,22 @@ impl ProviderConfig {
             return;
         };
         if status.is_success() {
-            *slot = KeySlot::default();
+            slot.auth_strikes = 0;
+            slot.throttle_strikes = 0;
+            slot.blocked_until = None;
             return;
         }
         match status.as_u16() {
             429 => {
-                slot.blocked_until = Some(now + retry_after.unwrap_or(KEY_THROTTLE));
+                slot.throttle_strikes = slot.throttle_strikes.saturating_add(1).min(6);
+                let backoff = match retry_after {
+                    Some(after) => after.max(KEY_THROTTLE),
+                    None => {
+                        let multiplier = 1_u32 << slot.throttle_strikes.saturating_sub(1).min(5);
+                        (KEY_THROTTLE * multiplier).min(KEY_THROTTLE_CAP)
+                    }
+                };
+                slot.blocked_until = Some(now + backoff);
             }
             401 | 403 => {
                 slot.auth_strikes = slot.auth_strikes.saturating_add(1).min(6);
@@ -979,7 +1085,12 @@ impl ArRouteExec for HttpExec {
             // The credential this attempt carries, chosen here so the same
             // index can be handed the verdict below: one key per attempt, the
             // next usable one when an earlier key is still cooling.
+            let is_oauth = self.oauth.contains_key(provider);
             let key = cfg.pick_key();
+            if !is_oauth {
+                cfg.acquire_key(key);
+            }
+            let dispatch_start = std::time::Instant::now();
             // The request's own remaining budget bounds this attempt: the
             // model deadline is enforced around the whole loop, so an attempt
             // allowed to wait longer than it would spend the entire budget on
@@ -1016,7 +1127,12 @@ impl ArRouteExec for HttpExec {
                         // The provider passed `is_dispatchable` at boot, so a wire with
                         // no renderer here means the two drifted — a diagnosable error
                         // rather than a 502-shaped `Upstream`.
-                        Err(e) => return Err(flatten(e)),
+                        Err(e) => {
+                            if !is_oauth {
+                                cfg.release_key(key);
+                            }
+                            return Err(flatten(e));
+                        }
                     };
                     self.core.post_rendered(&shape, body, &abort).await
                 }
@@ -1028,13 +1144,21 @@ impl ArRouteExec for HttpExec {
                 // (another chain may still work) and the client gets a body it can
                 // branch on.
                 Err(ar_exec::ExecError::OAuthTerminal(report)) => {
+                    if !is_oauth {
+                        cfg.release_key(key);
+                    }
                     return Ok(Upstream::failure(
                         StatusCode::UNAUTHORIZED,
                         report.client_body(),
                         None,
                     ));
                 }
-                Err(e) => return Err(flatten(e)),
+                Err(e) => {
+                    if !is_oauth {
+                        cfg.release_key(key);
+                    }
+                    return Err(flatten(e));
+                }
             };
 
             let status = stream.status();
@@ -1042,10 +1166,16 @@ impl ArRouteExec for HttpExec {
             // The credential layer's own verdict on the key that carried the
             // attempt. OAuth sessions manage their own rotation and never
             // read the `api_keys` list, so they are exempt.
-            if !self.oauth.contains_key(provider) {
+            if !is_oauth {
                 cfg.note_key_result(key, status, retry_after);
+                if status.is_success() {
+                    cfg.record_key_latency(key, dispatch_start.elapsed());
+                }
             }
             if !status.is_success() {
+                if !is_oauth {
+                    cfg.release_key(key);
+                }
                 let (status, body, _) = stream.into_failure().await;
                 return Ok(Upstream::failure(status, body, retry_after));
             }
@@ -1080,6 +1210,15 @@ impl ArRouteExec for HttpExec {
                         }
                     })
                 });
+                let boxed_stream: ar_route::ChunkStream = if is_oauth {
+                    chunks.boxed()
+                } else {
+                    Box::pin(KeyReleaseStream {
+                        inner: chunks.boxed(),
+                        cfg: cfg.clone(),
+                        key,
+                    })
+                };
                 return Ok(Upstream {
                     status,
                     // A 2xx can still carry `Retry-After` (an overloaded
@@ -1087,13 +1226,16 @@ impl ArRouteExec for HttpExec {
                     // reports it.
                     retry_after,
                     error_body: Bytes::new(),
-                    stream: chunks.boxed(),
+                    stream: boxed_stream,
                     cut,
                 });
             }
-            return Ok(
-                unwrap_response(cfg, stream, status, retry_after, canonical.model.as_ref()).await,
-            );
+            let unwrapped =
+                unwrap_response(cfg, stream, status, retry_after, canonical.model.as_ref()).await;
+            if !is_oauth {
+                cfg.release_key(key);
+            }
+            Ok(unwrapped)
         })
     }
 
@@ -1885,5 +2027,63 @@ mod tests {
             }
         }
         assert!(!p.all_keys_auth_blocked());
+    }
+
+    #[test]
+    fn concurrency_aware_key_selection_picks_idle_sibling_over_busy_key() {
+        let p = ProviderConfig::with_keys(
+            ProviderId::new("two-keys"),
+            "https://x/v1",
+            vec!["k0".to_owned(), "k1".to_owned()],
+        );
+        // Initially, key 0 serves first
+        assert_eq!(p.pick_key(), 0);
+        // Dispatch starts on key 0:
+        p.acquire_key(0);
+
+        // While key 0 is busy in flight, subsequent pick_key must choose idle key 1
+        assert_eq!(p.pick_key(), 1, "busy key 0 is skipped for idle key 1");
+        assert_eq!(
+            p.pick_key(),
+            1,
+            "subsequent request still prefers idle key 1"
+        );
+
+        // Key 0 finishes request:
+        p.release_key(0);
+
+        // Now both keys are idle again; round-robin resumes
+        assert_eq!(p.pick_key(), 0);
+    }
+
+    #[test]
+    fn exponential_backoff_on_repeated_throttles() {
+        let p = ProviderConfig::with_keys(
+            ProviderId::new("throttled"),
+            "https://x/v1",
+            vec!["k0".to_owned(), "k1".to_owned()],
+        );
+
+        // Strike 1 on k0 without retry-after
+        p.note_key_result(0, StatusCode::TOO_MANY_REQUESTS, None);
+        {
+            let state = p.key_state.lock().unwrap();
+            assert_eq!(state[0].throttle_strikes, 1);
+        }
+
+        // Strike 2 on k0 without retry-after
+        p.note_key_result(0, StatusCode::TOO_MANY_REQUESTS, None);
+        {
+            let state = p.key_state.lock().unwrap();
+            assert_eq!(state[0].throttle_strikes, 2);
+        }
+
+        // Success on k0 clears strikes
+        p.note_key_result(0, StatusCode::OK, None);
+        {
+            let state = p.key_state.lock().unwrap();
+            assert_eq!(state[0].throttle_strikes, 0);
+            assert!(state[0].blocked_until.is_none());
+        }
     }
 }
